@@ -1,0 +1,28 @@
+replan:
+  name: Replan
+  description: Force Wattson to refresh and rebuild its current plan.
+pause:
+  name: Pause
+  description: Pause active control for a number of minutes.
+  fields:
+    entry_id:
+      description: Optional config entry id.
+      example: "abcd1234"
+    minutes:
+      description: Pause length in minutes.
+      example: 60
+resume:
+  name: Resume
+  description: Resume active control immediately.
+set_ev_mode:
+  name: Set EV Mode
+  description: Change the active EV mode.
+set_battery_mode:
+  name: Set Battery Mode
+  description: Change the active battery mode.
+enable_shadow_mode:
+  name: Enable Shadow Mode
+  description: Disable writes and keep planning only.
+disable_shadow_mode:
+  name: Disable Shadow Mode
+  description: Allow Wattson to execute control plans again.

@@ -1,0 +1,25 @@
+"""Diagnostics for Wattson."""
+from __future__ import annotations
+
+from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .config import merged_entry_config
+from .const import CONF_EASEE_DEVICE_ID, DOMAIN
+
+TO_REDACT = {CONF_EASEE_DEVICE_ID}
+
+
+async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry) -> dict:
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    return async_redact_data(
+        {
+            "config": merged_entry_config(entry),
+            "site_state": coordinator.site_state,
+            "control_plan": coordinator.control_plan,
+            "last_actions": coordinator.last_actions,
+            "capabilities": coordinator.capabilities,
+        },
+        TO_REDACT,
+    )

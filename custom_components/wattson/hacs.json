@@ -1,0 +1,6 @@
+{
+  "name": "Wattson",
+  "homeassistant": "2025.1.0",
+  "content_in_root": true,
+  "render_readme": true
+}

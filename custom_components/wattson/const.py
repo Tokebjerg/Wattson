@@ -1,0 +1,139 @@
+"""Constants for Wattson."""
+from __future__ import annotations
+
+from datetime import timedelta
+
+from homeassistant.const import Platform
+
+DOMAIN = "wattson"
+NAME = "Wattson"
+
+PLATFORMS = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.SELECT,
+    Platform.BUTTON,
+]
+
+UPDATE_INTERVAL = timedelta(seconds=30)
+
+CONF_NAME = "name"
+CONF_SHADOW_MODE = "shadow_mode"
+CONF_AUTOMATION_ENABLED = "automation_enabled"
+CONF_BATTERY_CONTROL_ENABLED = "battery_control_enabled"
+CONF_EV_CONTROL_ENABLED = "ev_control_enabled"
+CONF_STALE_SECONDS = "stale_seconds"
+CONF_INVERT_GRID_POWER_SIGN = "invert_grid_power_sign"
+CONF_INVERT_BATTERY_POWER_SIGN = "invert_battery_power_sign"
+CONF_BUY_PRICE_ENTITY = "buy_price_entity"
+CONF_SELL_PRICE_ENTITY = "sell_price_entity"
+CONF_FORECAST_TODAY_ENTITY = "forecast_today_entity"
+CONF_EV_WINDOWS = "ev_windows"
+CONF_EV_MAX_AMPS = "ev_max_amps"
+CONF_EV_SOLAR_MIN_SURPLUS_W = "ev_solar_min_surplus_w"
+CONF_BATTERY_MIN_SOC = "battery_min_soc"
+CONF_BATTERY_MAX_SOC = "battery_max_soc"
+CONF_CHEAP_PRICE_THRESHOLD = "cheap_price_threshold"
+CONF_EXPENSIVE_PRICE_THRESHOLD = "expensive_price_threshold"
+CONF_ALLOW_GRID_CHARGE = "allow_grid_charge"
+CONF_ALLOW_NEGATIVE_EXPORT = "allow_negative_export"
+CONF_EV_MODE_DEFAULT = "ev_mode_default"
+CONF_BATTERY_MODE_DEFAULT = "battery_mode_default"
+
+CONF_PV1_POWER_ENTITY = "pv1_power_entity"
+CONF_PV2_POWER_ENTITY = "pv2_power_entity"
+CONF_LOAD_POWER_ENTITY = "load_power_entity"
+CONF_GRID_POWER_ENTITY = "grid_power_entity"
+CONF_BATTERY_SOC_ENTITY = "battery_soc_entity"
+CONF_BATTERY_POWER_ENTITY = "battery_power_entity"
+CONF_INVERTER_ONLINE_ENTITY = "inverter_online_entity"
+CONF_INVERTER_STATUS_ENTITY = "inverter_status_entity"
+CONF_GRID_CHARGE_SWITCH = "grid_charge_switch"
+CONF_SOLAR_SELL_SWITCH = "solar_sell_switch"
+CONF_ENERGY_PRIORITY_SELECT = "energy_priority_select"
+CONF_LIMIT_CONTROL_MODE_SELECT = "limit_control_mode_select"
+CONF_BATTERY_CHARGE_CURRENT_NUMBER = "battery_charge_current_number"
+CONF_BATTERY_DISCHARGE_CURRENT_NUMBER = "battery_discharge_current_number"
+CONF_BATTERY_GRID_CHARGE_CURRENT_NUMBER = "battery_grid_charge_current_number"
+CONF_EXPORT_LIMIT_NUMBER = "export_limit_number"
+CONF_TOU_ENABLE_SWITCH = "tou_enable_switch"
+
+CONF_EASEE_DEVICE_ID = "easee_device_id"
+CONF_EASEE_ENABLE_SWITCH = "easee_enable_switch"
+CONF_EASEE_STATUS_ENTITY = "easee_status_entity"
+CONF_EASEE_POWER_ENTITY = "easee_power_entity"
+CONF_EASEE_SESSION_ENTITY = "easee_session_entity"
+CONF_EASEE_PHASE_MODE_ENTITY = "easee_phase_mode_entity"
+CONF_EASEE_ONLINE_ENTITY = "easee_online_entity"
+
+DEFAULT_NAME = NAME
+DEFAULT_SHADOW_MODE = True
+DEFAULT_AUTOMATION_ENABLED = True
+DEFAULT_BATTERY_CONTROL_ENABLED = True
+DEFAULT_EV_CONTROL_ENABLED = True
+DEFAULT_STALE_SECONDS = 180
+DEFAULT_INVERT_GRID_POWER_SIGN = False
+DEFAULT_INVERT_BATTERY_POWER_SIGN = False
+DEFAULT_EV_WINDOWS = "00:00-06:00"
+DEFAULT_EV_MAX_AMPS = 16
+DEFAULT_EV_SOLAR_MIN_SURPLUS_W = 1400
+DEFAULT_BATTERY_MIN_SOC = 20
+DEFAULT_BATTERY_MAX_SOC = 90
+DEFAULT_CHEAP_PRICE_THRESHOLD = 0.75
+DEFAULT_EXPENSIVE_PRICE_THRESHOLD = 1.80
+DEFAULT_ALLOW_GRID_CHARGE = True
+DEFAULT_ALLOW_NEGATIVE_EXPORT = False
+DEFAULT_EV_MODE = "scheduled_periods"
+DEFAULT_BATTERY_MODE = "hybrid"
+
+EV_MODE_FULL_SPEED = "full_speed"
+EV_MODE_SOLAR_ONLY = "solar_only"
+EV_MODE_SCHEDULED = "scheduled_periods"
+EV_MODES = [EV_MODE_FULL_SPEED, EV_MODE_SOLAR_ONLY, EV_MODE_SCHEDULED]
+
+BATTERY_MODE_PRICE = "price"
+BATTERY_MODE_SELF = "self_consumption"
+BATTERY_MODE_HYBRID = "hybrid"
+BATTERY_MODE_PROTECT = "protect"
+BATTERY_MODES = [
+    BATTERY_MODE_PRICE,
+    BATTERY_MODE_SELF,
+    BATTERY_MODE_HYBRID,
+    BATTERY_MODE_PROTECT,
+]
+
+SERVICE_REPLAN = "replan"
+SERVICE_PAUSE = "pause"
+SERVICE_RESUME = "resume"
+SERVICE_SET_EV_MODE = "set_ev_mode"
+SERVICE_SET_BATTERY_MODE = "set_battery_mode"
+SERVICE_ENABLE_SHADOW_MODE = "enable_shadow_mode"
+SERVICE_DISABLE_SHADOW_MODE = "disable_shadow_mode"
+
+KNOWN_DEFAULTS = {
+    CONF_PV1_POWER_ENTITY: "sensor.klatremishw_deye_pv1_power",
+    CONF_PV2_POWER_ENTITY: "sensor.klatremishw_deye_pv2_power",
+    CONF_LOAD_POWER_ENTITY: "sensor.klatremishw_deye_load_totalpower",
+    CONF_GRID_POWER_ENTITY: "sensor.klatremishw_deye_total_grid_power",
+    CONF_BATTERY_SOC_ENTITY: "sensor.klatremishw_deye_battery_capacity",
+    CONF_BATTERY_POWER_ENTITY: "sensor.klatremishw_deye_battery_output_power",
+    CONF_INVERTER_ONLINE_ENTITY: "binary_sensor.klatremishw_deye_turn_off_on_status",
+    CONF_INVERTER_STATUS_ENTITY: "sensor.klatremishw_deye_running_status",
+    CONF_GRID_CHARGE_SWITCH: "switch.klatremishw_deye_grid_charge",
+    CONF_SOLAR_SELL_SWITCH: "switch.klatremishw_deye_solar_sell",
+    CONF_ENERGY_PRIORITY_SELECT: "select.klatremishw_deye_energy_priority",
+    CONF_LIMIT_CONTROL_MODE_SELECT: "select.klatremishw_deye_limit_control_mode",
+    CONF_BATTERY_CHARGE_CURRENT_NUMBER: "number.klatremishw_deye_maximum_battery_charge_current",
+    CONF_BATTERY_DISCHARGE_CURRENT_NUMBER: "number.klatremishw_deye_maximum_battery_discharge_current",
+    CONF_BATTERY_GRID_CHARGE_CURRENT_NUMBER: "number.klatremishw_deye_maximum_battery_grid_charge_current",
+    CONF_EXPORT_LIMIT_NUMBER: "number.klatremishw_deye_max_solar_sell_power",
+    CONF_TOU_ENABLE_SWITCH: "switch.klatremishw_deye_time_of_use",
+    CONF_EASEE_DEVICE_ID: "88a56e577d2923f177fd67d6ae61528b",
+    CONF_EASEE_ENABLE_SWITCH: "switch.ehut8c3w_charger_enabled",
+    CONF_EASEE_STATUS_ENTITY: "sensor.ehut8c3w_status",
+    CONF_EASEE_POWER_ENTITY: "sensor.ehut8c3w_power",
+    CONF_EASEE_SESSION_ENTITY: "sensor.ehut8c3w_session_energy",
+    CONF_EASEE_PHASE_MODE_ENTITY: "sensor.ehut8c3w_phase_mode",
+    CONF_EASEE_ONLINE_ENTITY: "binary_sensor.ehut8c3w_online",
+}
