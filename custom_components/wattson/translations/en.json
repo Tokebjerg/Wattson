@@ -46,7 +46,7 @@
           "export_limit_number": "Export limit number"
         }
       },
-      "ev": {
+      "charger": {
         "title": "Easee charger",
         "description": "Confirm the main Easee entities for {charger_name}. Device id hint: {device_id_hint}.",
         "data": {
@@ -99,7 +99,7 @@
         "menu_options": {
           "runtime": "Runtime",
           "battery": "Battery",
-          "ev": "EV",
+          "ev_settings": "EV",
           "mapping": "Mapping"
         }
       },
@@ -127,7 +127,7 @@
           "expensive_price_threshold": "Expensive price threshold"
         }
       },
-      "ev": {
+      "ev_settings": {
         "title": "EV",
         "description": "Adjust EV defaults and solar-only behavior.",
         "data": {

@@ -348,7 +348,7 @@ class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
         """Map inverter write entities."""
         if user_input is not None:
             self._data.update(user_input)
-            return await self.async_step_ev()
+            return await self.async_step_charger()
 
         defaults = _merge(self._defaults, self._data)
         return self.async_show_form(
@@ -359,7 +359,7 @@ class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_ev(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_charger(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Map Easee EV charger entities."""
         if user_input is not None:
             self._data.update(user_input)
@@ -367,7 +367,7 @@ class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
 
         defaults = _merge(self._defaults, self._data)
         return self.async_show_form(
-            step_id="ev",
+            step_id="charger",
             data_schema=_step_ev_schema(defaults),
             description_placeholders={
                 "charger_name": "Easee Charge Lite",
@@ -460,7 +460,7 @@ class WattsonOptionsFlow(OptionsFlow):
         """Show the options menu."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["runtime", "battery", "ev", "mapping"],
+            menu_options=["runtime", "battery", "ev_settings", "mapping"],
         )
 
     async def async_step_runtime(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
@@ -487,7 +487,7 @@ class WattsonOptionsFlow(OptionsFlow):
             data_schema=_options_battery_schema(defaults),
         )
 
-    async def async_step_ev(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_ev_settings(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Configure EV strategy defaults."""
         if user_input is not None:
             self._options.update(user_input)
@@ -495,7 +495,7 @@ class WattsonOptionsFlow(OptionsFlow):
 
         defaults = _merge(self._defaults(), self._options)
         return self.async_show_form(
-            step_id="ev",
+            step_id="ev_settings",
             data_schema=_options_ev_schema(defaults),
         )
 

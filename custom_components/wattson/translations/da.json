@@ -46,7 +46,7 @@
           "export_limit_number": "Export limit number"
         }
       },
-      "ev": {
+      "charger": {
         "title": "Easee lader",
         "description": "Bekræft de centrale Easee-entiteter for {charger_name}. Device-id hint: {device_id_hint}.",
         "data": {
@@ -99,7 +99,7 @@
         "menu_options": {
           "runtime": "Drift",
           "battery": "Batteri",
-          "ev": "Elbil",
+          "ev_settings": "Elbil",
           "mapping": "Mapping"
         }
       },
@@ -127,7 +127,7 @@
           "expensive_price_threshold": "Dyr pris tærskel"
         }
       },
-      "ev": {
+      "ev_settings": {
         "title": "Elbil",
         "description": "Juster EV-standarder og solar-only adfærd.",
         "data": {
