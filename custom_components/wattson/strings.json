@@ -1,0 +1,167 @@
+{
+  "title": "Wattson",
+  "config": {
+    "abort": {
+      "single_instance_allowed": "Wattson er allerede sat op."
+    },
+    "error": {
+      "confirm_single_controller": "Du skal bekræfte, at ingen andre aktive controllere styrer anlægget."
+    },
+    "step": {
+      "user": {
+        "title": "Velkomst",
+        "description": "Wattson styrer din Deye-inverter via klatremis og din Easee-lader via Home Assistant. Start i shadow mode, så vi først kan observere og validere før aktiv styring. Fundet inverterhint: {inverter_hint}. Fundet Easee-hint: {charger_hint}.",
+        "data": {
+          "name": "Navn",
+          "shadow_mode": "Start i shadow mode",
+          "confirm_single_controller": "Jeg bekræfter, at ingen andre controllere er aktive"
+        }
+      },
+      "inverter_read": {
+        "title": "Inverter sensorer",
+        "description": "Bekræft de læse-entiteter Wattson skal bruge fra {device_name}.",
+        "data": {
+          "pv1_power_entity": "PV1 effekt",
+          "pv2_power_entity": "PV2 effekt",
+          "load_power_entity": "Husforbrug",
+          "grid_power_entity": "Neteffekt",
+          "battery_soc_entity": "Batteri SOC",
+          "battery_power_entity": "Batteri effekt",
+          "inverter_online_entity": "Inverter online",
+          "inverter_status_entity": "Inverter status"
+        }
+      },
+      "inverter_control": {
+        "title": "Inverter styring",
+        "description": "Valgfri write-paths til aktiv batteristyring. Hvis du kun vil starte i shadow mode, kan nogle af dem være tomme. Hint: {write_path_hint}.",
+        "data": {
+          "grid_charge_switch": "Grid charge switch",
+          "solar_sell_switch": "Solar sell switch",
+          "tou_enable_switch": "TOU enable switch",
+          "energy_priority_select": "Energy priority select",
+          "limit_control_mode_select": "Limit control mode select",
+          "battery_charge_current_number": "Maks charge current",
+          "battery_discharge_current_number": "Maks discharge current",
+          "battery_grid_charge_current_number": "Maks grid charge current",
+          "export_limit_number": "Export limit number"
+        }
+      },
+      "ev": {
+        "title": "Easee lader",
+        "description": "Bekræft de centrale Easee-entiteter for {charger_name}. Device-id hint: {device_id_hint}.",
+        "data": {
+          "easee_device_id": "Easee device id",
+          "easee_enable_switch": "Charger enable switch",
+          "easee_status_entity": "Charger status",
+          "easee_power_entity": "Charger power",
+          "easee_session_entity": "Session energy",
+          "easee_phase_mode_entity": "Phase mode",
+          "easee_online_entity": "Charger online",
+          "ev_control_enabled": "Aktivér EV-styring"
+        }
+      },
+      "pricing": {
+        "title": "Priser og forecast",
+        "description": "Valgfrie pris- og forecast-kilder. Du kan lade dem være tomme i første omgang og starte simpelt.",
+        "data": {
+          "buy_price_entity": "Købpris sensor",
+          "sell_price_entity": "Salgspris sensor",
+          "forecast_today_entity": "Forecast i dag",
+          "cheap_price_threshold": "Billig pris tærskel",
+          "expensive_price_threshold": "Dyr pris tærskel"
+        }
+      },
+      "safety": {
+        "title": "Sikkerhed og defaults",
+        "description": "Til sidst vælger du sikkerhedsgrænser og standardstrategier. Fortegn kan justeres senere i options, hvis de viser sig at være omvendte i praksis.",
+        "data": {
+          "stale_seconds": "Stale timeout (sekunder)",
+          "invert_grid_power_sign": "Vend fortegn for neteffekt",
+          "invert_battery_power_sign": "Vend fortegn for batterieffekt",
+          "battery_control_enabled": "Aktivér batteristyring",
+          "battery_min_soc": "Min SOC",
+          "battery_max_soc": "Maks SOC",
+          "allow_grid_charge": "Tillad netladning",
+          "allow_negative_export": "Tillad eksport ved negative priser",
+          "ev_mode_default": "Standard EV-mode",
+          "battery_mode_default": "Standard batterimode",
+          "ev_max_amps": "Maks EV ampere",
+          "ev_solar_min_surplus_w": "Solar-only minimum overskud (W)",
+          "ev_windows": "Tilladte ladevinduer"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Wattson indstillinger",
+        "menu_options": {
+          "runtime": "Drift",
+          "battery": "Batteri",
+          "ev": "Elbil",
+          "mapping": "Mapping"
+        }
+      },
+      "runtime": {
+        "title": "Drift",
+        "description": "Juster shadow mode, freshness og fortegnskorrektion.",
+        "data": {
+          "shadow_mode": "Shadow mode",
+          "stale_seconds": "Stale timeout (sekunder)",
+          "invert_grid_power_sign": "Vend fortegn for neteffekt",
+          "invert_battery_power_sign": "Vend fortegn for batterieffekt"
+        }
+      },
+      "battery": {
+        "title": "Batteri",
+        "description": "Juster batteristrategi og prisgrænser.",
+        "data": {
+          "battery_control_enabled": "Aktivér batteristyring",
+          "battery_min_soc": "Min SOC",
+          "battery_max_soc": "Maks SOC",
+          "battery_mode_default": "Standard batterimode",
+          "allow_grid_charge": "Tillad netladning",
+          "allow_negative_export": "Tillad eksport ved negative priser",
+          "cheap_price_threshold": "Billig pris tærskel",
+          "expensive_price_threshold": "Dyr pris tærskel"
+        }
+      },
+      "ev": {
+        "title": "Elbil",
+        "description": "Juster EV-standarder og solar-only adfærd.",
+        "data": {
+          "ev_control_enabled": "Aktivér EV-styring",
+          "ev_mode_default": "Standard EV-mode",
+          "ev_max_amps": "Maks EV ampere",
+          "ev_solar_min_surplus_w": "Solar-only minimum overskud (W)",
+          "ev_windows": "Tilladte ladevinduer"
+        }
+      },
+      "mapping": {
+        "title": "Mapping",
+        "description": "Redigér entity mapping efter installation.",
+        "data": {
+          "pv1_power_entity": "PV1 effekt",
+          "pv2_power_entity": "PV2 effekt",
+          "load_power_entity": "Husforbrug",
+          "grid_power_entity": "Neteffekt",
+          "battery_soc_entity": "Batteri SOC",
+          "battery_power_entity": "Batteri effekt",
+          "inverter_online_entity": "Inverter online",
+          "inverter_status_entity": "Inverter status",
+          "easee_device_id": "Easee device id",
+          "easee_enable_switch": "Charger enable switch",
+          "easee_status_entity": "Charger status",
+          "easee_power_entity": "Charger power",
+          "easee_session_entity": "Session energy",
+          "easee_phase_mode_entity": "Phase mode",
+          "easee_online_entity": "Charger online",
+          "buy_price_entity": "Købpris sensor",
+          "sell_price_entity": "Salgspris sensor",
+          "forecast_today_entity": "Forecast i dag"
+        }
+      }
+    }
+  }
+}

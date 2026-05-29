@@ -1,0 +1,167 @@
+{
+  "title": "Wattson",
+  "config": {
+    "abort": {
+      "single_instance_allowed": "Wattson is already configured."
+    },
+    "error": {
+      "confirm_single_controller": "You must confirm that no other active controller is managing the site."
+    },
+    "step": {
+      "user": {
+        "title": "Welcome",
+        "description": "Wattson controls your Deye inverter through klatremis and your Easee charger through Home Assistant. Start in shadow mode so we can observe and validate before enabling active control. Detected inverter hint: {inverter_hint}. Detected Easee hint: {charger_hint}.",
+        "data": {
+          "name": "Name",
+          "shadow_mode": "Start in shadow mode",
+          "confirm_single_controller": "I confirm that no other active controllers are enabled"
+        }
+      },
+      "inverter_read": {
+        "title": "Inverter sensors",
+        "description": "Confirm the read entities Wattson should use from {device_name}.",
+        "data": {
+          "pv1_power_entity": "PV1 power",
+          "pv2_power_entity": "PV2 power",
+          "load_power_entity": "House load",
+          "grid_power_entity": "Grid power",
+          "battery_soc_entity": "Battery SOC",
+          "battery_power_entity": "Battery power",
+          "inverter_online_entity": "Inverter online",
+          "inverter_status_entity": "Inverter status"
+        }
+      },
+      "inverter_control": {
+        "title": "Inverter control",
+        "description": "Optional write paths for active battery control. If you only want to start in shadow mode, some of these can stay empty. Hint: {write_path_hint}.",
+        "data": {
+          "grid_charge_switch": "Grid charge switch",
+          "solar_sell_switch": "Solar sell switch",
+          "tou_enable_switch": "TOU enable switch",
+          "energy_priority_select": "Energy priority select",
+          "limit_control_mode_select": "Limit control mode select",
+          "battery_charge_current_number": "Max charge current",
+          "battery_discharge_current_number": "Max discharge current",
+          "battery_grid_charge_current_number": "Max grid charge current",
+          "export_limit_number": "Export limit number"
+        }
+      },
+      "ev": {
+        "title": "Easee charger",
+        "description": "Confirm the main Easee entities for {charger_name}. Device id hint: {device_id_hint}.",
+        "data": {
+          "easee_device_id": "Easee device id",
+          "easee_enable_switch": "Charger enable switch",
+          "easee_status_entity": "Charger status",
+          "easee_power_entity": "Charger power",
+          "easee_session_entity": "Session energy",
+          "easee_phase_mode_entity": "Phase mode",
+          "easee_online_entity": "Charger online",
+          "ev_control_enabled": "Enable EV control"
+        }
+      },
+      "pricing": {
+        "title": "Pricing and forecast",
+        "description": "Optional price and forecast sources. You can leave them empty initially and start with simpler behavior.",
+        "data": {
+          "buy_price_entity": "Import price sensor",
+          "sell_price_entity": "Export price sensor",
+          "forecast_today_entity": "Today's forecast",
+          "cheap_price_threshold": "Cheap price threshold",
+          "expensive_price_threshold": "Expensive price threshold"
+        }
+      },
+      "safety": {
+        "title": "Safety and defaults",
+        "description": "Finally, choose safety limits and default strategies. Sign handling can be adjusted later in options if the live values turn out to be reversed.",
+        "data": {
+          "stale_seconds": "Stale timeout (seconds)",
+          "invert_grid_power_sign": "Invert grid power sign",
+          "invert_battery_power_sign": "Invert battery power sign",
+          "battery_control_enabled": "Enable battery control",
+          "battery_min_soc": "Minimum SOC",
+          "battery_max_soc": "Maximum SOC",
+          "allow_grid_charge": "Allow grid charging",
+          "allow_negative_export": "Allow export during negative prices",
+          "ev_mode_default": "Default EV mode",
+          "battery_mode_default": "Default battery mode",
+          "ev_max_amps": "Maximum EV amps",
+          "ev_solar_min_surplus_w": "Solar-only minimum surplus (W)",
+          "ev_windows": "Allowed charging windows"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Wattson options",
+        "menu_options": {
+          "runtime": "Runtime",
+          "battery": "Battery",
+          "ev": "EV",
+          "mapping": "Mapping"
+        }
+      },
+      "runtime": {
+        "title": "Runtime",
+        "description": "Adjust shadow mode, freshness, and sign correction.",
+        "data": {
+          "shadow_mode": "Shadow mode",
+          "stale_seconds": "Stale timeout (seconds)",
+          "invert_grid_power_sign": "Invert grid power sign",
+          "invert_battery_power_sign": "Invert battery power sign"
+        }
+      },
+      "battery": {
+        "title": "Battery",
+        "description": "Adjust battery strategy and price thresholds.",
+        "data": {
+          "battery_control_enabled": "Enable battery control",
+          "battery_min_soc": "Minimum SOC",
+          "battery_max_soc": "Maximum SOC",
+          "battery_mode_default": "Default battery mode",
+          "allow_grid_charge": "Allow grid charging",
+          "allow_negative_export": "Allow export during negative prices",
+          "cheap_price_threshold": "Cheap price threshold",
+          "expensive_price_threshold": "Expensive price threshold"
+        }
+      },
+      "ev": {
+        "title": "EV",
+        "description": "Adjust EV defaults and solar-only behavior.",
+        "data": {
+          "ev_control_enabled": "Enable EV control",
+          "ev_mode_default": "Default EV mode",
+          "ev_max_amps": "Maximum EV amps",
+          "ev_solar_min_surplus_w": "Solar-only minimum surplus (W)",
+          "ev_windows": "Allowed charging windows"
+        }
+      },
+      "mapping": {
+        "title": "Mapping",
+        "description": "Edit entity mapping after installation.",
+        "data": {
+          "pv1_power_entity": "PV1 power",
+          "pv2_power_entity": "PV2 power",
+          "load_power_entity": "House load",
+          "grid_power_entity": "Grid power",
+          "battery_soc_entity": "Battery SOC",
+          "battery_power_entity": "Battery power",
+          "inverter_online_entity": "Inverter online",
+          "inverter_status_entity": "Inverter status",
+          "easee_device_id": "Easee device id",
+          "easee_enable_switch": "Charger enable switch",
+          "easee_status_entity": "Charger status",
+          "easee_power_entity": "Charger power",
+          "easee_session_entity": "Session energy",
+          "easee_phase_mode_entity": "Phase mode",
+          "easee_online_entity": "Charger online",
+          "buy_price_entity": "Import price sensor",
+          "sell_price_entity": "Export price sensor",
+          "forecast_today_entity": "Today's forecast"
+        }
+      }
+    }
+  }
+}
