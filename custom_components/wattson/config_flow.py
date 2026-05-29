@@ -407,14 +407,13 @@ class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     def async_get_options_flow(config_entry):
         """Get the options flow."""
-        return WattsonOptionsFlow(config_entry)
+        return WattsonOptionsFlow()
 
 
 class WattsonOptionsFlow(OptionsFlow):
     """Handle Wattson options."""
 
-    def __init__(self, config_entry) -> None:
-        self.config_entry = config_entry
+    def __init__(self) -> None:
         self._options: dict[str, Any] = {}
 
     def _defaults(self) -> dict[str, Any]:
