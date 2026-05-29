@@ -155,7 +155,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         safe_reasons: list[str] = []
         if self.site_state.missing_entities:
             safe_reasons.append("Missing required entities")
-        if self.site_state.stale_entities:
+        if self.site_state.stale_required_entities:
             safe_reasons.append("Stale required entities")
         if self.site_state.issues:
             safe_reasons.extend(self.site_state.issues)

@@ -71,6 +71,7 @@ class SiteState:
     current_sell_price: float | None
     forecast_today_kwh: float | None
     stale_entities: list[str] = field(default_factory=list)
+    stale_required_entities: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
 
