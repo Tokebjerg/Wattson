@@ -60,7 +60,7 @@ def build_battery_plan(
         )
     )
 
-    if state.issues or state.stale_entities or state.missing_entities:
+    if state.issues or state.stale_required_entities or state.missing_entities:
         return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
 
     if negative_export_active and not allow_negative_export:

@@ -39,16 +39,6 @@ from .const import (
 )
 from .models import Capabilities, EntityMapping, SiteState
 
-REQUIRED_STATE_KEYS = (
-    CONF_PV1_POWER_ENTITY,
-    CONF_PV2_POWER_ENTITY,
-    CONF_LOAD_POWER_ENTITY,
-    CONF_GRID_POWER_ENTITY,
-    CONF_BATTERY_SOC_ENTITY,
-    CONF_BATTERY_POWER_ENTITY,
-)
-
-
 def suggested_mapping(hass: HomeAssistant) -> dict[str, Any]:
     defaults: dict[str, Any] = {}
     for key, entity_id in KNOWN_DEFAULTS.items():
@@ -204,12 +194,22 @@ def build_site_state(
     missing: list[str] = []
     issues: list[str] = []
     stale: list[str] = []
-    required_entity_ids = {
+    required_missing_entity_ids = {
         entity_id
         for entity_id in [
             mapping.load_power_entity,
             mapping.grid_power_entity,
             mapping.battery_soc_entity,
+            mapping.battery_power_entity,
+            *mapping.pv_power_entities,
+        ]
+        if entity_id
+    }
+    required_stale_entity_ids = {
+        entity_id
+        for entity_id in [
+            mapping.load_power_entity,
+            mapping.grid_power_entity,
             mapping.battery_power_entity,
             *mapping.pv_power_entities,
         ]
@@ -251,11 +251,11 @@ def build_site_state(
     sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
     forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
 
-    required_missing = [entity_id for entity_id in missing if entity_id in required_entity_ids]
+    required_missing = [entity_id for entity_id in missing if entity_id in required_missing_entity_ids]
     if required_missing:
         issues.append(f"Missing required entities: {', '.join(required_missing)}")
 
-    stale_required = [entity_id for entity_id in stale if entity_id in required_entity_ids]
+    stale_required = [entity_id for entity_id in stale if entity_id in required_stale_entity_ids]
 
     grid_import = max(0.0, grid_power)
     grid_export = abs(min(0.0, grid_power))
