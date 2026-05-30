@@ -94,31 +94,37 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
     async def async_set_ev_mode(self, mode: str) -> None:
         self.ev_mode = mode
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_MODE_DEFAULT: mode})
         await self.async_request_refresh()
 
     async def async_set_battery_mode(self, mode: str) -> None:
         self.battery_mode = mode
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MODE_DEFAULT: mode})
         await self.async_request_refresh()
 
     async def async_set_shadow_mode(self, enabled: bool) -> None:
         self.shadow_mode = enabled
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_SHADOW_MODE: enabled})
         await self.async_request_refresh()
 
     async def async_set_control_enabled(self, enabled: bool) -> None:
         self.automation_enabled = enabled
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_AUTOMATION_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_battery_control_enabled(self, enabled: bool) -> None:
         self.battery_control_enabled = enabled
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_ev_control_enabled(self, enabled: bool) -> None:
         self.ev_control_enabled = enabled
+        self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
