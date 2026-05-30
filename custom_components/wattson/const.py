@@ -16,7 +16,7 @@ PLATFORMS = [
     Platform.BUTTON,
 ]
 
-UPDATE_INTERVAL = timedelta(seconds=30)
+UPDATE_INTERVAL = timedelta(seconds=10)
 
 CONF_NAME = "name"
 CONF_SHADOW_MODE = "shadow_mode"

@@ -51,6 +51,7 @@ class KlatremisController:
         actions.extend(await self._set_switch(mapping.solar_sell_switch, plan.desired_solar_sell) if plan.desired_solar_sell is not None else [])
         actions.extend(await self._set_select(mapping.energy_priority_select, plan.desired_energy_priority))
         actions.extend(await self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
+        actions.extend(await self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
         actions.extend(await self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
         actions.extend(await self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
         return actions

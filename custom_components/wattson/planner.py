@@ -51,12 +51,17 @@ def build_battery_plan(
     expensive_threshold: float,
     allow_grid_charge: bool,
     allow_negative_export: bool,
+    export_limit_default_w: float | None,
 ) -> tuple[BatteryPlan, bool]:
+    negative_price_window = bool(
+        (state.current_sell_price is not None and state.current_sell_price < 0)
+        or (state.current_sell_price is None and state.current_buy_price is not None and state.current_buy_price < 0)
+    )
     negative_export_active = bool(
-        state.grid_export_power_w > 10
+        negative_price_window
         and (
-            (state.current_sell_price is not None and state.current_sell_price < 0)
-            or (state.current_sell_price is None and state.current_buy_price is not None and state.current_buy_price < 0)
+            state.grid_export_power_w > 10
+            or state.pv_power_w > 100
         )
     )
 
@@ -68,9 +73,11 @@ def build_battery_plan(
             BatteryPlan(
                 strategy="BLOCK_NEGATIVE_EXPORT",
                 reason="Negative export window active, disabling export where possible",
+                desired_grid_charge=False,
                 desired_solar_sell=False,
                 desired_limit_control_mode="Zero export to CT",
-                desired_energy_priority="Battery first" if state.battery_soc_pct < max_soc else "Load first",
+                desired_energy_priority="Load first",
+                desired_export_limit_w=0.0,
             ),
             True,
         )
@@ -89,6 +96,7 @@ def build_battery_plan(
                 desired_grid_charge=True,
                 desired_solar_sell=False,
                 desired_energy_priority="Battery first",
+                desired_export_limit_w=export_limit_default_w,
             ),
             False,
         )
@@ -107,6 +115,7 @@ def build_battery_plan(
                 desired_solar_sell=True if (state.current_sell_price or 0) > 0 else False,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Selling first" if (state.current_sell_price or 0) > 0 else "Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
             ),
             False,
         )
@@ -120,6 +129,7 @@ def build_battery_plan(
                 desired_solar_sell=False,
                 desired_energy_priority="Battery first",
                 desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
             ),
             False,
         )
@@ -131,6 +141,7 @@ def build_battery_plan(
                 reason="Battery protect mode active",
                 desired_grid_charge=False,
                 desired_energy_priority="Load first",
+                desired_export_limit_w=export_limit_default_w,
             ),
             False,
         )
@@ -141,6 +152,7 @@ def build_battery_plan(
             reason="No strong battery action required right now",
             desired_grid_charge=False,
             desired_energy_priority="Load first" if state.battery_soc_pct > min_soc else "Battery first",
+            desired_export_limit_w=export_limit_default_w,
         ),
         False,
     )

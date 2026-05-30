@@ -88,6 +88,7 @@ class BatteryPlan:
     desired_solar_sell: bool | None = None
     desired_energy_priority: str | None = None
     desired_limit_control_mode: str | None = None
+    desired_export_limit_w: float | None = None
     desired_charge_current_a: float | None = None
     desired_discharge_current_a: float | None = None
 

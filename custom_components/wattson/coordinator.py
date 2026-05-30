@@ -80,6 +80,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._klatremis = KlatremisController(hass)
         self._easee = EaseeController(hass)
         self._last_fingerprint: tuple[Any, ...] | None = None
+        self._default_export_limit_w: float | None = None
 
     async def async_startup(self) -> None:
         return None
@@ -132,6 +133,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         config = merged_entry_config(self.config_entry)
         self.mapping = build_entity_mapping(config)
         self.capabilities = build_capabilities(self.mapping)
+        if self._default_export_limit_w is None and self.mapping.export_limit_number:
+            export_limit_state = self.hass.states.get(self.mapping.export_limit_number)
+            if export_limit_state is not None:
+                try:
+                    self._default_export_limit_w = float(export_limit_state.state)
+                except (TypeError, ValueError):
+                    self._default_export_limit_w = None
         self.site_state = build_site_state(
             self.hass,
             self.mapping,
@@ -149,6 +157,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             expensive_threshold=float(entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD)),
             allow_grid_charge=bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE)),
             allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
+            export_limit_default_w=self._default_export_limit_w,
         )
         ev_plan = build_ev_plan(
             self.site_state,
@@ -194,6 +203,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             plan.battery.desired_solar_sell,
             plan.battery.desired_energy_priority,
             plan.battery.desired_limit_control_mode,
+            plan.battery.desired_export_limit_w,
             plan.ev.mode,
             plan.ev.desired_enabled,
             plan.ev.desired_amps,
