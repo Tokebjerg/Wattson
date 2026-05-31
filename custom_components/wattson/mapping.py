@@ -255,7 +255,19 @@ def build_site_state(
     if required_missing:
         issues.append(f"Missing required entities: {', '.join(required_missing)}")
 
-    stale_required = [entity_id for entity_id in stale if entity_id in required_stale_entity_ids]
+    # Near or after sunset the Deye PV entities can stop updating once they have
+    # reached 0 W. Treat that as non-blocking so we do not enter safe mode just
+    # because the PV sensors are naturally idle overnight.
+    ignore_stale_pv_entities = {
+        entity_id
+        for entity_id, value in zip(mapping.pv_power_entities, pv_values)
+        if value is not None and value <= 0.0
+    }
+    stale_required = [
+        entity_id
+        for entity_id in stale
+        if entity_id in required_stale_entity_ids and entity_id not in ignore_stale_pv_entities
+    ]
 
     grid_import = max(0.0, grid_power)
     grid_export = abs(min(0.0, grid_power))
