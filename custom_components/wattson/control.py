@@ -61,6 +61,17 @@ class EaseeController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
 
+    @staticmethod
+    def _normalize_phase_mode(value: str | None) -> str | None:
+        if not value:
+            return None
+        lowered = value.lower()
+        if lowered in {"1_phase", "single", "one_phase", "one"}:
+            return "1_phase"
+        if lowered in {"3_phase", "three_phase", "three"}:
+            return "3_phase"
+        return lowered
+
     async def _set_switch(self, entity_id: str | None, enabled: bool) -> list[str]:
         if not entity_id:
             return []
@@ -97,10 +108,13 @@ class EaseeController:
         if plan.desired_action:
             if plan.desired_action == "pause" and state.easee_status == "awaiting_start":
                 pass
+            elif plan.desired_action == "resume" and state.easee_status == "charging":
+                pass
             else:
                 actions.extend(await self._action(mapping.easee_device_id, plan.desired_action))
         if plan.desired_amps is not None:
             actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
         if plan.desired_phase_mode is not None:
-            actions.extend(await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode))
+            if self._normalize_phase_mode(state.easee_phase_mode) != self._normalize_phase_mode(plan.desired_phase_mode):
+                actions.extend(await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode))
         return actions
