@@ -155,7 +155,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self.hass,
             self.mapping,
             stale_seconds=int(entry_value(self.config_entry, CONF_STALE_SECONDS, DEFAULT_STALE_SECONDS)),
-            invert_grid_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_GRID_POWER_SIGN, DEFAULT_INVERT_GRID_POWER_SIGN)),
+            invert_grid_power_sign=self._grid_power_sign_should_be_inverted(),
             invert_battery_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_BATTERY_POWER_SIGN, DEFAULT_INVERT_BATTERY_POWER_SIGN)),
         )
 
@@ -298,6 +298,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
         self.last_actions = actions
         self._last_fingerprint = fingerprint
+
+    def _grid_power_sign_should_be_inverted(self) -> bool:
+        configured = bool(entry_value(self.config_entry, CONF_INVERT_GRID_POWER_SIGN, DEFAULT_INVERT_GRID_POWER_SIGN))
+        if self.mapping and self.mapping.grid_power_entity == "sensor.klatremishw_deye_total_grid_power":
+            return True
+        return configured
 
     @property
     def display_name(self) -> str:
