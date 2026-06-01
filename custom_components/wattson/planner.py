@@ -171,7 +171,10 @@ def build_ev_plan(
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
 
     current_phase_mode = (state.easee_phase_mode or "").lower()
-    phases = 3 if current_phase_mode in {"3_phase", "three_phase", "three", "auto_phase"} else 1
+    current_phase_normalized = (
+        "3_phase" if current_phase_mode in {"3_phase", "three_phase", "three", "auto_phase", "auto"} else "1_phase"
+    )
+    phases = 3 if current_phase_normalized == "3_phase" else 1
     voltage = 230 * phases
 
     if ev_mode == EV_MODE_FULL_SPEED:
@@ -204,7 +207,6 @@ def build_ev_plan(
                 desired_action="pause",
             )
 
-        current_phase_normalized = "3_phase" if phases == 3 else "1_phase"
         single_phase_min_w = 6 * 235
         three_phase_min_w = 6 * 3 * 235
 
@@ -219,10 +221,24 @@ def build_ev_plan(
 
         if use_three_phase:
             per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / (3 * 235))), int(ev_max_amps)))
-            amps = min(per_phase_amps * 3, 32)
-            desired_phase_mode = "auto_phase"
-            desired_circuit_currents = (per_phase_amps, per_phase_amps, per_phase_amps)
-        else:
+            expected_three_phase_w = per_phase_amps * 3 * 230
+            # Some cars do not actually ramp up on automatic multi-phase charging even
+            # when the charger is told to. If observed power is far below the requested
+            # multi-phase target, fall back to single-phase where the car responds more
+            # predictably.
+            if (
+                ev_session_active
+                and current_ev_power_w >= 500.0
+                and current_phase_normalized == "3_phase"
+                and current_ev_power_w < (expected_three_phase_w * 0.65)
+            ):
+                use_three_phase = False
+            else:
+                amps = min(per_phase_amps * 3, 32)
+                desired_phase_mode = "auto_phase"
+                desired_circuit_currents = (per_phase_amps, per_phase_amps, per_phase_amps)
+
+        if not use_three_phase:
             per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
             amps = per_phase_amps
             desired_phase_mode = "1_phase" if current_phase_normalized != "1_phase" else None
