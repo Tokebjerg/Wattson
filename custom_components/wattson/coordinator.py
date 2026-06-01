@@ -83,6 +83,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._easee = EaseeController(hass)
         self._last_fingerprint: tuple[Any, ...] | None = None
         self._default_export_limit_w: float | None = None
+        self._default_discharge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
 
     async def async_startup(self) -> None:
@@ -143,6 +144,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     self._default_export_limit_w = float(export_limit_state.state)
                 except (TypeError, ValueError):
                     self._default_export_limit_w = None
+        if self._default_discharge_current_a is None and self.mapping.battery_discharge_current_number:
+            discharge_limit_state = self.hass.states.get(self.mapping.battery_discharge_current_number)
+            if discharge_limit_state is not None:
+                try:
+                    self._default_discharge_current_a = float(discharge_limit_state.state)
+                except (TypeError, ValueError):
+                    self._default_discharge_current_a = None
         self.site_state = build_site_state(
             self.hass,
             self.mapping,
@@ -215,7 +223,18 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_solar_sell=True,
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Selling first",
+                    desired_discharge_current_a=0.0,
                 )
+            elif self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
+                battery_plan = replace(
+                    battery_plan,
+                    desired_discharge_current_a=self._default_discharge_current_a,
+                )
+        elif self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
+            battery_plan = replace(
+                battery_plan,
+                desired_discharge_current_a=self._default_discharge_current_a,
+            )
 
         safe_reasons: list[str] = []
         if self.site_state.missing_entities:
