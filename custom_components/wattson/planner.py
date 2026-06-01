@@ -174,8 +174,6 @@ def build_ev_plan(
     current_phase_normalized = (
         "3_phase" if current_phase_mode in {"3_phase", "three_phase", "three", "auto_phase", "auto"} else "1_phase"
     )
-    phases = 3 if current_phase_normalized == "3_phase" else 1
-    voltage = 230 * phases
 
     if ev_mode == EV_MODE_FULL_SPEED:
         return EvPlan(
@@ -210,9 +208,9 @@ def build_ev_plan(
         single_phase_min_w = 6 * 235
         three_phase_min_w = 6 * 3 * 235
 
-        # Follow the article's model: below 1x6A pause, between 1x6A and 3x6A use
-        # single-phase, and above that use multi-phase charging. Keep a little
-        # hysteresis when already on 3-phase to avoid bouncing at the threshold.
+        # Keep the charger in auto phase mode and steer it with per-phase current
+        # limits. Below the multi-phase threshold we still only request current on a
+        # single phase, but we avoid flipping the charger between explicit phase modes.
         use_three_phase = False
         if current_phase_normalized == "3_phase":
             use_three_phase = effective_solar_surplus_w >= (three_phase_min_w - 400)
@@ -241,7 +239,7 @@ def build_ev_plan(
         if not use_three_phase:
             per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
             amps = per_phase_amps
-            desired_phase_mode = "1_phase" if current_phase_normalized != "1_phase" else None
+            desired_phase_mode = "auto_phase"
             desired_circuit_currents = (per_phase_amps, 0, 0)
 
         return EvPlan(
