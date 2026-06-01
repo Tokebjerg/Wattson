@@ -183,17 +183,19 @@ def build_ev_plan(
         )
 
     if ev_mode == EV_MODE_SOLAR_ONLY:
-        if state.solar_surplus_w < ev_solar_min_surplus_w:
+        current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
+        effective_solar_surplus_w = state.solar_surplus_w + current_ev_power_w
+        if effective_solar_surplus_w < ev_solar_min_surplus_w:
             return EvPlan(
                 mode=ev_mode,
-                reason=f"Solar surplus {state.solar_surplus_w:.0f}W is below minimum {ev_solar_min_surplus_w:.0f}W",
+                reason=f"Solar surplus {effective_solar_surplus_w:.0f}W is below minimum {ev_solar_min_surplus_w:.0f}W",
                 desired_enabled=False,
                 desired_action="pause",
             )
-        amps = max(6, min(int(math.floor(state.solar_surplus_w / voltage)), int(ev_max_amps)))
+        amps = max(6, min(int(math.floor(effective_solar_surplus_w / voltage)), int(ev_max_amps)))
         return EvPlan(
             mode=ev_mode,
-            reason=f"Solar surplus {state.solar_surplus_w:.0f}W supports EV charging",
+            reason=f"Solar surplus {effective_solar_surplus_w:.0f}W supports EV charging",
             desired_enabled=True,
             desired_amps=amps,
             desired_action="resume",

@@ -178,6 +178,16 @@ def _read_string(
     return str(state.state)
 
 
+def _normalize_power_to_watts(hass: HomeAssistant, entity_id: str | None, value: float | None) -> float | None:
+    if entity_id is None or value is None:
+        return value
+    state = hass.states.get(entity_id)
+    unit = str(state.attributes.get("unit_of_measurement", "")).lower() if state else ""
+    if unit == "kw":
+        return value * 1000.0
+    return value
+
+
 def _is_stale(state: State, stale_seconds: int) -> bool:
     age = dt_util.utcnow() - state.last_updated
     return age > timedelta(seconds=stale_seconds)
@@ -244,6 +254,7 @@ def build_site_state(
     easee_online = _read_bool(hass, mapping.easee_online_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     easee_status = _read_string(hass, mapping.easee_status_entity, missing=missing, stale=stale, stale_seconds=stale_seconds)
     easee_power = _read_float(hass, mapping.easee_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
+    easee_power = _normalize_power_to_watts(hass, mapping.easee_power_entity, easee_power)
     easee_session = _read_float(hass, mapping.easee_session_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     easee_phase_mode = _read_string(hass, mapping.easee_phase_mode_entity, missing=missing, stale=stale, stale_seconds=stale_seconds)
 
