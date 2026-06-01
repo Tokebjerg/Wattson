@@ -39,6 +39,15 @@ from .const import (
 )
 from .models import Capabilities, EntityMapping, SiteState
 
+
+def _preferred_grid_entity(hass: HomeAssistant, mapping: EntityMapping) -> str:
+    if (
+        mapping.grid_power_entity == "sensor.klatremishw_deye_total_grid_power"
+        and hass.states.get("sensor.klatremishw_deye_out_of_grid_total_power") is not None
+    ):
+        return "sensor.klatremishw_deye_out_of_grid_total_power"
+    return mapping.grid_power_entity
+
 def suggested_mapping(hass: HomeAssistant) -> dict[str, Any]:
     defaults: dict[str, Any] = {}
     for key, entity_id in KNOWN_DEFAULTS.items():
@@ -204,11 +213,12 @@ def build_site_state(
     missing: list[str] = []
     issues: list[str] = []
     stale: list[str] = []
+    grid_power_entity = _preferred_grid_entity(hass, mapping)
     required_missing_entity_ids = {
         entity_id
         for entity_id in [
             mapping.load_power_entity,
-            mapping.grid_power_entity,
+            grid_power_entity,
             mapping.battery_soc_entity,
             mapping.battery_power_entity,
             *mapping.pv_power_entities,
@@ -219,7 +229,7 @@ def build_site_state(
         entity_id
         for entity_id in [
             mapping.load_power_entity,
-            mapping.grid_power_entity,
+            grid_power_entity,
             mapping.battery_power_entity,
             *mapping.pv_power_entities,
         ]
@@ -239,14 +249,28 @@ def build_site_state(
     ]
     pv_power = sum(value for value in pv_values if value is not None)
 
-    load_power = _read_float(hass, mapping.load_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
-    grid_power = _read_float(hass, mapping.grid_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
+    raw_load_power = _read_float(
+        hass,
+        mapping.load_power_entity,
+        missing=missing,
+        issues=issues,
+        stale=stale,
+        stale_seconds=stale_seconds,
+    ) or 0.0
+    grid_power = _read_float(
+        hass,
+        grid_power_entity,
+        missing=missing,
+        issues=issues,
+        stale=stale,
+        stale_seconds=stale_seconds,
+    ) or 0.0
     battery_soc = _read_float(hass, mapping.battery_soc_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
     battery_power = _read_float(hass, mapping.battery_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
     inverter_online = _read_bool(hass, mapping.inverter_online_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     inverter_status = _read_string(hass, mapping.inverter_status_entity, missing=missing, stale=stale, stale_seconds=stale_seconds) or "unknown"
 
-    if invert_grid_power_sign:
+    if grid_power_entity != "sensor.klatremishw_deye_out_of_grid_total_power" and invert_grid_power_sign:
         grid_power = -grid_power
     if invert_battery_power_sign:
         battery_power = -battery_power
@@ -257,6 +281,19 @@ def build_site_state(
     easee_power = _normalize_power_to_watts(hass, mapping.easee_power_entity, easee_power)
     easee_session = _read_float(hass, mapping.easee_session_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     easee_phase_mode = _read_string(hass, mapping.easee_phase_mode_entity, missing=missing, stale=stale, stale_seconds=stale_seconds)
+
+    load_includes_ev = False
+    load_power = raw_load_power
+    if (
+        grid_power_entity == "sensor.klatremishw_deye_out_of_grid_total_power"
+        and mapping.load_power_entity == "sensor.klatremishw_deye_load_totalpower"
+    ):
+        # On this Deye/klatremis setup the built-in load sensor appears to exclude
+        # large site loads like the EV charger. Derive a whole-site load from the
+        # power balance instead so Wattson's telemetry and planning are physically
+        # consistent.
+        load_power = max(0.0, pv_power + grid_power + battery_power)
+        load_includes_ev = True
 
     buy_price = _read_float(hass, mapping.buy_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
     sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
@@ -289,6 +326,7 @@ def build_site_state(
         timestamp=dt_util.utcnow(),
         pv_power_w=pv_power,
         load_power_w=load_power,
+        load_includes_ev=load_includes_ev,
         grid_power_w=grid_power,
         grid_import_power_w=grid_import,
         grid_export_power_w=grid_export,

@@ -115,7 +115,7 @@ KNOWN_DEFAULTS = {
     CONF_PV1_POWER_ENTITY: "sensor.klatremishw_deye_pv1_power",
     CONF_PV2_POWER_ENTITY: "sensor.klatremishw_deye_pv2_power",
     CONF_LOAD_POWER_ENTITY: "sensor.klatremishw_deye_load_totalpower",
-    CONF_GRID_POWER_ENTITY: "sensor.klatremishw_deye_total_grid_power",
+    CONF_GRID_POWER_ENTITY: "sensor.klatremishw_deye_out_of_grid_total_power",
     CONF_BATTERY_SOC_ENTITY: "sensor.klatremishw_deye_battery_capacity",
     CONF_BATTERY_POWER_ENTITY: "sensor.klatremishw_deye_battery_output_power",
     CONF_INVERTER_ONLINE_ENTITY: "binary_sensor.klatremishw_deye_turn_off_on_status",

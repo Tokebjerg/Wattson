@@ -55,6 +55,7 @@ class SiteState:
     timestamp: datetime
     pv_power_w: float
     load_power_w: float
+    load_includes_ev: bool
     grid_power_w: float
     grid_import_power_w: float
     grid_export_power_w: float
