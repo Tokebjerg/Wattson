@@ -95,6 +95,28 @@ class EaseeController:
         await self.hass.services.async_call("easee", "set_charger_dynamic_limit", {"device_id": device_id, "current": amps}, blocking=True)
         return [f"easee.dynamic_limit={amps}A"]
 
+    async def _set_circuit_dynamic_limit(
+        self,
+        device_id: str | None,
+        currents: tuple[int, int, int] | None,
+    ) -> list[str]:
+        if not device_id or currents is None:
+            return []
+        p1, p2, p3 = currents
+        await self.hass.services.async_call(
+            "easee",
+            "set_circuit_dynamic_limit",
+            {
+                "device_id": device_id,
+                "current_p1": p1,
+                "current_p2": p2,
+                "current_p3": p3,
+                "time_to_live": 2,
+            },
+            blocking=True,
+        )
+        return [f"easee.circuit_dynamic_limit=({p1},{p2},{p3})A"]
+
     async def _set_phase_mode(self, device_id: str | None, phase_mode: str | None) -> list[str]:
         if not device_id or not phase_mode:
             return []
@@ -112,6 +134,8 @@ class EaseeController:
                 pass
             else:
                 actions.extend(await self._action(mapping.easee_device_id, plan.desired_action))
+        if plan.desired_circuit_currents is not None:
+            actions.extend(await self._set_circuit_dynamic_limit(mapping.easee_device_id, plan.desired_circuit_currents))
         if plan.desired_amps is not None:
             actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
         if plan.desired_phase_mode is not None:

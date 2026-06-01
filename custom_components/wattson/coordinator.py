@@ -235,6 +235,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             plan.ev.mode,
             plan.ev.desired_enabled,
             plan.ev.desired_amps,
+            plan.ev.desired_circuit_currents,
             plan.ev.desired_phase_mode,
             plan.ev.desired_action,
         )

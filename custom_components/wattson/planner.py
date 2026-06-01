@@ -201,28 +201,33 @@ def build_ev_plan(
             )
 
         current_phase_normalized = "3_phase" if phases == 3 else "1_phase"
+        single_phase_min_w = 6 * 235
+        three_phase_min_w = 6 * 3 * 235
 
-        # Prefer single-phase solar charging by default. In this installation the
-        # connected vehicle can appear phase-switched while still only drawing
-        # roughly single-phase power, which drops charging power to ~1.7-2.0 kW.
-        # If that happens while strong solar surplus is available, explicitly
-        # steer back to 1-phase so the dynamic current limit can use the surplus.
-        desired_phase_mode = None
-        desired_phases = 1
-        if (
-            current_phase_normalized == "3_phase"
-            and current_ev_power_w < 2500.0
-            and effective_solar_surplus_w >= 3000.0
-        ):
-            desired_phase_mode = "1_phase"
+        # Follow the article's model: below 1x6A pause, between 1x6A and 3x6A use
+        # single-phase, and above that use multi-phase charging. Keep a little
+        # hysteresis when already on 3-phase to avoid bouncing at the threshold.
+        use_three_phase = False
+        if current_phase_normalized == "3_phase":
+            use_three_phase = effective_solar_surplus_w >= (three_phase_min_w - 400)
+        else:
+            use_three_phase = effective_solar_surplus_w >= (three_phase_min_w + 200)
 
-        desired_voltage = 230 * desired_phases
-        amps = max(6, min(int(math.floor(effective_solar_surplus_w / desired_voltage)), int(ev_max_amps)))
+        if use_three_phase:
+            amps = max(6, min(int(math.floor(effective_solar_surplus_w / (3 * 235))), int(ev_max_amps)))
+            desired_phase_mode = "auto_phase"
+            desired_circuit_currents = (amps, amps, amps)
+        else:
+            amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
+            desired_phase_mode = "1_phase" if current_phase_normalized != "1_phase" else None
+            desired_circuit_currents = (amps, 0, 0)
+
         return EvPlan(
             mode=ev_mode,
             reason=f"Solar surplus {effective_solar_surplus_w:.0f}W supports EV charging",
             desired_enabled=True,
             desired_amps=amps,
+            desired_circuit_currents=desired_circuit_currents,
             desired_action="resume",
             desired_phase_mode=desired_phase_mode,
         )

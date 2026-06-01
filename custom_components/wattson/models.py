@@ -99,6 +99,7 @@ class EvPlan:
     reason: str
     desired_enabled: bool | None = None
     desired_amps: int | None = None
+    desired_circuit_currents: tuple[int, int, int] | None = None
     desired_phase_mode: str | None = None
     desired_action: str | None = None
 
