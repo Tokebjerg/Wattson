@@ -214,13 +214,15 @@ def build_ev_plan(
             use_three_phase = effective_solar_surplus_w >= (three_phase_min_w + 200)
 
         if use_three_phase:
-            amps = max(6, min(int(math.floor(effective_solar_surplus_w / (3 * 235))), int(ev_max_amps)))
+            per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / (3 * 235))), int(ev_max_amps)))
+            amps = min(per_phase_amps * 3, 32)
             desired_phase_mode = "auto_phase"
-            desired_circuit_currents = (amps, amps, amps)
+            desired_circuit_currents = (per_phase_amps, per_phase_amps, per_phase_amps)
         else:
-            amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
+            per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
+            amps = per_phase_amps
             desired_phase_mode = "1_phase" if current_phase_normalized != "1_phase" else None
-            desired_circuit_currents = (amps, 0, 0)
+            desired_circuit_currents = (per_phase_amps, 0, 0)
 
         return EvPlan(
             mode=ev_mode,
