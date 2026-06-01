@@ -1,6 +1,7 @@
 """Coordinator for Wattson."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 import logging
 from typing import Any
@@ -50,6 +51,7 @@ from .const import (
     DEFAULT_SHADOW_MODE,
     DEFAULT_STALE_SECONDS,
     DOMAIN,
+    EV_MODE_SOLAR_ONLY,
     NAME,
     UPDATE_INTERVAL,
 )
@@ -81,6 +83,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._easee = EaseeController(hass)
         self._last_fingerprint: tuple[Any, ...] | None = None
         self._default_export_limit_w: float | None = None
+        self._ev_solar_hold_until: datetime | None = None
 
     async def async_startup(self) -> None:
         return None
@@ -166,6 +169,31 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
             ev_windows=str(entry_value(self.config_entry, CONF_EV_WINDOWS, DEFAULT_EV_WINDOWS)),
         )
+
+        if self.ev_mode == EV_MODE_SOLAR_ONLY:
+            now = dt_util.utcnow()
+            normalized_status = (self.site_state.easee_status or "").lower()
+            ev_session_active = bool(
+                (self.site_state.easee_power_w or 0.0) >= 200.0
+                or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
+            )
+            if ev_plan.desired_action == "resume" and ev_plan.desired_enabled is True:
+                # Hold a solar-driven EV session through short PV dips to avoid rapid pause/resume flapping.
+                self._ev_solar_hold_until = now + timedelta(minutes=3)
+            elif (
+                ev_plan.desired_action == "pause"
+                and ev_session_active
+                and self._ev_solar_hold_until is not None
+                and now < self._ev_solar_hold_until
+            ):
+                ev_plan = replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
+                    desired_enabled=None,
+                    desired_amps=None,
+                    desired_phase_mode=None,
+                    desired_action=None,
+                )
 
         safe_reasons: list[str] = []
         if self.site_state.missing_entities:
