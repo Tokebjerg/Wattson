@@ -199,14 +199,26 @@ def build_ev_plan(
                 desired_enabled=None,
                 desired_action="pause",
             )
-        amps = max(6, min(int(math.floor(effective_solar_surplus_w / voltage)), int(ev_max_amps)))
+
+        # Scale between 1-phase and 3-phase charging based on available solar surplus.
+        # Use hysteresis so the charger does not bounce between phase modes around the threshold.
+        current_phase_normalized = "3_phase" if phases == 3 else "1_phase"
+        desired_phase_mode = current_phase_normalized
+        if current_phase_normalized == "1_phase" and effective_solar_surplus_w >= 4400:
+            desired_phase_mode = "3_phase"
+        elif current_phase_normalized == "3_phase" and effective_solar_surplus_w <= 3600:
+            desired_phase_mode = "1_phase"
+
+        desired_phases = 3 if desired_phase_mode == "3_phase" else 1
+        desired_voltage = 230 * desired_phases
+        amps = max(6, min(int(math.floor(effective_solar_surplus_w / desired_voltage)), int(ev_max_amps)))
         return EvPlan(
             mode=ev_mode,
             reason=f"Solar surplus {effective_solar_surplus_w:.0f}W supports EV charging",
             desired_enabled=True,
             desired_amps=amps,
             desired_action="resume",
-            desired_phase_mode="1_phase" if phases == 1 else None,
+            desired_phase_mode=desired_phase_mode if desired_phase_mode != current_phase_normalized else None,
         )
 
     windows = _parse_windows(ev_windows)
