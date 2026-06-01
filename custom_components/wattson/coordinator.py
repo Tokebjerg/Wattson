@@ -168,6 +168,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)),
             ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
             ev_windows=str(entry_value(self.config_entry, CONF_EV_WINDOWS, DEFAULT_EV_WINDOWS)),
+            can_reclaim_battery_charge=self.battery_control_enabled,
         )
 
         if self.ev_mode == EV_MODE_SOLAR_ONLY:
@@ -193,6 +194,23 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_amps=None,
                     desired_phase_mode=None,
                     desired_action=None,
+                )
+
+            if (
+                self.battery_control_enabled
+                and ev_plan.desired_enabled is True
+                and ev_plan.desired_action == "resume"
+            ):
+                # When solar-only EV charging is active, prioritize available PV for the car
+                # instead of charging the house battery at the same time.
+                battery_plan = replace(
+                    battery_plan,
+                    strategy="EV_SOLAR_PRIORITY",
+                    reason=f"{battery_plan.reason} | EV solar-only active, prioritizing EV over battery charging",
+                    desired_grid_charge=False,
+                    desired_solar_sell=False,
+                    desired_energy_priority="Load first",
+                    desired_limit_control_mode="Zero export to CT",
                 )
 
         safe_reasons: list[str] = []

@@ -165,6 +165,7 @@ def build_ev_plan(
     ev_max_amps: int,
     ev_solar_min_surplus_w: float,
     ev_windows: str,
+    can_reclaim_battery_charge: bool = False,
 ) -> EvPlan:
     if state.easee_status is None:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
@@ -186,7 +187,10 @@ def build_ev_plan(
         current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
         normalized_status = (state.easee_status or "").lower()
         ev_session_active = current_ev_power_w >= 200.0 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
-        effective_solar_surplus_w = state.solar_surplus_w + current_ev_power_w
+        reclaimable_battery_charge_w = 0.0
+        if can_reclaim_battery_charge and state.battery_power_w < -100.0:
+            reclaimable_battery_charge_w = abs(state.battery_power_w)
+        effective_solar_surplus_w = state.solar_surplus_w + current_ev_power_w + reclaimable_battery_charge_w
         stop_surplus_threshold_w = max(500.0, ev_solar_min_surplus_w * 0.6)
         required_surplus_w = stop_surplus_threshold_w if ev_session_active else ev_solar_min_surplus_w
         if effective_solar_surplus_w < required_surplus_w:
