@@ -200,16 +200,22 @@ def build_ev_plan(
                 desired_action="pause",
             )
 
-        # Scale between 1-phase and 3-phase charging based on available solar surplus.
-        # Use hysteresis so the charger does not bounce between phase modes around the threshold.
         current_phase_normalized = "3_phase" if phases == 3 else "1_phase"
-        desired_phase_mode = current_phase_normalized
-        if current_phase_normalized == "1_phase" and effective_solar_surplus_w >= 4400:
-            desired_phase_mode = "3_phase"
-        elif current_phase_normalized == "3_phase" and effective_solar_surplus_w <= 3600:
+
+        # Prefer single-phase solar charging by default. In this installation the
+        # connected vehicle can appear phase-switched while still only drawing
+        # roughly single-phase power, which drops charging power to ~1.7-2.0 kW.
+        # If that happens while strong solar surplus is available, explicitly
+        # steer back to 1-phase so the dynamic current limit can use the surplus.
+        desired_phase_mode = None
+        desired_phases = 1
+        if (
+            current_phase_normalized == "3_phase"
+            and current_ev_power_w < 2500.0
+            and effective_solar_surplus_w >= 3000.0
+        ):
             desired_phase_mode = "1_phase"
 
-        desired_phases = 3 if desired_phase_mode == "3_phase" else 1
         desired_voltage = 230 * desired_phases
         amps = max(6, min(int(math.floor(effective_solar_surplus_w / desired_voltage)), int(ev_max_amps)))
         return EvPlan(
@@ -218,7 +224,7 @@ def build_ev_plan(
             desired_enabled=True,
             desired_amps=amps,
             desired_action="resume",
-            desired_phase_mode=desired_phase_mode if desired_phase_mode != current_phase_normalized else None,
+            desired_phase_mode=desired_phase_mode,
         )
 
     windows = _parse_windows(ev_windows)
