@@ -191,7 +191,12 @@ def build_ev_plan(
         reclaimable_battery_charge_w = 0.0
         if can_reclaim_battery_charge and state.battery_power_w < -100.0:
             reclaimable_battery_charge_w = abs(state.battery_power_w)
-        effective_solar_surplus_w = state.solar_surplus_w + current_ev_power_w + reclaimable_battery_charge_w
+        # For this Deye/Easee setup the house load sensor excludes the EV charger, so the
+        # true solar power available to the car is the PV power left after house load,
+        # plus any battery charging that Wattson can reclaim for the EV. Do not add the
+        # current EV power itself here, or the planner will mistake grid-backed charging
+        # for extra solar surplus and ramp the charger to full speed from the grid.
+        effective_solar_surplus_w = max(0.0, state.pv_power_w - state.load_power_w) + reclaimable_battery_charge_w
         stop_surplus_threshold_w = max(500.0, ev_solar_min_surplus_w * 0.6)
         required_surplus_w = stop_surplus_threshold_w if ev_session_active else ev_solar_min_surplus_w
         if effective_solar_surplus_w < required_surplus_w:
