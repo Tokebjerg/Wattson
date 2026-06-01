@@ -202,15 +202,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 and ev_plan.desired_action == "resume"
             ):
                 # When solar-only EV charging is active, prioritize available PV for the car
-                # instead of charging the house battery at the same time.
+                # and avoid zero-export curtailment that can throttle PV production before the
+                # charger has had a chance to absorb the surplus.
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
-                    reason=f"{battery_plan.reason} | EV solar-only active, prioritizing EV over battery charging",
+                    reason=(
+                        f"{battery_plan.reason} | EV solar-only active, prioritizing EV over battery charging "
+                        "and allowing full PV production"
+                    ),
                     desired_grid_charge=False,
-                    desired_solar_sell=False,
+                    desired_solar_sell=True,
                     desired_energy_priority="Load first",
-                    desired_limit_control_mode="Zero export to CT",
+                    desired_limit_control_mode="Selling first",
                 )
 
         safe_reasons: list[str] = []
