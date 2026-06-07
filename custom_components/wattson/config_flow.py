@@ -29,6 +29,8 @@ from .const import (
     CONF_BATTERY_DISCHARGE_CURRENT_NUMBER,
     CONF_BATTERY_GRID_CHARGE_CURRENT_NUMBER,
     CONF_BATTERY_MAX_SOC,
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_EV_REQUIRED_HOURS,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MODE_DEFAULT,
     CONF_BATTERY_POWER_ENTITY,
@@ -71,6 +73,8 @@ from .const import (
     DEFAULT_ALLOW_NEGATIVE_EXPORT,
     DEFAULT_BATTERY_CONTROL_ENABLED,
     DEFAULT_BATTERY_MAX_SOC,
+    DEFAULT_BATTERY_CAPACITY_KWH,
+    DEFAULT_EV_REQUIRED_HOURS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
@@ -246,6 +250,7 @@ def _options_battery_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_ALLOW_NEGATIVE_EXPORT, default=defaults[CONF_ALLOW_NEGATIVE_EXPORT]): _bool(),
             vol.Required(CONF_CHEAP_PRICE_THRESHOLD, default=defaults[CONF_CHEAP_PRICE_THRESHOLD]): _number(-5, 10, 0.05),
             vol.Required(CONF_EXPENSIVE_PRICE_THRESHOLD, default=defaults[CONF_EXPENSIVE_PRICE_THRESHOLD]): _number(-5, 20, 0.05),
+            vol.Required(CONF_BATTERY_CAPACITY_KWH, default=defaults[CONF_BATTERY_CAPACITY_KWH]): _number(1, 100, 0.5),
         }
     )
 
@@ -257,6 +262,7 @@ def _options_ev_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_EV_MODE_DEFAULT, default=defaults[CONF_EV_MODE_DEFAULT]): _select(EV_MODES),
             vol.Required(CONF_EV_MAX_AMPS, default=defaults[CONF_EV_MAX_AMPS]): _number(6, 32, 1),
             vol.Required(CONF_EV_SOLAR_MIN_SURPLUS_W, default=defaults[CONF_EV_SOLAR_MIN_SURPLUS_W]): _number(500, 20000, 100),
+            vol.Required(CONF_EV_REQUIRED_HOURS, default=defaults[CONF_EV_REQUIRED_HOURS]): _number(1, 12, 1),
             vol.Required(CONF_EV_WINDOWS, default=defaults[CONF_EV_WINDOWS]): _text(),
         }
     )
@@ -430,6 +436,8 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_ALLOW_NEGATIVE_EXPORT: entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT),
             CONF_CHEAP_PRICE_THRESHOLD: entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD),
             CONF_EXPENSIVE_PRICE_THRESHOLD: entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD),
+            CONF_BATTERY_CAPACITY_KWH: entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH),
+            CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
             CONF_EV_CONTROL_ENABLED: entry_value(self.config_entry, CONF_EV_CONTROL_ENABLED, DEFAULT_EV_CONTROL_ENABLED),
             CONF_EV_MODE_DEFAULT: entry_value(self.config_entry, CONF_EV_MODE_DEFAULT, DEFAULT_EV_MODE),
             CONF_EV_MAX_AMPS: entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS),

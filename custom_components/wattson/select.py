@@ -57,6 +57,7 @@ class _BaseSelect(SelectEntity):
 class WattsonEVModeSelect(_BaseSelect):
     _attr_options = EV_MODES
     _attr_icon = "mdi:ev-station"
+    _attr_translation_key = "ev_mode"
 
     def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "EV Mode", "ev_mode")
@@ -74,6 +75,7 @@ class WattsonEVModeSelect(_BaseSelect):
 class WattsonBatteryModeSelect(_BaseSelect):
     _attr_options = BATTERY_MODES
     _attr_icon = "mdi:battery-clock-outline"
+    _attr_translation_key = "battery_mode"
 
     def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "Battery Mode", "battery_mode")

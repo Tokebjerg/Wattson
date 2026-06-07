@@ -1,5 +1,27 @@
 {
   "title": "Wattson",
+  "entity": {
+    "select": {
+      "battery_mode": {
+        "name": "Batteri-profil",
+        "state": {
+          "red": "Rød · ROI (tjen mest)",
+          "blue": "Blå · Konservativ",
+          "green": "Grøn · Selvforsyning",
+          "protect": "Beskyt batteri"
+        }
+      },
+      "ev_mode": {
+        "name": "Elbil-mode",
+        "state": {
+          "full_speed": "Altid oplad (fuld hastighed)",
+          "solar_only": "Kun sol",
+          "scheduled_periods": "Planlagt periode",
+          "scheduled_cheapest": "Planlagt billigste timer"
+        }
+      }
+    }
+  },
   "config": {
     "abort": {
       "single_instance_allowed": "Wattson er allerede sat op."
@@ -124,7 +146,8 @@
           "allow_grid_charge": "Tillad netladning",
           "allow_negative_export": "Tillad eksport ved negative priser",
           "cheap_price_threshold": "Billig pris tærskel",
-          "expensive_price_threshold": "Dyr pris tærskel"
+          "expensive_price_threshold": "Dyr pris tærskel",
+          "battery_capacity_kwh": "Batterikapacitet (kWh)"
         }
       },
       "ev_settings": {
@@ -135,7 +158,8 @@
           "ev_mode_default": "Standard EV-mode",
           "ev_max_amps": "Maks EV ampere",
           "ev_solar_min_surplus_w": "Solar-only minimum overskud (W)",
-          "ev_windows": "Tilladte ladevinduer"
+          "ev_windows": "Tilladte ladevinduer",
+          "ev_required_hours": "Antal billigste timer (planlagt billigste)"
         }
       },
       "mapping": {

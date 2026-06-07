@@ -1,5 +1,27 @@
 {
   "title": "Wattson",
+  "entity": {
+    "select": {
+      "battery_mode": {
+        "name": "Battery profile",
+        "state": {
+          "red": "Red · ROI (max earnings)",
+          "blue": "Blue · Conservative",
+          "green": "Green · Self-sufficiency",
+          "protect": "Protect battery"
+        }
+      },
+      "ev_mode": {
+        "name": "EV mode",
+        "state": {
+          "full_speed": "Always charge (full speed)",
+          "solar_only": "Solar only",
+          "scheduled_periods": "Scheduled period",
+          "scheduled_cheapest": "Scheduled cheapest hours"
+        }
+      }
+    }
+  },
   "config": {
     "abort": {
       "single_instance_allowed": "Wattson is already configured."
@@ -124,7 +146,8 @@
           "allow_grid_charge": "Allow grid charging",
           "allow_negative_export": "Allow export during negative prices",
           "cheap_price_threshold": "Cheap price threshold",
-          "expensive_price_threshold": "Expensive price threshold"
+          "expensive_price_threshold": "Expensive price threshold",
+          "battery_capacity_kwh": "Battery capacity (kWh)"
         }
       },
       "ev_settings": {
@@ -135,7 +158,8 @@
           "ev_mode_default": "Default EV mode",
           "ev_max_amps": "Maximum EV amps",
           "ev_solar_min_surplus_w": "Solar-only minimum surplus (W)",
-          "ev_windows": "Allowed charging windows"
+          "ev_windows": "Allowed charging windows",
+          "ev_required_hours": "Cheapest hours count (scheduled cheapest)"
         }
       },
       "mapping": {
