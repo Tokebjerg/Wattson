@@ -51,6 +51,24 @@ class Capabilities:
 
 
 @dataclass(frozen=True)
+class ProfileWeights:
+    """Phase B: how an AI profile (Rød/Blå/Grøn) shapes the shared planner.
+
+    A profile is a weight-set, not a separate code path: it tunes how many hours
+    count as cheap/expensive, the profit margin required before cycling the
+    battery, how much reserve to hold back for self-use, and the export policy.
+    """
+
+    name: str
+    reserve_soc_offset: float       # extra SOC held above min before discharging
+    cheap_hours: int                # cheapest N remaining hours = charge candidates
+    expensive_hours: int            # most expensive N remaining hours = discharge candidates
+    profit_margin: float            # DKK/kWh value-add required (wear cost added on top)
+    sell_at_peak: bool              # sell to grid during expensive hours
+    self_consumption_first: bool    # hold PV/battery for own load; minimise export
+
+
+@dataclass(frozen=True)
 class PriceSlot:
     """One hourly price slot in the planning horizon.
 

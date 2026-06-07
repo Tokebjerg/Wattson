@@ -707,6 +707,73 @@ def test_a2_planning():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 9. Phase B — Rød/Blå/Grøn profile tests.
+# --------------------------------------------------------------------------- #
+def test_b_profiles():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 7, h, 0, tzinfo=TZ)
+
+    def pslot(h, total, exp=None):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=exp)
+
+    def make_state(now, soc, slots, pv=0.0, load=0.0):
+        return models.SiteState(
+            timestamp=now, pv_power_w=pv, load_power_w=load, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
+            price_slots=slots, solar_slots=[],
+        )
+
+    def plan(mode, st):
+        bp, _ = planner.build_battery_plan(
+            st, battery_mode=mode, min_soc=20, max_soc=90, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        return bp
+
+    # 1. Legacy mode migration onto profiles.
+    checks.append(("legacy hybrid -> blue", planner.profile_for("hybrid").name == "blue", planner.profile_for("hybrid").name))
+    checks.append(("legacy price -> red", planner.profile_for("price").name == "red", planner.profile_for("price").name))
+    checks.append(("legacy self_consumption -> green", planner.profile_for("self_consumption").name == "green", planner.profile_for("self_consumption").name))
+    checks.append(("protect detected", planner._is_protect("protect") is True, "protect"))
+
+    # 2. Cheap hour with a 0.45 spread: Red (needs 0.30) charges; Blue (0.50) and Green (0.60) hold.
+    spread_curve = [pslot(0, 0.20), pslot(1, 0.30), pslot(2, 0.40), pslot(3, 0.50), pslot(4, 0.60), pslot(5, 0.65)]
+    st2 = make_state(at(0), 50, spread_curve)
+    checks.append(("Red charges at 0.45 spread", plan("red", st2).strategy == "GRID_CHARGE", plan("red", st2).strategy))
+    checks.append(("Blue holds at 0.45 spread (needs 0.50)", plan("blue", st2).strategy != "GRID_CHARGE", plan("blue", st2).strategy))
+    checks.append(("Green holds at 0.45 spread (needs 0.60)", plan("green", st2).strategy != "GRID_CHARGE", plan("green", st2).strategy))
+
+    # 3. Expensive hour at SOC 28: Red discharges (reserve 0); Blue (10) & Green (15) hold the reserve.
+    exp_curve = [pslot(0, 1.50, exp=0.5), pslot(1, 0.50), pslot(2, 0.40), pslot(3, 0.30), pslot(4, 0.20), pslot(5, 0.10)]
+    st3 = make_state(at(0), 28, exp_curve)
+    red3, blue3, green3 = plan("red", st3), plan("blue", st3), plan("green", st3)
+    checks.append(("Red discharges at SOC28 (reserve 0)", red3.strategy == "DISCHARGE_TO_LOAD", red3.strategy))
+    checks.append(("Red sells at peak", red3.desired_solar_sell is True, str(red3.desired_solar_sell)))
+    checks.append(("Blue holds reserve at SOC28", blue3.strategy != "DISCHARGE_TO_LOAD", blue3.strategy))
+    checks.append(("Green holds reserve at SOC28", green3.strategy != "DISCHARGE_TO_LOAD", green3.strategy))
+
+    # 4. Green self-consumption at a mid-rank hour with PV surplus; Blue stays idle.
+    asc = [pslot(h, 0.1 * (h + 1)) for h in range(8)]  # 0.1 .. 0.8
+    st4 = make_state(at(4), 60, asc, pv=3000.0, load=2000.0)  # surplus 1000W
+    checks.append(("Green self-consumes surplus", plan("green", st4).strategy == "SOLAR_SELF_CONSUMPTION", plan("green", st4).strategy))
+    checks.append(("Blue idle at mid hour", plan("blue", st4).strategy == "IDLE", plan("blue", st4).strategy))
+
+    # 5. Protect overrides everything.
+    checks.append(("protect -> PROTECT", plan("protect", make_state(at(0), 50, spread_curve)).strategy == "PROTECT", plan("protect", make_state(at(0), 50, spread_curve)).strategy))
+
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -733,7 +800,8 @@ def main():
     total = len(SCENARIOS)
     for title, suite in (("PHASE A · A1 HORIZON INGESTION", test_horizon),
                          ("PHASE A · A0 WRITE VERIFICATION", test_write_verification),
-                         ("PHASE A · A2 HORIZON PLANNING", test_a2_planning)):
+                         ("PHASE A · A2 HORIZON PLANNING", test_a2_planning),
+                         ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles)):
         print("\n" + "-" * 100)
         print(title)
         try:

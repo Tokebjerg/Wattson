@@ -5,46 +5,84 @@ from datetime import datetime, time
 import math
 
 from .const import (
-    BATTERY_MODE_HYBRID,
-    BATTERY_MODE_PRICE,
+    BATTERY_MODE_BLUE,
+    BATTERY_MODE_GREEN,
     BATTERY_MODE_PROTECT,
-    BATTERY_MODE_SELF,
+    BATTERY_MODE_RED,
+    BATTERY_WEAR_COST,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
     EV_MODE_SOLAR_ONLY,
+    LEGACY_BATTERY_MODE_MAP,
 )
 from .horizon import current_price_slot, remaining_price_slots
-from .models import BatteryPlan, ControlPlan, EvPlan, PlanTask, SiteState
+from .models import BatteryPlan, ControlPlan, EvPlan, PlanTask, ProfileWeights, SiteState
 
-# Phase A trin A2: horizon-aware planning constants. When the price horizon is
-# available the planner ranks hours within the remaining day instead of using a
-# flat absolute threshold, which adapts to whatever the day's price shape is.
-CHEAP_HOURS = 6              # cheapest N remaining hours are grid-charge candidates
-EXPENSIVE_HOURS = 4         # most expensive N remaining hours are discharge candidates
-MIN_ARBITRAGE_SPREAD = 0.40  # DKK/kWh total-price spread required to justify grid charging
 SCHEDULE_MAX_HOURS = 24
+
+# Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
+# Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
+# (charge more, sell less, moderate reserve); Grøn = self-sufficiency (high
+# reserve, export only true surplus). The required arbitrage spread is the
+# profit margin PLUS the BATTERY_WEAR_COST cycling penalty.
+PROFILES: dict[str, ProfileWeights] = {
+    BATTERY_MODE_RED: ProfileWeights(
+        name="red", reserve_soc_offset=0, cheap_hours=8, expensive_hours=6,
+        profit_margin=0.20, sell_at_peak=True, self_consumption_first=False,
+    ),
+    BATTERY_MODE_BLUE: ProfileWeights(
+        name="blue", reserve_soc_offset=10, cheap_hours=5, expensive_hours=3,
+        profit_margin=0.40, sell_at_peak=False, self_consumption_first=False,
+    ),
+    BATTERY_MODE_GREEN: ProfileWeights(
+        name="green", reserve_soc_offset=15, cheap_hours=4, expensive_hours=2,
+        profit_margin=0.50, sell_at_peak=False, self_consumption_first=True,
+    ),
+}
+
+
+def _resolve_mode(mode: str) -> str:
+    """Map legacy mode strings (hybrid/price/self_consumption) onto the profiles."""
+    return LEGACY_BATTERY_MODE_MAP.get(mode, mode)
+
+
+def _is_protect(mode: str) -> bool:
+    return _resolve_mode(mode) == BATTERY_MODE_PROTECT
+
+
+def profile_for(mode: str) -> ProfileWeights:
+    """Resolve any (new or legacy) mode string to a profile weight-set.
+
+    Protect has no arbitrage weights of its own; it is handled separately and
+    defaults to the conservative Blå weights for the informational schedule.
+    """
+    return PROFILES.get(_resolve_mode(mode), PROFILES[BATTERY_MODE_BLUE])
+
+
+def required_spread(profile: ProfileWeights) -> float:
+    return profile.profit_margin + BATTERY_WEAR_COST
 
 
 class _HorizonView:
-    """Ranked view of the remaining price horizon for a single tick."""
+    """Ranked view of the remaining price horizon for a single tick + profile."""
 
-    def __init__(self, slots: list, now: datetime) -> None:
+    def __init__(self, slots: list, now: datetime, cheap_hours: int, expensive_hours: int) -> None:
         self.slots = slots
         self.current = current_price_slot(slots, now) or (slots[0] if slots else None)
         by_price = sorted(slots, key=lambda s: s.total_import_price)
-        self.cheap_starts = {s.start for s in by_price[:CHEAP_HOURS]}
-        self.expensive_starts = {s.start for s in by_price[-EXPENSIVE_HOURS:]} if slots else set()
+        self.cheap_starts = {s.start for s in by_price[:cheap_hours]}
+        self.expensive_starts = {s.start for s in by_price[-expensive_hours:]} if slots else set()
 
     def max_price_after(self, start: datetime) -> float | None:
         future = [s.total_import_price for s in self.slots if s.start > start]
         return max(future) if future else None
 
 
-def _horizon_view(state: SiteState) -> _HorizonView | None:
+def _horizon_view(state: SiteState, profile: ProfileWeights) -> _HorizonView | None:
     slots = remaining_price_slots(state.price_slots, state.timestamp)
     if not slots:
         return None
-    view = _HorizonView(slots, state.timestamp)
+    view = _HorizonView(slots, state.timestamp, profile.cheap_hours, profile.expensive_hours)
     if view.current is None:
         return None
     return view
@@ -79,50 +117,42 @@ def _horizon_battery_plan(
     state: SiteState,
     view: _HorizonView,
     *,
-    battery_mode: str,
+    profile: ProfileWeights,
     min_soc: float,
     max_soc: float,
     allow_grid_charge: bool,
     export_limit_default_w: float | None,
 ) -> BatteryPlan:
-    """Plan-driven battery decision using the ranked price horizon.
+    """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
-    Same decision structure as the legacy threshold logic, but "cheap"/"expensive"
-    are decided by rank within the remaining day (using the total import price),
-    and grid charging additionally requires a worthwhile later price spread.
+    "Cheap"/"expensive" are decided by rank within the remaining day on the total
+    import price; the profile sets how many hours count, the profit margin needed
+    to justify a cycle (wear cost added), the reserve SOC held back, and whether
+    to actually sell to the grid at peaks.
     """
     current = view.current
     price = current.total_import_price
     is_cheap = current.start in view.cheap_starts
     is_expensive = current.start in view.expensive_starts
     max_after = view.max_price_after(current.start)
-    worthwhile = max_after is not None and (max_after - price) >= MIN_ARBITRAGE_SPREAD
+    worthwhile = max_after is not None and (max_after - price) >= required_spread(profile)
+    discharge_floor = min_soc + profile.reserve_soc_offset
 
-    if (
-        allow_grid_charge
-        and battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
-        and is_cheap
-        and worthwhile
-        and state.battery_soc_pct < max_soc
-    ):
+    if allow_grid_charge and is_cheap and worthwhile and state.battery_soc_pct < max_soc:
         return BatteryPlan(
             strategy="GRID_CHARGE",
-            reason=f"Total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window",
+            reason=f"[{profile.name}] total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window",
             desired_grid_charge=True,
             desired_solar_sell=False,
             desired_energy_priority="Battery first",
             desired_export_limit_w=export_limit_default_w,
         )
 
-    if (
-        battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
-        and is_expensive
-        and state.battery_soc_pct > min_soc
-    ):
-        sell = (current.export_value or 0) > 0
+    if is_expensive and state.battery_soc_pct > discharge_floor:
+        sell = profile.sell_at_peak and (current.export_value or 0) > 0
         return BatteryPlan(
             strategy="DISCHARGE_TO_LOAD",
-            reason=f"Total price {price:.2f} is among the most expensive hours",
+            reason=f"[{profile.name}] total price {price:.2f} is among the most expensive hours",
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
@@ -130,10 +160,10 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
-    if battery_mode == BATTERY_MODE_SELF and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
+    if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
         return BatteryPlan(
             strategy="SOLAR_SELF_CONSUMPTION",
-            reason="Solar surplus available, prioritizing self-consumption",
+            reason=f"[{profile.name}] solar surplus available, prioritizing self-consumption",
             desired_grid_charge=False,
             desired_solar_sell=False,
             desired_energy_priority="Battery first",
@@ -141,27 +171,20 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
-    if battery_mode == BATTERY_MODE_PROTECT:
-        return BatteryPlan(
-            strategy="PROTECT",
-            reason="Battery protect mode active",
-            desired_grid_charge=False,
-            desired_energy_priority="Load first",
-            desired_export_limit_w=export_limit_default_w,
-        )
-
     return BatteryPlan(
         strategy="IDLE",
         reason="No strong battery action required right now",
         desired_grid_charge=False,
-        desired_energy_priority="Load first" if state.battery_soc_pct > min_soc else "Battery first",
+        desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
+        # Green keeps PV for self-consumption rather than exporting while idle.
+        desired_limit_control_mode="Zero export to CT" if profile.self_consumption_first else None,
         desired_export_limit_w=export_limit_default_w,
     )
 
 
-def _build_schedule(state: SiteState) -> tuple[list[PlanTask], str | None, str | None]:
+def _build_schedule(state: SiteState, profile: ProfileWeights) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan and the next cheap/expensive windows."""
-    view = _horizon_view(state)
+    view = _horizon_view(state, profile)
     if view is None:
         return [], None, None
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
@@ -172,7 +195,7 @@ def _build_schedule(state: SiteState) -> tuple[list[PlanTask], str | None, str |
         is_cheap = slot.start in view.cheap_starts
         is_expensive = slot.start in view.expensive_starts
         max_after = view.max_price_after(slot.start)
-        worthwhile = max_after is not None and (max_after - slot.total_import_price) >= MIN_ARBITRAGE_SPREAD
+        worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
         if is_cheap and worthwhile:
             action = "GRID_CHARGE"
         elif is_expensive:
@@ -238,78 +261,7 @@ def build_battery_plan(
             True,
         )
 
-    # Phase A trin A2: prefer the plan-driven, horizon-aware decision when the
-    # hourly price horizon is available. Falls through to the legacy flat-
-    # threshold logic below only when no horizon data is present (so behaviour is
-    # unchanged if the price entity ever stops exposing hourly attributes).
-    horizon = _horizon_view(state)
-    if horizon is not None:
-        return (
-            _horizon_battery_plan(
-                state,
-                horizon,
-                battery_mode=battery_mode,
-                min_soc=min_soc,
-                max_soc=max_soc,
-                allow_grid_charge=allow_grid_charge,
-                export_limit_default_w=export_limit_default_w,
-            ),
-            False,
-        )
-
-    if (
-        allow_grid_charge
-        and battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
-        and state.current_buy_price is not None
-        and state.current_buy_price <= cheap_threshold
-        and state.battery_soc_pct < max_soc
-    ):
-        return (
-            BatteryPlan(
-                strategy="GRID_CHARGE",
-                reason=f"Current import price {state.current_buy_price:.3f} is at or below cheap threshold",
-                desired_grid_charge=True,
-                desired_solar_sell=False,
-                desired_energy_priority="Battery first",
-                desired_export_limit_w=export_limit_default_w,
-            ),
-            False,
-        )
-
-    if (
-        battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
-        and state.current_buy_price is not None
-        and state.current_buy_price >= expensive_threshold
-        and state.battery_soc_pct > min_soc
-    ):
-        return (
-            BatteryPlan(
-                strategy="DISCHARGE_TO_LOAD",
-                reason=f"Current import price {state.current_buy_price:.3f} is at or above expensive threshold",
-                desired_grid_charge=False,
-                desired_solar_sell=True if (state.current_sell_price or 0) > 0 else False,
-                desired_energy_priority="Load first",
-                desired_limit_control_mode="Selling first" if (state.current_sell_price or 0) > 0 else "Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
-            ),
-            False,
-        )
-
-    if battery_mode == BATTERY_MODE_SELF and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
-        return (
-            BatteryPlan(
-                strategy="SOLAR_SELF_CONSUMPTION",
-                reason="Solar surplus available, prioritizing self-consumption",
-                desired_grid_charge=False,
-                desired_solar_sell=False,
-                desired_energy_priority="Battery first",
-                desired_limit_control_mode="Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
-            ),
-            False,
-        )
-
-    if battery_mode == BATTERY_MODE_PROTECT:
+    if _is_protect(battery_mode):
         return (
             BatteryPlan(
                 strategy="PROTECT",
@@ -321,12 +273,90 @@ def build_battery_plan(
             False,
         )
 
+    profile = profile_for(battery_mode)
+
+    # Phase A trin A2 / Phase B: prefer the plan-driven, profile-shaped decision
+    # when the hourly price horizon is available. Falls through to the legacy
+    # flat-threshold logic below only when no horizon data is present (so
+    # behaviour degrades safely if the price entity stops exposing hourly data).
+    horizon = _horizon_view(state, profile)
+    if horizon is not None:
+        return (
+            _horizon_battery_plan(
+                state,
+                horizon,
+                profile=profile,
+                min_soc=min_soc,
+                max_soc=max_soc,
+                allow_grid_charge=allow_grid_charge,
+                export_limit_default_w=export_limit_default_w,
+            ),
+            False,
+        )
+
+    # Legacy fallback (no horizon): flat absolute thresholds, profile-shaped.
+    discharge_floor = min_soc + profile.reserve_soc_offset
+
+    if (
+        allow_grid_charge
+        and not profile.self_consumption_first
+        and state.current_buy_price is not None
+        and state.current_buy_price <= cheap_threshold
+        and state.battery_soc_pct < max_soc
+    ):
+        return (
+            BatteryPlan(
+                strategy="GRID_CHARGE",
+                reason=f"[{profile.name}] import price {state.current_buy_price:.3f} at or below cheap threshold",
+                desired_grid_charge=True,
+                desired_solar_sell=False,
+                desired_energy_priority="Battery first",
+                desired_export_limit_w=export_limit_default_w,
+            ),
+            False,
+        )
+
+    if (
+        not profile.self_consumption_first
+        and state.current_buy_price is not None
+        and state.current_buy_price >= expensive_threshold
+        and state.battery_soc_pct > discharge_floor
+    ):
+        sell = profile.sell_at_peak and (state.current_sell_price or 0) > 0
+        return (
+            BatteryPlan(
+                strategy="DISCHARGE_TO_LOAD",
+                reason=f"[{profile.name}] import price {state.current_buy_price:.3f} at or above expensive threshold",
+                desired_grid_charge=False,
+                desired_solar_sell=sell,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
+            ),
+            False,
+        )
+
+    if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
+        return (
+            BatteryPlan(
+                strategy="SOLAR_SELF_CONSUMPTION",
+                reason=f"[{profile.name}] solar surplus available, prioritizing self-consumption",
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_energy_priority="Battery first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
+            ),
+            False,
+        )
+
     return (
         BatteryPlan(
             strategy="IDLE",
             reason="No strong battery action required right now",
             desired_grid_charge=False,
-            desired_energy_priority="Load first" if state.battery_soc_pct > min_soc else "Battery first",
+            desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
+            desired_limit_control_mode="Zero export to CT" if profile.self_consumption_first else None,
             desired_export_limit_w=export_limit_default_w,
         ),
         False,
@@ -461,6 +491,7 @@ def build_control_plan(
     ev_plan: EvPlan,
     safe_reasons: list[str],
     negative_price_active: bool,
+    battery_mode: str = BATTERY_MODE_BLUE,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -468,7 +499,7 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
-    schedule, next_cheap_window, next_expensive_window = _build_schedule(state)
+    schedule, next_cheap_window, next_expensive_window = _build_schedule(state, profile_for(battery_mode))
     return ControlPlan(
         battery=battery_plan,
         ev=ev_plan,

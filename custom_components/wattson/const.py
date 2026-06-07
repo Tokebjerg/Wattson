@@ -85,23 +85,41 @@ DEFAULT_EXPENSIVE_PRICE_THRESHOLD = 1.80
 DEFAULT_ALLOW_GRID_CHARGE = True
 DEFAULT_ALLOW_NEGATIVE_EXPORT = False
 DEFAULT_EV_MODE = "scheduled_periods"
-DEFAULT_BATTERY_MODE = "hybrid"
+DEFAULT_BATTERY_MODE = "blue"
 
 EV_MODE_FULL_SPEED = "full_speed"
 EV_MODE_SOLAR_ONLY = "solar_only"
 EV_MODE_SCHEDULED = "scheduled_periods"
 EV_MODES = [EV_MODE_FULL_SPEED, EV_MODE_SOLAR_ONLY, EV_MODE_SCHEDULED]
 
+# Phase B: SunMate-style AI prioritization profiles.
+BATTERY_MODE_RED = "red"      # ROI maximization: aggressive arbitrage + selling
+BATTERY_MODE_BLUE = "blue"    # conservative middle: charge more, sell less
+BATTERY_MODE_GREEN = "green"  # self-sufficiency: export only true surplus
+BATTERY_MODE_PROTECT = "protect"
+
+# Legacy modes (kept for migration + the no-horizon fallback path).
 BATTERY_MODE_PRICE = "price"
 BATTERY_MODE_SELF = "self_consumption"
 BATTERY_MODE_HYBRID = "hybrid"
-BATTERY_MODE_PROTECT = "protect"
+
 BATTERY_MODES = [
-    BATTERY_MODE_PRICE,
-    BATTERY_MODE_SELF,
-    BATTERY_MODE_HYBRID,
+    BATTERY_MODE_RED,
+    BATTERY_MODE_BLUE,
+    BATTERY_MODE_GREEN,
     BATTERY_MODE_PROTECT,
 ]
+
+# Map old stored values onto the new profiles.
+LEGACY_BATTERY_MODE_MAP = {
+    BATTERY_MODE_HYBRID: BATTERY_MODE_BLUE,
+    BATTERY_MODE_PRICE: BATTERY_MODE_RED,
+    BATTERY_MODE_SELF: BATTERY_MODE_GREEN,
+}
+
+# DKK/kWh cycling penalty added to a profile's required arbitrage margin so the
+# planner does not chase small gains and wear the battery (simple wear model).
+BATTERY_WEAR_COST = 0.10
 
 SERVICE_REPLAN = "replan"
 SERVICE_PAUSE = "pause"

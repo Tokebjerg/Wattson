@@ -52,6 +52,7 @@ from .const import (
     DEFAULT_STALE_SECONDS,
     DOMAIN,
     EV_MODE_SOLAR_ONLY,
+    LEGACY_BATTERY_MODE_MAP,
     NAME,
     UPDATE_INTERVAL,
 )
@@ -78,7 +79,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.battery_control_enabled = bool(entry_value(entry, CONF_BATTERY_CONTROL_ENABLED, DEFAULT_BATTERY_CONTROL_ENABLED))
         self.ev_control_enabled = bool(entry_value(entry, CONF_EV_CONTROL_ENABLED, DEFAULT_EV_CONTROL_ENABLED))
         self.ev_mode = str(entry_value(entry, CONF_EV_MODE_DEFAULT, DEFAULT_EV_MODE))
-        self.battery_mode = str(entry_value(entry, CONF_BATTERY_MODE_DEFAULT, DEFAULT_BATTERY_MODE))
+        _raw_battery_mode = str(entry_value(entry, CONF_BATTERY_MODE_DEFAULT, DEFAULT_BATTERY_MODE))
+        self.battery_mode = LEGACY_BATTERY_MODE_MAP.get(_raw_battery_mode, _raw_battery_mode)
         self._klatremis = KlatremisController(hass)
         self._easee = EaseeController(hass)
         self._last_fingerprint: tuple[Any, ...] | None = None
@@ -256,6 +258,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev_plan=ev_plan,
             safe_reasons=safe_reasons,
             negative_price_active=negative_price_active,
+            battery_mode=self.battery_mode,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:
