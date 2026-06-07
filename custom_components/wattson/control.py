@@ -1,11 +1,13 @@
 """Control adapters for Wattson."""
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from .const import EV_PHASE_LOCK_MINUTES
 from .models import BatteryPlan, EntityMapping, EvPlan, SiteState
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +104,7 @@ class KlatremisController:
 class EaseeController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
+        self._last_phase_change_at = None  # datetime of the last 1<->3 phase switch
 
     @staticmethod
     def _normalize_phase_mode(value: str | None) -> str | None:
@@ -182,5 +185,16 @@ class EaseeController:
             actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
         if plan.desired_phase_mode is not None:
             if self._normalize_phase_mode(state.easee_phase_mode) != self._normalize_phase_mode(plan.desired_phase_mode):
-                actions.extend(await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode))
+                now = state.timestamp
+                locked = (
+                    self._last_phase_change_at is not None
+                    and (now - self._last_phase_change_at) < timedelta(minutes=EV_PHASE_LOCK_MINUTES)
+                )
+                if locked:
+                    actions.append(f"easee.phase_mode change suppressed ({EV_PHASE_LOCK_MINUTES}-min lock)")
+                else:
+                    changed = await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode)
+                    if changed:
+                        self._last_phase_change_at = now
+                        actions.extend(changed)
         return actions

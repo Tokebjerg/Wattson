@@ -25,6 +25,8 @@ from .const import (
     CONF_EV_MAX_AMPS,
     CONF_EV_MODE_DEFAULT,
     CONF_EV_SOLAR_MIN_SURPLUS_W,
+    CONF_EV_SOLAR_BATTERY_THRESHOLD,
+    CONF_EV_REQUIRED_HOURS,
     CONF_EV_WINDOWS,
     CONF_EXPENSIVE_PRICE_THRESHOLD,
     CONF_INVERT_BATTERY_POWER_SIGN,
@@ -43,6 +45,9 @@ from .const import (
     DEFAULT_EV_MAX_AMPS,
     DEFAULT_EV_MODE,
     DEFAULT_EV_SOLAR_MIN_SURPLUS_W,
+    DEFAULT_EV_SOLAR_BATTERY_THRESHOLD,
+    DEFAULT_EV_REQUIRED_HOURS,
+    EV_SURPLUS_AVERAGE_SECONDS,
     DEFAULT_EV_WINDOWS,
     DEFAULT_EXPENSIVE_PRICE_THRESHOLD,
     DEFAULT_INVERT_BATTERY_POWER_SIGN,
@@ -59,7 +64,7 @@ from .const import (
 from .control import EaseeController, KlatremisController
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
-from .planner import build_battery_plan, build_control_plan, build_ev_plan
+from .planner import build_battery_plan, build_control_plan, build_ev_plan, effective_solar_surplus_w
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +92,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._default_export_limit_w: float | None = None
         self._default_discharge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
+        self._surplus_samples: list[tuple[datetime, float]] = []
 
     async def async_startup(self) -> None:
         return None
@@ -172,6 +178,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
             export_limit_default_w=self._default_export_limit_w,
         )
+        # Phase C: smooth the solar surplus over a rolling window so the EV
+        # regulation reacts to a 2-minute average instead of 10s spikes.
+        sample_now = dt_util.utcnow()
+        self._surplus_samples.append((sample_now, effective_solar_surplus_w(self.site_state, self.battery_control_enabled)))
+        cutoff = sample_now - timedelta(seconds=EV_SURPLUS_AVERAGE_SECONDS)
+        self._surplus_samples = [(t, v) for (t, v) in self._surplus_samples if t >= cutoff]
+        averaged_surplus = sum(v for _, v in self._surplus_samples) / len(self._surplus_samples)
+
         ev_plan = build_ev_plan(
             self.site_state,
             ev_mode=self.ev_mode,
@@ -179,6 +193,9 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
             ev_windows=str(entry_value(self.config_entry, CONF_EV_WINDOWS, DEFAULT_EV_WINDOWS)),
             can_reclaim_battery_charge=self.battery_control_enabled,
+            ev_solar_battery_threshold=float(entry_value(self.config_entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD)),
+            ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
+            solar_surplus_override=averaged_surplus,
         )
 
         if self.ev_mode == EV_MODE_SOLAR_ONLY:

@@ -32,6 +32,8 @@ CONF_FORECAST_TODAY_ENTITY = "forecast_today_entity"
 CONF_EV_WINDOWS = "ev_windows"
 CONF_EV_MAX_AMPS = "ev_max_amps"
 CONF_EV_SOLAR_MIN_SURPLUS_W = "ev_solar_min_surplus_w"
+CONF_EV_SOLAR_BATTERY_THRESHOLD = "ev_solar_battery_threshold"
+CONF_EV_REQUIRED_HOURS = "ev_required_hours"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 CONF_CHEAP_PRICE_THRESHOLD = "cheap_price_threshold"
@@ -78,6 +80,11 @@ DEFAULT_INVERT_BATTERY_POWER_SIGN = False
 DEFAULT_EV_WINDOWS = "00:00-06:00"
 DEFAULT_EV_MAX_AMPS = 16
 DEFAULT_EV_SOLAR_MIN_SURPLUS_W = 1400
+# Home-battery SOC (%) required before solar EV charging starts (0 = disabled,
+# i.e. the car may charge on surplus regardless of the house battery level).
+DEFAULT_EV_SOLAR_BATTERY_THRESHOLD = 0
+# Number of cheapest in-window hours to charge in scheduled_cheapest mode.
+DEFAULT_EV_REQUIRED_HOURS = 4
 DEFAULT_BATTERY_MIN_SOC = 20
 DEFAULT_BATTERY_MAX_SOC = 90
 DEFAULT_CHEAP_PRICE_THRESHOLD = 0.75
@@ -90,7 +97,17 @@ DEFAULT_BATTERY_MODE = "blue"
 EV_MODE_FULL_SPEED = "full_speed"
 EV_MODE_SOLAR_ONLY = "solar_only"
 EV_MODE_SCHEDULED = "scheduled_periods"
-EV_MODES = [EV_MODE_FULL_SPEED, EV_MODE_SOLAR_ONLY, EV_MODE_SCHEDULED]
+EV_MODE_SCHEDULED_CHEAPEST = "scheduled_cheapest"
+EV_MODES = [
+    EV_MODE_FULL_SPEED,
+    EV_MODE_SOLAR_ONLY,
+    EV_MODE_SCHEDULED,
+    EV_MODE_SCHEDULED_CHEAPEST,
+]
+
+# Phase C anti-flap parameters.
+EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
+EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
 
 # Phase B: SunMate-style AI prioritization profiles.
 BATTERY_MODE_RED = "red"      # ROI maximization: aggressive arbitrage + selling

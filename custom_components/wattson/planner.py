@@ -12,6 +12,7 @@ from .const import (
     BATTERY_WEAR_COST,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
+    EV_MODE_SCHEDULED_CHEAPEST,
     EV_MODE_SOLAR_ONLY,
     LEGACY_BATTERY_MODE_MAP,
 )
@@ -363,6 +364,25 @@ def build_battery_plan(
     )
 
 
+def effective_solar_surplus_w(state: SiteState, can_reclaim_battery_charge: bool) -> float:
+    """PV power available for the car right now (W).
+
+    Shared by the planner and the coordinator's 2-minute averaging buffer so both
+    use the same surplus definition.
+    """
+    current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
+    reclaimable = abs(state.battery_power_w) if (can_reclaim_battery_charge and state.battery_power_w < -100.0) else 0.0
+    if state.load_includes_ev:
+        # Load already includes the EV session: add the measured EV power back
+        # before estimating what PV remains for the car.
+        surplus = max(0.0, state.pv_power_w + current_ev_power_w - state.load_power_w)
+    else:
+        # House load sensor excludes the charger: do not add EV power, or grid-backed
+        # charging would be mistaken for extra solar surplus.
+        surplus = max(0.0, state.pv_power_w - state.load_power_w)
+    return surplus + reclaimable
+
+
 def build_ev_plan(
     state: SiteState,
     *,
@@ -371,6 +391,9 @@ def build_ev_plan(
     ev_solar_min_surplus_w: float,
     ev_windows: str,
     can_reclaim_battery_charge: bool = False,
+    ev_solar_battery_threshold: float = 0.0,
+    ev_required_hours: int = 4,
+    solar_surplus_override: float | None = None,
 ) -> EvPlan:
     if state.easee_status is None:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
@@ -393,34 +416,40 @@ def build_ev_plan(
         current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
         normalized_status = (state.easee_status or "").lower()
         ev_session_active = current_ev_power_w >= 200.0 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
-        reclaimable_battery_charge_w = 0.0
-        if can_reclaim_battery_charge and state.battery_power_w < -100.0:
-            reclaimable_battery_charge_w = abs(state.battery_power_w)
-        if state.load_includes_ev:
-            # When load already includes the current EV session, add the measured EV
-            # power back before estimating what PV remains available for the car.
-            effective_solar_surplus_w = max(0.0, state.pv_power_w + current_ev_power_w - state.load_power_w)
-        else:
-            # For setups where the house load sensor excludes the EV charger, use the
-            # PV power left after house load directly. Do not add the current EV power
-            # itself here, or the planner will mistake grid-backed charging for extra
-            # solar surplus and ramp the charger to full speed from the grid.
-            effective_solar_surplus_w = max(0.0, state.pv_power_w - state.load_power_w)
-        effective_solar_surplus_w += reclaimable_battery_charge_w
-        stop_surplus_threshold_w = max(500.0, ev_solar_min_surplus_w * 0.6)
-        required_surplus_w = stop_surplus_threshold_w if ev_session_active else ev_solar_min_surplus_w
-        if effective_solar_surplus_w < required_surplus_w:
+
+        # Phase C: hold solar for the house battery until it reaches the configured
+        # threshold, so the car does not compete with filling the home battery.
+        if ev_solar_battery_threshold and state.battery_soc_pct < ev_solar_battery_threshold:
             return EvPlan(
                 mode=ev_mode,
                 reason=(
-                    f"Solar surplus {effective_solar_surplus_w:.0f}W is below "
+                    f"House battery {state.battery_soc_pct:.0f}% below {ev_solar_battery_threshold:.0f}% "
+                    "threshold; filling home battery before solar EV charging"
+                ),
+                desired_enabled=None,
+                desired_action="pause",
+            )
+
+        # Phase C: use the smoothed (2-minute averaged) surplus when supplied by the
+        # coordinator, otherwise the instantaneous value.
+        surplus_w = (
+            solar_surplus_override
+            if solar_surplus_override is not None
+            else effective_solar_surplus_w(state, can_reclaim_battery_charge)
+        )
+        stop_surplus_threshold_w = max(500.0, ev_solar_min_surplus_w * 0.6)
+        required_surplus_w = stop_surplus_threshold_w if ev_session_active else ev_solar_min_surplus_w
+        if surplus_w < required_surplus_w:
+            return EvPlan(
+                mode=ev_mode,
+                reason=(
+                    f"Solar surplus {surplus_w:.0f}W is below "
                     f"{required_surplus_w:.0f}W required for solar-only charging"
                 ),
                 desired_enabled=None,
                 desired_action="pause",
             )
 
-        single_phase_min_w = 6 * 235
         three_phase_min_w = 6 * 3 * 235
 
         # Keep the charger in auto phase mode and steer it with per-phase current
@@ -428,12 +457,12 @@ def build_ev_plan(
         # single phase, but we avoid flipping the charger between explicit phase modes.
         use_three_phase = False
         if current_phase_normalized == "3_phase":
-            use_three_phase = effective_solar_surplus_w >= (three_phase_min_w - 400)
+            use_three_phase = surplus_w >= (three_phase_min_w - 400)
         else:
-            use_three_phase = effective_solar_surplus_w >= (three_phase_min_w + 200)
+            use_three_phase = surplus_w >= (three_phase_min_w + 200)
 
         if use_three_phase:
-            per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / (3 * 235))), int(ev_max_amps)))
+            per_phase_amps = max(6, min(int(math.floor(surplus_w / (3 * 235))), int(ev_max_amps)))
             expected_three_phase_w = per_phase_amps * 3 * 230
             # Some cars do not actually ramp up on automatic multi-phase charging even
             # when the charger is told to. If observed power is far below the requested
@@ -452,19 +481,62 @@ def build_ev_plan(
                 desired_circuit_currents = (per_phase_amps, per_phase_amps, per_phase_amps)
 
         if not use_three_phase:
-            per_phase_amps = max(6, min(int(math.floor(effective_solar_surplus_w / 235)), int(ev_max_amps)))
+            per_phase_amps = max(6, min(int(math.floor(surplus_w / 235)), int(ev_max_amps)))
             amps = per_phase_amps
             desired_phase_mode = "auto_phase"
             desired_circuit_currents = (per_phase_amps, 0, 0)
 
         return EvPlan(
             mode=ev_mode,
-            reason=f"Solar surplus {effective_solar_surplus_w:.0f}W supports EV charging",
+            reason=f"Solar surplus {surplus_w:.0f}W supports EV charging",
             desired_enabled=True,
             desired_amps=amps,
             desired_circuit_currents=desired_circuit_currents,
             desired_action="resume",
             desired_phase_mode=desired_phase_mode,
+        )
+
+    if ev_mode == EV_MODE_SCHEDULED_CHEAPEST:
+        windows = _parse_windows(ev_windows)
+        in_window = _in_windows(state.timestamp, windows) if windows else True
+        horizon_slots = [
+            slot
+            for slot in remaining_price_slots(state.price_slots, state.timestamp)
+            if not windows or _in_windows(slot.start, windows)
+        ]
+        if horizon_slots:
+            wanted = max(1, int(ev_required_hours))
+            cheapest = sorted(horizon_slots, key=lambda s: s.total_import_price)[:wanted]
+            cheapest_starts = {s.start for s in cheapest}
+            current = current_price_slot(state.price_slots, state.timestamp)
+            if in_window and current is not None and current.start in cheapest_starts:
+                return EvPlan(
+                    mode=ev_mode,
+                    reason=f"Within the {wanted} cheapest allowed hours ({current.total_import_price:.2f})",
+                    desired_enabled=True,
+                    desired_amps=int(ev_max_amps),
+                    desired_action="resume",
+                )
+            return EvPlan(
+                mode=ev_mode,
+                reason="Outside the cheapest allowed charging hours",
+                desired_enabled=False,
+                desired_action="pause",
+            )
+        # No price horizon: fall back to plain scheduled-window behaviour.
+        if in_window:
+            return EvPlan(
+                mode=ev_mode,
+                reason="Within scheduled window (no price horizon for cheapest-hour selection)",
+                desired_enabled=True,
+                desired_amps=int(ev_max_amps),
+                desired_action="resume",
+            )
+        return EvPlan(
+            mode=ev_mode,
+            reason="Outside scheduled EV charging windows",
+            desired_enabled=False,
+            desired_action="pause",
         )
 
     windows = _parse_windows(ev_windows)
@@ -500,6 +572,12 @@ def build_control_plan(
     if safe_reasons:
         reasons.extend(safe_reasons)
     schedule, next_cheap_window, next_expensive_window = _build_schedule(state, profile_for(battery_mode))
+    last_decision_reason = " | ".join([reason for reason in reasons if reason])
+    if len(last_decision_reason) > 255:
+        # Home Assistant truncates entity states longer than 255 chars to
+        # "unknown"; keep the reason within the limit (happens at startup when
+        # the degraded-runtime reason lists every missing entity).
+        last_decision_reason = last_decision_reason[:252] + "..."
     return ControlPlan(
         battery=battery_plan,
         ev=ev_plan,
@@ -507,7 +585,7 @@ def build_control_plan(
         safe_reasons=safe_reasons,
         negative_price_active=negative_price_active,
         next_action=next_action,
-        last_decision_reason=" | ".join([reason for reason in reasons if reason]),
+        last_decision_reason=last_decision_reason,
         schedule=schedule,
         next_cheap_window=next_cheap_window,
         next_expensive_window=next_expensive_window,

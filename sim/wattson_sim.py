@@ -774,6 +774,99 @@ def test_b_profiles():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 10. Phase C — SmartCharge tests.
+# --------------------------------------------------------------------------- #
+def test_c_smartcharge():
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h, m=0):
+        return datetime(2026, 6, 7, h, m, tzinfo=TZ)
+
+    def pslot(h, total):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=0.5)
+
+    def ev_state(now, soc=80.0, status="charging", power=0.0, pv=0.0, load=0.0, slots=None, phase="auto"):
+        return models.SiteState(
+            timestamp=now, pv_power_w=pv, load_power_w=load, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status=status, easee_power_w=power, easee_session_kwh=0.0,
+            easee_phase_mode=phase, current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
+            price_slots=slots or [], solar_slots=[],
+        )
+
+    # --- scheduled_cheapest: charge only during the cheapest in-window hours ---
+    night = [pslot(0, 0.50), pslot(1, 0.30), pslot(2, 0.20), pslot(3, 0.10), pslot(4, 0.40), pslot(5, 0.60)]
+
+    def sched(now_h):
+        return planner.build_ev_plan(
+            ev_state(at(now_h), slots=night), ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
+            ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_required_hours=2,
+        )
+
+    checks.append(("scheduled_cheapest charges at cheapest hour", sched(3).desired_action == "resume", sched(3).reason))
+    checks.append(("scheduled_cheapest charges at 2nd cheapest hour", sched(2).desired_action == "resume", sched(2).reason))
+    checks.append(("scheduled_cheapest pauses at a pricier in-window hour", sched(0).desired_action == "pause", sched(0).reason))
+    nohorizon = planner.build_ev_plan(
+        ev_state(at(2), slots=[]), ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_required_hours=2,
+    )
+    checks.append(("scheduled_cheapest falls back to window when no horizon", nohorizon.desired_action == "resume", nohorizon.reason))
+
+    # --- solar-only house-battery threshold ---
+    below = planner.build_ev_plan(
+        ev_state(at(12), soc=40, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
+    )
+    checks.append(("solar threshold: battery 40% < 50% -> pause", below.desired_action == "pause" and "threshold" in below.reason, below.reason))
+    above = planner.build_ev_plan(
+        ev_state(at(12), soc=60, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
+    )
+    checks.append(("solar threshold: battery 60% >= 50% -> resume", above.desired_action == "resume", above.reason))
+
+    # --- 2-minute averaged surplus override plumbing ---
+    base = ev_state(at(12), pv=0, load=0)  # instantaneous surplus 0
+    hi = planner.build_ev_plan(base, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=5000)
+    lo = planner.build_ev_plan(base, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=200)
+    checks.append(("averaged override high -> resume", hi.desired_action == "resume", hi.reason))
+    checks.append(("averaged override low -> pause", lo.desired_action == "pause", lo.reason))
+
+    # --- 15-minute phase lock ---
+    class MutStates:
+        def get(self, eid):
+            return None
+
+    class MutServices:
+        def __init__(self):
+            self.calls = []
+
+        async def async_call(self, domain, service, data, blocking=False):
+            self.calls.append((domain, service, data))
+
+    class MutHass:
+        def __init__(self):
+            self.states = MutStates()
+            self.services = MutServices()
+
+    ec = control.EaseeController(MutHass())
+    mp = mapping.build_entity_mapping(BASE_CONFIG)
+    phase_plan = models.EvPlan(mode="solar_only", reason="", desired_phase_mode="auto_phase")
+    a1 = asyncio.run(ec.apply_ev_plan(mp, ev_state(at(12), phase="1_phase"), phase_plan))
+    a2 = asyncio.run(ec.apply_ev_plan(mp, ev_state(at(12, 5), phase="1_phase"), phase_plan))
+    a3 = asyncio.run(ec.apply_ev_plan(mp, ev_state(at(12, 20), phase="1_phase"), phase_plan))
+    checks.append(("phase change applied first time", any("phase_mode" in x and "suppressed" not in x for x in a1), str(a1)))
+    checks.append(("phase change suppressed within 15 min", any("suppressed" in x for x in a2), str(a2)))
+    checks.append(("phase change allowed after 15 min", any("phase_mode" in x and "suppressed" not in x for x in a3), str(a3)))
+
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -801,7 +894,8 @@ def main():
     for title, suite in (("PHASE A · A1 HORIZON INGESTION", test_horizon),
                          ("PHASE A · A0 WRITE VERIFICATION", test_write_verification),
                          ("PHASE A · A2 HORIZON PLANNING", test_a2_planning),
-                         ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles)):
+                         ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
+                         ("PHASE C · SMARTCHARGE", test_c_smartcharge)):
         print("\n" + "-" * 100)
         print(title)
         try:
