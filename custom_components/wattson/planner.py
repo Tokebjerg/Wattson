@@ -13,7 +13,41 @@ from .const import (
     EV_MODE_SCHEDULED,
     EV_MODE_SOLAR_ONLY,
 )
-from .models import BatteryPlan, ControlPlan, EvPlan, SiteState
+from .horizon import current_price_slot, remaining_price_slots
+from .models import BatteryPlan, ControlPlan, EvPlan, PlanTask, SiteState
+
+# Phase A trin A2: horizon-aware planning constants. When the price horizon is
+# available the planner ranks hours within the remaining day instead of using a
+# flat absolute threshold, which adapts to whatever the day's price shape is.
+CHEAP_HOURS = 6              # cheapest N remaining hours are grid-charge candidates
+EXPENSIVE_HOURS = 4         # most expensive N remaining hours are discharge candidates
+MIN_ARBITRAGE_SPREAD = 0.40  # DKK/kWh total-price spread required to justify grid charging
+SCHEDULE_MAX_HOURS = 24
+
+
+class _HorizonView:
+    """Ranked view of the remaining price horizon for a single tick."""
+
+    def __init__(self, slots: list, now: datetime) -> None:
+        self.slots = slots
+        self.current = current_price_slot(slots, now) or (slots[0] if slots else None)
+        by_price = sorted(slots, key=lambda s: s.total_import_price)
+        self.cheap_starts = {s.start for s in by_price[:CHEAP_HOURS]}
+        self.expensive_starts = {s.start for s in by_price[-EXPENSIVE_HOURS:]} if slots else set()
+
+    def max_price_after(self, start: datetime) -> float | None:
+        future = [s.total_import_price for s in self.slots if s.start > start]
+        return max(future) if future else None
+
+
+def _horizon_view(state: SiteState) -> _HorizonView | None:
+    slots = remaining_price_slots(state.price_slots, state.timestamp)
+    if not slots:
+        return None
+    view = _HorizonView(slots, state.timestamp)
+    if view.current is None:
+        return None
+    return view
 
 
 def _parse_windows(raw: str) -> list[tuple[time, time]]:
@@ -39,6 +73,128 @@ def _in_windows(now: datetime, windows: list[tuple[time, time]]) -> bool:
             if current >= start or current < end:
                 return True
     return False
+
+
+def _horizon_battery_plan(
+    state: SiteState,
+    view: _HorizonView,
+    *,
+    battery_mode: str,
+    min_soc: float,
+    max_soc: float,
+    allow_grid_charge: bool,
+    export_limit_default_w: float | None,
+) -> BatteryPlan:
+    """Plan-driven battery decision using the ranked price horizon.
+
+    Same decision structure as the legacy threshold logic, but "cheap"/"expensive"
+    are decided by rank within the remaining day (using the total import price),
+    and grid charging additionally requires a worthwhile later price spread.
+    """
+    current = view.current
+    price = current.total_import_price
+    is_cheap = current.start in view.cheap_starts
+    is_expensive = current.start in view.expensive_starts
+    max_after = view.max_price_after(current.start)
+    worthwhile = max_after is not None and (max_after - price) >= MIN_ARBITRAGE_SPREAD
+
+    if (
+        allow_grid_charge
+        and battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
+        and is_cheap
+        and worthwhile
+        and state.battery_soc_pct < max_soc
+    ):
+        return BatteryPlan(
+            strategy="GRID_CHARGE",
+            reason=f"Total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window",
+            desired_grid_charge=True,
+            desired_solar_sell=False,
+            desired_energy_priority="Battery first",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    if (
+        battery_mode in {BATTERY_MODE_PRICE, BATTERY_MODE_HYBRID}
+        and is_expensive
+        and state.battery_soc_pct > min_soc
+    ):
+        sell = (current.export_value or 0) > 0
+        return BatteryPlan(
+            strategy="DISCHARGE_TO_LOAD",
+            reason=f"Total price {price:.2f} is among the most expensive hours",
+            desired_grid_charge=False,
+            desired_solar_sell=sell,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    if battery_mode == BATTERY_MODE_SELF and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
+        return BatteryPlan(
+            strategy="SOLAR_SELF_CONSUMPTION",
+            reason="Solar surplus available, prioritizing self-consumption",
+            desired_grid_charge=False,
+            desired_solar_sell=False,
+            desired_energy_priority="Battery first",
+            desired_limit_control_mode="Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    if battery_mode == BATTERY_MODE_PROTECT:
+        return BatteryPlan(
+            strategy="PROTECT",
+            reason="Battery protect mode active",
+            desired_grid_charge=False,
+            desired_energy_priority="Load first",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    return BatteryPlan(
+        strategy="IDLE",
+        reason="No strong battery action required right now",
+        desired_grid_charge=False,
+        desired_energy_priority="Load first" if state.battery_soc_pct > min_soc else "Battery first",
+        desired_export_limit_w=export_limit_default_w,
+    )
+
+
+def _build_schedule(state: SiteState) -> tuple[list[PlanTask], str | None, str | None]:
+    """Build the forward-looking hourly plan and the next cheap/expensive windows."""
+    view = _horizon_view(state)
+    if view is None:
+        return [], None, None
+    solar_by_start = {slot.start: slot for slot in state.solar_slots}
+    tasks: list[PlanTask] = []
+    next_cheap: str | None = None
+    next_expensive: str | None = None
+    for slot in view.slots[:SCHEDULE_MAX_HOURS]:
+        is_cheap = slot.start in view.cheap_starts
+        is_expensive = slot.start in view.expensive_starts
+        max_after = view.max_price_after(slot.start)
+        worthwhile = max_after is not None and (max_after - slot.total_import_price) >= MIN_ARBITRAGE_SPREAD
+        if is_cheap and worthwhile:
+            action = "GRID_CHARGE"
+        elif is_expensive:
+            action = "DISCHARGE"
+        elif slot.export_value is not None and slot.export_value < 0:
+            action = "LIMIT_EXPORT"
+        else:
+            action = "IDLE"
+        pv = solar_by_start.get(slot.start)
+        tasks.append(
+            PlanTask(
+                start=slot.start,
+                action=action,
+                total_import_price=round(slot.total_import_price, 4),
+                pv_estimate_kwh=round(pv.pv_estimate_kwh, 3) if pv else None,
+            )
+        )
+        if action == "GRID_CHARGE" and next_cheap is None:
+            next_cheap = slot.start.isoformat()
+        if action == "DISCHARGE" and next_expensive is None:
+            next_expensive = slot.start.isoformat()
+    return tasks, next_cheap, next_expensive
 
 
 def build_battery_plan(
@@ -80,6 +236,25 @@ def build_battery_plan(
                 desired_export_limit_w=0.0,
             ),
             True,
+        )
+
+    # Phase A trin A2: prefer the plan-driven, horizon-aware decision when the
+    # hourly price horizon is available. Falls through to the legacy flat-
+    # threshold logic below only when no horizon data is present (so behaviour is
+    # unchanged if the price entity ever stops exposing hourly attributes).
+    horizon = _horizon_view(state)
+    if horizon is not None:
+        return (
+            _horizon_battery_plan(
+                state,
+                horizon,
+                battery_mode=battery_mode,
+                min_soc=min_soc,
+                max_soc=max_soc,
+                allow_grid_charge=allow_grid_charge,
+                export_limit_default_w=export_limit_default_w,
+            ),
+            False,
         )
 
     if (
@@ -293,6 +468,7 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
+    schedule, next_cheap_window, next_expensive_window = _build_schedule(state)
     return ControlPlan(
         battery=battery_plan,
         ev=ev_plan,
@@ -301,4 +477,7 @@ def build_control_plan(
         negative_price_active=negative_price_active,
         next_action=next_action,
         last_decision_reason=" | ".join([reason for reason in reasons if reason]),
+        schedule=schedule,
+        next_cheap_window=next_cheap_window,
+        next_expensive_window=next_expensive_window,
     )

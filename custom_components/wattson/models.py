@@ -137,6 +137,17 @@ class EvPlan:
 
 
 @dataclass(frozen=True)
+class PlanTask:
+    """One hour of the forward-looking plan ("Automatiseringsopgaver")."""
+
+    start: datetime
+    action: str  # GRID_CHARGE | DISCHARGE | LIMIT_EXPORT | IDLE
+    total_import_price: float
+    pv_estimate_kwh: float | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class ControlPlan:
     battery: BatteryPlan
     ev: EvPlan
@@ -145,3 +156,7 @@ class ControlPlan:
     negative_price_active: bool
     next_action: str
     last_decision_reason: str
+    # Phase A trin A2: forward-looking 24h plan and the next price windows.
+    schedule: list[PlanTask] = field(default_factory=list)
+    next_cheap_window: str | None = None
+    next_expensive_window: str | None = None

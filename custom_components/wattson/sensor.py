@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
@@ -104,7 +105,49 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         value_fn=lambda c: round(c.site_state.forecast_today_kwh, 3) if c.site_state and c.site_state.forecast_today_kwh is not None else None,
     ),
+    WattsonSensorDescription(
+        key="next_cheap_window",
+        name="Next Cheap Window",
+        icon="mdi:cash-clock",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda c: _parse_window(c.control_plan.next_cheap_window) if c.control_plan else None,
+    ),
+    WattsonSensorDescription(
+        key="next_expensive_window",
+        name="Next Expensive Window",
+        icon="mdi:cash-clock",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda c: _parse_window(c.control_plan.next_expensive_window) if c.control_plan else None,
+    ),
+    WattsonSensorDescription(
+        key="plan_schedule",
+        name="Plan Schedule",
+        icon="mdi:timeline-clock-outline",
+        value_fn=lambda c: (c.control_plan.schedule[0].action if c.control_plan and c.control_plan.schedule else None),
+        attrs_fn=lambda c: {
+            "automatiseringsopgaver": [
+                {
+                    "hour": task.start.isoformat(),
+                    "action": task.action,
+                    "total_import_price": task.total_import_price,
+                    "pv_estimate_kwh": task.pv_estimate_kwh,
+                }
+                for task in c.control_plan.schedule
+            ]
+        }
+        if c.control_plan and c.control_plan.schedule
+        else None,
+    ),
 )
+
+
+def _parse_window(value: str | None) -> Any:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:

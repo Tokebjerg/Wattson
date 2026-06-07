@@ -170,3 +170,11 @@ def current_price_slot(slots: list[PriceSlot], now: datetime) -> PriceSlot | Non
         else:
             break
     return candidate
+
+
+def remaining_price_slots(slots: list[PriceSlot], now: datetime) -> list[PriceSlot]:
+    """Slots from the current hour onward (the part of the horizon we can still act on)."""
+    current = current_price_slot(slots, now)
+    if current is None:
+        return [slot for slot in slots if slot.start >= now]
+    return [slot for slot in slots if slot.start >= current.start]

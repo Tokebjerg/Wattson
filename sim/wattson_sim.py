@@ -608,6 +608,75 @@ def test_write_verification():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 8. Phase A trin A2 — horizon-aware planning tests (deterministic day curve).
+# --------------------------------------------------------------------------- #
+def test_a2_planning():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 7, h, 0, tzinfo=TZ)
+
+    def pslot(h, total, exp=None):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=exp)
+
+    totals = {0: 0.20, 1: 0.18, 2: 0.15, 3: 0.12, 4: 0.10, 5: 0.16, 6: 0.45, 7: 0.50,
+              8: 0.50, 9: 0.48, 10: 0.46, 11: 0.50, 12: 0.52, 13: 0.50, 14: 0.55, 15: 0.60,
+              16: 0.70, 17: 1.10, 18: 1.40, 19: 1.50, 20: 1.50, 21: 1.30, 22: 0.60, 23: 0.50}
+    day = [pslot(h, totals[h]) for h in range(24)]
+
+    def make_state(now, soc, price_slots, solar_slots=None):
+        return models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=500.0, load_includes_ev=False,
+            grid_power_w=500.0, grid_import_power_w=500.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=40.0,
+            price_slots=price_slots, solar_slots=solar_slots or [],
+        )
+
+    def plan_at(now, soc, price_slots=None):
+        st = make_state(now, soc, day if price_slots is None else price_slots)
+        bp, _ = planner.build_battery_plan(
+            st, battery_mode=const.BATTERY_MODE_HYBRID, min_soc=20, max_soc=90,
+            cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
+            allow_negative_export=False, export_limit_default_w=6000.0,
+        )
+        return bp
+
+    checks.append(("cheap night hour -> GRID_CHARGE", plan_at(at(3), 50).strategy == "GRID_CHARGE", plan_at(at(3), 50).strategy))
+    checks.append(("expensive evening -> DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy == "DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy))
+    checks.append(("cheap but battery full -> not GRID_CHARGE", plan_at(at(3), 95).strategy != "GRID_CHARGE", plan_at(at(3), 95).strategy))
+    checks.append(("expensive but at min SOC -> not DISCHARGE", plan_at(at(19), 18).strategy != "DISCHARGE_TO_LOAD", plan_at(at(19), 18).strategy))
+
+    flat = [pslot(h, 0.50) for h in range(24)]
+    checks.append(("flat day -> no grid charge (arbitrage spread guard)", plan_at(at(3), 50, flat).strategy != "GRID_CHARGE", plan_at(at(3), 50, flat).strategy))
+
+    # Schedule + windows.
+    st = make_state(at(0), 50, day, [models.SolarSlot(start=at(12), pv_estimate_kwh=7.0)])
+    bp, neg = planner.build_battery_plan(
+        st, battery_mode=const.BATTERY_MODE_HYBRID, min_soc=20, max_soc=90,
+        cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
+        allow_negative_export=False, export_limit_default_w=6000.0,
+    )
+    cp = planner.build_control_plan(st, battery_plan=bp, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""), safe_reasons=[], negative_price_active=neg)
+    checks.append(("schedule built (24 tasks)", len(cp.schedule) == 24, f"got {len(cp.schedule)}"))
+    checks.append(("next_cheap_window set", cp.next_cheap_window is not None, f"{cp.next_cheap_window}"))
+    checks.append(("next_expensive_window set", cp.next_expensive_window is not None, f"{cp.next_expensive_window}"))
+    checks.append(("cheap window precedes expensive window", (cp.next_cheap_window or "") < (cp.next_expensive_window or ""), f"{cp.next_cheap_window} vs {cp.next_expensive_window}"))
+    h12 = next((t for t in cp.schedule if t.start == at(12)), None)
+    checks.append(("schedule carries solar estimate @12", h12 is not None and h12.pv_estimate_kwh == 7.0, f"{getattr(h12, 'pv_estimate_kwh', None)}"))
+
+    # Legacy fallback intact when no horizon present.
+    bp_legacy = plan_at(at(3), 50, [])
+    checks.append(("no horizon -> legacy flat-threshold still works (GRID_CHARGE)", bp_legacy.strategy == "GRID_CHARGE", bp_legacy.strategy))
+
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -633,7 +702,8 @@ def main():
 
     total = len(SCENARIOS)
     for title, suite in (("PHASE A · A1 HORIZON INGESTION", test_horizon),
-                         ("PHASE A · A0 WRITE VERIFICATION", test_write_verification)):
+                         ("PHASE A · A0 WRITE VERIFICATION", test_write_verification),
+                         ("PHASE A · A2 HORIZON PLANNING", test_a2_planning)):
         print("\n" + "-" * 100)
         print(title)
         try:
