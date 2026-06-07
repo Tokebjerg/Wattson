@@ -26,7 +26,10 @@ from .const import (
     CONF_EV_MODE_DEFAULT,
     CONF_EV_SOLAR_MIN_SURPLUS_W,
     CONF_EV_SOLAR_BATTERY_THRESHOLD,
+    CONF_EV_SOLAR_BATTERY_PRIORITY,
     CONF_EV_REQUIRED_HOURS,
+    CONF_EV_WINDOW_START,
+    CONF_EV_WINDOW_END,
     CONF_EV_WINDOWS,
     CONF_EXPENSIVE_PRICE_THRESHOLD,
     CONF_INVERT_BATTERY_POWER_SIGN,
@@ -46,7 +49,10 @@ from .const import (
     DEFAULT_EV_MODE,
     DEFAULT_EV_SOLAR_MIN_SURPLUS_W,
     DEFAULT_EV_SOLAR_BATTERY_THRESHOLD,
+    DEFAULT_EV_SOLAR_BATTERY_PRIORITY,
     DEFAULT_EV_REQUIRED_HOURS,
+    DEFAULT_EV_WINDOW_START,
+    DEFAULT_EV_WINDOW_END,
     EV_SURPLUS_AVERAGE_SECONDS,
     DEFAULT_EV_WINDOWS,
     DEFAULT_EXPENSIVE_PRICE_THRESHOLD,
@@ -93,6 +99,10 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._default_discharge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
         self._surplus_samples: list[tuple[datetime, float]] = []
+        self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
+        self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
+        self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
+        self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
 
     async def async_startup(self) -> None:
         return None
@@ -109,6 +119,30 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.ev_mode = mode
         self._last_fingerprint = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_MODE_DEFAULT: mode})
+        await self.async_request_refresh()
+
+    async def async_set_ev_window_start(self, hour: int) -> None:
+        self.ev_window_start = int(hour)
+        self._last_fingerprint = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_WINDOW_START: int(hour)})
+        await self.async_request_refresh()
+
+    async def async_set_ev_window_end(self, hour: int) -> None:
+        self.ev_window_end = int(hour)
+        self._last_fingerprint = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_WINDOW_END: int(hour)})
+        await self.async_request_refresh()
+
+    async def async_set_ev_solar_battery_priority(self, enabled: bool) -> None:
+        self.ev_solar_battery_priority = bool(enabled)
+        self._last_fingerprint = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_SOLAR_BATTERY_PRIORITY: bool(enabled)})
+        await self.async_request_refresh()
+
+    async def async_set_ev_solar_battery_threshold(self, percent: float) -> None:
+        self.ev_solar_battery_threshold = float(percent)
+        self._last_fingerprint = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_SOLAR_BATTERY_THRESHOLD: float(percent)})
         await self.async_request_refresh()
 
     async def async_set_battery_mode(self, mode: str) -> None:
@@ -186,14 +220,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._surplus_samples = [(t, v) for (t, v) in self._surplus_samples if t >= cutoff]
         averaged_surplus = sum(v for _, v in self._surplus_samples) / len(self._surplus_samples)
 
+        # Phase C UI: scheduled window is built from the start/end hour numbers;
+        # the house-battery threshold only applies when the priority toggle is on.
+        ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
+        effective_battery_threshold = self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0
+
         ev_plan = build_ev_plan(
             self.site_state,
             ev_mode=self.ev_mode,
             ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)),
             ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
-            ev_windows=str(entry_value(self.config_entry, CONF_EV_WINDOWS, DEFAULT_EV_WINDOWS)),
+            ev_windows=ev_windows,
             can_reclaim_battery_charge=self.battery_control_enabled,
-            ev_solar_battery_threshold=float(entry_value(self.config_entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD)),
+            ev_solar_battery_threshold=effective_battery_threshold,
             ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
             solar_surplus_override=averaged_surplus,
         )

@@ -13,6 +13,7 @@ PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.SWITCH,
     Platform.SELECT,
+    Platform.NUMBER,
     Platform.BUTTON,
 ]
 
@@ -33,7 +34,10 @@ CONF_EV_WINDOWS = "ev_windows"
 CONF_EV_MAX_AMPS = "ev_max_amps"
 CONF_EV_SOLAR_MIN_SURPLUS_W = "ev_solar_min_surplus_w"
 CONF_EV_SOLAR_BATTERY_THRESHOLD = "ev_solar_battery_threshold"
+CONF_EV_SOLAR_BATTERY_PRIORITY = "ev_solar_battery_priority"
 CONF_EV_REQUIRED_HOURS = "ev_required_hours"
+CONF_EV_WINDOW_START = "ev_window_start"
+CONF_EV_WINDOW_END = "ev_window_end"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 CONF_CHEAP_PRICE_THRESHOLD = "cheap_price_threshold"
@@ -80,11 +84,17 @@ DEFAULT_INVERT_BATTERY_POWER_SIGN = False
 DEFAULT_EV_WINDOWS = "00:00-06:00"
 DEFAULT_EV_MAX_AMPS = 16
 DEFAULT_EV_SOLAR_MIN_SURPLUS_W = 1400
-# Home-battery SOC (%) required before solar EV charging starts (0 = disabled,
-# i.e. the car may charge on surplus regardless of the house battery level).
-DEFAULT_EV_SOLAR_BATTERY_THRESHOLD = 0
+# House-battery SOC (%) the home battery must reach before solar EV charging
+# starts. Only takes effect when the priority toggle is on (solar-only mode).
+DEFAULT_EV_SOLAR_BATTERY_THRESHOLD = 50
+# Whether the house-battery-first prioritization is enabled (off by default, so
+# the car may charge on surplus regardless of the house battery level).
+DEFAULT_EV_SOLAR_BATTERY_PRIORITY = False
 # Number of cheapest in-window hours to charge in scheduled_cheapest mode.
 DEFAULT_EV_REQUIRED_HOURS = 4
+# Scheduled charging window (whole hours, local time). 00:00-06:00 by default.
+DEFAULT_EV_WINDOW_START = 0
+DEFAULT_EV_WINDOW_END = 6
 DEFAULT_BATTERY_MIN_SOC = 20
 DEFAULT_BATTERY_MAX_SOC = 90
 DEFAULT_CHEAP_PRICE_THRESHOLD = 0.75

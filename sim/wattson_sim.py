@@ -36,6 +36,7 @@ def _install_ha_stubs() -> None:
         BINARY_SENSOR = "binary_sensor"
         SWITCH = "switch"
         SELECT = "select"
+        NUMBER = "number"
         BUTTON = "button"
 
     ha_const.Platform = Platform
@@ -863,6 +864,23 @@ def test_c_smartcharge():
     checks.append(("phase change applied first time", any("phase_mode" in x and "suppressed" not in x for x in a1), str(a1)))
     checks.append(("phase change suppressed within 15 min", any("suppressed" in x for x in a2), str(a2)))
     checks.append(("phase change allowed after 15 min", any("phase_mode" in x and "suppressed" not in x for x in a3), str(a3)))
+
+    # --- custom scheduled window (built from start/end hours, e.g. "01:00-05:00") ---
+    def scheduled(now_h, window):
+        return planner.build_ev_plan(
+            ev_state(at(now_h)), ev_mode=const.EV_MODE_SCHEDULED, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows=window,
+        )
+
+    checks.append(("custom window 01-05: charges at 02:00", scheduled(2, "01:00-05:00").desired_action == "resume", scheduled(2, "01:00-05:00").reason))
+    checks.append(("custom window 01-05: pauses at 06:00", scheduled(6, "01:00-05:00").desired_action == "pause", scheduled(6, "01:00-05:00").reason))
+
+    # --- priority gate: threshold 0 (toggle off) charges regardless of house battery ---
+    off = planner.build_ev_plan(
+        ev_state(at(12), soc=10, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="x", ev_solar_battery_threshold=0,
+    )
+    checks.append(("priority off (threshold 0): charges despite low house battery", off.desired_action == "resume", off.reason))
 
     return checks
 
