@@ -22,12 +22,17 @@ from .models import PriceSlot, SolarSlot
 
 
 def _parse_dt(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
+    # Energi Data Service and Solcast expose the per-hour timestamp as a real
+    # datetime object in the in-memory state (it only looks like an ISO string
+    # once serialized to JSON), so accept both forms.
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _attrs(hass: Any, entity_id: str | None) -> dict[str, Any]:

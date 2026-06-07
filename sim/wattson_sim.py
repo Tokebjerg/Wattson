@@ -519,6 +519,36 @@ def test_horizon():
     checks.append(("solar slots parsed", len(solar_slots) == 2 and abs(solar_slots[0].pv_estimate_kwh - 7.0) < 1e-6, f"got {len(solar_slots)}"))
     checks.append(("solar 10/90 bands parsed", solar_slots[0].pv_estimate10_kwh == 5.7 and solar_slots[0].pv_estimate90_kwh == 7.9, "bands"))
 
+    # Real HA stores the per-hour timestamps as datetime objects, not ISO
+    # strings (they only look like strings once serialized to JSON). Regression
+    # guard for that: feed datetime-typed hour/period_start.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _TZ = _tz(_td(hours=2))
+    buy_dt = {
+        "state": 0.18,
+        "attributes": {
+            "raw_today": [
+                {"hour": _dt(2026, 6, 7, 0, 0, tzinfo=_TZ), "price": 0.18},
+                {"hour": _dt(2026, 6, 7, 17, 0, tzinfo=_TZ), "price": -0.61},
+            ],
+            "tariffs": {"additional_tariffs": {"a": 0.05}, "tariffs": {"0": 0.08, "17": 0.32}},
+        },
+    }
+    solar_dt = {
+        "state": 10.0,
+        "attributes": {"detailedHourly": [{"period_start": _dt(2026, 6, 7, 11, 0, tzinfo=_TZ), "pv_estimate": 7.0}]},
+    }
+    dt_hass = FakeHass({"sensor.buy": buy_dt, "sensor.sell": 0.6, "sensor.solar": solar_dt})
+    dt_price = horizon.build_price_slots(dt_hass, "sensor.buy", "sensor.sell")
+    dt_solar = horizon.build_solar_slots(dt_hass, "sensor.solar")
+    checks.append((
+        "datetime-typed hour parses (real-HA shape)",
+        len(dt_price) == 2 and abs(dt_price[0].total_import_price - (0.18 + 0.08 + 0.05)) < 1e-6,
+        f"got {len(dt_price)} slots",
+    ))
+    checks.append(("datetime-typed period_start parses", len(dt_solar) == 1 and dt_solar[0].pv_estimate_kwh == 7.0, f"got {len(dt_solar)}"))
+
     # Defensive: a plain numeric entity with no hourly attributes -> empty horizon.
     empty_hass = FakeHass({"sensor.buy": 0.4, "sensor.sell": 0.6, "sensor.solar": 46.0})
     checks.append((
