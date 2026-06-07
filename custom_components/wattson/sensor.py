@@ -25,6 +25,25 @@ class WattsonSensorDescription(SensorEntityDescription):
     attrs_fn: Callable[[Any], dict[str, Any] | None] = lambda coordinator: None
 
 
+# Human-readable Danish labels for the plan/schedule actions, used so the
+# sensor state reads nicely everywhere (entity page, more-info, cards).
+ACTION_LABELS = {
+    "GRID_CHARGE": "🔋⚡ Lad fra net",
+    "DISCHARGE": "🔌 Aflad til hus",
+    "SOLAR_CHARGE": "☀️🔋 Lad fra sol",
+    "LIMIT_EXPORT": "🚫 Begræns eksport",
+    "IDLE": "⏸️ Afvent",
+}
+
+
+def _plan_action_label(coordinator: Any) -> Any:
+    plan = getattr(coordinator, "control_plan", None)
+    if not plan or not plan.schedule:
+        return None
+    action = plan.schedule[0].action
+    return ACTION_LABELS.get(action, action)
+
+
 SENSORS: tuple[WattsonSensorDescription, ...] = (
     WattsonSensorDescription(
         key="site_status",
@@ -139,7 +158,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         key="plan_schedule",
         name="Plan Schedule",
         icon="mdi:timeline-clock-outline",
-        value_fn=lambda c: (c.control_plan.schedule[0].action if c.control_plan and c.control_plan.schedule else None),
+        value_fn=_plan_action_label,
         attrs_fn=lambda c: {
             "automatiseringsopgaver": [
                 {
