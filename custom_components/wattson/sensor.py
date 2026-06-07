@@ -14,6 +14,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, NAME
+from .learning import predicted_today_kwh
 from .models import ControlPlan, SiteState
 
 
@@ -104,6 +105,20 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         icon="mdi:sun-clock",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         value_fn=lambda c: round(c.site_state.forecast_today_kwh, 3) if c.site_state and c.site_state.forecast_today_kwh is not None else None,
+    ),
+    WattsonSensorDescription(
+        key="predicted_load_today",
+        name="Predicted Load Today",
+        icon="mdi:home-lightning-bolt-outline",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        value_fn=lambda c: round(predicted_today_kwh(getattr(c, "load_profile", None)), 2) if getattr(c, "load_profile", None) else None,
+        attrs_fn=lambda c: {
+            "days_observed": c.load_profile.days_observed,
+            "confidence": c.load_profile.confidence,
+            "hourly_w": {str(h): round(c.load_profile.hourly_w.get(h, 0.0)) for h in range(24)},
+        }
+        if getattr(c, "load_profile", None)
+        else None,
     ),
     WattsonSensorDescription(
         key="next_cheap_window",

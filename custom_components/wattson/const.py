@@ -40,6 +40,7 @@ CONF_EV_WINDOW_START = "ev_window_start"
 CONF_EV_WINDOW_END = "ev_window_end"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
+CONF_BATTERY_CAPACITY_KWH = "battery_capacity_kwh"
 CONF_CHEAP_PRICE_THRESHOLD = "cheap_price_threshold"
 CONF_EXPENSIVE_PRICE_THRESHOLD = "expensive_price_threshold"
 CONF_ALLOW_GRID_CHARGE = "allow_grid_charge"
@@ -97,6 +98,14 @@ DEFAULT_EV_WINDOW_START = 0
 DEFAULT_EV_WINDOW_END = 6
 DEFAULT_BATTERY_MIN_SOC = 20
 DEFAULT_BATTERY_MAX_SOC = 90
+DEFAULT_BATTERY_CAPACITY_KWH = 10.0
+
+# Phase D learning parameters.
+LEARNING_WINDOW_DAYS = 28          # how far back to read load history
+LEARNING_MIN_DAYS = 7              # min observed days before the reserve is applied
+LEARNING_RESERVE_HOURS = 6         # hours of predicted load to hold back for self-use
+LEARNING_RESERVE_MAX_PCT = 50.0    # cap the learned reserve so it never locks the battery
+LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
 DEFAULT_CHEAP_PRICE_THRESHOLD = 0.75
 DEFAULT_EXPENSIVE_PRICE_THRESHOLD = 1.80
 DEFAULT_ALLOW_GRID_CHARGE = True

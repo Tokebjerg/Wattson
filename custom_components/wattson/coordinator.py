@@ -18,6 +18,7 @@ from .const import (
     CONF_AUTOMATION_ENABLED,
     CONF_BATTERY_CONTROL_ENABLED,
     CONF_BATTERY_MAX_SOC,
+    CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MODE_DEFAULT,
     CONF_CHEAP_PRICE_THRESHOLD,
@@ -41,6 +42,12 @@ from .const import (
     DEFAULT_AUTOMATION_ENABLED,
     DEFAULT_BATTERY_CONTROL_ENABLED,
     DEFAULT_BATTERY_MAX_SOC,
+    DEFAULT_BATTERY_CAPACITY_KWH,
+    LEARNING_WINDOW_DAYS,
+    LEARNING_MIN_DAYS,
+    LEARNING_RESERVE_HOURS,
+    LEARNING_RESERVE_MAX_PCT,
+    LEARNING_REBUILD_SECONDS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
@@ -70,6 +77,8 @@ from .const import (
 from .control import EaseeController, KlatremisController
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
+from .learning import build_load_profile, predicted_load_kwh
+from .models import LoadProfile
 from .planner import build_battery_plan, build_control_plan, build_ev_plan, effective_solar_surplus_w
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,13 +108,65 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._default_discharge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
         self._surplus_samples: list[tuple[datetime, float]] = []
+        self.load_profile: LoadProfile | None = None
+        self._profile_built_at: datetime | None = None
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
         self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
 
     async def async_startup(self) -> None:
-        return None
+        await self._async_update_load_profile()
+
+    async def _async_update_load_profile(self) -> None:
+        """Phase D: build the hour-of-day house-load profile from Recorder history.
+
+        Defensive: any failure (no recorder, no statistics, API change) leaves the
+        profile unchanged/None so the planner simply runs without a learned reserve.
+        """
+        mapping = self.mapping or build_entity_mapping(merged_entry_config(self.config_entry))
+        load_entity = mapping.load_power_entity
+        if not load_entity:
+            return
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.statistics import statistics_during_period
+
+            end = dt_util.utcnow()
+            start = end - timedelta(days=LEARNING_WINDOW_DAYS)
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period, self.hass, start, end, {load_entity}, "hour", None, {"mean"}
+            )
+            rows = stats.get(load_entity, []) if stats else []
+            samples: list[tuple[datetime, float | None]] = []
+            for row in rows:
+                raw_start = row.get("start")
+                mean = row.get("mean")
+                if isinstance(raw_start, (int, float)):
+                    ts = dt_util.utc_from_timestamp(raw_start)
+                elif isinstance(raw_start, datetime):
+                    ts = raw_start
+                else:
+                    continue
+                samples.append((dt_util.as_local(ts), mean))
+            profile = build_load_profile(samples)
+            if profile is not None:
+                self.load_profile = profile
+            self._profile_built_at = dt_util.utcnow()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Wattson could not build load profile (learning inactive): %s", err)
+            self._profile_built_at = dt_util.utcnow()
+
+    def _learned_reserve_pct(self) -> float:
+        """SOC (%) to hold back for predicted self-use over the next reserve window."""
+        profile = self.load_profile
+        if profile is None or profile.days_observed < LEARNING_MIN_DAYS:
+            return 0.0
+        capacity_kwh = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        if capacity_kwh <= 0:
+            return 0.0
+        reserve_kwh = predicted_load_kwh(profile, dt_util.now().hour, LEARNING_RESERVE_HOURS)
+        return min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
@@ -201,6 +262,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             invert_battery_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_BATTERY_POWER_SIGN, DEFAULT_INVERT_BATTERY_POWER_SIGN)),
         )
 
+        # Phase D: refresh the learned load profile at most every few hours and
+        # derive how much SOC to reserve for predicted self-use.
+        profile_age = dt_util.utcnow() - self._profile_built_at if self._profile_built_at else None
+        if profile_age is None or profile_age >= timedelta(seconds=LEARNING_REBUILD_SECONDS):
+            await self._async_update_load_profile()
+        learned_reserve_pct = self._learned_reserve_pct()
+
         battery_plan, negative_price_active = build_battery_plan(
             self.site_state,
             battery_mode=self.battery_mode,
@@ -211,6 +279,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             allow_grid_charge=bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE)),
             allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
             export_limit_default_w=self._default_export_limit_w,
+            learned_reserve_pct=learned_reserve_pct,
         )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.

@@ -123,6 +123,7 @@ def _horizon_battery_plan(
     max_soc: float,
     allow_grid_charge: bool,
     export_limit_default_w: float | None,
+    learned_reserve_pct: float = 0.0,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -137,7 +138,9 @@ def _horizon_battery_plan(
     is_expensive = current.start in view.expensive_starts
     max_after = view.max_price_after(current.start)
     worthwhile = max_after is not None and (max_after - price) >= required_spread(profile)
-    discharge_floor = min_soc + profile.reserve_soc_offset
+    # Discharge floor = profile reserve, raised to also cover the learned reserve
+    # (predicted self-use) so we don't sell/discharge energy we'll soon need.
+    discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
     if allow_grid_charge and is_cheap and worthwhile and state.battery_soc_pct < max_soc:
         return BatteryPlan(
@@ -232,6 +235,7 @@ def build_battery_plan(
     allow_grid_charge: bool,
     allow_negative_export: bool,
     export_limit_default_w: float | None,
+    learned_reserve_pct: float = 0.0,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -291,12 +295,13 @@ def build_battery_plan(
                 max_soc=max_soc,
                 allow_grid_charge=allow_grid_charge,
                 export_limit_default_w=export_limit_default_w,
+                learned_reserve_pct=learned_reserve_pct,
             ),
             False,
         )
 
     # Legacy fallback (no horizon): flat absolute thresholds, profile-shaped.
-    discharge_floor = min_soc + profile.reserve_soc_offset
+    discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
     if (
         allow_grid_charge

@@ -51,6 +51,20 @@ class Capabilities:
 
 
 @dataclass(frozen=True)
+class LoadProfile:
+    """Phase D: learned house-load profile by hour-of-day (local time).
+
+    ``hourly_w`` maps hour 0-23 to the mean house load in W observed at that
+    hour over the learning window; ``confidence`` ramps 0->1 as more days are
+    observed (full after ~4 weeks, like SunMate's 3-4 week optimisation ramp).
+    """
+
+    hourly_w: dict[int, float]
+    days_observed: int
+    confidence: float
+
+
+@dataclass(frozen=True)
 class ProfileWeights:
     """Phase B: how an AI profile (Rød/Blå/Grøn) shapes the shared planner.
 

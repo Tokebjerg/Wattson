@@ -83,14 +83,15 @@ def _load_wattson():
     const = importlib.import_module("wattson.const")
     models = importlib.import_module("wattson.models")
     horizon = importlib.import_module("wattson.horizon")
+    learning = importlib.import_module("wattson.learning")
     mapping = importlib.import_module("wattson.mapping")
     planner = importlib.import_module("wattson.planner")
     control = importlib.import_module("wattson.control")
-    return const, models, horizon, mapping, planner, control
+    return const, models, horizon, learning, mapping, planner, control
 
 
 _install_ha_stubs()
-const, models, horizon, mapping, planner, control = _load_wattson()
+const, models, horizon, learning, mapping, planner, control = _load_wattson()
 State = sys.modules["homeassistant.core"].State
 
 
@@ -885,6 +886,62 @@ def test_c_smartcharge():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 11. Phase D — consumption learning tests.
+# --------------------------------------------------------------------------- #
+def test_d_learning():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 7, h, 0, tzinfo=TZ)
+
+    # Build a profile from 10 days of samples: 18:00 = 2000 W, 03:00 = 300 W.
+    samples = []
+    for d in range(10):
+        samples.append((datetime(2026, 5, 1 + d, 18, 0, tzinfo=TZ), 2000.0))
+        samples.append((datetime(2026, 5, 1 + d, 3, 0, tzinfo=TZ), 300.0))
+    prof = learning.build_load_profile(samples)
+    checks.append(("profile hour 18 mean = 2000W", abs(prof.hourly_w[18] - 2000) < 1e-6, str(prof.hourly_w.get(18))))
+    checks.append(("profile days_observed = 10", prof.days_observed == 10, str(prof.days_observed)))
+    checks.append(("confidence = 10/28", abs(prof.confidence - round(10 / 28, 3)) < 1e-6, str(prof.confidence)))
+    checks.append(("predicted_load_kwh 1h@18 = 2.0", abs(learning.predicted_load_kwh(prof, 18, 1) - 2.0) < 1e-6, str(learning.predicted_load_kwh(prof, 18, 1))))
+    checks.append(("predicted_load_kwh wraps past midnight", abs(learning.predicted_load_kwh(prof, 23, 5) - 0.3) < 1e-6, str(learning.predicted_load_kwh(prof, 23, 5))))
+    checks.append(("predicted_today_kwh = 2.3", abs(learning.predicted_today_kwh(prof) - 2.3) < 1e-6, str(learning.predicted_today_kwh(prof))))
+    checks.append(("no samples -> None profile", learning.build_load_profile([]) is None, "none"))
+
+    # Reserve gating: expensive hour, SOC 50, blue (profile floor 30).
+    def pslot(h, total):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=0.5)
+
+    exp_curve = [pslot(0, 1.50), pslot(1, 0.5), pslot(2, 0.4), pslot(3, 0.3), pslot(4, 0.2), pslot(5, 0.1)]
+
+    def make_state(now, soc, slots):
+        return models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
+            price_slots=slots, solar_slots=[],
+        )
+
+    def plan(reserve):
+        bp, _ = planner.build_battery_plan(
+            make_state(at(0), 50, exp_curve), battery_mode="blue", min_soc=20, max_soc=90,
+            cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
+            allow_negative_export=False, export_limit_default_w=6000.0, learned_reserve_pct=reserve,
+        )
+        return bp
+
+    checks.append(("no learned reserve -> discharges at SOC50", plan(0.0).strategy == "DISCHARGE_TO_LOAD", plan(0.0).strategy))
+    checks.append(("learned reserve 40% -> holds at SOC50", plan(40.0).strategy != "DISCHARGE_TO_LOAD", plan(40.0).strategy))
+
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -913,7 +970,8 @@ def main():
                          ("PHASE A · A0 WRITE VERIFICATION", test_write_verification),
                          ("PHASE A · A2 HORIZON PLANNING", test_a2_planning),
                          ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
-                         ("PHASE C · SMARTCHARGE", test_c_smartcharge)):
+                         ("PHASE C · SMARTCHARGE", test_c_smartcharge),
+                         ("PHASE D · CONSUMPTION LEARNING", test_d_learning)):
         print("\n" + "-" * 100)
         print(title)
         try:
