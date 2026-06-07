@@ -31,6 +31,7 @@ ACTION_LABELS = {
     "GRID_CHARGE": "🔋⚡ Lad fra net",
     "DISCHARGE": "🔌 Aflad til hus",
     "SOLAR_CHARGE": "☀️🔋 Lad fra sol",
+    "EXPORT": "☀️➡️ Sælg overskud",
     "LIMIT_EXPORT": "🚫 Begræns eksport",
     "IDLE": "⏸️ Afvent",
 }

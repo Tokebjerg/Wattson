@@ -694,11 +694,9 @@ def test_a2_planning():
         cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
         allow_negative_export=False, export_limit_default_w=6000.0,
     )
-    cp = planner.build_control_plan(st, battery_plan=bp, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""), safe_reasons=[], negative_price_active=neg)
+    cp = planner.build_control_plan(st, battery_plan=bp, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""), safe_reasons=[], negative_price_active=neg, load_hourly_w={h: 1500 for h in range(24)})
     checks.append(("schedule built (24 tasks)", len(cp.schedule) == 24, f"got {len(cp.schedule)}"))
-    checks.append(("next_cheap_window set", cp.next_cheap_window is not None, f"{cp.next_cheap_window}"))
     checks.append(("next_expensive_window set", cp.next_expensive_window is not None, f"{cp.next_expensive_window}"))
-    checks.append(("cheap window precedes expensive window", (cp.next_cheap_window or "") < (cp.next_expensive_window or ""), f"{cp.next_cheap_window} vs {cp.next_expensive_window}"))
     h12 = next((t for t in cp.schedule if t.start == at(12)), None)
     checks.append(("schedule carries solar estimate @12", h12 is not None and h12.pv_estimate_kwh == 7.0, f"{getattr(h12, 'pv_estimate_kwh', None)}"))
 
@@ -1014,9 +1012,83 @@ def test_solar_aware():
         safe_reasons=[], negative_price_active=False, load_hourly_w={h: 1900 for h in range(24)},
     )
     actions = {t.start.hour: t.action for t in cp.schedule}
-    checks.append(("solar-rich cheap midday -> SOLAR_CHARGE", actions.get(12) == "SOLAR_CHARGE", str(actions.get(12))))
-    checks.append(("cheap night, no solar -> GRID_CHARGE in schedule", actions.get(3) == "GRID_CHARGE", str(actions.get(3))))
+    checks.append(("first solar hour -> SOLAR_CHARGE (not grid)", actions.get(10) == "SOLAR_CHARGE", str(actions.get(10))))
+    checks.append(("solar midday never grid-charges", all(actions.get(h) in ("SOLAR_CHARGE", "EXPORT") for h in range(10, 15)), str({h: actions.get(h) for h in range(10, 15)})))
 
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# 14. SOC-aware forward schedule.
+# --------------------------------------------------------------------------- #
+def test_soc_schedule():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 8, h, 0, tzinfo=TZ)
+
+    def pslot(h, total):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=0.4)
+
+    def sslot(h, kwh):
+        return models.SolarSlot(start=at(h), pv_estimate_kwh=kwh)
+
+    totals = {h: (0.15 if 10 <= h <= 14 else (1.6 if 18 <= h <= 20 else 0.6)) for h in range(24)}
+    day = [pslot(h, totals[h]) for h in range(24)]
+    solar = [sslot(h, 6.0 if 10 <= h <= 15 else 0.0) for h in range(24)]
+    st = models.SiteState(
+        timestamp=at(0), pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=20.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.2, current_sell_price=0.4, forecast_today_kwh=0.0,
+        price_slots=day, solar_slots=solar,
+    )
+    bp, _ = planner.build_battery_plan(
+        st, battery_mode="blue", min_soc=20, max_soc=90, cheap_threshold=0.75,
+        expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False, export_limit_default_w=6000.0,
+    )
+    cp = planner.build_control_plan(
+        st, battery_plan=bp, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""),
+        safe_reasons=[], negative_price_active=False, load_hourly_w={h: 1000 for h in range(24)},
+        capacity_kwh=10.0, min_soc=20, max_soc=90, learned_reserve_pct=0.0,
+    )
+    by_hour = {t.start.hour: t for t in cp.schedule}
+    socs = [t.projected_soc_pct for t in cp.schedule]
+    checks.append(("projected SOC populated for all hours", all(s is not None for s in socs), "ok"))
+    checks.append(("SOC caps at max 90", max(socs) <= 90, str(max(socs))))
+    checks.append(("SOC never below min 20", min(socs) >= 20, str(min(socs))))
+    checks.append(("battery charges from sun to near full by afternoon", by_hour[15].projected_soc_pct >= 85, str(by_hour[15].projected_soc_pct)))
+    checks.append(("battery full + sun -> EXPORT", any(t.action == "EXPORT" for t in cp.schedule), str([h for h, t in by_hour.items() if t.action == "EXPORT"])))
+    checks.append(("expensive evening with load -> DISCHARGE", any(t.action == "DISCHARGE" for t in cp.schedule), str([h for h, t in by_hour.items() if t.action == "DISCHARGE"])))
+
+    # Cloudy day (little solar): cheap night SHOULD grid-charge, since the sun
+    # won't fill the battery before the expensive evening.
+    cloudy_solar = [sslot(h, 0.3 if 10 <= h <= 15 else 0.0) for h in range(24)]
+    totals_c = {h: (0.15 if 2 <= h <= 4 else (1.6 if 18 <= h <= 20 else 0.6)) for h in range(24)}
+    day_c = [pslot(h, totals_c[h]) for h in range(24)]
+    st_c = models.SiteState(
+        timestamp=at(0), pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=25.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.2, current_sell_price=0.4, forecast_today_kwh=0.0,
+        price_slots=day_c, solar_slots=cloudy_solar,
+    )
+    bpc, _ = planner.build_battery_plan(
+        st_c, battery_mode="blue", min_soc=20, max_soc=90, cheap_threshold=0.75,
+        expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False, export_limit_default_w=6000.0,
+    )
+    cpc = planner.build_control_plan(
+        st_c, battery_plan=bpc, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""),
+        safe_reasons=[], negative_price_active=False, load_hourly_w={h: 1000 for h in range(24)},
+        capacity_kwh=10.0, min_soc=20, max_soc=90, learned_reserve_pct=0.0,
+    )
+    actions_c = {t.start.hour: t.action for t in cpc.schedule}
+    checks.append(("cloudy day: cheap night -> GRID_CHARGE", any(actions_c.get(h) == "GRID_CHARGE" for h in range(0, 6)), str({h: actions_c.get(h) for h in range(0, 6)})))
     return checks
 
 
@@ -1051,7 +1123,8 @@ def main():
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
-                         ("SOLAR-AWARE CHARGING", test_solar_aware)):
+                         ("SOLAR-AWARE CHARGING", test_solar_aware),
+                         ("SOC-AWARE SCHEDULE", test_soc_schedule)):
         print("\n" + "-" * 100)
         print(title)
         try:

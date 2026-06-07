@@ -421,6 +421,10 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             negative_price_active=negative_price_active,
             battery_mode=self.battery_mode,
             load_hourly_w=self.load_profile.hourly_w if self.load_profile else None,
+            capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
+            min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
+            max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
+            learned_reserve_pct=learned_reserve_pct,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:

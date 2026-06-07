@@ -27,6 +27,10 @@ SCHEDULE_MAX_HOURS = 24
 SOLAR_CHARGE_BLOCK_W = 500.0
 SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
 
+# Assumed battery charge rate (kWh per hour) used only for the forward SOC
+# projection in the schedule, so it knows roughly how fast grid-charging fills.
+SCHEDULE_CHARGE_RATE_KWH = 5.0
+
 # Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
 # Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
 # (charge more, sell less, moderate reserve); Grøn = self-sufficiency (high
@@ -224,47 +228,88 @@ def _build_schedule(
     state: SiteState,
     profile: ProfileWeights,
     load_hourly_w: dict[int, float] | None = None,
+    *,
+    capacity_kwh: float = 10.0,
+    min_soc: float = 20.0,
+    max_soc: float = 90.0,
+    learned_reserve_pct: float = 0.0,
 ) -> tuple[list[PlanTask], str | None, str | None]:
-    """Build the forward-looking hourly plan and the next cheap/expensive windows.
+    """Build the forward-looking hourly plan with a battery-SOC projection.
 
-    Hours with enough forecast solar surplus (PV minus expected house load) are
-    marked SOLAR_CHARGE — the battery fills from the sun, so they are NOT shown
-    as grid-charge even when the price is cheap.
+    Simulates the battery state of charge across the horizon using the current
+    SOC, capacity, the solar forecast and the learned house-load profile, so the
+    plan adapts intelligently: it charges (from sun first, then cheap grid) only
+    until full, discharges in expensive hours only down to the reserve, and shows
+    the projected SOC for every hour.
     """
     view = _horizon_view(state, profile)
     if view is None:
         return [], None, None
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
     load_hourly_w = load_hourly_w or {}
+
+    capacity_kwh = max(0.1, capacity_kwh)
+    floor_pct = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
+    soc_kwh = max(0.0, min(max_soc, state.battery_soc_pct)) / 100.0 * capacity_kwh
+    max_kwh = max_soc / 100.0 * capacity_kwh
+    floor_kwh = min(max_kwh, floor_pct / 100.0 * capacity_kwh)
+
+    slots = view.slots[:SCHEDULE_MAX_HOURS]
+    # Per-hour solar / load / surplus, precomputed so grid-charge can look ahead.
+    info = []
+    for slot in slots:
+        pv = solar_by_start.get(slot.start)
+        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
+        load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
+        info.append((slot, solar_kwh, load_kwh, solar_kwh - load_kwh, pv is not None))
+
     tasks: list[PlanTask] = []
     next_cheap: str | None = None
     next_expensive: str | None = None
-    for slot in view.slots[:SCHEDULE_MAX_HOURS]:
+    for i, (slot, solar_kwh, load_kwh, surplus_kwh, has_pv) in enumerate(info):
         is_cheap = slot.start in view.cheap_starts
         is_expensive = slot.start in view.expensive_starts
         max_after = view.max_price_after(slot.start)
         worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
-        pv = solar_by_start.get(slot.start)
-        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
-        expected_load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
-        solar_surplus_kwh = solar_kwh - expected_load_kwh
 
-        if solar_surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
+        if surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
+            soc_kwh = min(max_kwh, soc_kwh + surplus_kwh)
             action = "SOLAR_CHARGE"
-        elif is_cheap and worthwhile:
-            action = "GRID_CHARGE"
-        elif is_expensive:
+        elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
+            action = "EXPORT"  # battery full, sell the surplus
+        elif is_cheap and worthwhile and soc_kwh < max_kwh - 0.05:
+            # Only grid-charge if the forecast solar before the next expensive
+            # window won't already fill the battery — don't pay the grid for
+            # energy the sun will deliver for free.
+            future_solar = 0.0
+            for (s2, _sk, _lk, surp2, _hp) in info[i + 1:]:
+                if s2.start in view.expensive_starts:
+                    break
+                future_solar += max(0.0, surp2)
+            if future_solar >= (max_kwh - soc_kwh):
+                action = "IDLE"
+            else:
+                soc_kwh = min(max_kwh, soc_kwh + SCHEDULE_CHARGE_RATE_KWH)
+                action = "GRID_CHARGE"
+        elif is_expensive and soc_kwh > floor_kwh + 0.05:
+            # Reserve the battery for the expensive hours: discharge to cover the
+            # load deficit (down to the floor) only at peak prices, not all day.
+            deficit_kwh = max(load_kwh - solar_kwh, 0.0)
+            drain = min(max(deficit_kwh, 0.5), soc_kwh - floor_kwh)
+            soc_kwh -= drain
             action = "DISCHARGE"
         elif slot.export_value is not None and slot.export_value < 0:
             action = "LIMIT_EXPORT"
         else:
             action = "IDLE"
+
         tasks.append(
             PlanTask(
                 start=slot.start,
                 action=action,
                 total_import_price=round(slot.total_import_price, 4),
-                pv_estimate_kwh=round(solar_kwh, 3) if pv else None,
+                pv_estimate_kwh=round(solar_kwh, 3) if has_pv else None,
+                projected_soc_pct=round(soc_kwh / capacity_kwh * 100.0),
             )
         )
         if action == "GRID_CHARGE" and next_cheap is None:
@@ -621,6 +666,10 @@ def build_control_plan(
     negative_price_active: bool,
     battery_mode: str = BATTERY_MODE_BLUE,
     load_hourly_w: dict[int, float] | None = None,
+    capacity_kwh: float = 10.0,
+    min_soc: float = 20.0,
+    max_soc: float = 90.0,
+    learned_reserve_pct: float = 0.0,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -628,7 +677,10 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
-    schedule, next_cheap_window, next_expensive_window = _build_schedule(state, profile_for(battery_mode), load_hourly_w)
+    schedule, next_cheap_window, next_expensive_window = _build_schedule(
+        state, profile_for(battery_mode), load_hourly_w,
+        capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
+    )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:
         # Home Assistant truncates entity states longer than 255 chars to
