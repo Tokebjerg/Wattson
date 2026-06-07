@@ -5,13 +5,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
+from homeassistant.components.sensor import RestoreSensor, SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower, UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, NAME
 from .learning import predicted_today_kwh
@@ -167,7 +168,9 @@ def _parse_window(value: str | None) -> Any:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([WattsonSensor(coordinator, entry, description) for description in SENSORS])
+    entities: list[Any] = [WattsonSensor(coordinator, entry, description) for description in SENSORS]
+    entities.append(WattsonSavingsSensor(coordinator, entry))
+    async_add_entities(entities)
 
 
 class WattsonSensor(CoordinatorEntity, SensorEntity):
@@ -205,3 +208,42 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "safe_reasons": control_plan.safe_reasons if control_plan else [],
             }
         return None
+
+
+class WattsonSavingsSensor(CoordinatorEntity, RestoreSensor):
+    """Phase F: today's delivered value (avoided import + export), restored across restarts."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Savings Today"
+    _attr_icon = "mdi:piggy-bank"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_savings_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        try:
+            value = float(last_state.state)
+        except (TypeError, ValueError):
+            return
+        # Only restore if the saved value is from today (same local date).
+        if dt_util.as_local(last_state.last_updated).date() == dt_util.now().date():
+            self.coordinator.value_today_kr = value
+            self.coordinator._value_day = dt_util.now().date()
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.value_today_kr, 2)

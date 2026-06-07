@@ -942,6 +942,25 @@ def test_d_learning():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 12. Phase F — savings/value tests.
+# --------------------------------------------------------------------------- #
+def test_f_savings():
+    checks = []
+    v = planner.value_increment_kr
+    # 2000W load, 500W imported -> 1500W (1.5 kWh over 1h) avoided @ 2.0 kr = 3.0 kr.
+    checks.append(("avoided import valued at import price", abs(v(2000, 500, 0, 2.0, 0.5, 1.0) - 3.0) < 1e-6, str(v(2000, 500, 0, 2.0, 0.5, 1.0))))
+    # Export 800W for 1h @ 0.5 kr = 0.4 kr; no avoided import (import == load).
+    checks.append(("export revenue counted", abs(v(1000, 1000, 800, 2.0, 0.5, 1.0) - 0.4) < 1e-6, str(v(1000, 1000, 800, 2.0, 0.5, 1.0))))
+    # Negative import price -> avoided import is not a saving.
+    checks.append(("negative import price -> no saving", v(2000, 0, 0, -0.5, 0.0, 1.0) == 0.0, str(v(2000, 0, 0, -0.5, 0.0, 1.0))))
+    # Zero/!positive dt -> no value.
+    checks.append(("zero dt -> no value", v(2000, 0, 0, 2.0, 0.5, 0.0) == 0.0, str(v(2000, 0, 0, 2.0, 0.5, 0.0))))
+    # Combined avoided + export.
+    checks.append(("combined avoided + export", abs(v(3000, 1000, 500, 1.0, 0.6, 1.0) - (2.0 * 1.0 + 0.5 * 0.6)) < 1e-6, str(v(3000, 1000, 500, 1.0, 0.6, 1.0))))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -971,7 +990,8 @@ def main():
                          ("PHASE A · A2 HORIZON PLANNING", test_a2_planning),
                          ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
-                         ("PHASE D · CONSUMPTION LEARNING", test_d_learning)):
+                         ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
+                         ("PHASE F · SAVINGS / VALUE", test_f_savings)):
         print("\n" + "-" * 100)
         print(title)
         try:

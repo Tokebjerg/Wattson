@@ -106,6 +106,10 @@ LEARNING_MIN_DAYS = 7              # min observed days before the reserve is app
 LEARNING_RESERVE_HOURS = 6         # hours of predicted load to hold back for self-use
 LEARNING_RESERVE_MAX_PCT = 50.0    # cap the learned reserve so it never locks the battery
 LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
+
+# Phase F: cap a single value-accumulation tick so restart/sleep gaps don't
+# inflate the daily savings figure.
+VALUE_MAX_TICK_SECONDS = 180
 DEFAULT_CHEAP_PRICE_THRESHOLD = 0.75
 DEFAULT_EXPENSIVE_PRICE_THRESHOLD = 1.80
 DEFAULT_ALLOW_GRID_CHARGE = True

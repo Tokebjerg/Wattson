@@ -42,6 +42,28 @@ PROFILES: dict[str, ProfileWeights] = {
 }
 
 
+def value_increment_kr(
+    load_w: float,
+    grid_import_w: float,
+    grid_export_w: float,
+    import_price: float | None,
+    export_price: float | None,
+    dt_hours: float,
+) -> float:
+    """Phase F: value (DKK) delivered in one tick.
+
+    = avoided grid import (house load supplied by solar/battery) valued at the
+    total import price + export revenue. Negative import prices count as zero
+    (self-consuming when grid is free/negative isn't a saving).
+    """
+    if dt_hours <= 0:
+        return 0.0
+    avoided_w = max(0.0, load_w - grid_import_w)
+    saved = avoided_w / 1000.0 * dt_hours * max(0.0, import_price or 0.0)
+    earned = max(0.0, grid_export_w) / 1000.0 * dt_hours * max(0.0, export_price or 0.0)
+    return saved + earned
+
+
 def _resolve_mode(mode: str) -> str:
     """Map legacy mode strings (hybrid/price/self_consumption) onto the profiles."""
     return LEGACY_BATTERY_MODE_MAP.get(mode, mode)

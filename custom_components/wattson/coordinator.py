@@ -48,6 +48,7 @@ from .const import (
     LEARNING_RESERVE_HOURS,
     LEARNING_RESERVE_MAX_PCT,
     LEARNING_REBUILD_SECONDS,
+    VALUE_MAX_TICK_SECONDS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
@@ -77,9 +78,10 @@ from .const import (
 from .control import EaseeController, KlatremisController
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
+from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh
 from .models import LoadProfile
-from .planner import build_battery_plan, build_control_plan, build_ev_plan, effective_solar_surplus_w
+from .planner import build_battery_plan, build_control_plan, build_ev_plan, effective_solar_surplus_w, value_increment_kr
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +112,9 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
+        self.value_today_kr: float = 0.0
+        self._value_day = None
+        self._value_last_tick: datetime | None = None
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
         self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
@@ -167,6 +172,33 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             return 0.0
         reserve_kwh = predicted_load_kwh(profile, dt_util.now().hour, LEARNING_RESERVE_HOURS)
         return min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
+
+    def _accumulate_value(self) -> None:
+        """Phase F: accumulate today's delivered value (avoided import + export)."""
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._value_day != today:
+            self._value_day = today
+            self.value_today_kr = 0.0
+            self._value_last_tick = now
+            return
+        if self._value_last_tick is None:
+            self._value_last_tick = now
+            return
+        dt_hours = (now - self._value_last_tick).total_seconds() / 3600.0
+        self._value_last_tick = now
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return  # skip restart/sleep gaps
+        slot = current_price_slot(state.price_slots, state.timestamp) if state.price_slots else None
+        import_price = slot.total_import_price if slot else state.current_buy_price
+        export_price = slot.export_value if (slot and slot.export_value is not None) else state.current_sell_price
+        self.value_today_kr += value_increment_kr(
+            state.load_power_w, state.grid_import_power_w, state.grid_export_power_w,
+            import_price, export_price, dt_hours,
+        )
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
@@ -261,6 +293,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             invert_grid_power_sign=self._grid_power_sign_should_be_inverted(),
             invert_battery_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_BATTERY_POWER_SIGN, DEFAULT_INVERT_BATTERY_POWER_SIGN)),
         )
+
+        self._accumulate_value()
 
         # Phase D: refresh the learned load profile at most every few hours and
         # derive how much SOC to reserve for predicted self-use.
