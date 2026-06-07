@@ -71,6 +71,14 @@ from .const import (
     DEFAULT_STALE_SECONDS,
     DOMAIN,
     EV_MODE_SOLAR_ONLY,
+    BATTERY_OVERRIDE_AUTO,
+    BATTERY_OVERRIDE_OPTIONS,
+    EV_OVERRIDE_AUTO,
+    EV_OVERRIDE_OPTIONS,
+    CONF_OVERRIDE_MINUTES,
+    DEFAULT_OVERRIDE_MINUTES,
+    OVERRIDE_MIN_MINUTES,
+    OVERRIDE_MAX_MINUTES,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
     UPDATE_INTERVAL,
@@ -81,7 +89,15 @@ from .models import Capabilities, ControlPlan, EntityMapping, SiteState
 from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh
 from .models import LoadProfile
-from .planner import build_battery_plan, build_control_plan, build_ev_plan, effective_solar_surplus_w, value_increment_kr
+from .planner import (
+    build_battery_plan,
+    build_control_plan,
+    build_ev_plan,
+    build_override_battery_plan,
+    build_override_ev_plan,
+    effective_solar_surplus_w,
+    value_increment_kr,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +112,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.capabilities: Capabilities | None = None
         self.last_actions: list[str] = []
         self.pause_until: datetime | None = None
+        # Phase E: timed manual override (in-memory; a restart clears it so a
+        # forced action never silently persists for hours).
+        self.battery_override: str = BATTERY_OVERRIDE_AUTO
+        self.battery_override_until: datetime | None = None
+        self.ev_override: str = EV_OVERRIDE_AUTO
+        self.ev_override_until: datetime | None = None
+        self.override_minutes = int(entry_value(entry, CONF_OVERRIDE_MINUTES, DEFAULT_OVERRIDE_MINUTES))
         self.shadow_mode = bool(entry_value(entry, CONF_SHADOW_MODE, DEFAULT_SHADOW_MODE))
         self.automation_enabled = bool(entry_value(entry, CONF_AUTOMATION_ENABLED, DEFAULT_AUTOMATION_ENABLED))
         self.battery_control_enabled = bool(entry_value(entry, CONF_BATTERY_CONTROL_ENABLED, DEFAULT_BATTERY_CONTROL_ENABLED))
@@ -208,7 +231,70 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def async_resume(self) -> None:
+        # Resume = back to the AI plan: clear the pause and any manual override.
         self.pause_until = None
+        self.battery_override = BATTERY_OVERRIDE_AUTO
+        self.battery_override_until = None
+        self.ev_override = EV_OVERRIDE_AUTO
+        self.ev_override_until = None
+        self._last_fingerprint = None
+        await self.async_request_refresh()
+
+    def _override_remaining_minutes(self, until: datetime | None) -> int | None:
+        if until is None:
+            return None
+        remaining = (until - dt_util.utcnow()).total_seconds()
+        return max(0, int(round(remaining / 60.0)))
+
+    @property
+    def battery_override_remaining_minutes(self) -> int | None:
+        return self._override_remaining_minutes(self.battery_override_until)
+
+    @property
+    def ev_override_remaining_minutes(self) -> int | None:
+        return self._override_remaining_minutes(self.ev_override_until)
+
+    def _expire_overrides(self, now: datetime) -> None:
+        """Phase E auto-resume: drop overrides whose window has elapsed."""
+        if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until and now >= self.battery_override_until:
+            self.battery_override = BATTERY_OVERRIDE_AUTO
+            self.battery_override_until = None
+            self._last_fingerprint = None
+        if self.ev_override != EV_OVERRIDE_AUTO and self.ev_override_until and now >= self.ev_override_until:
+            self.ev_override = EV_OVERRIDE_AUTO
+            self.ev_override_until = None
+            self._last_fingerprint = None
+
+    async def async_set_battery_override(self, action: str) -> None:
+        if action not in BATTERY_OVERRIDE_OPTIONS:
+            return
+        self.battery_override = action
+        if action == BATTERY_OVERRIDE_AUTO:
+            self.battery_override_until = None
+        else:
+            # Setting an override is an explicit "do this now" intent; clear any
+            # passive pause so the forced action is actually applied.
+            self.pause_until = None
+            self.battery_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
+        self._last_fingerprint = None
+        await self.async_request_refresh()
+
+    async def async_set_ev_override(self, action: str) -> None:
+        if action not in EV_OVERRIDE_OPTIONS:
+            return
+        self.ev_override = action
+        if action == EV_OVERRIDE_AUTO:
+            self.ev_override_until = None
+        else:
+            self.pause_until = None
+            self.ev_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
+        self._last_fingerprint = None
+        await self.async_request_refresh()
+
+    async def async_set_override_minutes(self, minutes: int) -> None:
+        clamped = max(OVERRIDE_MIN_MINUTES, min(OVERRIDE_MAX_MINUTES, int(minutes)))
+        self.override_minutes = clamped
+        update_entry_options(self.hass, self.config_entry, **{CONF_OVERRIDE_MINUTES: clamped})
         await self.async_request_refresh()
 
     async def async_set_ev_mode(self, mode: str) -> None:
@@ -272,6 +358,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def _async_update_data(self) -> ControlPlan:
+        # Phase E: auto-resume — drop any manual override whose window elapsed.
+        self._expire_overrides(dt_util.utcnow())
         config = merged_entry_config(self.config_entry)
         self.mapping = build_entity_mapping(config)
         self.capabilities = build_capabilities(self.mapping)
@@ -338,10 +426,11 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
         effective_battery_threshold = self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0
 
+        ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_plan = build_ev_plan(
             self.site_state,
             ev_mode=self.ev_mode,
-            ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)),
+            ev_max_amps=ev_max_amps,
             ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
             ev_windows=ev_windows,
             can_reclaim_battery_charge=self.battery_control_enabled,
@@ -350,7 +439,15 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             solar_surplus_override=averaged_surplus,
         )
 
-        if self.ev_mode == EV_MODE_SOLAR_ONLY:
+        # Phase E: a manual EV override is an explicit user action and wins over
+        # the AI plan (and suppresses the solar-only auto-adjustments below).
+        ev_override_active = self.ev_override != EV_OVERRIDE_AUTO
+        if ev_override_active:
+            forced_ev = build_override_ev_plan(self.ev_override, ev_max_amps=ev_max_amps)
+            if forced_ev is not None:
+                ev_plan = forced_ev
+
+        if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
             normalized_status = (self.site_state.easee_status or "").lower()
             ev_session_active = bool(
@@ -396,24 +493,31 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_limit_control_mode="Selling first",
                     desired_discharge_current_a=0.0,
                 )
-            elif self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
-                battery_plan = replace(
-                    battery_plan,
-                    desired_discharge_current_a=self._default_discharge_current_a,
-                )
-        elif self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
+
+        # Restore the normal discharge / max-charge currents when the plan left
+        # them unset (charge current keeps a trickle if peak-solar-export asked).
+        if self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
             battery_plan = replace(
                 battery_plan,
                 desired_discharge_current_a=self._default_discharge_current_a,
             )
-
-        # Restore the normal max battery charge current unless the plan asked for
-        # a trickle (peak-solar-export), so 10A doesn't stick after the peak.
         if self._default_charge_current_a is not None and battery_plan.desired_max_charge_current_a is None:
             battery_plan = replace(
                 battery_plan,
                 desired_max_charge_current_a=self._default_charge_current_a,
             )
+
+        # Phase E: a manual battery override is an explicit user action and wins
+        # over the AI plan, EV-solar priority and the current restoration above.
+        if self.battery_override != BATTERY_OVERRIDE_AUTO:
+            forced_battery = build_override_battery_plan(
+                self.battery_override,
+                export_limit_default_w=self._default_export_limit_w,
+                default_charge_current_a=self._default_charge_current_a,
+                default_discharge_current_a=self._default_discharge_current_a,
+            )
+            if forced_battery is not None:
+                battery_plan = forced_battery
 
         safe_reasons: list[str] = []
         if self.site_state.missing_entities:

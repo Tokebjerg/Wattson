@@ -19,6 +19,23 @@
           "scheduled_periods": "Scheduled period",
           "scheduled_cheapest": "Scheduled cheapest hours"
         }
+      },
+      "battery_override": {
+        "name": "Battery override",
+        "state": {
+          "auto": "Automatic (AI)",
+          "force_charge": "Force charge",
+          "force_discharge": "Force discharge / sell",
+          "force_hold": "Hold (no charge/discharge)"
+        }
+      },
+      "ev_override": {
+        "name": "EV override",
+        "state": {
+          "auto": "Automatic (AI)",
+          "force_charge": "Force charge",
+          "force_stop": "Force stop"
+        }
       }
     }
   },

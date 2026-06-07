@@ -9,11 +9,16 @@ from .const import (
     BATTERY_MODE_GREEN,
     BATTERY_MODE_PROTECT,
     BATTERY_MODE_RED,
+    BATTERY_OVERRIDE_CHARGE,
+    BATTERY_OVERRIDE_DISCHARGE,
+    BATTERY_OVERRIDE_HOLD,
     BATTERY_WEAR_COST,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
     EV_MODE_SCHEDULED_CHEAPEST,
     EV_MODE_SOLAR_ONLY,
+    EV_OVERRIDE_CHARGE,
+    EV_OVERRIDE_STOP,
     LEGACY_BATTERY_MODE_MAP,
 )
 from .horizon import current_price_slot, remaining_price_slots
@@ -695,6 +700,75 @@ def build_ev_plan(
         desired_enabled=False,
         desired_action="pause",
     )
+
+
+def build_override_battery_plan(
+    action: str,
+    *,
+    export_limit_default_w: float | None,
+    default_charge_current_a: float | None = None,
+    default_discharge_current_a: float | None = None,
+) -> BatteryPlan | None:
+    """Phase E: a manually forced battery action (or None to follow the AI plan).
+
+    These plans deliberately ignore prices and SOC reserves — they encode an
+    explicit user intent that wins over the planner for the override window.
+    """
+    if action == BATTERY_OVERRIDE_CHARGE:
+        return BatteryPlan(
+            strategy="OVERRIDE_CHARGE",
+            reason="Manual override: forced grid charge",
+            desired_grid_charge=True,
+            desired_solar_sell=False,
+            desired_energy_priority="Battery first",
+            desired_limit_control_mode="Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=default_charge_current_a,
+            desired_discharge_current_a=0.0,
+        )
+    if action == BATTERY_OVERRIDE_DISCHARGE:
+        return BatteryPlan(
+            strategy="OVERRIDE_DISCHARGE",
+            reason="Manual override: forced discharge / sell",
+            desired_grid_charge=False,
+            desired_solar_sell=True,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first",
+            desired_export_limit_w=export_limit_default_w,
+            desired_discharge_current_a=default_discharge_current_a,
+        )
+    if action == BATTERY_OVERRIDE_HOLD:
+        return BatteryPlan(
+            strategy="OVERRIDE_HOLD",
+            reason="Manual override: holding SOC (no charge, no discharge)",
+            desired_grid_charge=False,
+            desired_solar_sell=False,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+            desired_discharge_current_a=0.0,
+        )
+    return None
+
+
+def build_override_ev_plan(action: str, *, ev_max_amps: int) -> EvPlan | None:
+    """Phase E: a manually forced EV action (or None to follow the AI plan)."""
+    if action == EV_OVERRIDE_CHARGE:
+        return EvPlan(
+            mode="override_charge",
+            reason="Manual override: forced EV charge",
+            desired_enabled=True,
+            desired_amps=int(ev_max_amps),
+            desired_action="resume",
+        )
+    if action == EV_OVERRIDE_STOP:
+        return EvPlan(
+            mode="override_stop",
+            reason="Manual override: forced EV stop",
+            desired_enabled=False,
+            desired_action="pause",
+        )
+    return None
 
 
 def build_control_plan(

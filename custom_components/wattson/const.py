@@ -132,6 +132,33 @@ EV_MODES = [
 EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
 EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
 
+# Phase E: timed manual override. A forced action wins over the AI plan for a
+# configurable number of minutes, then the system auto-resumes the normal plan.
+CONF_OVERRIDE_MINUTES = "override_minutes"
+DEFAULT_OVERRIDE_MINUTES = 30
+OVERRIDE_MIN_MINUTES = 1
+OVERRIDE_MAX_MINUTES = 720
+
+BATTERY_OVERRIDE_AUTO = "auto"            # no override; follow the AI plan
+BATTERY_OVERRIDE_CHARGE = "force_charge"  # force grid-charging now
+BATTERY_OVERRIDE_DISCHARGE = "force_discharge"  # force discharge/sell now
+BATTERY_OVERRIDE_HOLD = "force_hold"      # hold SOC (no charge, no discharge)
+BATTERY_OVERRIDE_OPTIONS = [
+    BATTERY_OVERRIDE_AUTO,
+    BATTERY_OVERRIDE_CHARGE,
+    BATTERY_OVERRIDE_DISCHARGE,
+    BATTERY_OVERRIDE_HOLD,
+]
+
+EV_OVERRIDE_AUTO = "auto"            # no override; follow the AI plan
+EV_OVERRIDE_CHARGE = "force_charge"  # force full-speed EV charging now
+EV_OVERRIDE_STOP = "force_stop"      # force the EV charger to stop now
+EV_OVERRIDE_OPTIONS = [
+    EV_OVERRIDE_AUTO,
+    EV_OVERRIDE_CHARGE,
+    EV_OVERRIDE_STOP,
+]
+
 # Phase B: SunMate-style AI prioritization profiles.
 BATTERY_MODE_RED = "red"      # ROI maximization: aggressive arbitrage + selling
 BATTERY_MODE_BLUE = "blue"    # conservative middle: charge more, sell less

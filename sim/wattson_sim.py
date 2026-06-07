@@ -1024,6 +1024,58 @@ def test_f_savings():
 
 
 # --------------------------------------------------------------------------- #
+# 12b. Phase E — timed manual override (forced action, auto-resume).
+# --------------------------------------------------------------------------- #
+def test_e_override():
+    checks = []
+
+    # --- Battery override plans ---
+    none_plan = planner.build_override_battery_plan(const.BATTERY_OVERRIDE_AUTO, export_limit_default_w=6000.0)
+    checks.append(("auto -> no battery override plan", none_plan is None, str(none_plan)))
+
+    chg = planner.build_override_battery_plan(
+        const.BATTERY_OVERRIDE_CHARGE, export_limit_default_w=6000.0,
+        default_charge_current_a=40.0, default_discharge_current_a=50.0,
+    )
+    checks.append(("force_charge -> OVERRIDE_CHARGE", chg.strategy == "OVERRIDE_CHARGE", chg.strategy))
+    checks.append(("force_charge grid-charges", chg.desired_grid_charge is True, str(chg.desired_grid_charge)))
+    checks.append(("force_charge does not sell", chg.desired_solar_sell is False, str(chg.desired_solar_sell)))
+    checks.append(("force_charge uses default charge current", chg.desired_max_charge_current_a == 40.0, str(chg.desired_max_charge_current_a)))
+    checks.append(("force_charge blocks discharge (0A)", chg.desired_discharge_current_a == 0.0, str(chg.desired_discharge_current_a)))
+
+    dis = planner.build_override_battery_plan(
+        const.BATTERY_OVERRIDE_DISCHARGE, export_limit_default_w=6000.0,
+        default_charge_current_a=40.0, default_discharge_current_a=50.0,
+    )
+    checks.append(("force_discharge -> OVERRIDE_DISCHARGE", dis.strategy == "OVERRIDE_DISCHARGE", dis.strategy))
+    checks.append(("force_discharge does not grid-charge", dis.desired_grid_charge is False, str(dis.desired_grid_charge)))
+    checks.append(("force_discharge sells", dis.desired_solar_sell is True, str(dis.desired_solar_sell)))
+    checks.append(("force_discharge uses default discharge current", dis.desired_discharge_current_a == 50.0, str(dis.desired_discharge_current_a)))
+
+    hold = planner.build_override_battery_plan(const.BATTERY_OVERRIDE_HOLD, export_limit_default_w=6000.0)
+    checks.append(("force_hold -> OVERRIDE_HOLD", hold.strategy == "OVERRIDE_HOLD", hold.strategy))
+    checks.append(("force_hold neither charges nor sells", hold.desired_grid_charge is False and hold.desired_solar_sell is False, f"{hold.desired_grid_charge}/{hold.desired_solar_sell}"))
+    checks.append(("force_hold blocks discharge (0A)", hold.desired_discharge_current_a == 0.0, str(hold.desired_discharge_current_a)))
+
+    # --- EV override plans ---
+    ev_none = planner.build_override_ev_plan(const.EV_OVERRIDE_AUTO, ev_max_amps=16)
+    checks.append(("auto -> no EV override plan", ev_none is None, str(ev_none)))
+
+    ev_chg = planner.build_override_ev_plan(const.EV_OVERRIDE_CHARGE, ev_max_amps=16)
+    checks.append(("EV force_charge resumes at max amps", ev_chg.desired_enabled is True and ev_chg.desired_amps == 16 and ev_chg.desired_action == "resume", f"{ev_chg.desired_enabled}/{ev_chg.desired_amps}/{ev_chg.desired_action}"))
+
+    ev_stop = planner.build_override_ev_plan(const.EV_OVERRIDE_STOP, ev_max_amps=16)
+    checks.append(("EV force_stop pauses", ev_stop.desired_enabled is False and ev_stop.desired_action == "pause", f"{ev_stop.desired_enabled}/{ev_stop.desired_action}"))
+
+    # --- Override wins over the AI plan regardless of price ---
+    # An expensive hour would normally NOT charge; force_charge must still charge.
+    chg2 = planner.build_override_battery_plan(const.BATTERY_OVERRIDE_CHARGE, export_limit_default_w=6000.0)
+    checks.append(("override ignores prices (still charges)", chg2.desired_grid_charge is True, str(chg2.desired_grid_charge)))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 13. Solar-aware charging (don't grid-charge when solar covers it).
 # --------------------------------------------------------------------------- #
 def test_solar_aware():
@@ -1186,6 +1238,7 @@ def main():
                          ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
+                         ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),
                          ("SOC-AWARE SCHEDULE", test_soc_schedule)):

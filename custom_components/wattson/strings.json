@@ -19,6 +19,23 @@
           "scheduled_periods": "Planlagt periode",
           "scheduled_cheapest": "Planlagt billigste timer"
         }
+      },
+      "battery_override": {
+        "name": "Batteri-tilsidesættelse",
+        "state": {
+          "auto": "Automatisk (AI)",
+          "force_charge": "Tving opladning",
+          "force_discharge": "Tving afladning / salg",
+          "force_hold": "Hold (lad/aflad ikke)"
+        }
+      },
+      "ev_override": {
+        "name": "Elbil-tilsidesættelse",
+        "state": {
+          "auto": "Automatisk (AI)",
+          "force_charge": "Tving opladning",
+          "force_stop": "Tving stop"
+        }
       }
     }
   },
