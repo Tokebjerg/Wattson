@@ -420,6 +420,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             safe_reasons=safe_reasons,
             negative_price_active=negative_price_active,
             battery_mode=self.battery_mode,
+            load_hourly_w=self.load_profile.hourly_w if self.load_profile else None,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:

@@ -129,13 +129,10 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
     return slots
 
 
-def build_solar_slots(hass: Any, forecast_entity: str | None) -> list[SolarSlot]:
-    """Build hourly solar-forecast slots from a Solcast-style entity."""
-    attrs = _attrs(hass, forecast_entity)
-    hourly = attrs.get("detailedHourly")
+def _solar_slots_from(hass: Any, entity_id: str | None) -> list[SolarSlot]:
+    hourly = _attrs(hass, entity_id).get("detailedHourly")
     if not isinstance(hourly, list):
         return []
-
     slots: list[SolarSlot] = []
     for item in hourly:
         if not isinstance(item, dict):
@@ -162,6 +159,19 @@ def build_solar_slots(hass: Any, forecast_entity: str | None) -> list[SolarSlot]
                 pv_estimate90_kwh=_opt("pv_estimate90"),
             )
         )
+    return slots
+
+
+def build_solar_slots(hass: Any, forecast_entity: str | None) -> list[SolarSlot]:
+    """Build hourly solar-forecast slots for today AND tomorrow.
+
+    Solcast exposes today and tomorrow as separate entities; derive the tomorrow
+    entity from the configured today entity (``_today`` -> ``_tomorrow``) so the
+    24-48h plan has solar data for both days.
+    """
+    slots = _solar_slots_from(hass, forecast_entity)
+    if forecast_entity and "_today" in forecast_entity:
+        slots += _solar_slots_from(hass, forecast_entity.replace("_today", "_tomorrow"))
     slots.sort(key=lambda slot: slot.start)
     return slots
 

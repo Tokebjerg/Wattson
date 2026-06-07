@@ -21,6 +21,12 @@ from .models import BatteryPlan, ControlPlan, EvPlan, PlanTask, ProfileWeights, 
 
 SCHEDULE_MAX_HOURS = 24
 
+# Don't grid-charge when solar already covers charging. Live: suppress grid
+# charge above this instantaneous surplus. Schedule: an hour with at least this
+# much forecast solar surplus (PV minus expected load) is a "solar charge" hour.
+SOLAR_CHARGE_BLOCK_W = 500.0
+SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
+
 # Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
 # Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
 # (charge more, sell less, moderate reserve); Grøn = self-sufficiency (high
@@ -164,7 +170,13 @@ def _horizon_battery_plan(
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
-    if allow_grid_charge and is_cheap and worthwhile and state.battery_soc_pct < max_soc:
+    if (
+        allow_grid_charge
+        and is_cheap
+        and worthwhile
+        and state.battery_soc_pct < max_soc
+        and state.solar_surplus_w < SOLAR_CHARGE_BLOCK_W
+    ):
         return BatteryPlan(
             strategy="GRID_CHARGE",
             reason=f"[{profile.name}] total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window",
@@ -208,12 +220,22 @@ def _horizon_battery_plan(
     )
 
 
-def _build_schedule(state: SiteState, profile: ProfileWeights) -> tuple[list[PlanTask], str | None, str | None]:
-    """Build the forward-looking hourly plan and the next cheap/expensive windows."""
+def _build_schedule(
+    state: SiteState,
+    profile: ProfileWeights,
+    load_hourly_w: dict[int, float] | None = None,
+) -> tuple[list[PlanTask], str | None, str | None]:
+    """Build the forward-looking hourly plan and the next cheap/expensive windows.
+
+    Hours with enough forecast solar surplus (PV minus expected house load) are
+    marked SOLAR_CHARGE — the battery fills from the sun, so they are NOT shown
+    as grid-charge even when the price is cheap.
+    """
     view = _horizon_view(state, profile)
     if view is None:
         return [], None, None
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
+    load_hourly_w = load_hourly_w or {}
     tasks: list[PlanTask] = []
     next_cheap: str | None = None
     next_expensive: str | None = None
@@ -222,7 +244,14 @@ def _build_schedule(state: SiteState, profile: ProfileWeights) -> tuple[list[Pla
         is_expensive = slot.start in view.expensive_starts
         max_after = view.max_price_after(slot.start)
         worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
-        if is_cheap and worthwhile:
+        pv = solar_by_start.get(slot.start)
+        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
+        expected_load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
+        solar_surplus_kwh = solar_kwh - expected_load_kwh
+
+        if solar_surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
+            action = "SOLAR_CHARGE"
+        elif is_cheap and worthwhile:
             action = "GRID_CHARGE"
         elif is_expensive:
             action = "DISCHARGE"
@@ -230,13 +259,12 @@ def _build_schedule(state: SiteState, profile: ProfileWeights) -> tuple[list[Pla
             action = "LIMIT_EXPORT"
         else:
             action = "IDLE"
-        pv = solar_by_start.get(slot.start)
         tasks.append(
             PlanTask(
                 start=slot.start,
                 action=action,
                 total_import_price=round(slot.total_import_price, 4),
-                pv_estimate_kwh=round(pv.pv_estimate_kwh, 3) if pv else None,
+                pv_estimate_kwh=round(solar_kwh, 3) if pv else None,
             )
         )
         if action == "GRID_CHARGE" and next_cheap is None:
@@ -331,6 +359,7 @@ def build_battery_plan(
         and state.current_buy_price is not None
         and state.current_buy_price <= cheap_threshold
         and state.battery_soc_pct < max_soc
+        and state.solar_surplus_w < SOLAR_CHARGE_BLOCK_W
     ):
         return (
             BatteryPlan(
@@ -591,6 +620,7 @@ def build_control_plan(
     safe_reasons: list[str],
     negative_price_active: bool,
     battery_mode: str = BATTERY_MODE_BLUE,
+    load_hourly_w: dict[int, float] | None = None,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -598,7 +628,7 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
-    schedule, next_cheap_window, next_expensive_window = _build_schedule(state, profile_for(battery_mode))
+    schedule, next_cheap_window, next_expensive_window = _build_schedule(state, profile_for(battery_mode), load_hourly_w)
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:
         # Home Assistant truncates entity states longer than 255 chars to

@@ -961,6 +961,65 @@ def test_f_savings():
     return checks
 
 
+# --------------------------------------------------------------------------- #
+# 13. Solar-aware charging (don't grid-charge when solar covers it).
+# --------------------------------------------------------------------------- #
+def test_solar_aware():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 8, h, 0, tzinfo=TZ)
+
+    def pslot(h, total):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=0.4)
+
+    def sslot(h, kwh):
+        return models.SolarSlot(start=at(h), pv_estimate_kwh=kwh)
+
+    def make_state(now, soc, price_slots, solar_slots, pv=0.0, load=0.0):
+        return models.SiteState(
+            timestamp=now, pv_power_w=pv, load_power_w=load, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.2, current_sell_price=0.4, forecast_today_kwh=0.0,
+            price_slots=price_slots, solar_slots=solar_slots,
+        )
+
+    totals = {h: (0.15 if 10 <= h <= 14 else (1.6 if 18 <= h <= 20 else 0.6)) for h in range(24)}
+    totals[3] = 0.15  # a cheap night hour with no solar
+    day = [pslot(h, totals[h]) for h in range(24)]
+    solar = [sslot(h, 5.0 if 10 <= h <= 14 else 0.0) for h in range(24)]
+
+    def bp(state):
+        plan, _ = planner.build_battery_plan(
+            state, battery_mode="blue", min_soc=20, max_soc=90, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        return plan
+
+    # Live decision: cheap hour, no live solar -> grid charge; with live solar -> not.
+    checks.append(("cheap hour, no live solar -> GRID_CHARGE", bp(make_state(at(12), 50, day, [], pv=0.0, load=0.0)).strategy == "GRID_CHARGE", bp(make_state(at(12), 50, day, [], 0.0, 0.0)).strategy))
+    checks.append(("cheap hour WITH live solar surplus -> not GRID_CHARGE", bp(make_state(at(12), 50, day, [], pv=6000.0, load=1000.0)).strategy != "GRID_CHARGE", bp(make_state(at(12), 50, day, [], 6000.0, 1000.0)).strategy))
+
+    # Schedule: solar-rich cheap midday -> SOLAR_CHARGE; cheap night without solar -> GRID_CHARGE.
+    st = make_state(at(0), 50, day, solar)
+    plan = bp(st)
+    cp = planner.build_control_plan(
+        st, battery_plan=plan, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""),
+        safe_reasons=[], negative_price_active=False, load_hourly_w={h: 1900 for h in range(24)},
+    )
+    actions = {t.start.hour: t.action for t in cp.schedule}
+    checks.append(("solar-rich cheap midday -> SOLAR_CHARGE", actions.get(12) == "SOLAR_CHARGE", str(actions.get(12))))
+    checks.append(("cheap night, no solar -> GRID_CHARGE in schedule", actions.get(3) == "GRID_CHARGE", str(actions.get(3))))
+
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -991,7 +1050,8 @@ def main():
                          ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
-                         ("PHASE F · SAVINGS / VALUE", test_f_savings)):
+                         ("PHASE F · SAVINGS / VALUE", test_f_savings),
+                         ("SOLAR-AWARE CHARGING", test_solar_aware)):
         print("\n" + "-" * 100)
         print(title)
         try:
