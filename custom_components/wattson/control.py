@@ -1,14 +1,19 @@
 """Control adapters for Wattson."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
-from .const import EV_PHASE_LOCK_MINUTES
+from .const import (
+    CONTENTION_WINDOW_SECONDS,
+    CONTENTION_WRITE_THRESHOLD,
+    EV_PHASE_LOCK_MINUTES,
+)
 from .models import BatteryPlan, EntityMapping, EvPlan, SiteState
+from .safety import is_contended, prune_history
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +31,37 @@ class KlatremisController:
         # entity_id -> consecutive unconverged write attempts
         self._write_attempts: dict[str, int] = {}
         self.degraded_entities: set[str] = set()
+        # Phase E part 2: entity_id -> timestamps of corrective writes (a write
+        # that actually issued a service call because the value had drifted).
+        # A competing controller shows up as the same control being rewritten
+        # again and again within the contention window.
+        self._write_history: dict[str, list[datetime]] = {}
+
+    def _record_write(self, entity_id: str | None, now: datetime | None) -> None:
+        if not entity_id or now is None:
+            return
+        history = prune_history(self._write_history.get(entity_id, []), now, CONTENTION_WINDOW_SECONDS)
+        history.append(now)
+        self._write_history[entity_id] = history
+
+    def contended_entities(self, now: datetime) -> list[str]:
+        """Control entities Wattson has had to re-assert too often (likely a
+        competing controller). Prunes the history as a side effect."""
+        contended: list[str] = []
+        for entity_id, history in list(self._write_history.items()):
+            pruned = prune_history(history, now, CONTENTION_WINDOW_SECONDS)
+            self._write_history[entity_id] = pruned
+            if not pruned:
+                del self._write_history[entity_id]
+            elif is_contended(pruned, now, CONTENTION_WINDOW_SECONDS, CONTENTION_WRITE_THRESHOLD):
+                contended.append(entity_id)
+        return contended
+
+    def reset_write_history(self) -> None:
+        """Clear contention state so the next tick re-probes from scratch."""
+        self._write_history.clear()
+        self._write_attempts.clear()
+        self.degraded_entities.clear()
 
     def _mark_converged(self, entity_id: str) -> None:
         self._write_attempts.pop(entity_id, None)
@@ -89,16 +125,29 @@ class KlatremisController:
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, value, degraded)]
 
-    async def apply_battery_plan(self, mapping: EntityMapping, plan: BatteryPlan) -> list[str]:
+    async def apply_battery_plan(
+        self, mapping: EntityMapping, plan: BatteryPlan, now: datetime | None = None
+    ) -> list[str]:
         actions: list[str] = []
-        actions.extend(await self._set_switch(mapping.grid_charge_switch, plan.desired_grid_charge) if plan.desired_grid_charge is not None else [])
-        actions.extend(await self._set_switch(mapping.solar_sell_switch, plan.desired_solar_sell) if plan.desired_solar_sell is not None else [])
-        actions.extend(await self._set_select(mapping.energy_priority_select, plan.desired_energy_priority))
-        actions.extend(await self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
-        actions.extend(await self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
-        actions.extend(await self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
-        actions.extend(await self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
-        actions.extend(await self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
+
+        async def do(entity_id: str | None, coro) -> None:
+            result = await coro
+            if result:
+                # An actual service call was issued (the value had drifted), so
+                # record it for competing-controller detection.
+                self._record_write(entity_id, now)
+            actions.extend(result)
+
+        if plan.desired_grid_charge is not None:
+            await do(mapping.grid_charge_switch, self._set_switch(mapping.grid_charge_switch, plan.desired_grid_charge))
+        if plan.desired_solar_sell is not None:
+            await do(mapping.solar_sell_switch, self._set_switch(mapping.solar_sell_switch, plan.desired_solar_sell))
+        await do(mapping.energy_priority_select, self._set_select(mapping.energy_priority_select, plan.desired_energy_priority))
+        await do(mapping.limit_control_mode_select, self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
+        await do(mapping.export_limit_number, self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
+        await do(mapping.battery_grid_charge_current_number, self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
+        await do(mapping.battery_charge_current_number, self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
+        await do(mapping.battery_discharge_current_number, self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
         return actions
 
 

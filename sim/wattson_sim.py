@@ -92,6 +92,7 @@ def _load_wattson():
 
 _install_ha_stubs()
 const, models, horizon, learning, mapping, planner, control = _load_wattson()
+safety = importlib.import_module("wattson.safety")
 State = sys.modules["homeassistant.core"].State
 
 
@@ -1076,6 +1077,93 @@ def test_e_override():
 
 
 # --------------------------------------------------------------------------- #
+# 12c. Phase E part 2 — cooldowns + master-controller lock.
+# --------------------------------------------------------------------------- #
+def test_e2_master_lock():
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone.utc
+    t0 = datetime(2026, 6, 8, 12, 0, tzinfo=TZ)
+
+    # --- write cooldown (anti-flap) ---
+    checks.append(("cooldown: first write allowed", safety.write_allowed(None, 30, t0) is True, "None"))
+    checks.append(("cooldown: within window blocked", safety.write_allowed(t0, 30, t0 + timedelta(seconds=10)) is False, "10s"))
+    checks.append(("cooldown: after window allowed", safety.write_allowed(t0, 30, t0 + timedelta(seconds=31)) is True, "31s"))
+
+    # --- contention window math ---
+    hist = [t0 - timedelta(seconds=s) for s in (0, 100, 200, 700)]
+    checks.append(("prune drops out-of-window stamps", len(safety.prune_history(hist, t0, 600)) == 3, str(len(safety.prune_history(hist, t0, 600)))))
+    checks.append(("not contended below threshold", safety.is_contended(hist, t0, 600, 5) is False, "3<5"))
+    checks.append(("contended at threshold", safety.is_contended([t0] * 5, t0, 600, 5) is True, "5>=5"))
+
+    # --- controller flags a competing controller from repeated corrective writes ---
+    eid = "switch.klatremishw_deye_grid_charge"
+
+    class _States:
+        def __init__(self):
+            self._m = {eid: State("off")}
+
+        def get(self, e):
+            return self._m.get(e)
+
+        def set(self, e, v):
+            self._m[e] = State(str(v))
+
+    class _Services:
+        def __init__(self, states, apply):
+            self.states, self.apply = states, apply
+
+        async def async_call(self, domain, service, data, blocking=False):
+            if not self.apply:
+                return
+            self.states.set(data["entity_id"], "on" if service == "turn_on" else "off")
+
+    class _Hass:
+        def __init__(self, states, services):
+            self.states, self.services = states, services
+
+    mp = types.SimpleNamespace(
+        grid_charge_switch=eid, solar_sell_switch=None, energy_priority_select=None,
+        limit_control_mode_select=None, export_limit_number=None,
+        battery_grid_charge_current_number=None, battery_charge_current_number=None,
+        battery_discharge_current_number=None,
+    )
+    plan = models.BatteryPlan(strategy="x", reason="x", desired_grid_charge=True)
+    threshold = const.CONTENTION_WRITE_THRESHOLD
+
+    # Competing controller: the value never sticks, so every re-assert writes.
+    states = _States()
+    ctrl = control.KlatremisController(_Hass(states, _Services(states, apply=False)))
+    for i in range(threshold):
+        asyncio.run(ctrl.apply_battery_plan(mp, plan, t0 + timedelta(seconds=40 * i)))
+    detected = ctrl.contended_entities(t0 + timedelta(seconds=40 * threshold))
+    checks.append(("competing controller detected after repeated re-asserts", eid in detected, str(detected)))
+
+    # Healthy device: the value sticks after one write -> never flagged.
+    states2 = _States()
+    ctrl2 = control.KlatremisController(_Hass(states2, _Services(states2, apply=True)))
+    for i in range(threshold + 2):
+        asyncio.run(ctrl2.apply_battery_plan(mp, plan, t0 + timedelta(seconds=40 * i)))
+    checks.append(("stable device never flagged", ctrl2.contended_entities(t0 + timedelta(seconds=400)) == [], str(ctrl2.contended_entities(t0 + timedelta(seconds=400)))))
+
+    # reset clears contention so the next probe starts fresh.
+    ctrl.reset_write_history()
+    checks.append(("reset clears contention", ctrl.contended_entities(t0 + timedelta(seconds=400)) == [], "after reset"))
+
+    # writes that fall outside the window age out and stop counting as contention.
+    states3 = _States()
+    ctrl3 = control.KlatremisController(_Hass(states3, _Services(states3, apply=False)))
+    for i in range(threshold):
+        asyncio.run(ctrl3.apply_battery_plan(mp, plan, t0 + timedelta(seconds=40 * i)))
+    far = t0 + timedelta(seconds=const.CONTENTION_WINDOW_SECONDS + 1000)
+    checks.append(("old corrective writes age out of the window", ctrl3.contended_entities(far) == [], str(ctrl3.contended_entities(far))))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 13. Solar-aware charging (don't grid-charge when solar covers it).
 # --------------------------------------------------------------------------- #
 def test_solar_aware():
@@ -1239,6 +1327,7 @@ def main():
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
+                         ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),
                          ("SOC-AWARE SCHEDULE", test_soc_schedule)):

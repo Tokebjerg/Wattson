@@ -4,7 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from homeassistant.components.binary_sensor import BinarySensorEntity, BinarySensorEntityDescription
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -50,6 +54,13 @@ BINARY_SENSORS: tuple[WattsonBinarySensorDescription, ...] = (
         icon="mdi:cash-remove",
         value_fn=lambda c: bool(c.control_plan and c.control_plan.negative_price_active),
     ),
+    WattsonBinarySensorDescription(
+        key="control_contended",
+        name="Competing Controller",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        icon="mdi:account-alert-outline",
+        value_fn=lambda c: bool(getattr(c, "battery_contended", False)),
+    ),
 )
 
 
@@ -76,3 +87,14 @@ class WattsonBinarySensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool | None:
         return self.entity_description.value_fn(self.coordinator)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.key == "control_contended":
+            until = getattr(self.coordinator, "_battery_contended_until", None)
+            return {
+                "contended_entities": list(getattr(self.coordinator, "contended_entities", [])),
+                "backoff_until": until.isoformat() if until else None,
+                "master_lock_enabled": bool(getattr(self.coordinator, "master_lock_enabled", True)),
+            }
+        return None

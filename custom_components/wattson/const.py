@@ -132,6 +132,22 @@ EV_MODES = [
 EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
 EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
 
+# Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
+# the inverter / charger more often than this, so a rapidly oscillating plan
+# cannot hammer the hardware.
+INVERTER_WRITE_COOLDOWN_SECONDS = 30
+EV_WRITE_COOLDOWN_SECONDS = 10
+
+# Phase E part 2: master-controller lock. The battery plan is re-asserted every
+# tick (idempotent — only writes on drift); if Wattson has to correct the SAME
+# inverter control this many times within the window, a competing controller is
+# suspected and Wattson backs off (then re-probes) while it stays contended.
+CONTENTION_WINDOW_SECONDS = 600        # 10 min look-back for corrective writes
+CONTENTION_WRITE_THRESHOLD = 5         # corrective writes within the window -> contended
+MASTER_LOCK_BACKOFF_SECONDS = 600      # back off control while contended, then re-probe
+CONF_MASTER_LOCK_ENABLED = "master_lock_enabled"
+DEFAULT_MASTER_LOCK_ENABLED = True
+
 # Phase E: timed manual override. A forced action wins over the AI plan for a
 # configurable number of minutes, then the system auto-resumes the normal plan.
 CONF_OVERRIDE_MINUTES = "override_minutes"

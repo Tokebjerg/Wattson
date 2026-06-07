@@ -79,11 +79,17 @@ from .const import (
     DEFAULT_OVERRIDE_MINUTES,
     OVERRIDE_MIN_MINUTES,
     OVERRIDE_MAX_MINUTES,
+    CONF_MASTER_LOCK_ENABLED,
+    DEFAULT_MASTER_LOCK_ENABLED,
+    INVERTER_WRITE_COOLDOWN_SECONDS,
+    EV_WRITE_COOLDOWN_SECONDS,
+    MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
     UPDATE_INTERVAL,
 )
 from .control import EaseeController, KlatremisController
+from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
 from .horizon import current_price_slot
@@ -128,7 +134,16 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.battery_mode = LEGACY_BATTERY_MODE_MAP.get(_raw_battery_mode, _raw_battery_mode)
         self._klatremis = KlatremisController(hass)
         self._easee = EaseeController(hass)
-        self._last_fingerprint: tuple[Any, ...] | None = None
+        # EV writes are not idempotent, so they are still gated on the plan
+        # changing. The battery plan is re-asserted continuously (idempotent).
+        self._last_ev_fp: tuple[Any, ...] | None = None
+        # Phase E part 2: per-device write cooldowns + master-controller lock.
+        self._last_battery_write_at: datetime | None = None
+        self._last_ev_write_at: datetime | None = None
+        self._battery_contended_until: datetime | None = None
+        self.battery_contended = False
+        self.contended_entities: list[str] = []
+        self.master_lock_enabled = bool(entry_value(entry, CONF_MASTER_LOCK_ENABLED, DEFAULT_MASTER_LOCK_ENABLED))
         self._default_export_limit_w: float | None = None
         self._default_discharge_current_a: float | None = None
         self._default_charge_current_a: float | None = None
@@ -237,7 +252,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.battery_override_until = None
         self.ev_override = EV_OVERRIDE_AUTO
         self.ev_override_until = None
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         await self.async_request_refresh()
 
     def _override_remaining_minutes(self, until: datetime | None) -> int | None:
@@ -259,11 +274,11 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until and now >= self.battery_override_until:
             self.battery_override = BATTERY_OVERRIDE_AUTO
             self.battery_override_until = None
-            self._last_fingerprint = None
+            self._last_ev_fp = None
         if self.ev_override != EV_OVERRIDE_AUTO and self.ev_override_until and now >= self.ev_override_until:
             self.ev_override = EV_OVERRIDE_AUTO
             self.ev_override_until = None
-            self._last_fingerprint = None
+            self._last_ev_fp = None
 
     async def async_set_battery_override(self, action: str) -> None:
         if action not in BATTERY_OVERRIDE_OPTIONS:
@@ -276,7 +291,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             # passive pause so the forced action is actually applied.
             self.pause_until = None
             self.battery_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         await self.async_request_refresh()
 
     async def async_set_ev_override(self, action: str) -> None:
@@ -288,7 +303,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         else:
             self.pause_until = None
             self.ev_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         await self.async_request_refresh()
 
     async def async_set_override_minutes(self, minutes: int) -> None:
@@ -297,63 +312,74 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_OVERRIDE_MINUTES: clamped})
         await self.async_request_refresh()
 
+    async def async_set_master_lock_enabled(self, enabled: bool) -> None:
+        self.master_lock_enabled = bool(enabled)
+        if not enabled:
+            # Turning the lock off lifts any active back-off and re-probes.
+            self._battery_contended_until = None
+            self.battery_contended = False
+            self.contended_entities = []
+            self._klatremis.reset_write_history()
+        update_entry_options(self.hass, self.config_entry, **{CONF_MASTER_LOCK_ENABLED: bool(enabled)})
+        await self.async_request_refresh()
+
     async def async_set_ev_mode(self, mode: str) -> None:
         self.ev_mode = mode
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_MODE_DEFAULT: mode})
         await self.async_request_refresh()
 
     async def async_set_ev_window_start(self, hour: int) -> None:
         self.ev_window_start = int(hour)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_WINDOW_START: int(hour)})
         await self.async_request_refresh()
 
     async def async_set_ev_window_end(self, hour: int) -> None:
         self.ev_window_end = int(hour)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_WINDOW_END: int(hour)})
         await self.async_request_refresh()
 
     async def async_set_ev_solar_battery_priority(self, enabled: bool) -> None:
         self.ev_solar_battery_priority = bool(enabled)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_SOLAR_BATTERY_PRIORITY: bool(enabled)})
         await self.async_request_refresh()
 
     async def async_set_ev_solar_battery_threshold(self, percent: float) -> None:
         self.ev_solar_battery_threshold = float(percent)
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_SOLAR_BATTERY_THRESHOLD: float(percent)})
         await self.async_request_refresh()
 
     async def async_set_battery_mode(self, mode: str) -> None:
         self.battery_mode = mode
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MODE_DEFAULT: mode})
         await self.async_request_refresh()
 
     async def async_set_shadow_mode(self, enabled: bool) -> None:
         self.shadow_mode = enabled
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_SHADOW_MODE: enabled})
         await self.async_request_refresh()
 
     async def async_set_control_enabled(self, enabled: bool) -> None:
         self.automation_enabled = enabled
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_AUTOMATION_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_battery_control_enabled(self, enabled: bool) -> None:
         self.battery_control_enabled = enabled
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_ev_control_enabled(self, enabled: bool) -> None:
         self.ev_control_enabled = enabled
-        self._last_fingerprint = None
+        self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
@@ -548,20 +574,67 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:
-            await self._async_apply_plan(self.control_plan)
+            await self._async_apply_plan(self.control_plan, dt_util.utcnow())
         else:
             self.last_actions = []
         return self.control_plan
 
-    async def _async_apply_plan(self, plan: ControlPlan) -> None:
+    async def _async_apply_plan(self, plan: ControlPlan, now: datetime) -> None:
         if self.mapping is None or self.site_state is None:
             return
-        fingerprint = (
-            plan.battery.desired_grid_charge,
-            plan.battery.desired_solar_sell,
-            plan.battery.desired_energy_priority,
-            plan.battery.desired_limit_control_mode,
-            plan.battery.desired_export_limit_w,
+
+        actions: list[str] = []
+        try:
+            actions.extend(await self._async_apply_battery(plan, now))
+            actions.extend(await self._async_apply_ev(plan, now))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Failed to apply control plan: %s", err)
+            self.last_actions = [f"Execution error: {err}"]
+            self._last_ev_fp = None
+            return
+
+        self.last_actions = actions
+
+    async def _async_apply_battery(self, plan: ControlPlan, now: datetime) -> list[str]:
+        """Continuously re-assert the battery plan (idempotent writes), bounded by
+        the inverter cooldown, with master-controller-lock back-off."""
+        actions: list[str] = []
+        # Expire an elapsed contention back-off and re-probe from a clean slate.
+        if self._battery_contended_until is not None and now >= self._battery_contended_until:
+            self._battery_contended_until = None
+            self.contended_entities = []
+            self._klatremis.reset_write_history()
+
+        backed_off = self.master_lock_enabled and self._battery_contended_until is not None
+        if self.battery_control_enabled and not backed_off:
+            if write_allowed(self._last_battery_write_at, INVERTER_WRITE_COOLDOWN_SECONDS, now):
+                acts = await self._klatremis.apply_battery_plan(self.mapping, plan.battery, now)
+                if acts:
+                    self._last_battery_write_at = now
+                actions.extend(acts)
+                # A competing controller shows up as repeated corrective writes.
+                contended = self._klatremis.contended_entities(now)
+                if contended:
+                    self.contended_entities = contended
+                    self._battery_contended_until = now + timedelta(seconds=MASTER_LOCK_BACKOFF_SECONDS)
+                    _LOGGER.warning(
+                        "Wattson suspects a competing controller writing %s; backing off battery control",
+                        ", ".join(contended),
+                    )
+        elif backed_off:
+            actions.append(
+                f"battery control backed off — competing controller suspected on {', '.join(self.contended_entities)}"
+            )
+
+        self.battery_contended = self._battery_contended_until is not None
+        return actions
+
+    async def _async_apply_ev(self, plan: ControlPlan, now: datetime) -> list[str]:
+        """Apply the EV plan only when it changes (Easee service calls are not
+        idempotent), bounded by the EV cooldown."""
+        if not self.ev_control_enabled:
+            return []
+        ev_fp = (
             plan.ev.mode,
             plan.ev.desired_enabled,
             plan.ev.desired_amps,
@@ -569,24 +642,16 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             plan.ev.desired_phase_mode,
             plan.ev.desired_action,
         )
-        if fingerprint == self._last_fingerprint:
-            self.last_actions = []
-            return
-
-        actions: list[str] = []
-        try:
-            if self.battery_control_enabled:
-                actions.extend(await self._klatremis.apply_battery_plan(self.mapping, plan.battery))
-            if self.ev_control_enabled:
-                actions.extend(await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev))
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.exception("Failed to apply control plan: %s", err)
-            self.last_actions = [f"Execution error: {err}"]
-            self._last_fingerprint = None
-            return
-
-        self.last_actions = actions
-        self._last_fingerprint = fingerprint
+        if ev_fp == self._last_ev_fp:
+            return []
+        if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
+            # Cooldown active: leave the fingerprint unset so we retry next tick.
+            return []
+        acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev)
+        if acts:
+            self._last_ev_write_at = now
+        self._last_ev_fp = ev_fp
+        return acts
 
     def _grid_power_sign_should_be_inverted(self) -> bool:
         configured = bool(entry_value(self.config_entry, CONF_INVERT_GRID_POWER_SIGN, DEFAULT_INVERT_GRID_POWER_SIGN))

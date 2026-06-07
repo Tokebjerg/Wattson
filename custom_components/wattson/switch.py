@@ -22,6 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             WattsonBatteryControlSwitch(coordinator, entry),
             WattsonEVControlSwitch(coordinator, entry),
             WattsonEVSolarBatteryPrioritySwitch(coordinator, entry),
+            WattsonMasterLockSwitch(coordinator, entry),
         ]
     )
 
@@ -127,4 +128,24 @@ class WattsonEVSolarBatteryPrioritySwitch(_BaseSwitch):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._coordinator.async_set_ev_solar_battery_priority(False)
+        self.async_write_ha_state()
+
+
+class WattsonMasterLockSwitch(_BaseSwitch):
+    """Phase E part 2: back off battery control when a competing controller is
+    detected. When off, contention is still reported but control is not paused."""
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "Master Controller Lock", "master_lock_enabled", "mdi:lock-check-outline")
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coordinator.master_lock_enabled)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_master_lock_enabled(True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_master_lock_enabled(False)
         self.async_write_ha_state()
