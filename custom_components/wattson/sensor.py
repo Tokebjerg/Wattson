@@ -170,6 +170,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     coordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[Any] = [WattsonSensor(coordinator, entry, description) for description in SENSORS]
     entities.append(WattsonSavingsSensor(coordinator, entry))
+    entities.append(WattsonSavingsTotalSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -247,3 +248,39 @@ class WattsonSavingsSensor(CoordinatorEntity, RestoreSensor):
     @property
     def native_value(self) -> float:
         return round(self.coordinator.value_today_kr, 2)
+
+
+class WattsonSavingsTotalSensor(CoordinatorEntity, RestoreSensor):
+    """Phase F: lifetime cumulative delivered value; source for utility_meter cycles."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Savings Total"
+    _attr_icon = "mdi:cash-multiple"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_savings_total"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        try:
+            # Lifetime counter: always restore (no date gate).
+            self.coordinator.value_total_kr = float(last_state.state)
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.value_total_kr, 2)

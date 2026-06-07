@@ -113,6 +113,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
         self.value_today_kr: float = 0.0
+        self.value_total_kr: float = 0.0
         self._value_day = None
         self._value_last_tick: datetime | None = None
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
@@ -181,24 +182,25 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         now = dt_util.utcnow()
         today = dt_util.now().date()
         if self._value_day != today:
+            # New local day: reset today's figure. The lifetime total is never reset.
             self._value_day = today
             self.value_today_kr = 0.0
-            self._value_last_tick = now
-            return
-        if self._value_last_tick is None:
-            self._value_last_tick = now
-            return
-        dt_hours = (now - self._value_last_tick).total_seconds() / 3600.0
+        last = self._value_last_tick
         self._value_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return  # skip restart/sleep gaps
         slot = current_price_slot(state.price_slots, state.timestamp) if state.price_slots else None
         import_price = slot.total_import_price if slot else state.current_buy_price
         export_price = slot.export_value if (slot and slot.export_value is not None) else state.current_sell_price
-        self.value_today_kr += value_increment_kr(
+        inc = value_increment_kr(
             state.load_power_w, state.grid_import_power_w, state.grid_export_power_w,
             import_price, export_price, dt_hours,
         )
+        self.value_today_kr += inc
+        self.value_total_kr += inc
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
