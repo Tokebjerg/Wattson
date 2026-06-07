@@ -167,6 +167,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "action": task.action,
                     "total_import_price": task.total_import_price,
                     "pv_estimate_kwh": task.pv_estimate_kwh,
+                    "projected_soc_pct": task.projected_soc_pct,
                 }
                 for task in c.control_plan.schedule
             ]
