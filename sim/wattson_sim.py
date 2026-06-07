@@ -700,6 +700,44 @@ def test_a2_planning():
     h12 = next((t for t in cp.schedule if t.start == at(12)), None)
     checks.append(("schedule carries solar estimate @12", h12 is not None and h12.pv_estimate_kwh == 7.0, f"{getattr(h12, 'pv_estimate_kwh', None)}"))
 
+    # Peak-solar-export in the forward schedule: expensive sunny morning sells
+    # the surplus (trickle only), then the cheap midday sun does the bulk charge.
+    # Morning 6-10 = 1.20 (above avg, export), midday 11-15 = 0.20 (below avg).
+    pe_totals = {h: 0.30 for h in range(6)}
+    pe_totals.update({h: 1.20 for h in range(6, 11)})
+    pe_totals.update({h: 0.20 for h in range(11, 16)})
+    pe_totals.update({h: 0.50 for h in range(16, 24)})
+    pe_day = [pslot(h, pe_totals[h], exp=0.5) for h in range(24)]
+    pe_solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=5.0) for h in range(6, 16)]
+    pe_state = models.SiteState(
+        timestamp=at(0), pv_power_w=0.0, load_power_w=1500.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=30.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=40.0,
+        price_slots=pe_day, solar_slots=pe_solar,
+    )
+
+    def pe_schedule(mode):
+        bp_pe, neg_pe = planner.build_battery_plan(
+            pe_state, battery_mode=mode, min_soc=20, max_soc=90, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        cp_pe = planner.build_control_plan(
+            pe_state, battery_plan=bp_pe, ev_plan=models.EvPlan(mode="x", reason=""),
+            safe_reasons=[], negative_price_active=neg_pe, battery_mode=mode,
+            load_hourly_w={h: 1500 for h in range(24)}, capacity_kwh=10.0, min_soc=20, max_soc=90,
+        )
+        return {t.start.hour: t for t in cp_pe.schedule}
+
+    blue_sched = pe_schedule(const.BATTERY_MODE_BLUE)
+    green_sched = pe_schedule(const.BATTERY_MODE_GREEN)
+    checks.append(("schedule: expensive sunny morning -> EXPORT (sell surplus)", blue_sched[7].action == "EXPORT", blue_sched[7].action))
+    checks.append(("schedule: morning export only trickle-charges (slow SOC rise)", blue_sched[7].projected_soc_pct <= blue_sched[6].projected_soc_pct + 6, f"{blue_sched[6].projected_soc_pct}->{blue_sched[7].projected_soc_pct}"))
+    checks.append(("schedule: cheap midday sun -> SOLAR_CHARGE (bulk fill)", blue_sched[11].action == "SOLAR_CHARGE", blue_sched[11].action))
+    checks.append(("schedule: Green keeps charging at sunny morning (no peak-sell)", green_sched[7].action == "SOLAR_CHARGE", green_sched[7].action))
+
     # Legacy fallback intact when no horizon present.
     bp_legacy = plan_at(at(3), 50, [])
     checks.append(("no horizon -> legacy flat-threshold still works (GRID_CHARGE)", bp_legacy.strategy == "GRID_CHARGE", bp_legacy.strategy))
@@ -770,6 +808,32 @@ def test_b_profiles():
 
     # 5. Protect overrides everything.
     checks.append(("protect -> PROTECT", plan("protect", make_state(at(0), 50, spread_curve)).strategy == "PROTECT", plan("protect", make_state(at(0), 50, spread_curve)).strategy))
+
+    # 6. Peak-solar-export: above-average price + solar surplus -> sell the
+    #    surplus and only trickle-charge (10A); save bulk charge for cheap sun.
+    #    Full remaining day: expensive sunny morning, cheap midday, mid evening.
+    #    "Above average" is judged over the remaining horizon, like in production.
+    peak_totals = {h: 1.20 for h in range(7, 11)}   # expensive morning/forenoon
+    peak_totals.update({h: 0.20 for h in range(11, 16)})  # cheap midday sun
+    peak_totals.update({h: 0.50 for h in range(16, 24)})  # mid evening
+    peak_day = [pslot(h, peak_totals[h], exp=0.5) for h in range(7, 24)]
+    st6 = make_state(at(7), 60, peak_day, pv=6000.0, load=1000.0)  # surplus 5000W, 1.20 > avg
+    blue6, red6, green6 = plan("blue", st6), plan("red", st6), plan("green", st6)
+    checks.append(("Blue sells solar at above-avg sunny hour", blue6.strategy == "SELL_SOLAR_PEAK", blue6.strategy))
+    checks.append(("Blue trickle-charges at 10A during peak export", blue6.desired_max_charge_current_a == 10, str(blue6.desired_max_charge_current_a)))
+    checks.append(("Blue sells the surplus during peak export", blue6.desired_solar_sell is True, str(blue6.desired_solar_sell)))
+    checks.append(("Red also sells solar at above-avg sunny hour", red6.strategy == "SELL_SOLAR_PEAK", red6.strategy))
+    checks.append(("Green does NOT peak-sell (self-sufficiency)", green6.strategy != "SELL_SOLAR_PEAK", green6.strategy))
+
+    # 7. Below-average sunny hour: even export-friendly Blue charges, not sells.
+    #    now=midday (0.20) with cheap midday + mid evening remaining -> below avg.
+    midday_day = [pslot(h, peak_totals[h], exp=0.5) for h in range(11, 24)]
+    st7 = make_state(at(11), 60, midday_day, pv=6000.0, load=1000.0)
+    checks.append(("Blue does NOT peak-sell below average price", plan("blue", st7).strategy != "SELL_SOLAR_PEAK", plan("blue", st7).strategy))
+
+    # 8. Battery full: nothing left to trickle-charge, so don't enter peak-sell.
+    st8 = make_state(at(7), 90, peak_day, pv=6000.0, load=1000.0)
+    checks.append(("Blue does NOT peak-sell when battery full", plan("blue", st8).strategy != "SELL_SOLAR_PEAK", plan("blue", st8).strategy))
 
     return checks
 

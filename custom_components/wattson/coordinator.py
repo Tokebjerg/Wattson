@@ -108,6 +108,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._last_fingerprint: tuple[Any, ...] | None = None
         self._default_export_limit_w: float | None = None
         self._default_discharge_current_a: float | None = None
+        self._default_charge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
@@ -288,6 +289,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     self._default_discharge_current_a = float(discharge_limit_state.state)
                 except (TypeError, ValueError):
                     self._default_discharge_current_a = None
+        if self._default_charge_current_a is None and self.mapping.battery_charge_current_number:
+            charge_limit_state = self.hass.states.get(self.mapping.battery_charge_current_number)
+            if charge_limit_state is not None:
+                try:
+                    self._default_charge_current_a = float(charge_limit_state.state)
+                except (TypeError, ValueError):
+                    self._default_charge_current_a = None
         self.site_state = build_site_state(
             self.hass,
             self.mapping,
@@ -397,6 +405,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             battery_plan = replace(
                 battery_plan,
                 desired_discharge_current_a=self._default_discharge_current_a,
+            )
+
+        # Restore the normal max battery charge current unless the plan asked for
+        # a trickle (peak-solar-export), so 10A doesn't stick after the peak.
+        if self._default_charge_current_a is not None and battery_plan.desired_max_charge_current_a is None:
+            battery_plan = replace(
+                battery_plan,
+                desired_max_charge_current_a=self._default_charge_current_a,
             )
 
         safe_reasons: list[str] = []

@@ -97,6 +97,7 @@ class KlatremisController:
         actions.extend(await self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
         actions.extend(await self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
         actions.extend(await self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
+        actions.extend(await self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
         actions.extend(await self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
         return actions
 

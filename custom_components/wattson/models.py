@@ -80,6 +80,9 @@ class ProfileWeights:
     profit_margin: float            # DKK/kWh value-add required (wear cost added on top)
     sell_at_peak: bool              # sell to grid during expensive hours
     self_consumption_first: bool    # hold PV/battery for own load; minimise export
+    sell_solar_at_peak: bool = False  # in above-average-price sunny hours, sell the
+                                    # solar surplus and only trickle-charge the battery,
+                                    # saving the bulk charge for cheap midday sun
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,7 @@ class BatteryPlan:
     desired_export_limit_w: float | None = None
     desired_charge_current_a: float | None = None
     desired_discharge_current_a: float | None = None
+    desired_max_charge_current_a: float | None = None
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,13 @@ SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
 # projection in the schedule, so it knows roughly how fast grid-charging fills.
 SCHEDULE_CHARGE_RATE_KWH = 5.0
 
+# Peak-solar-export (export-friendly profiles): in sunny hours priced above the
+# day's average, sell the surplus and only trickle-charge the battery at this
+# current (~0.5 kWh/h on a ~50V LV battery), saving the bulk charge for the
+# cheap midday sun.
+TRICKLE_CHARGE_A = 10
+TRICKLE_CHARGE_KWH = 0.5
+
 # Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
 # Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
 # (charge more, sell less, moderate reserve); Grøn = self-sufficiency (high
@@ -40,14 +47,17 @@ PROFILES: dict[str, ProfileWeights] = {
     BATTERY_MODE_RED: ProfileWeights(
         name="red", reserve_soc_offset=0, cheap_hours=8, expensive_hours=6,
         profit_margin=0.20, sell_at_peak=True, self_consumption_first=False,
+        sell_solar_at_peak=True,
     ),
     BATTERY_MODE_BLUE: ProfileWeights(
         name="blue", reserve_soc_offset=10, cheap_hours=5, expensive_hours=3,
         profit_margin=0.40, sell_at_peak=False, self_consumption_first=False,
+        sell_solar_at_peak=True,
     ),
     BATTERY_MODE_GREEN: ProfileWeights(
         name="green", reserve_soc_offset=15, cheap_hours=4, expensive_hours=2,
         profit_margin=0.50, sell_at_peak=False, self_consumption_first=True,
+        sell_solar_at_peak=False,
     ),
 }
 
@@ -105,6 +115,7 @@ class _HorizonView:
         by_price = sorted(slots, key=lambda s: s.total_import_price)
         self.cheap_starts = {s.start for s in by_price[:cheap_hours]}
         self.expensive_starts = {s.start for s in by_price[-expensive_hours:]} if slots else set()
+        self.mean_price = (sum(s.total_import_price for s in slots) / len(slots)) if slots else 0.0
 
     def max_price_after(self, start: datetime) -> float | None:
         future = [s.total_import_price for s in self.slots if s.start > start]
@@ -190,6 +201,24 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
+    if (
+        profile.sell_solar_at_peak
+        and price >= view.mean_price
+        and (current.export_value or 0) > 0
+        and state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
+        and state.battery_soc_pct < max_soc
+    ):
+        return BatteryPlan(
+            strategy="SELL_SOLAR_PEAK",
+            reason=f"[{profile.name}] price {price:.2f} above average with solar — selling the surplus and trickle-charging at {TRICKLE_CHARGE_A}A, saving the battery for cheap midday sun",
+            desired_grid_charge=False,
+            desired_solar_sell=True,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first",
+            desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=TRICKLE_CHARGE_A,
+        )
+
     if is_expensive and state.battery_soc_pct > discharge_floor:
         sell = profile.sell_at_peak and (current.export_value or 0) > 0
         return BatteryPlan(
@@ -272,7 +301,18 @@ def _build_schedule(
         max_after = view.max_price_after(slot.start)
         worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
 
-        if surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
+        price_high = slot.total_import_price >= view.mean_price and (slot.export_value or 0) > 0
+        if (
+            profile.sell_solar_at_peak
+            and surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH
+            and price_high
+            and soc_kwh < max_kwh - 0.05
+        ):
+            # Above-average price + sun: sell the surplus, trickle-charge only,
+            # and save the bulk battery charge for the cheap midday sun.
+            soc_kwh = min(max_kwh, soc_kwh + TRICKLE_CHARGE_KWH)
+            action = "EXPORT"
+        elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
             soc_kwh = min(max_kwh, soc_kwh + surplus_kwh)
             action = "SOLAR_CHARGE"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
