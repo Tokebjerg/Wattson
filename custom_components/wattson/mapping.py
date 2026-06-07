@@ -37,6 +37,7 @@ from .const import (
     CONF_TOU_ENABLE_SWITCH,
     KNOWN_DEFAULTS,
 )
+from .horizon import build_price_slots, build_solar_slots
 from .models import Capabilities, EntityMapping, SiteState
 
 
@@ -299,6 +300,11 @@ def build_site_state(
     sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
     forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
 
+    # Phase A trin A1: ingest the hourly planning horizon. Defensive — returns
+    # empty lists when the entities do not expose hourly attributes.
+    price_slots = build_price_slots(hass, mapping.buy_price_entity, mapping.sell_price_entity)
+    solar_slots = build_solar_slots(hass, mapping.forecast_today_entity)
+
     required_missing = [entity_id for entity_id in missing if entity_id in required_missing_entity_ids]
     if required_missing:
         issues.append(f"Missing required entities: {', '.join(required_missing)}")
@@ -346,4 +352,6 @@ def build_site_state(
         stale_required_entities=sorted(set(stale_required)),
         missing_entities=sorted(set(required_missing)),
         issues=issues,
+        price_slots=price_slots,
+        solar_slots=solar_slots,
     )

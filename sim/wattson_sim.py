@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Wattson behaviour simulation.
+
+Runs the *real* Wattson decision code (mapping.py + planner.py + the
+coordinator's EV-solar overrides) against a battery of synthetic scenarios and
+prints a pass/fail report. Home Assistant does not need to be installed: the
+handful of HA symbols the integration imports are stubbed in-memory before the
+real modules are loaded, so this exercises the actual shipping logic rather than
+a copy of it.
+
+Run:  python3 sim/wattson_sim.py
+Exit code is non-zero if any scenario check fails.
+"""
+from __future__ import annotations
+
+import importlib
+import sys
+import types
+from dataclasses import replace
+from datetime import datetime, timezone
+
+REPO_ROOT = "/Users/emiltokebjerg/Documents/Playground"
+WATTSON_DIR = f"{REPO_ROOT}/custom_components/wattson"
+
+
+# --------------------------------------------------------------------------- #
+# 1. Stub the minimal Home Assistant surface the integration imports.
+# --------------------------------------------------------------------------- #
+def _install_ha_stubs() -> None:
+    ha = types.ModuleType("homeassistant")
+
+    ha_const = types.ModuleType("homeassistant.const")
+
+    class Platform:
+        SENSOR = "sensor"
+        BINARY_SENSOR = "binary_sensor"
+        SWITCH = "switch"
+        SELECT = "select"
+        BUTTON = "button"
+
+    ha_const.Platform = Platform
+
+    ha_core = types.ModuleType("homeassistant.core")
+
+    class HomeAssistant:  # marker type only
+        pass
+
+    class State:
+        def __init__(self, state, attributes=None, last_updated=None):
+            self.state = state
+            self.attributes = attributes or {}
+            self.last_updated = last_updated or datetime.now(timezone.utc)
+
+    ha_core.HomeAssistant = HomeAssistant
+    ha_core.State = State
+
+    ha_util = types.ModuleType("homeassistant.util")
+    ha_util_dt = types.ModuleType("homeassistant.util.dt")
+    ha_util_dt.utcnow = lambda: datetime.now(timezone.utc)
+
+    ha.const = ha_const
+    ha.core = ha_core
+    ha.util = ha_util
+    ha_util.dt = ha_util_dt
+
+    sys.modules.update(
+        {
+            "homeassistant": ha,
+            "homeassistant.const": ha_const,
+            "homeassistant.core": ha_core,
+            "homeassistant.util": ha_util,
+            "homeassistant.util.dt": ha_util_dt,
+        }
+    )
+
+
+def _load_wattson():
+    """Load the real wattson submodules without running its __init__.py."""
+    pkg = types.ModuleType("wattson")
+    pkg.__path__ = [WATTSON_DIR]
+    sys.modules["wattson"] = pkg
+    const = importlib.import_module("wattson.const")
+    models = importlib.import_module("wattson.models")
+    horizon = importlib.import_module("wattson.horizon")
+    mapping = importlib.import_module("wattson.mapping")
+    planner = importlib.import_module("wattson.planner")
+    control = importlib.import_module("wattson.control")
+    return const, models, horizon, mapping, planner, control
+
+
+_install_ha_stubs()
+const, models, horizon, mapping, planner, control = _load_wattson()
+State = sys.modules["homeassistant.core"].State
+
+
+# --------------------------------------------------------------------------- #
+# 2. Fake hass whose .states.get() serves scenario entity states.
+# --------------------------------------------------------------------------- #
+class FakeStates:
+    def __init__(self, entities):
+        # entities: {entity_id: value} | {entity_id: (value, unit)}
+        #         | {entity_id: {"state": value, "attributes": {...}}}
+        self._map = {}
+        for eid, raw in entities.items():
+            if isinstance(raw, dict):
+                value = raw.get("state", "")
+                attrs = dict(raw.get("attributes", {}))
+            elif isinstance(raw, tuple):
+                value, unit = raw
+                attrs = {"unit_of_measurement": unit} if unit else {}
+            else:
+                value, attrs = raw, {}
+            self._map[eid] = State(str(value), attributes=attrs)
+
+    def get(self, entity_id):
+        return self._map.get(entity_id)
+
+
+class FakeHass:
+    def __init__(self, entities):
+        self.states = FakeStates(entities)
+
+
+# Default klatremis/Easee wiring (mirrors const.KNOWN_DEFAULTS).
+BASE_CONFIG = dict(const.KNOWN_DEFAULTS)
+
+E = {  # short aliases for the entity ids we set per scenario
+    "pv1": const.KNOWN_DEFAULTS[const.CONF_PV1_POWER_ENTITY],
+    "pv2": const.KNOWN_DEFAULTS[const.CONF_PV2_POWER_ENTITY],
+    "load": const.KNOWN_DEFAULTS[const.CONF_LOAD_POWER_ENTITY],
+    "grid": const.KNOWN_DEFAULTS[const.CONF_GRID_POWER_ENTITY],
+    "soc": const.KNOWN_DEFAULTS[const.CONF_BATTERY_SOC_ENTITY],
+    "bat": const.KNOWN_DEFAULTS[const.CONF_BATTERY_POWER_ENTITY],
+    "inv_online": const.KNOWN_DEFAULTS[const.CONF_INVERTER_ONLINE_ENTITY],
+    "inv_status": const.KNOWN_DEFAULTS[const.CONF_INVERTER_STATUS_ENTITY],
+    "buy": const.KNOWN_DEFAULTS[const.CONF_BUY_PRICE_ENTITY] if const.CONF_BUY_PRICE_ENTITY in const.KNOWN_DEFAULTS else "sensor.buy_price",
+    "sell": const.KNOWN_DEFAULTS[const.CONF_SELL_PRICE_ENTITY] if const.CONF_SELL_PRICE_ENTITY in const.KNOWN_DEFAULTS else "sensor.sell_price",
+    "ev_status": const.KNOWN_DEFAULTS[const.CONF_EASEE_STATUS_ENTITY],
+    "ev_power": const.KNOWN_DEFAULTS[const.CONF_EASEE_POWER_ENTITY],
+    "ev_phase": const.KNOWN_DEFAULTS[const.CONF_EASEE_PHASE_MODE_ENTITY],
+    "ev_online": const.KNOWN_DEFAULTS[const.CONF_EASEE_ONLINE_ENTITY],
+}
+
+# Price entities are not in KNOWN_DEFAULTS by default; wire them so scenarios can
+# drive prices. (If they ARE in KNOWN_DEFAULTS this is a harmless no-op.)
+BASE_CONFIG.setdefault(const.CONF_BUY_PRICE_ENTITY, E["buy"])
+BASE_CONFIG.setdefault(const.CONF_SELL_PRICE_ENTITY, E["sell"])
+
+
+# --------------------------------------------------------------------------- #
+# 3. Settings + one simulation tick (mirrors coordinator orchestration).
+# --------------------------------------------------------------------------- #
+class Settings:
+    battery_mode = const.BATTERY_MODE_HYBRID
+    ev_mode = const.EV_MODE_SOLAR_ONLY
+    min_soc = const.DEFAULT_BATTERY_MIN_SOC
+    max_soc = const.DEFAULT_BATTERY_MAX_SOC
+    cheap = const.DEFAULT_CHEAP_PRICE_THRESHOLD
+    expensive = const.DEFAULT_EXPENSIVE_PRICE_THRESHOLD
+    allow_grid_charge = const.DEFAULT_ALLOW_GRID_CHARGE
+    allow_negative_export = const.DEFAULT_ALLOW_NEGATIVE_EXPORT
+    ev_max_amps = const.DEFAULT_EV_MAX_AMPS
+    ev_min_surplus = const.DEFAULT_EV_SOLAR_MIN_SURPLUS_W
+    ev_windows = const.DEFAULT_EV_WINDOWS
+    battery_control_enabled = True
+    invert_grid_sign = const.DEFAULT_INVERT_GRID_POWER_SIGN
+    invert_battery_sign = const.DEFAULT_INVERT_BATTERY_POWER_SIGN
+    export_limit_default_w = 6000.0
+    discharge_current_default_a = 50.0
+    config_over = None  # optional {CONF_*: entity_id} overrides for the mapping
+
+    def __init__(self, **over):
+        for k, v in over.items():
+            setattr(self, k, v)
+
+
+def simulate_tick(entities, s: Settings):
+    hass = FakeHass(entities)
+    cfg = dict(BASE_CONFIG)
+    if s.config_over:
+        cfg.update(s.config_over)
+    m = mapping.build_entity_mapping(cfg)
+
+    # Force klatremis grid sign inversion exactly like coordinator does.
+    invert_grid = s.invert_grid_sign
+    if m.grid_power_entity == "sensor.klatremishw_deye_total_grid_power":
+        invert_grid = True
+
+    state = mapping.build_site_state(
+        hass,
+        m,
+        stale_seconds=const.DEFAULT_STALE_SECONDS,
+        invert_grid_power_sign=invert_grid,
+        invert_battery_power_sign=s.invert_battery_sign,
+    )
+
+    battery_plan, negative_price_active = planner.build_battery_plan(
+        state,
+        battery_mode=s.battery_mode,
+        min_soc=float(s.min_soc),
+        max_soc=float(s.max_soc),
+        cheap_threshold=float(s.cheap),
+        expensive_threshold=float(s.expensive),
+        allow_grid_charge=s.allow_grid_charge,
+        allow_negative_export=s.allow_negative_export,
+        export_limit_default_w=s.export_limit_default_w,
+    )
+    ev_plan = planner.build_ev_plan(
+        state,
+        ev_mode=s.ev_mode,
+        ev_max_amps=int(s.ev_max_amps),
+        ev_solar_min_surplus_w=float(s.ev_min_surplus),
+        ev_windows=s.ev_windows,
+        can_reclaim_battery_charge=s.battery_control_enabled,
+    )
+
+    # Coordinator-level EV-solar priority override.
+    if s.ev_mode == const.EV_MODE_SOLAR_ONLY:
+        if (
+            s.battery_control_enabled
+            and ev_plan.desired_enabled is True
+            and ev_plan.desired_action == "resume"
+        ):
+            battery_plan = replace(
+                battery_plan,
+                strategy="EV_SOLAR_PRIORITY",
+                reason=f"{battery_plan.reason} | EV solar-only active",
+                desired_grid_charge=False,
+                desired_solar_sell=True,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Selling first",
+                desired_discharge_current_a=0.0,
+            )
+
+    safe_reasons = []
+    if state.missing_entities:
+        safe_reasons.append("Missing required entities")
+    if state.stale_required_entities:
+        safe_reasons.append("Stale required entities")
+    if state.issues:
+        safe_reasons.extend(state.issues)
+
+    plan = planner.build_control_plan(
+        state,
+        battery_plan=battery_plan,
+        ev_plan=ev_plan,
+        safe_reasons=safe_reasons,
+        negative_price_active=negative_price_active,
+    )
+    return state, plan
+
+
+# --------------------------------------------------------------------------- #
+# 4. Scenario builders.
+# --------------------------------------------------------------------------- #
+def entities(*, pv1=0, pv2=0, grid=0.0, soc=50.0, bat=0.0,
+             inv_online="on", inv_status="Normal",
+             buy=None, sell=None,
+             ev_status="disconnected", ev_power=0.0, ev_phase="auto", ev_online="on",
+             grid_unit=None, ev_power_unit=None,
+             grid_entity=None, omit=()):
+    """Build an entity dict. `grid` uses the code's convention: positive = import,
+    negative = export. `bat`: negative = charging, positive = discharging."""
+    ents = {
+        E["pv1"]: pv1,
+        E["pv2"]: pv2,
+        E["load"]: 0,  # ignored on klatremis (load is derived), kept for completeness
+        (grid_entity or E["grid"]): (grid, grid_unit) if grid_unit else grid,
+        E["soc"]: soc,
+        E["bat"]: bat,
+        E["inv_online"]: inv_online,
+        E["inv_status"]: inv_status,
+        E["ev_status"]: ev_status,
+        E["ev_power"]: (ev_power, ev_power_unit) if ev_power_unit else ev_power,
+        E["ev_phase"]: ev_phase,
+        E["ev_online"]: ev_online,
+    }
+    if buy is not None:
+        ents[E["buy"]] = buy
+    if sell is not None:
+        ents[E["sell"]] = sell
+    for key in omit:
+        ents.pop(E[key], None)
+    return ents
+
+
+# Each scenario: (name, entities, settings, check_fn(state, plan) -> (ok, detail))
+def chk_battery(strategy):
+    return lambda st, pl: (pl.battery.strategy == strategy,
+                           f"battery.strategy={pl.battery.strategy} (want {strategy})")
+
+
+def chk_ev_action(action):
+    return lambda st, pl: (pl.ev.desired_action == action,
+                           f"ev.desired_action={pl.ev.desired_action} (want {action})")
+
+
+def chk(fn, label):
+    def wrapped(st, pl):
+        ok = fn(st, pl)
+        return ok, label
+    return wrapped
+
+
+SCENARIOS = [
+    # ----- Battery (mode=hybrid unless noted) -----
+    ("Cheap night price -> grid charge",
+     entities(pv1=0, pv2=0, grid=800, soc=45, bat=0, buy=0.40, sell=0.30,
+              ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("GRID_CHARGE")),
+
+    ("Expensive peak price -> discharge to load",
+     entities(pv1=0, pv2=0, grid=1500, soc=70, bat=300, buy=2.50, sell=0.30,
+              ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("DISCHARGE_TO_LOAD")),
+
+    ("Cheap price but battery already full -> not grid charge (idle)",
+     entities(grid=400, soc=92, buy=0.40, sell=0.30, ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk(lambda st, pl: pl.battery.strategy != "GRID_CHARGE",
+         "must not GRID_CHARGE at/above max_soc")),
+
+    ("Expensive price but battery at min -> not discharge",
+     entities(grid=1500, soc=18, buy=2.50, sell=0.30, ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk(lambda st, pl: pl.battery.strategy != "DISCHARGE_TO_LOAD",
+         "must not DISCHARGE_TO_LOAD at/below min_soc")),
+
+    ("Negative sell price with export -> block negative export",
+     entities(pv1=2000, pv2=1500, grid=-1200, soc=80, bat=0, buy=0.50, sell=-0.10,
+              ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("BLOCK_NEGATIVE_EXPORT")),
+
+    ("Self-consumption mode, solar surplus -> self consumption",
+     entities(pv1=2500, pv2=1500, grid=-1500, soc=60, bat=-500,
+              buy=1.00, sell=0.30, ev_status="disconnected"),
+     Settings(battery_mode=const.BATTERY_MODE_SELF, ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("SOLAR_SELF_CONSUMPTION")),
+
+    ("Protect mode -> protect",
+     entities(grid=500, soc=55, buy=1.00, sell=0.30, ev_status="disconnected"),
+     Settings(battery_mode=const.BATTERY_MODE_PROTECT, ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("PROTECT")),
+
+    ("Mid price, nothing special -> idle",
+     entities(grid=600, soc=55, buy=1.20, sell=0.30, ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk_battery("IDLE")),
+
+    ("Missing required entity (battery power) -> safe mode + HOLD",
+     entities(grid=600, soc=55, buy=1.20, ev_status="disconnected", omit=("bat",)),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk(lambda st, pl: pl.safe_mode and pl.battery.strategy == "HOLD",
+         "expect safe_mode + HOLD on missing battery power")),
+
+    ("Inverter offline -> safe mode",
+     entities(grid=600, soc=55, buy=1.20, inv_online="off", ev_status="disconnected"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED),
+     chk(lambda st, pl: pl.safe_mode is True, "expect safe_mode when inverter offline")),
+
+    # ----- EV solar-only -----
+    ("EV solar: large surplus, car ramps up -> resume, 3-phase",
+     # Consistent balance: 7.5 kW PV, ~7 kW into the car, ~0.5 kW house, grid~0.
+     # Car genuinely pulling near the 3-phase target, so the single-phase
+     # fallback safeguard does NOT trigger.
+     entities(pv1=4000, pv2=3500, grid=0, soc=80, bat=0,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=7000, ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: pl.ev.desired_action == "resume"
+         and pl.ev.desired_circuit_currents is not None
+         and pl.ev.desired_circuit_currents[1] > 0,
+         "expect resume on 3 phases (phase B current > 0)")),
+
+    ("EV solar: 3-phase requested but car won't ramp -> fall back to 1-phase",
+     # Big surplus, charger in 3-phase, but the car only draws 3 kW (< 65% of the
+     # 3-phase target). The safeguard should steer back to single phase.
+     entities(pv1=4000, pv2=3500, grid=-5000, soc=80, bat=0,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=3000, ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: pl.ev.desired_action == "resume"
+         and pl.ev.desired_circuit_currents is not None
+         and pl.ev.desired_circuit_currents[1] == 0,
+         "expect single-phase fallback (phase B current == 0)")),
+
+    ("EV solar: modest surplus -> resume, single phase",
+     entities(pv1=1200, pv2=800, grid=-1700, soc=80, bat=0,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=1000, ev_phase="1_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: pl.ev.desired_action == "resume"
+         and pl.ev.desired_circuit_currents is not None
+         and pl.ev.desired_circuit_currents[1] == 0
+         and pl.ev.desired_circuit_currents[0] >= 6,
+         "expect resume single-phase (only phase A > 0, >=6A)")),
+
+    ("EV solar: surplus below threshold, idle car -> pause",
+     entities(pv1=400, pv2=300, grid=-100, soc=80, bat=0,
+              buy=1.0, sell=0.4, ev_status="awaiting_start", ev_power=0, ev_phase="1_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk_ev_action("pause")),
+
+    ("EV solar active -> battery becomes EV_SOLAR_PRIORITY",
+     entities(pv1=3000, pv2=2500, grid=-4000, soc=80, bat=-300,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=2500, ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk_battery("EV_SOLAR_PRIORITY")),
+
+    ("EV full speed -> resume at max amps",
+     entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=3000, ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_FULL_SPEED),
+     chk(lambda st, pl: pl.ev.desired_action == "resume" and pl.ev.desired_amps == const.DEFAULT_EV_MAX_AMPS,
+         f"expect resume at {const.DEFAULT_EV_MAX_AMPS}A")),
+
+    ("EV status unavailable -> no EV control",
+     entities(pv1=3000, pv2=2000, grid=-3000, soc=80, ev_phase="3_phase", omit=("ev_status",)),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: pl.ev.desired_enabled is None,
+         "expect no EV action when status unavailable")),
+
+    # ----- Sign / unit handling regressions -----
+    ("Grid sign: legacy total_grid_power entity is force-inverted",
+     # Map the grid onto the legacy entity and feed raw +1000. The coordinator
+     # forces inversion for this entity, so it must be read as export(-1000).
+     entities(pv1=3000, pv2=2000, grid=1000, soc=70, bat=0,
+              buy=1.0, sell=0.4, ev_status="disconnected",
+              grid_entity="sensor.klatremishw_deye_total_grid_power"),
+     Settings(ev_mode=const.EV_MODE_SCHEDULED,
+              config_over={const.CONF_GRID_POWER_ENTITY: "sensor.klatremishw_deye_total_grid_power"}),
+     chk(lambda st, pl: st.grid_export_power_w > 0 and st.grid_import_power_w == 0,
+         "raw +1000 on total_grid_power must become export")),
+
+    ("EV power in kW is normalized to W",
+     entities(pv1=4000, pv2=3500, grid=-5000, soc=80,
+              buy=1.0, sell=0.4, ev_status="charging", ev_power=3.0, ev_power_unit="kW",
+              ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: st.easee_power_w == 3000.0,
+         "3 kW must normalize to 3000 W")),
+]
+
+
+# --------------------------------------------------------------------------- #
+# 5. Run + report.
+# --------------------------------------------------------------------------- #
+def fmt_state(st):
+    return (
+        f"pv={st.pv_power_w:.0f}W load={st.load_power_w:.0f}W "
+        f"grid(imp={st.grid_import_power_w:.0f}/exp={st.grid_export_power_w:.0f})W "
+        f"surplus={st.solar_surplus_w:.0f}W soc={st.battery_soc_pct:.0f}% bat={st.battery_power_w:.0f}W"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 6. Phase A trin A1 — horizon ingestion tests.
+# --------------------------------------------------------------------------- #
+def test_horizon():
+    checks = []
+    buy = {
+        "state": -0.61,
+        "attributes": {
+            "raw_today": [
+                {"hour": "2026-06-07T00:00:00+02:00", "price": 0.18},
+                {"hour": "2026-06-07T17:00:00+02:00", "price": -0.61},
+            ],
+            "raw_tomorrow": [
+                {"hour": "2026-06-08T20:00:00+02:00", "price": 1.34},
+            ],
+            "tariffs": {
+                "additional_tariffs": {"transmissions_nettarif": 0.05, "systemtarif": 0.09, "elafgift": 0.01},
+                "tariffs": {"0": 0.08, "17": 0.32, "20": 0.32},
+            },
+        },
+    }
+    sell = {
+        "state": -0.166,
+        "attributes": {
+            "raw_today": [
+                {"hour": "2026-06-07T17:00:00+02:00", "price": -0.166},
+            ],
+        },
+    }
+    solar = {
+        "state": 46.49,
+        "attributes": {
+            "detailedHourly": [
+                {"period_start": "2026-06-07T11:00:00+02:00", "pv_estimate": 7.0, "pv_estimate10": 5.7, "pv_estimate90": 7.9},
+                {"period_start": "2026-06-07T12:00:00+02:00", "pv_estimate": 5.58},
+            ],
+        },
+    }
+    hass = FakeHass({"sensor.buy": buy, "sensor.sell": sell, "sensor.solar": solar})
+
+    price_slots = horizon.build_price_slots(hass, "sensor.buy", "sensor.sell")
+    solar_slots = horizon.build_solar_slots(hass, "sensor.solar")
+    by_hour = {s.start.hour: s for s in price_slots}
+
+    flat = 0.05 + 0.09 + 0.01
+    checks.append(("price slots count (2 today + 1 tomorrow)", len(price_slots) == 3, f"got {len(price_slots)}"))
+    checks.append((
+        "total import @00 = spot+tariff+flat",
+        abs(by_hour[0].total_import_price - (0.18 + 0.08 + flat)) < 1e-6,
+        f"got {by_hour[0].total_import_price:.4f} (want {0.18 + 0.08 + flat:.4f})",
+    ))
+    checks.append((
+        "total import @17 (negative spot)",
+        abs(by_hour[17].total_import_price - (-0.61 + 0.32 + flat)) < 1e-6,
+        f"got {by_hour[17].total_import_price:.4f} (want {-0.61 + 0.32 + flat:.4f})",
+    ))
+    checks.append((
+        "export value @17 matched from sell entity",
+        by_hour[17].export_value is not None and abs(by_hour[17].export_value - (-0.166)) < 1e-6,
+        f"got {by_hour[17].export_value}",
+    ))
+    checks.append(("export value @00 missing -> None", by_hour[0].export_value is None, f"got {by_hour[0].export_value}"))
+    checks.append(("slots sorted ascending", price_slots == sorted(price_slots, key=lambda s: s.start), "order"))
+    checks.append(("solar slots parsed", len(solar_slots) == 2 and abs(solar_slots[0].pv_estimate_kwh - 7.0) < 1e-6, f"got {len(solar_slots)}"))
+    checks.append(("solar 10/90 bands parsed", solar_slots[0].pv_estimate10_kwh == 5.7 and solar_slots[0].pv_estimate90_kwh == 7.9, "bands"))
+
+    # Defensive: a plain numeric entity with no hourly attributes -> empty horizon.
+    empty_hass = FakeHass({"sensor.buy": 0.4, "sensor.sell": 0.6, "sensor.solar": 46.0})
+    checks.append((
+        "missing attributes -> empty horizon (no crash)",
+        horizon.build_price_slots(empty_hass, "sensor.buy", "sensor.sell") == []
+        and horizon.build_solar_slots(empty_hass, "sensor.solar") == [],
+        "graceful",
+    ))
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# 7. Phase A trin A0 — write-verification tests.
+# --------------------------------------------------------------------------- #
+def test_write_verification():
+    import asyncio
+
+    checks = []
+
+    class MutStates:
+        def __init__(self, init):
+            self._map = {eid: State(str(v)) for eid, v in init.items()}
+
+        def get(self, eid):
+            return self._map.get(eid)
+
+        def set(self, eid, value):
+            self._map[eid] = State(str(value))
+
+    class MutServices:
+        def __init__(self, states, apply=True):
+            self.states = states
+            self.apply = apply
+            self.calls = []
+
+        async def async_call(self, domain, service, data, blocking=False):
+            self.calls.append((domain, service, data))
+            if not self.apply:
+                return
+            eid = data["entity_id"]
+            if domain == "switch":
+                self.states.set(eid, "on" if service == "turn_on" else "off")
+            elif domain == "select":
+                self.states.set(eid, data["option"])
+            elif domain == "number":
+                self.states.set(eid, data["value"])
+
+    class MutHass:
+        def __init__(self, states, services):
+            self.states = states
+            self.services = services
+
+    eid = "switch.klatremishw_deye_grid_charge"
+
+    # Case 1: device accepts writes -> converges, never degraded.
+    states = MutStates({eid: "off"})
+    hass = MutHass(states, MutServices(states, apply=True))
+    ctrl = control.KlatremisController(hass)
+    actions = []
+    for _ in range(4):
+        actions.append(asyncio.run(ctrl._set_switch(eid, True)))
+    # first tick writes; subsequent ticks see "on" and no-op
+    checks.append(("healthy write converges (1 write then no-ops)", actions[0] and not actions[1] and not actions[3], f"{actions}"))
+    checks.append(("healthy entity not degraded", eid not in ctrl.degraded_entities, f"{ctrl.degraded_entities}"))
+
+    # Case 2: stuck device -> degraded after MAX_WRITE_ATTEMPTS.
+    states = MutStates({eid: "off"})
+    hass = MutHass(states, MutServices(states, apply=False))
+    ctrl = control.KlatremisController(hass)
+    pre_degraded = []
+    for _ in range(control.MAX_WRITE_ATTEMPTS):
+        asyncio.run(ctrl._set_switch(eid, True))
+        pre_degraded.append(eid in ctrl.degraded_entities)
+    checks.append((
+        f"stuck device degraded exactly at attempt {control.MAX_WRITE_ATTEMPTS}",
+        pre_degraded[-1] is True and pre_degraded[0] is False,
+        f"degraded-per-attempt={pre_degraded}",
+    ))
+    last = asyncio.run(ctrl._set_switch(eid, True))
+    checks.append(("degraded write marked UNVERIFIED", any("UNVERIFIED" in a for a in last), f"{last}"))
+
+    # Case 3: recovery -> once it converges, degraded flag clears.
+    states.set(eid, "on")
+    recovered = asyncio.run(ctrl._set_switch(eid, True))
+    checks.append(("recovers when device finally converges", recovered == [] and eid not in ctrl.degraded_entities, f"{recovered}, {ctrl.degraded_entities}"))
+
+    return checks
+
+
+def main():
+    passed = failed = 0
+    print("=" * 100)
+    print("WATTSON BEHAVIOUR SIMULATION".center(100))
+    print("=" * 100)
+    for i, (name, ents, settings, check) in enumerate(SCENARIOS, 1):
+        try:
+            st, pl = simulate_tick(ents, settings)
+            ok, detail = check(st, pl)
+        except Exception as err:  # noqa: BLE001
+            ok, detail, st, pl = False, f"EXCEPTION: {err!r}", None, None
+        status = "PASS" if ok else "FAIL"
+        passed += ok
+        failed += not ok
+        print(f"\n[{i:02d}] {status}  {name}")
+        if st is not None:
+            print(f"      state : {fmt_state(st)}")
+            print(f"      battery: {pl.battery.strategy:<22} ev: action={pl.ev.desired_action} "
+                  f"amps={pl.ev.desired_amps} phases={pl.ev.desired_circuit_currents}")
+            print(f"      safe_mode={pl.safe_mode} neg_export={pl.negative_price_active}")
+            print(f"      next  : {pl.next_action}")
+        print(f"      check : {detail}")
+
+    total = len(SCENARIOS)
+    for title, suite in (("PHASE A · A1 HORIZON INGESTION", test_horizon),
+                         ("PHASE A · A0 WRITE VERIFICATION", test_write_verification)):
+        print("\n" + "-" * 100)
+        print(title)
+        try:
+            results = suite()
+        except Exception as err:  # noqa: BLE001
+            results = [(f"{title} crashed", False, repr(err))]
+        for name, ok, detail in results:
+            total += 1
+            passed += ok
+            failed += not ok
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+            if not ok:
+                print(f"         -> {detail}")
+
+    print("\n" + "=" * 100)
+    print(f"RESULT: {passed} passed, {failed} failed, {total} total".center(100))
+    print("=" * 100)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

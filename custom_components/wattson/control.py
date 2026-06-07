@@ -1,16 +1,52 @@
 """Control adapters for Wattson."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
 from .models import BatteryPlan, EntityMapping, EvPlan, SiteState
 
+_LOGGER = logging.getLogger(__name__)
+
+# Phase A trin A0: after issuing a write we expect the entity to converge to the
+# desired value within a couple of ticks. If we keep re-issuing the same write
+# this many times without it sticking, the write path is treated as degraded.
+# Counting across ticks (rather than reading back immediately) tolerates the
+# real latency of writing to the Deye via the klatremis bridge.
+MAX_WRITE_ATTEMPTS = 3
+
 
 class KlatremisController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
+        # entity_id -> consecutive unconverged write attempts
+        self._write_attempts: dict[str, int] = {}
+        self.degraded_entities: set[str] = set()
+
+    def _mark_converged(self, entity_id: str) -> None:
+        self._write_attempts.pop(entity_id, None)
+        self.degraded_entities.discard(entity_id)
+
+    def _mark_attempt(self, entity_id: str) -> bool:
+        """Record a write attempt; return True if the entity is now degraded."""
+        attempts = self._write_attempts.get(entity_id, 0) + 1
+        self._write_attempts[entity_id] = attempts
+        if attempts >= MAX_WRITE_ATTEMPTS:
+            if entity_id not in self.degraded_entities:
+                _LOGGER.warning(
+                    "Wattson wrote %s %d times without it converging to the desired value; "
+                    "marking write path degraded",
+                    entity_id,
+                    attempts,
+                )
+            self.degraded_entities.add(entity_id)
+            return True
+        return False
+
+    def _action(self, entity_id: str, value: Any, degraded: bool) -> str:
+        return f"{entity_id}={value}{' (UNVERIFIED)' if degraded else ''}"
 
     async def _set_switch(self, entity_id: str | None, enabled: bool) -> list[str]:
         if not entity_id:
@@ -18,19 +54,23 @@ class KlatremisController:
         current = self.hass.states.get(entity_id)
         target_state = "on" if enabled else "off"
         if current is not None and current.state == target_state:
+            self._mark_converged(entity_id)
             return []
         service = "turn_on" if enabled else "turn_off"
         await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
-        return [f"{entity_id}={target_state}"]
+        degraded = self._mark_attempt(entity_id)
+        return [self._action(entity_id, target_state, degraded)]
 
     async def _set_select(self, entity_id: str | None, option: str | None) -> list[str]:
         if not entity_id or option is None:
             return []
         current = self.hass.states.get(entity_id)
         if current is not None and current.state == option:
+            self._mark_converged(entity_id)
             return []
         await self.hass.services.async_call("select", "select_option", {"entity_id": entity_id, "option": option}, blocking=True)
-        return [f"{entity_id}={option}"]
+        degraded = self._mark_attempt(entity_id)
+        return [self._action(entity_id, option, degraded)]
 
     async def _set_number(self, entity_id: str | None, value: float | None) -> list[str]:
         if not entity_id or value is None:
@@ -39,11 +79,13 @@ class KlatremisController:
         if current is not None:
             try:
                 if abs(float(current.state) - value) < 0.1:
+                    self._mark_converged(entity_id)
                     return []
             except (TypeError, ValueError):
                 pass
         await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
-        return [f"{entity_id}={value}"]
+        degraded = self._mark_attempt(entity_id)
+        return [self._action(entity_id, value, degraded)]
 
     async def apply_battery_plan(self, mapping: EntityMapping, plan: BatteryPlan) -> list[str]:
         actions: list[str] = []

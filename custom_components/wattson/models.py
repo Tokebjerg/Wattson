@@ -51,6 +51,32 @@ class Capabilities:
 
 
 @dataclass(frozen=True)
+class PriceSlot:
+    """One hourly price slot in the planning horizon.
+
+    Prices are in DKK/kWh. ``total_import_price`` is the economically relevant
+    buy price (spot + grid tariff + additional tariffs); ``export_value`` is the
+    value of exporting one kWh in this hour.
+    """
+
+    start: datetime
+    spot_price: float
+    tariff: float
+    total_import_price: float
+    export_value: float | None = None
+
+
+@dataclass(frozen=True)
+class SolarSlot:
+    """One hourly solar-forecast slot. Energy in kWh expected within the hour."""
+
+    start: datetime
+    pv_estimate_kwh: float
+    pv_estimate10_kwh: float | None = None
+    pv_estimate90_kwh: float | None = None
+
+
+@dataclass(frozen=True)
 class SiteState:
     timestamp: datetime
     pv_power_w: float
@@ -75,6 +101,11 @@ class SiteState:
     stale_required_entities: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    # Phase A planning horizon (empty until the price/forecast entities expose
+    # hourly data). The reactive planner does not consume these yet — they are
+    # ingested in trin A1 and used by the 24h planner in trin A2.
+    price_slots: list[PriceSlot] = field(default_factory=list)
+    solar_slots: list[SolarSlot] = field(default_factory=list)
 
     @property
     def solar_surplus_w(self) -> float:

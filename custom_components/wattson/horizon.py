@@ -1,0 +1,172 @@
+"""Planning-horizon ingestion for Wattson (Phase A, trin A1).
+
+Builds an hourly price and solar-forecast horizon from the configured Home
+Assistant entities, so the 24h planner (trin A2) can reason over the day rather
+than only the current instant.
+
+Data sources for this installation:
+- buy price  : Energi Data Service ``raw_today`` / ``raw_tomorrow`` (spot) +
+               ``tariffs`` (hourly grid tariff + flat additional tariffs)
+- sell price : Energi Data Service (export) ``raw_today`` / ``raw_tomorrow``
+- solar      : Solcast ``detailedHourly`` (pv_estimate kWh per hour, with 10/90)
+
+Everything here is defensive: a missing attribute yields an empty horizon
+rather than raising, so the reactive planner keeps working unchanged.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from .models import PriceSlot, SolarSlot
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _attrs(hass: Any, entity_id: str | None) -> dict[str, Any]:
+    if not entity_id:
+        return {}
+    state = hass.states.get(entity_id)
+    if state is None:
+        return {}
+    return dict(getattr(state, "attributes", None) or {})
+
+
+def _flat_tariff_total(tariffs_attr: Any) -> float:
+    """Sum of the flat additional tariffs (transmission, system, tax)."""
+    if not isinstance(tariffs_attr, dict):
+        return 0.0
+    additional = tariffs_attr.get("additional_tariffs")
+    if not isinstance(additional, dict):
+        return 0.0
+    total = 0.0
+    for value in additional.values():
+        try:
+            total += float(value)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _hourly_tariff(tariffs_attr: Any, hour: int) -> float:
+    if not isinstance(tariffs_attr, dict):
+        return 0.0
+    hourly = tariffs_attr.get("tariffs")
+    if not isinstance(hourly, dict):
+        return 0.0
+    value = hourly.get(str(hour))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _raw_points(attrs: dict[str, Any]) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for key in ("raw_today", "raw_tomorrow"):
+        value = attrs.get(key)
+        if isinstance(value, list):
+            points.extend(item for item in value if isinstance(item, dict))
+    return points
+
+
+def _export_value_index(sell_attrs: dict[str, Any]) -> dict[datetime, float]:
+    index: dict[datetime, float] = {}
+    for item in _raw_points(sell_attrs):
+        start = _parse_dt(item.get("hour"))
+        if start is None:
+            continue
+        try:
+            index[start] = float(item["price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+    return index
+
+
+def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None) -> list[PriceSlot]:
+    """Build hourly price slots with total import price and export value."""
+    buy_attrs = _attrs(hass, buy_entity)
+    points = _raw_points(buy_attrs)
+    if not points:
+        return []
+
+    tariffs_attr = buy_attrs.get("tariffs")
+    flat_total = _flat_tariff_total(tariffs_attr)
+    export_index = _export_value_index(_attrs(hass, sell_entity))
+
+    slots: list[PriceSlot] = []
+    for item in points:
+        start = _parse_dt(item.get("hour"))
+        if start is None:
+            continue
+        try:
+            spot = float(item["price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        tariff = _hourly_tariff(tariffs_attr, start.hour) + flat_total
+        slots.append(
+            PriceSlot(
+                start=start,
+                spot_price=spot,
+                tariff=tariff,
+                total_import_price=spot + tariff,
+                export_value=export_index.get(start),
+            )
+        )
+    slots.sort(key=lambda slot: slot.start)
+    return slots
+
+
+def build_solar_slots(hass: Any, forecast_entity: str | None) -> list[SolarSlot]:
+    """Build hourly solar-forecast slots from a Solcast-style entity."""
+    attrs = _attrs(hass, forecast_entity)
+    hourly = attrs.get("detailedHourly")
+    if not isinstance(hourly, list):
+        return []
+
+    slots: list[SolarSlot] = []
+    for item in hourly:
+        if not isinstance(item, dict):
+            continue
+        start = _parse_dt(item.get("period_start"))
+        if start is None:
+            continue
+        try:
+            estimate = float(item.get("pv_estimate"))
+        except (TypeError, ValueError):
+            continue
+
+        def _opt(key: str) -> float | None:
+            try:
+                return float(item[key])
+            except (TypeError, ValueError, KeyError):
+                return None
+
+        slots.append(
+            SolarSlot(
+                start=start,
+                pv_estimate_kwh=estimate,
+                pv_estimate10_kwh=_opt("pv_estimate10"),
+                pv_estimate90_kwh=_opt("pv_estimate90"),
+            )
+        )
+    slots.sort(key=lambda slot: slot.start)
+    return slots
+
+
+def current_price_slot(slots: list[PriceSlot], now: datetime) -> PriceSlot | None:
+    """Return the price slot whose hour contains ``now`` (or the latest past one)."""
+    candidate: PriceSlot | None = None
+    for slot in slots:
+        if slot.start <= now:
+            candidate = slot
+        else:
+            break
+    return candidate
