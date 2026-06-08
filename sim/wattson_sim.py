@@ -1164,6 +1164,70 @@ def test_e2_master_lock():
 
 
 # --------------------------------------------------------------------------- #
+# 12d. Inverter-mode coherence (no charge-vs-sell hunting).
+# --------------------------------------------------------------------------- #
+def test_mode_coherence():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 8, h, 0, tzinfo=TZ)
+
+    def pslot(h, total, exp=None):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=exp)
+
+    def make_state(now, soc, slots, pv=0.0, load=0.0):
+        return models.SiteState(
+            timestamp=now, pv_power_w=pv, load_power_w=load, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
+            price_slots=slots, solar_slots=[],
+        )
+
+    def plan(mode, st):
+        bp, _ = planner.build_battery_plan(
+            st, battery_mode=mode, min_soc=20, max_soc=90, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        return bp
+
+    spread = [pslot(0, 0.20), pslot(1, 0.30), pslot(2, 0.40), pslot(3, 0.50), pslot(4, 0.60), pslot(5, 0.65)]
+    asc = [pslot(h, 0.1 * (h + 1)) for h in range(8)]
+
+    # GRID_CHARGE must be coherent: no sell + zero export while charging.
+    gc = plan("red", make_state(at(0), 50, spread))
+    checks.append(("GRID_CHARGE coherent (no sell, zero export)", gc.strategy == "GRID_CHARGE" and gc.desired_solar_sell is False and gc.desired_limit_control_mode == "Zero export to CT", f"{gc.strategy}/{gc.desired_solar_sell}/{gc.desired_limit_control_mode}"))
+
+    # IDLE, battery not full: no sell + zero export (this was the hunting bug).
+    idle = plan("blue", make_state(at(4), 50, asc))
+    checks.append(("IDLE (not full) no sell + zero export", idle.strategy == "IDLE" and idle.desired_solar_sell is False and idle.desired_limit_control_mode == "Zero export to CT", f"{idle.strategy}/{idle.desired_solar_sell}/{idle.desired_limit_control_mode}"))
+
+    # IDLE, battery full: surplus may be sold.
+    idlefull = plan("blue", make_state(at(4), 90, asc))
+    checks.append(("IDLE (full) allows sell", idlefull.strategy == "IDLE" and idlefull.desired_solar_sell is True and idlefull.desired_limit_control_mode == "Selling first", f"{idlefull.strategy}/{idlefull.desired_solar_sell}/{idlefull.desired_limit_control_mode}"))
+
+    # INVARIANT: never sell while charging the battery ("Battery first").
+    violations = []
+    for mode in ["red", "blue", "green"]:
+        for soc in [10, 25, 50, 89, 90]:
+            for slots in [spread, asc, [pslot(h, 1.5, exp=0.5) for h in range(6)]]:
+                for (pv, load) in [(0.0, 0.0), (3000.0, 500.0), (6000.0, 200.0)]:
+                    bp = plan(mode, make_state(at(0), soc, slots, pv=pv, load=load))
+                    if bp.desired_energy_priority == "Battery first" and (
+                        bp.desired_solar_sell is True or bp.desired_limit_control_mode == "Selling first"
+                    ):
+                        violations.append((mode, soc, bp.strategy, bp.desired_solar_sell, bp.desired_limit_control_mode))
+    checks.append(("no charge-vs-sell conflict (Battery first never sells)", not violations, f"violations={violations[:3]}"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 13. Solar-aware charging (don't grid-charge when solar covers it).
 # --------------------------------------------------------------------------- #
 def test_solar_aware():
@@ -1328,6 +1392,7 @@ def main():
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
+                         ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),
                          ("SOC-AWARE SCHEDULE", test_soc_schedule)):

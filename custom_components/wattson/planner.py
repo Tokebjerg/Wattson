@@ -203,6 +203,9 @@ def _horizon_battery_plan(
             desired_grid_charge=True,
             desired_solar_sell=False,
             desired_energy_priority="Battery first",
+            # Coherent mode while charging: never leave the inverter in "sell"
+            # mode, or it hunts between charging and exporting.
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         )
 
@@ -247,13 +250,17 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
+    # Coherent idle mode: only allow selling when the battery is full and genuinely
+    # cannot absorb the surplus. Otherwise keep solar_sell OFF + zero-export so the
+    # inverter charges from PV instead of hunting between charge and grid-export.
+    battery_full = state.battery_soc_pct >= max_soc
     return BatteryPlan(
         strategy="IDLE",
         reason="No strong battery action required right now",
         desired_grid_charge=False,
+        desired_solar_sell=battery_full,
         desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-        # Green keeps PV for self-consumption rather than exporting while idle.
-        desired_limit_control_mode="Zero export to CT" if profile.self_consumption_first else None,
+        desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
         desired_export_limit_w=export_limit_default_w,
     )
 
@@ -458,6 +465,7 @@ def build_battery_plan(
                 desired_grid_charge=True,
                 desired_solar_sell=False,
                 desired_energy_priority="Battery first",
+                desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
             ),
             False,
@@ -497,13 +505,15 @@ def build_battery_plan(
             False,
         )
 
+    battery_full = state.battery_soc_pct >= max_soc
     return (
         BatteryPlan(
             strategy="IDLE",
             reason="No strong battery action required right now",
             desired_grid_charge=False,
+            desired_solar_sell=battery_full,
             desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-            desired_limit_control_mode="Zero export to CT" if profile.self_consumption_first else None,
+            desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         ),
         False,
