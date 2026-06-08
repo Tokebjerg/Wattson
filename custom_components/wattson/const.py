@@ -132,6 +132,12 @@ EV_MODES = [
 EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
 EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
 
+# Only hand PV to the car (stop charging the house battery + allow export) when
+# the charger actually draws at least this much. A charger that is merely enabled
+# / awaiting_start at ~0 W must not cause surplus to be exported at low prices
+# while the house battery still has room to charge.
+EV_SOLAR_PRIORITY_MIN_DRAW_W = 500.0
+
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan
 # cannot hammer the hardware.

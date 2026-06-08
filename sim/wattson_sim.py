@@ -1228,6 +1228,37 @@ def test_mode_coherence():
 
 
 # --------------------------------------------------------------------------- #
+# 12e. EV-solar priority only when the car actually draws power.
+# --------------------------------------------------------------------------- #
+def test_ev_solar_priority_gate():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def st(power, status="awaiting_start"):
+        return models.SiteState(
+            timestamp=datetime(2026, 6, 8, 11, 0, tzinfo=TZ), pv_power_w=4000.0, load_power_w=100.0,
+            load_includes_ev=False, grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=25.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status=status, easee_power_w=power, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.01, current_sell_price=0.01, forecast_today_kwh=0.0,
+        )
+
+    resume = models.EvPlan(mode="solar_only", reason="", desired_enabled=True, desired_action="resume")
+    pause = models.EvPlan(mode="solar_only", reason="", desired_enabled=False, desired_action="pause")
+    sp = planner.should_prioritize_ev_solar
+
+    checks.append(("EV actually drawing -> prioritize EV (export allowed)", sp(st(1400.0, "charging"), resume, battery_control_enabled=True) is True, "1400W"))
+    checks.append(("EV enabled but 0W (awaiting_start) -> battery charges instead", sp(st(0.0), resume, battery_control_enabled=True) is False, "0W"))
+    checks.append(("EV idle 100W (<500) -> do NOT prioritize", sp(st(100.0), resume, battery_control_enabled=True) is False, "100W"))
+    checks.append(("EV paused -> do NOT prioritize", sp(st(2000.0), pause, battery_control_enabled=True) is False, "pause"))
+    checks.append(("battery control disabled -> do NOT prioritize", sp(st(2000.0, "charging"), resume, battery_control_enabled=False) is False, "no batt ctrl"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 13. Solar-aware charging (don't grid-charge when solar covers it).
 # --------------------------------------------------------------------------- #
 def test_solar_aware():
@@ -1393,6 +1424,7 @@ def main():
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
+                         ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),
                          ("SOC-AWARE SCHEDULE", test_soc_schedule)):

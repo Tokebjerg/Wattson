@@ -102,6 +102,7 @@ from .planner import (
     build_override_battery_plan,
     build_override_ev_plan,
     effective_solar_surplus_w,
+    should_prioritize_ev_solar,
     value_increment_kr,
 )
 
@@ -498,19 +499,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_action=None,
                 )
 
-            if (
-                self.battery_control_enabled
-                and ev_plan.desired_enabled is True
-                and ev_plan.desired_action == "resume"
+            if should_prioritize_ev_solar(
+                self.site_state, ev_plan, battery_control_enabled=self.battery_control_enabled
             ):
-                # When solar-only EV charging is active, prioritize available PV for the car
-                # and avoid zero-export curtailment that can throttle PV production before the
-                # charger has had a chance to absorb the surplus.
+                # The car is ACTUALLY charging on solar: prioritize available PV for
+                # the car and avoid zero-export curtailment that can throttle PV
+                # production. When the charger is only enabled/awaiting_start at ~0 W
+                # this branch is skipped, so the surplus charges the house battery
+                # instead of being exported at low prices.
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
-                        f"{battery_plan.reason} | EV solar-only active, prioritizing EV over battery charging "
+                        f"{battery_plan.reason} | EV solar-only actively charging, prioritizing EV over battery "
                         "and allowing full PV production"
                     ),
                     desired_grid_charge=False,
