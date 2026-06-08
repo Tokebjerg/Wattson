@@ -145,6 +145,11 @@ EV_ACTIVE_HOLD_SECONDS = 150
 # every small solar wiggle makes the charger renegotiate, which makes the car
 # cycle awaiting_start <-> charging. Only resend on a material change.
 EV_CURRENT_DEADBAND_A = 2
+# And never change the offered EV current more often than this (s). The solar
+# surplus oscillates as the car's own draw changes it, which made the offered
+# current bounce 16A<->6A every ~15s and the car cycle. Rate-limiting current
+# changes gives the car a steady offer long enough to settle.
+EV_CURRENT_RETUNE_SECONDS = 90
 
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan

@@ -85,6 +85,7 @@ from .const import (
     EV_WRITE_COOLDOWN_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
+    EV_CURRENT_RETUNE_SECONDS,
     MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
@@ -147,6 +148,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._last_ev_fp: tuple[Any, ...] | None = None
         self._last_ev_amps: int | None = None
         self._last_ev_currents: tuple[int, int, int] | None = None
+        self._last_ev_current_change_at: datetime | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -681,7 +683,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev.desired_circuit_currents,
             EV_CURRENT_DEADBAND_A,
         )
-        if not structural_changed and within_deadband:
+        # Rate-limit current changes: a material change is only applied once the
+        # re-tune interval has elapsed, so the offered current can't bounce and
+        # make the car cycle. Structural changes are always honoured immediately.
+        retune_due = write_allowed(self._last_ev_current_change_at, EV_CURRENT_RETUNE_SECONDS, now)
+        current_change_wanted = (not within_deadband) and retune_due
+        if not structural_changed and not current_change_wanted:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
             # Cooldown active: leave state unchanged so we retry next tick.
@@ -690,8 +697,10 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         if acts:
             self._last_ev_write_at = now
         self._last_ev_fp = structural
-        self._last_ev_amps = ev.desired_amps
-        self._last_ev_currents = ev.desired_circuit_currents
+        if not within_deadband:
+            self._last_ev_amps = ev.desired_amps
+            self._last_ev_currents = ev.desired_circuit_currents
+            self._last_ev_current_change_at = now
         return acts
 
     def _grid_power_sign_should_be_inverted(self) -> bool:
