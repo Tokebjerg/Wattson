@@ -141,6 +141,10 @@ EV_SOLAR_PRIORITY_MIN_DRAW_W = 500.0
 # so brief charger dips (awaiting_start <-> charging) do not flip the battery
 # strategy every few seconds (which would churn the inverter settings).
 EV_ACTIVE_HOLD_SECONDS = 150
+# Don't re-send the EV charging current for changes smaller than this (A). Chasing
+# every small solar wiggle makes the charger renegotiate, which makes the car
+# cycle awaiting_start <-> charging. Only resend on a material change.
+EV_CURRENT_DEADBAND_A = 2
 
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan

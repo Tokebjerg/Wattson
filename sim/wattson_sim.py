@@ -1272,6 +1272,17 @@ def test_ev_solar_priority_gate():
     checks.append(("paused -> do NOT prioritize", sp(pause, battery_control_enabled=True, ev_recently_active=True) is False, "pause"))
     checks.append(("battery control disabled -> do NOT prioritize", sp(resume, battery_control_enabled=False, ev_recently_active=True) is False, "no batt ctrl"))
 
+    # EV current deadband: don't re-send near-identical currents (stops car cycling).
+    db = const.EV_CURRENT_DEADBAND_A
+    wd = planner.ev_current_within_deadband
+    checks.append(("nothing sent yet -> must send", wd(None, None, 10, None, db) is False, "fresh"))
+    checks.append(("same per-phase current -> within deadband (skip)", wd(None, (10, 0, 0), None, (10, 0, 0), db) is True, "same"))
+    checks.append(("per-phase +1A (<2) -> within deadband (skip)", wd(None, (10, 0, 0), None, (11, 0, 0), db) is True, "+1A"))
+    checks.append(("per-phase +2A (>=2) -> resend", wd(None, (10, 0, 0), None, (12, 0, 0), db) is False, "+2A"))
+    checks.append(("phase shape change (1->3) -> resend", wd(None, (10, 0, 0), None, (10, 10, 10), db) is False, "shape"))
+    checks.append(("amps +1 -> within deadband (skip)", wd(10, None, 11, None, db) is True, "+1A amps"))
+    checks.append(("amps +3 -> resend", wd(10, None, 13, None, db) is False, "+3A amps"))
+
     return checks
 
 

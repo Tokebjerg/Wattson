@@ -84,6 +84,7 @@ from .const import (
     INVERTER_WRITE_COOLDOWN_SECONDS,
     EV_WRITE_COOLDOWN_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
+    EV_CURRENT_DEADBAND_A,
     MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
@@ -103,6 +104,7 @@ from .planner import (
     build_override_battery_plan,
     build_override_ev_plan,
     effective_solar_surplus_w,
+    ev_current_within_deadband,
     ev_drawing_real_power,
     should_prioritize_ev_solar,
     value_increment_kr,
@@ -139,7 +141,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._easee = EaseeController(hass)
         # EV writes are not idempotent, so they are still gated on the plan
         # changing. The battery plan is re-asserted continuously (idempotent).
+        # _last_ev_fp holds the STRUCTURAL EV state (mode/enabled/phase/action);
+        # the charging current is gated separately by a deadband so small solar
+        # wiggles don't make the charger renegotiate.
         self._last_ev_fp: tuple[Any, ...] | None = None
+        self._last_ev_amps: int | None = None
+        self._last_ev_currents: tuple[int, int, int] | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -658,26 +665,33 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
     async def _async_apply_ev(self, plan: ControlPlan, now: datetime) -> list[str]:
         """Apply the EV plan only when it changes (Easee service calls are not
-        idempotent), bounded by the EV cooldown."""
+        idempotent), bounded by the EV cooldown. The charging current is gated by
+        a deadband so small solar wiggles don't make the charger renegotiate (and
+        the car cycle awaiting_start <-> charging)."""
         if not self.ev_control_enabled:
             return []
-        ev_fp = (
-            plan.ev.mode,
-            plan.ev.desired_enabled,
-            plan.ev.desired_amps,
-            plan.ev.desired_circuit_currents,
-            plan.ev.desired_phase_mode,
-            plan.ev.desired_action,
+        ev = plan.ev
+        # Structural changes (mode / enable / phase / start-stop) always apply.
+        structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
+        structural_changed = structural != self._last_ev_fp
+        within_deadband = ev_current_within_deadband(
+            self._last_ev_amps,
+            self._last_ev_currents,
+            ev.desired_amps,
+            ev.desired_circuit_currents,
+            EV_CURRENT_DEADBAND_A,
         )
-        if ev_fp == self._last_ev_fp:
+        if not structural_changed and within_deadband:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
-            # Cooldown active: leave the fingerprint unset so we retry next tick.
+            # Cooldown active: leave state unchanged so we retry next tick.
             return []
         acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev)
         if acts:
             self._last_ev_write_at = now
-        self._last_ev_fp = ev_fp
+        self._last_ev_fp = structural
+        self._last_ev_amps = ev.desired_amps
+        self._last_ev_currents = ev.desired_circuit_currents
         return acts
 
     def _grid_power_sign_should_be_inverted(self) -> bool:

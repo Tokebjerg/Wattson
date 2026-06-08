@@ -762,6 +762,32 @@ def build_override_battery_plan(
     return None
 
 
+def ev_current_within_deadband(
+    prev_amps: int | None,
+    prev_currents: tuple[int, int, int] | None,
+    new_amps: int | None,
+    new_currents: tuple[int, int, int] | None,
+    deadband: int,
+) -> bool:
+    """True when the new EV charging current is within ``deadband`` amps of the
+    last one actually sent — i.e. re-sending it would only make the charger
+    renegotiate (and the car cycle) for no real change. Returns False whenever
+    nothing has been sent yet or the phase shape changed, so a genuine change is
+    always applied.
+    """
+    if prev_amps is None and prev_currents is None:
+        return False
+    if (prev_currents is None) != (new_currents is None):
+        return False
+    if prev_currents is not None and new_currents is not None:
+        if max(abs(a - b) for a, b in zip(new_currents, prev_currents)) >= deadband:
+            return False
+    if prev_amps is not None and new_amps is not None:
+        if abs(new_amps - prev_amps) >= deadband:
+            return False
+    return True
+
+
 def ev_drawing_real_power(state: SiteState, min_draw_w: float = EV_SOLAR_PRIORITY_MIN_DRAW_W) -> bool:
     """True when the charger is actually pulling meaningful power (a real session),
     not merely enabled / awaiting_start at ~0 W."""

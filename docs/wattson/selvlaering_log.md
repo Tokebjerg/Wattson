@@ -30,9 +30,11 @@ Efter v0.7.12 (EV-flap/master-lock/override-fix) er Wattson-siden stabil, MEN Ea
 rapporterer stadig `awaiting_start`↔`charging` på egen hånd (~hvert 20-60s). Nu uskadeligt
 (destabiliserer ikke batteri/inverter/master-lås; bilen trækker ~3,7 kW i snit). Mistanke:
 EV dynamic-current re-sends ved små sol-udsving får bilen til at genforhandle.
-**Opgave i 21:00-kørslen:** evaluér EV-opladning over hele dagen (hvor ofte cykler status,
-korrelerer det med ændringer i ladestrøm/circuit-limit fra Wattson?). Hvis Wattson-drevet →
-foreslå/implementér et EV-strøm-deadband (genforhandl ikke ved <~2A ændring) + evt. længere
-re-tune-interval. Hvis rent bil-drevet → notér som uden for Wattsons kontrol.
+**OPDATERING:** EV-strøm-deadband ER nu implementeret (v0.7.13): Wattson genforhandler ikke
+ladestrømmen ved <2A ændring (EV_CURRENT_DEADBAND_A=2, planner.ev_current_within_deadband,
+coordinator._async_apply_ev). **Opgave i 21:00-kørslen:** mål om bilens
+`awaiting_start↔charging`-cykling faktisk er faldet efter deadband'et. Hvis stadig hyppig →
+overvej større deadband / længere re-tune-interval; hvis rent bil-drevet → notér som uden
+for Wattsons kontrol.
 
 <!-- Nye dage indsættes herunder af den daglige kørsel. -->
