@@ -209,6 +209,9 @@ def _horizon_battery_plan(
             desired_limit_control_mode="Selling first",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=TRICKLE_CHARGE_A,
+            # Only the SOLAR surplus is sold here — never drain the battery into the
+            # grid (that's saved for the evening). So block battery discharge.
+            desired_discharge_current_a=0.0,
         )
 
     # 2. Self-consumption first: cover the house from the battery whenever PV can't,
@@ -249,6 +252,7 @@ def _horizon_battery_plan(
             # mode, or it hunts between charging and exporting.
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            desired_discharge_current_a=0.0,
         )
 
     if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
@@ -276,6 +280,10 @@ def _horizon_battery_plan(
         desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
         desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
         desired_export_limit_w=export_limit_default_w,
+        # When selling surplus at a full battery, only the SOLAR surplus is sold —
+        # block battery discharge so the pack isn't drained into the grid. Otherwise
+        # leave it unset so the battery can still cover a house deficit.
+        desired_discharge_current_a=(0.0 if sell_when_full else None),
     )
 
 
@@ -491,6 +499,7 @@ def build_battery_plan(
                 desired_energy_priority="Battery first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
+                desired_discharge_current_a=0.0,
             ),
             False,
         )
@@ -540,6 +549,7 @@ def build_battery_plan(
             desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
             desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            desired_discharge_current_a=(0.0 if sell_when_full else None),
         ),
         False,
     )

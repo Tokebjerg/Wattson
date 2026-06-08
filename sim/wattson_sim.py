@@ -826,6 +826,7 @@ def test_b_profiles():
     checks.append(("Blue sells solar at above-avg sunny hour", blue6.strategy == "SELL_SOLAR_PEAK", blue6.strategy))
     checks.append(("Blue trickle-charges at 10A during peak export", blue6.desired_max_charge_current_a == 10, str(blue6.desired_max_charge_current_a)))
     checks.append(("Blue sells the surplus during peak export", blue6.desired_solar_sell is True, str(blue6.desired_solar_sell)))
+    checks.append(("peak export does NOT drain battery (sells solar only, discharge=0)", blue6.desired_discharge_current_a == 0.0 and red6.desired_discharge_current_a == 0.0, f"{blue6.desired_discharge_current_a}/{red6.desired_discharge_current_a}"))
     checks.append(("Red also sells solar at above-avg sunny hour", red6.strategy == "SELL_SOLAR_PEAK", red6.strategy))
     checks.append(("Green does NOT peak-sell (self-sufficiency)", green6.strategy != "SELL_SOLAR_PEAK", green6.strategy))
 
@@ -1293,9 +1294,18 @@ def test_mode_coherence():
     idle = plan("blue", make_state(at(4), 50, asc))
     checks.append(("IDLE (not full) no sell + zero export", idle.strategy == "IDLE" and idle.desired_solar_sell is False and idle.desired_limit_control_mode == "Zero export to CT", f"{idle.strategy}/{idle.desired_solar_sell}/{idle.desired_limit_control_mode}"))
 
-    # IDLE, battery full: surplus may be sold.
+    # GRID_CHARGE must not allow battery discharge while charging.
+    checks.append(("GRID_CHARGE blocks battery discharge (0A)", gc.desired_discharge_current_a == 0.0, str(gc.desired_discharge_current_a)))
+
+    # IDLE, battery full: surplus may be sold — but ONLY the solar surplus, never
+    # the battery (discharge blocked), and DISCHARGE covers the house with no export.
     idlefull = plan("blue", make_state(at(4), 90, asc))
     checks.append(("IDLE (full) allows sell", idlefull.strategy == "IDLE" and idlefull.desired_solar_sell is True and idlefull.desired_limit_control_mode == "Selling first", f"{idlefull.strategy}/{idlefull.desired_solar_sell}/{idlefull.desired_limit_control_mode}"))
+    checks.append(("IDLE (full) sells solar only, not the battery (discharge=0)", idlefull.desired_discharge_current_a == 0.0, str(idlefull.desired_discharge_current_a)))
+    # Blue DISCHARGE_TO_LOAD covers the house: zero export + discharge left for the
+    # coordinator to set (so the battery covers load but never exports).
+    disc = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=2000.0))
+    checks.append(("Blue DISCHARGE covers house, no export", disc.strategy == "DISCHARGE_TO_LOAD" and disc.desired_solar_sell is False and disc.desired_limit_control_mode == "Zero export to CT" and disc.desired_discharge_current_a is None, f"{disc.strategy}/{disc.desired_solar_sell}/{disc.desired_limit_control_mode}/{disc.desired_discharge_current_a}"))
 
     # INVARIANT: never sell while charging the battery ("Battery first").
     violations = []
