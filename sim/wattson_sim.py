@@ -1160,6 +1160,18 @@ def test_e2_master_lock():
     far = t0 + timedelta(seconds=const.CONTENTION_WINDOW_SECONDS + 1000)
     checks.append(("old corrective writes age out of the window", ctrl3.contended_entities(far) == [], str(ctrl3.contended_entities(far))))
 
+    # Wattson legitimately ALTERNATING a setting (its own decisions) must NOT trip
+    # contention — counting is per (entity, value), so the count splits across
+    # values. Same entity written 2*(threshold-1) times, but each value < threshold.
+    states4 = _States()
+    ctrl4 = control.KlatremisController(_Hass(states4, _Services(states4, apply=True)))
+    plan_on = models.BatteryPlan(strategy="x", reason="x", desired_grid_charge=True)
+    plan_off = models.BatteryPlan(strategy="x", reason="x", desired_grid_charge=False)
+    for i in range(2 * (threshold - 1)):
+        p = plan_on if i % 2 == 0 else plan_off
+        asyncio.run(ctrl4.apply_battery_plan(mp, p, t0 + timedelta(seconds=40 * i)))
+    checks.append(("alternating values not mistaken for a competitor", ctrl4.contended_entities(t0 + timedelta(seconds=40 * 2 * threshold)) == [], str(ctrl4.contended_entities(t0 + timedelta(seconds=40 * 2 * threshold)))))
+
     return checks
 
 
@@ -1247,13 +1259,18 @@ def test_ev_solar_priority_gate():
 
     resume = models.EvPlan(mode="solar_only", reason="", desired_enabled=True, desired_action="resume")
     pause = models.EvPlan(mode="solar_only", reason="", desired_enabled=False, desired_action="pause")
-    sp = planner.should_prioritize_ev_solar
 
-    checks.append(("EV actually drawing -> prioritize EV (export allowed)", sp(st(1400.0, "charging"), resume, battery_control_enabled=True) is True, "1400W"))
-    checks.append(("EV enabled but 0W (awaiting_start) -> battery charges instead", sp(st(0.0), resume, battery_control_enabled=True) is False, "0W"))
-    checks.append(("EV idle 100W (<500) -> do NOT prioritize", sp(st(100.0), resume, battery_control_enabled=True) is False, "100W"))
-    checks.append(("EV paused -> do NOT prioritize", sp(st(2000.0), pause, battery_control_enabled=True) is False, "pause"))
-    checks.append(("battery control disabled -> do NOT prioritize", sp(st(2000.0, "charging"), resume, battery_control_enabled=False) is False, "no batt ctrl"))
+    # ev_drawing_real_power: distinguishes a real session from enabled-but-idle.
+    checks.append(("EV 1400W -> real power", planner.ev_drawing_real_power(st(1400.0)) is True, "1400W"))
+    checks.append(("EV 0W (awaiting_start) -> not real power", planner.ev_drawing_real_power(st(0.0)) is False, "0W"))
+    checks.append(("EV 100W (<500) -> not real power", planner.ev_drawing_real_power(st(100.0)) is False, "100W"))
+
+    # should_prioritize_ev_solar: sticky boolean drives battery deprioritization.
+    sp = planner.should_prioritize_ev_solar
+    checks.append(("resume + recently active -> prioritize EV", sp(resume, battery_control_enabled=True, ev_recently_active=True) is True, "active"))
+    checks.append(("resume but not recently active -> battery charges instead", sp(resume, battery_control_enabled=True, ev_recently_active=False) is False, "idle"))
+    checks.append(("paused -> do NOT prioritize", sp(pause, battery_control_enabled=True, ev_recently_active=True) is False, "pause"))
+    checks.append(("battery control disabled -> do NOT prioritize", sp(resume, battery_control_enabled=False, ev_recently_active=True) is False, "no batt ctrl"))
 
     return checks
 

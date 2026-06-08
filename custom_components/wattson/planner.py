@@ -762,23 +762,30 @@ def build_override_battery_plan(
     return None
 
 
+def ev_drawing_real_power(state: SiteState, min_draw_w: float = EV_SOLAR_PRIORITY_MIN_DRAW_W) -> bool:
+    """True when the charger is actually pulling meaningful power (a real session),
+    not merely enabled / awaiting_start at ~0 W."""
+    return (state.easee_power_w or 0.0) >= min_draw_w
+
+
 def should_prioritize_ev_solar(
-    state: SiteState,
     ev_plan: EvPlan,
     *,
     battery_control_enabled: bool,
-    min_draw_w: float = EV_SOLAR_PRIORITY_MIN_DRAW_W,
+    ev_recently_active: bool,
 ) -> bool:
-    """Whether to hand PV to the car and stop charging the house battery / allow
-    export. Only true when the car is ACTUALLY drawing power — a charger that is
-    merely enabled / awaiting_start at ~0 W must not cause the surplus to be
-    exported at low prices while the battery still has room to charge.
+    """Whether to hand PV to the car and stop charging the house battery for export.
+    Requires the car to be actively charging (``ev_recently_active`` stays true for
+    a short hold after the car last drew real power, so brief charger dips don't
+    flip the battery strategy). When the charger is merely enabled / awaiting_start
+    at ~0 W, this is false so the surplus charges the house battery instead of
+    being exported at low prices.
     """
     return bool(
         battery_control_enabled
         and ev_plan.desired_enabled is True
         and ev_plan.desired_action == "resume"
-        and (state.easee_power_w or 0.0) >= min_draw_w
+        and ev_recently_active
     )
 
 

@@ -83,6 +83,7 @@ from .const import (
     DEFAULT_MASTER_LOCK_ENABLED,
     INVERTER_WRITE_COOLDOWN_SECONDS,
     EV_WRITE_COOLDOWN_SECONDS,
+    EV_ACTIVE_HOLD_SECONDS,
     MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
@@ -102,6 +103,7 @@ from .planner import (
     build_override_battery_plan,
     build_override_ev_plan,
     effective_solar_surplus_w,
+    ev_drawing_real_power,
     should_prioritize_ev_solar,
     value_increment_kr,
 )
@@ -149,6 +151,9 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._default_discharge_current_a: float | None = None
         self._default_charge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
+        # Keeps EV-solar priority engaged through brief charger dips so the battery
+        # strategy doesn't flip (and churn the inverter settings) every few seconds.
+        self._ev_active_until: datetime | None = None
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
@@ -289,8 +294,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self.battery_override_until = None
         else:
             # Setting an override is an explicit "do this now" intent; clear any
-            # passive pause so the forced action is actually applied.
+            # passive pause AND any master-lock back-off so the forced action is
+            # actually applied immediately.
             self.pause_until = None
+            self._battery_contended_until = None
+            self.battery_contended = False
+            self.contended_entities = []
+            self._klatremis.reset_write_history()
             self.battery_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
         self._last_ev_fp = None
         await self.async_request_refresh()
@@ -499,25 +509,36 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_action=None,
                 )
 
+            # Sticky: keep EV-solar priority through brief charger dips so the
+            # battery strategy doesn't flip every few seconds and churn the
+            # inverter settings.
+            if ev_drawing_real_power(self.site_state):
+                self._ev_active_until = now + timedelta(seconds=EV_ACTIVE_HOLD_SECONDS)
+            ev_recently_active = self._ev_active_until is not None and now < self._ev_active_until
+
             if should_prioritize_ev_solar(
-                self.site_state, ev_plan, battery_control_enabled=self.battery_control_enabled
+                ev_plan,
+                battery_control_enabled=self.battery_control_enabled,
+                ev_recently_active=ev_recently_active,
             ):
-                # The car is ACTUALLY charging on solar: prioritize available PV for
-                # the car and avoid zero-export curtailment that can throttle PV
-                # production. When the charger is only enabled/awaiting_start at ~0 W
-                # this branch is skipped, so the surplus charges the house battery
-                # instead of being exported at low prices.
+                # The car is actively charging on solar: prioritize PV for the car.
+                # Coherent inverter mode (like IDLE): the house battery absorbs the
+                # surplus the car isn't using (zero export) instead of dumping it at
+                # low prices; only a FULL battery exports the genuine surplus.
+                battery_full = self.site_state.battery_soc_pct >= float(
+                    entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)
+                )
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
-                        f"{battery_plan.reason} | EV solar-only actively charging, prioritizing EV over battery "
-                        "and allowing full PV production"
+                        f"{battery_plan.reason} | EV solar-only actively charging; PV to car, "
+                        "surplus charges the house battery"
                     ),
                     desired_grid_charge=False,
-                    desired_solar_sell=True,
+                    desired_solar_sell=battery_full,
                     desired_energy_priority="Load first",
-                    desired_limit_control_mode="Selling first",
+                    desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
                     desired_discharge_current_a=0.0,
                 )
 
@@ -606,22 +627,27 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self.contended_entities = []
             self._klatremis.reset_write_history()
 
-        backed_off = self.master_lock_enabled and self._battery_contended_until is not None
+        # A manual override is an explicit user action and must always be applied,
+        # even if the master lock is in back-off.
+        override_active = self.battery_override != BATTERY_OVERRIDE_AUTO
+        backed_off = self.master_lock_enabled and self._battery_contended_until is not None and not override_active
         if self.battery_control_enabled and not backed_off:
             if write_allowed(self._last_battery_write_at, INVERTER_WRITE_COOLDOWN_SECONDS, now):
                 acts = await self._klatremis.apply_battery_plan(self.mapping, plan.battery, now)
                 if acts:
                     self._last_battery_write_at = now
                 actions.extend(acts)
-                # A competing controller shows up as repeated corrective writes.
-                contended = self._klatremis.contended_entities(now)
-                if contended:
-                    self.contended_entities = contended
-                    self._battery_contended_until = now + timedelta(seconds=MASTER_LOCK_BACKOFF_SECONDS)
-                    _LOGGER.warning(
-                        "Wattson suspects a competing controller writing %s; backing off battery control",
-                        ", ".join(contended),
-                    )
+                # A competing controller shows up as repeated re-asserts of the SAME
+                # value. Don't arm the lock from a forced override's own writes.
+                if not override_active:
+                    contended = self._klatremis.contended_entities(now)
+                    if contended:
+                        self.contended_entities = contended
+                        self._battery_contended_until = now + timedelta(seconds=MASTER_LOCK_BACKOFF_SECONDS)
+                        _LOGGER.warning(
+                            "Wattson suspects a competing controller writing %s; backing off battery control",
+                            ", ".join(contended),
+                        )
         elif backed_off:
             actions.append(
                 f"battery control backed off — competing controller suspected on {', '.join(self.contended_entities)}"

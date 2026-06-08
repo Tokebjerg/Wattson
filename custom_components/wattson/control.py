@@ -31,31 +31,35 @@ class KlatremisController:
         # entity_id -> consecutive unconverged write attempts
         self._write_attempts: dict[str, int] = {}
         self.degraded_entities: set[str] = set()
-        # Phase E part 2: entity_id -> timestamps of corrective writes (a write
-        # that actually issued a service call because the value had drifted).
-        # A competing controller shows up as the same control being rewritten
-        # again and again within the contention window.
-        self._write_history: dict[str, list[datetime]] = {}
+        # Phase E part 2: (entity_id, value) -> timestamps of corrective writes (a
+        # write that actually issued a service call because the value had drifted).
+        # Keyed by VALUE too, so Wattson legitimately alternating a setting
+        # (on->off->on as the strategy changes) is NOT mistaken for contention —
+        # a real competing controller shows up as the SAME value being re-asserted
+        # again and again because something keeps reverting it.
+        self._write_history: dict[tuple[str, str], list[datetime]] = {}
 
-    def _record_write(self, entity_id: str | None, now: datetime | None) -> None:
+    def _record_write(self, entity_id: str | None, value, now: datetime | None) -> None:
         if not entity_id or now is None:
             return
-        history = prune_history(self._write_history.get(entity_id, []), now, CONTENTION_WINDOW_SECONDS)
+        key = (entity_id, str(value))
+        history = prune_history(self._write_history.get(key, []), now, CONTENTION_WINDOW_SECONDS)
         history.append(now)
-        self._write_history[entity_id] = history
+        self._write_history[key] = history
 
     def contended_entities(self, now: datetime) -> list[str]:
-        """Control entities Wattson has had to re-assert too often (likely a
-        competing controller). Prunes the history as a side effect."""
-        contended: list[str] = []
-        for entity_id, history in list(self._write_history.items()):
+        """Control entities Wattson has had to re-assert the SAME value too often
+        (likely a competing controller reverting it). Prunes history as a side
+        effect."""
+        contended: set[str] = set()
+        for key, history in list(self._write_history.items()):
             pruned = prune_history(history, now, CONTENTION_WINDOW_SECONDS)
-            self._write_history[entity_id] = pruned
+            self._write_history[key] = pruned
             if not pruned:
-                del self._write_history[entity_id]
+                del self._write_history[key]
             elif is_contended(pruned, now, CONTENTION_WINDOW_SECONDS, CONTENTION_WRITE_THRESHOLD):
-                contended.append(entity_id)
-        return contended
+                contended.add(key[0])
+        return sorted(contended)
 
     def reset_write_history(self) -> None:
         """Clear contention state so the next tick re-probes from scratch."""
@@ -130,24 +134,24 @@ class KlatremisController:
     ) -> list[str]:
         actions: list[str] = []
 
-        async def do(entity_id: str | None, coro) -> None:
+        async def do(entity_id: str | None, value, coro) -> None:
             result = await coro
             if result:
                 # An actual service call was issued (the value had drifted), so
-                # record it for competing-controller detection.
-                self._record_write(entity_id, now)
+                # record it (keyed by value) for competing-controller detection.
+                self._record_write(entity_id, value, now)
             actions.extend(result)
 
         if plan.desired_grid_charge is not None:
-            await do(mapping.grid_charge_switch, self._set_switch(mapping.grid_charge_switch, plan.desired_grid_charge))
+            await do(mapping.grid_charge_switch, plan.desired_grid_charge, self._set_switch(mapping.grid_charge_switch, plan.desired_grid_charge))
         if plan.desired_solar_sell is not None:
-            await do(mapping.solar_sell_switch, self._set_switch(mapping.solar_sell_switch, plan.desired_solar_sell))
-        await do(mapping.energy_priority_select, self._set_select(mapping.energy_priority_select, plan.desired_energy_priority))
-        await do(mapping.limit_control_mode_select, self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
-        await do(mapping.export_limit_number, self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
-        await do(mapping.battery_grid_charge_current_number, self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
-        await do(mapping.battery_charge_current_number, self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
-        await do(mapping.battery_discharge_current_number, self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
+            await do(mapping.solar_sell_switch, plan.desired_solar_sell, self._set_switch(mapping.solar_sell_switch, plan.desired_solar_sell))
+        await do(mapping.energy_priority_select, plan.desired_energy_priority, self._set_select(mapping.energy_priority_select, plan.desired_energy_priority))
+        await do(mapping.limit_control_mode_select, plan.desired_limit_control_mode, self._set_select(mapping.limit_control_mode_select, plan.desired_limit_control_mode))
+        await do(mapping.export_limit_number, plan.desired_export_limit_w, self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
+        await do(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a, self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
+        await do(mapping.battery_charge_current_number, plan.desired_max_charge_current_a, self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
+        await do(mapping.battery_discharge_current_number, plan.desired_discharge_current_a, self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
         return actions
 
 

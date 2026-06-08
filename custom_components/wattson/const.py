@@ -137,6 +137,10 @@ EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surpl
 # / awaiting_start at ~0 W must not cause surplus to be exported at low prices
 # while the house battery still has room to charge.
 EV_SOLAR_PRIORITY_MIN_DRAW_W = 500.0
+# Keep EV-solar priority engaged for this long after the car last drew real power,
+# so brief charger dips (awaiting_start <-> charging) do not flip the battery
+# strategy every few seconds (which would churn the inverter settings).
+EV_ACTIVE_HOLD_SECONDS = 150
 
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan
