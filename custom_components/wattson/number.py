@@ -18,6 +18,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         [
             WattsonEVSolarBatteryThresholdNumber(coordinator, entry),
             WattsonOverrideMinutesNumber(coordinator, entry),
+            WattsonBatteryMinSocNumber(coordinator, entry),
+            WattsonBatteryMaxSocNumber(coordinator, entry),
         ]
     )
 
@@ -83,4 +85,56 @@ class WattsonOverrideMinutesNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_override_minutes(int(value))
+        self.async_write_ha_state()
+
+
+class _BaseSocNumber(NumberEntity):
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry, name: str, suffix: str, icon: str) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._attr_name = name
+        self._attr_unique_id = f"{entry.entry_id}_{suffix}"
+        self._attr_icon = icon
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+
+class WattsonBatteryMinSocNumber(_BaseSocNumber):
+    """Lowest SOC (%) the battery is discharged to."""
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "Battery Min SOC", "battery_min_soc", "mdi:battery-low")
+
+    @property
+    def native_value(self) -> float:
+        return float(self._coordinator.battery_min_soc)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.async_set_battery_min_soc(float(value))
+        self.async_write_ha_state()
+
+
+class WattsonBatteryMaxSocNumber(_BaseSocNumber):
+    """Highest SOC (%) the battery is charged to."""
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "Battery Max SOC", "battery_max_soc", "mdi:battery-high")
+
+    @property
+    def native_value(self) -> float:
+        return float(self._coordinator.battery_max_soc)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.async_set_battery_max_soc(float(value))
         self.async_write_ha_state()

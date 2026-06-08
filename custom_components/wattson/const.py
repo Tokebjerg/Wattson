@@ -106,7 +106,9 @@ LEARNING_MIN_DAYS = 7              # min observed days before the reserve is app
 LEARNING_RESERVE_HOURS = 3         # hours of predicted load to hold back for self-use
                                    # (near-term: protects the morning ramp without
                                    #  over-reserving and blocking evening/night use)
-LEARNING_RESERVE_MAX_PCT = 35.0    # cap the learned reserve so it never locks the battery
+LEARNING_RESERVE_MAX_PCT = 15.0    # cap the learned reserve so the battery is still
+                                   # used down toward min_soc, keeping only a small
+                                   # morning buffer rather than locking ~half the pack
 LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
 
 # Phase F: cap a single value-accumulation tick so restart/sleep gaps don't

@@ -332,6 +332,22 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_OVERRIDE_MINUTES: clamped})
         await self.async_request_refresh()
 
+    @property
+    def battery_min_soc(self) -> float:
+        return float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
+
+    @property
+    def battery_max_soc(self) -> float:
+        return float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+
+    async def async_set_battery_min_soc(self, value: float) -> None:
+        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MIN_SOC: float(value)})
+        await self.async_request_refresh()
+
+    async def async_set_battery_max_soc(self, value: float) -> None:
+        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MAX_SOC: float(value)})
+        await self.async_request_refresh()
+
     async def async_set_master_lock_enabled(self, enabled: bool) -> None:
         self.master_lock_enabled = bool(enabled)
         if not enabled:
