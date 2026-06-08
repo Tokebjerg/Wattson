@@ -96,15 +96,17 @@ DEFAULT_EV_REQUIRED_HOURS = 4
 # Scheduled charging window (whole hours, local time). 00:00-06:00 by default.
 DEFAULT_EV_WINDOW_START = 0
 DEFAULT_EV_WINDOW_END = 6
-DEFAULT_BATTERY_MIN_SOC = 20
-DEFAULT_BATTERY_MAX_SOC = 90
+DEFAULT_BATTERY_MIN_SOC = 15       # use the battery down to 15%
+DEFAULT_BATTERY_MAX_SOC = 100      # charge all the way to 100%
 DEFAULT_BATTERY_CAPACITY_KWH = 10.0
 
 # Phase D learning parameters.
 LEARNING_WINDOW_DAYS = 28          # how far back to read load history
 LEARNING_MIN_DAYS = 7              # min observed days before the reserve is applied
-LEARNING_RESERVE_HOURS = 6         # hours of predicted load to hold back for self-use
-LEARNING_RESERVE_MAX_PCT = 50.0    # cap the learned reserve so it never locks the battery
+LEARNING_RESERVE_HOURS = 3         # hours of predicted load to hold back for self-use
+                                   # (near-term: protects the morning ramp without
+                                   #  over-reserving and blocking evening/night use)
+LEARNING_RESERVE_MAX_PCT = 35.0    # cap the learned reserve so it never locks the battery
 LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
 
 # Phase F: cap a single value-accumulation tick so restart/sleep gaps don't

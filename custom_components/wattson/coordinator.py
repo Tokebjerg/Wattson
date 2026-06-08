@@ -537,6 +537,10 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 battery_full = self.site_state.battery_soc_pct >= float(
                     entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)
                 )
+                # Only sell when the battery is full AND export actually pays; at a
+                # zero/negative price keep zero-export so the car absorbs the surplus
+                # (no curtailment) instead of exporting at a loss.
+                sell_surplus = battery_full and (self.site_state.current_sell_price or 0) > 0
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
@@ -545,9 +549,9 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                         "surplus charges the house battery"
                     ),
                     desired_grid_charge=False,
-                    desired_solar_sell=battery_full,
+                    desired_solar_sell=sell_surplus,
                     desired_energy_priority="Load first",
-                    desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
+                    desired_limit_control_mode="Selling first" if sell_surplus else "Zero export to CT",
                     desired_discharge_current_a=0.0,
                 )
 

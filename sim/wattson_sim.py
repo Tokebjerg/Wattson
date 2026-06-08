@@ -320,13 +320,13 @@ SCENARIOS = [
      chk_battery("DISCHARGE_TO_LOAD")),
 
     ("Cheap price but battery already full -> not grid charge (idle)",
-     entities(grid=400, soc=92, buy=0.40, sell=0.30, ev_status="disconnected"),
+     entities(grid=400, soc=100, buy=0.40, sell=0.30, ev_status="disconnected"),
      Settings(ev_mode=const.EV_MODE_SCHEDULED),
      chk(lambda st, pl: pl.battery.strategy != "GRID_CHARGE",
          "must not GRID_CHARGE at/above max_soc")),
 
     ("Expensive price but battery at min -> not discharge",
-     entities(grid=1500, soc=18, buy=2.50, sell=0.30, ev_status="disconnected"),
+     entities(grid=1500, soc=15, buy=2.50, sell=0.30, ev_status="disconnected"),
      Settings(ev_mode=const.EV_MODE_SCHEDULED),
      chk(lambda st, pl: pl.battery.strategy != "DISCHARGE_TO_LOAD",
          "must not DISCHARGE_TO_LOAD at/below min_soc")),
@@ -680,7 +680,10 @@ def test_a2_planning():
         )
         return bp
 
-    checks.append(("cheap night hour -> GRID_CHARGE", plan_at(at(3), 50).strategy == "GRID_CHARGE", plan_at(at(3), 50).strategy))
+    # Self-consumption first: a cheap night hour with a usable battery covers the
+    # house (DISCHARGE); only a near-empty battery tops up from the cheap grid.
+    checks.append(("cheap night, low SOC -> GRID_CHARGE", plan_at(at(3), 18).strategy == "GRID_CHARGE", plan_at(at(3), 18).strategy))
+    checks.append(("cheap night, usable SOC -> DISCHARGE (self-consume)", plan_at(at(3), 50).strategy == "DISCHARGE_TO_LOAD", plan_at(at(3), 50).strategy))
     checks.append(("expensive evening -> DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy == "DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy))
     checks.append(("cheap but battery full -> not GRID_CHARGE", plan_at(at(3), 95).strategy != "GRID_CHARGE", plan_at(at(3), 95).strategy))
     checks.append(("expensive but at min SOC -> not DISCHARGE", plan_at(at(19), 18).strategy != "DISCHARGE_TO_LOAD", plan_at(at(19), 18).strategy))
@@ -983,8 +986,8 @@ def test_d_learning():
 
     def make_state(now, soc, slots):
         return models.SiteState(
-            timestamp=now, pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
-            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            timestamp=now, pv_power_w=0.0, load_power_w=2000.0, load_includes_ev=False,
+            grid_power_w=2000.0, grid_import_power_w=2000.0, grid_export_power_w=0.0,
             battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
             easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
             easee_phase_mode="auto", current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
@@ -1021,6 +1024,77 @@ def test_f_savings():
     checks.append(("zero dt -> no value", v(2000, 0, 0, 2.0, 0.5, 0.0) == 0.0, str(v(2000, 0, 0, 2.0, 0.5, 0.0))))
     # Combined avoided + export.
     checks.append(("combined avoided + export", abs(v(3000, 1000, 500, 1.0, 0.6, 1.0) - (2.0 * 1.0 + 0.5 * 0.6)) < 1e-6, str(v(3000, 1000, 500, 1.0, 0.6, 1.0))))
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# 11b. Self-consumption schedule (100/15 range, sell+trickle, evening+night
+#      discharge, no export at negative prices).
+# --------------------------------------------------------------------------- #
+def test_self_consumption_schedule():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 9, h, 0, tzinfo=TZ)
+
+    def pslot(h, total, exp):
+        return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=exp)
+
+    # Night cheap; expensive sunny morning (above avg); NEGATIVE-price sunny midday;
+    # evening peak; mid late-evening.
+    price = {h: (0.30, 0.20) for h in range(6)}
+    price[6] = (0.80, 0.5); price[7] = (0.95, 0.5)
+    for h in (8, 9, 10):
+        price[h] = (1.10, 0.5)
+    for h in (11, 12, 13, 14, 15):
+        price[h] = (-0.10, -0.10)        # negative: exporting costs money
+    price[16] = (0.55, 0.3)
+    price[17] = (1.06, 0.5); price[18] = (1.40, 0.5); price[19] = (1.70, 0.5)
+    price[20] = (1.80, 0.5); price[21] = (1.19, 0.5); price[22] = (0.70, 0.4); price[23] = (0.60, 0.4)
+    day = [pslot(h, price[h][0], price[h][1]) for h in range(24)]
+
+    solar_kwh = {7: 1.0, 8: 3.0, 9: 5.0, 10: 6.0, 11: 6.5, 12: 7.0, 13: 6.5, 14: 5.5, 15: 4.0, 16: 2.0}
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=solar_kwh.get(h, 0.0)) for h in range(24)]
+    load = {h: 1500 for h in range(24)}
+
+    st = models.SiteState(
+        timestamp=at(6), pv_power_w=0.0, load_power_w=1500.0, load_includes_ev=False,
+        grid_power_w=1500.0, grid_import_power_w=1500.0, grid_export_power_w=0.0,
+        battery_soc_pct=30.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.30, current_sell_price=0.20, forecast_today_kwh=40.0,
+        price_slots=day, solar_slots=solar,
+    )
+    bp, neg = planner.build_battery_plan(
+        st, battery_mode="blue", min_soc=15, max_soc=100, cheap_threshold=0.75,
+        expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+        export_limit_default_w=6000.0,
+    )
+    cp = planner.build_control_plan(
+        st, battery_plan=bp, ev_plan=models.EvPlan(mode="x", reason=""), safe_reasons=[],
+        negative_price_active=neg, battery_mode="blue", load_hourly_w=load,
+        capacity_kwh=10.0, min_soc=15, max_soc=100, learned_reserve_pct=0.0,
+    )
+    sched = {t.start.hour: t for t in cp.schedule}
+
+    # Request 3: expensive sunny morning sells the surplus + trickle-charges.
+    checks.append(("morning 8-10 above-avg sunny -> EXPORT (sell+trickle)", all(sched[h].action == "EXPORT" for h in (8, 9, 10)), str([sched[h].action for h in (8, 9, 10)])))
+    # Request 4: never EXPORT at a negative price; charge the battery / curtail instead.
+    midday = [sched[h].action for h in (11, 12, 13, 14, 15)]
+    checks.append(("negative-price midday never EXPORTs", "EXPORT" not in midday, str(midday)))
+    checks.append(("negative-price midday charges then curtails (no loss export)", all(a in ("SOLAR_CHARGE", "LIMIT_EXPORT", "IDLE") for a in midday) and "SOLAR_CHARGE" in midday, str(midday)))
+    checks.append(("full battery at negative price -> LIMIT_EXPORT (curtail)", "LIMIT_EXPORT" in midday, str(midday)))
+    # Request 1: charges all the way to ~100%.
+    checks.append(("battery charged to ~100%", max(t.projected_soc_pct for t in cp.schedule) >= 99, str(max(t.projected_soc_pct for t in cp.schedule))))
+    # Request 2: discharge at 17 and 21 (not only the top-3 peak), and overnight.
+    checks.append(("evening 17 -> DISCHARGE", sched[17].action == "DISCHARGE", sched[17].action))
+    checks.append(("evening 21 -> DISCHARGE", sched[21].action == "DISCHARGE", sched[21].action))
+    checks.append(("discharge continues into the night past the peak", sched[22].action == "DISCHARGE", sched[22].action))
+    checks.append(("discharges down toward the 15% floor", min(t.projected_soc_pct for t in cp.schedule) <= 20, str(min(t.projected_soc_pct for t in cp.schedule))))
+
     return checks
 
 
@@ -1449,6 +1523,7 @@ def main():
                          ("PHASE B · RØD/BLÅ/GRØN PROFILES", test_b_profiles),
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
+                         ("SELF-CONSUMPTION SCHEDULE (100/15)", test_self_consumption_schedule),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

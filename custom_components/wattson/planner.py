@@ -56,7 +56,7 @@ PROFILES: dict[str, ProfileWeights] = {
         sell_solar_at_peak=True,
     ),
     BATTERY_MODE_BLUE: ProfileWeights(
-        name="blue", reserve_soc_offset=10, cheap_hours=5, expensive_hours=3,
+        name="blue", reserve_soc_offset=0, cheap_hours=5, expensive_hours=3,
         profit_margin=0.40, sell_at_peak=False, self_consumption_first=False,
         sell_solar_at_peak=True,
     ),
@@ -191,6 +191,47 @@ def _horizon_battery_plan(
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
+    # 1. Sell the solar surplus at an above-average price, trickle-charging only,
+    #    so the bulk charge waits for the cheap midday sun.
+    if (
+        profile.sell_solar_at_peak
+        and price >= view.mean_price
+        and (current.export_value or 0) > 0
+        and state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
+        and state.battery_soc_pct < max_soc
+    ):
+        return BatteryPlan(
+            strategy="SELL_SOLAR_PEAK",
+            reason=f"[{profile.name}] price {price:.2f} above average with solar — selling the surplus and trickle-charging at {TRICKLE_CHARGE_A}A, saving the battery for cheap midday sun",
+            desired_grid_charge=False,
+            desired_solar_sell=True,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first",
+            desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=TRICKLE_CHARGE_A,
+        )
+
+    # 2. Self-consumption first: cover the house from the battery whenever PV can't,
+    #    through the evening AND night, down to the reserve floor (which protects the
+    #    morning). Also discharge to SELL at a genuine peak (sell-at-peak profiles,
+    #    when export pays) even with no house deficit. This comes BEFORE grid-charge
+    #    so stored solar is used for the house rather than buying from the grid.
+    house_deficit = state.load_power_w - state.pv_power_w
+    sell = is_expensive and profile.sell_at_peak and (current.export_value or 0) > 0
+    if state.battery_soc_pct > discharge_floor and (house_deficit > 50 or sell):
+        peak = "peak " if is_expensive else ""
+        return BatteryPlan(
+            strategy="DISCHARGE_TO_LOAD",
+            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f})",
+            desired_grid_charge=False,
+            desired_solar_sell=sell,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    # 3. Top up from cheap grid only when the battery is at/near its floor and can't
+    #    cover the upcoming expensive window itself (rare in a solar-rich setup).
     if (
         allow_grid_charge
         and is_cheap
@@ -210,36 +251,6 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
-    if (
-        profile.sell_solar_at_peak
-        and price >= view.mean_price
-        and (current.export_value or 0) > 0
-        and state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
-        and state.battery_soc_pct < max_soc
-    ):
-        return BatteryPlan(
-            strategy="SELL_SOLAR_PEAK",
-            reason=f"[{profile.name}] price {price:.2f} above average with solar — selling the surplus and trickle-charging at {TRICKLE_CHARGE_A}A, saving the battery for cheap midday sun",
-            desired_grid_charge=False,
-            desired_solar_sell=True,
-            desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first",
-            desired_export_limit_w=export_limit_default_w,
-            desired_max_charge_current_a=TRICKLE_CHARGE_A,
-        )
-
-    if is_expensive and state.battery_soc_pct > discharge_floor:
-        sell = profile.sell_at_peak and (current.export_value or 0) > 0
-        return BatteryPlan(
-            strategy="DISCHARGE_TO_LOAD",
-            reason=f"[{profile.name}] total price {price:.2f} is among the most expensive hours",
-            desired_grid_charge=False,
-            desired_solar_sell=sell,
-            desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
-            desired_export_limit_w=export_limit_default_w,
-        )
-
     if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
         return BatteryPlan(
             strategy="SOLAR_SELF_CONSUMPTION",
@@ -251,17 +262,19 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
-    # Coherent idle mode: only allow selling when the battery is full and genuinely
-    # cannot absorb the surplus. Otherwise keep solar_sell OFF + zero-export so the
-    # inverter charges from PV instead of hunting between charge and grid-export.
-    battery_full = state.battery_soc_pct >= max_soc
+    # Coherent idle mode: only sell when the battery is full AND export actually
+    # pays (never export at a zero/negative price). Otherwise keep solar_sell OFF +
+    # zero-export so the surplus charges the battery / covers the house rather than
+    # being dumped at a loss or making the inverter hunt.
+    known_worthless_export = current.export_value is not None and current.export_value <= 0
+    sell_when_full = state.battery_soc_pct >= max_soc and not known_worthless_export
     return BatteryPlan(
         strategy="IDLE",
         reason="No strong battery action required right now",
         desired_grid_charge=False,
-        desired_solar_sell=battery_full,
+        desired_solar_sell=sell_when_full,
         desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-        desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
+        desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
         desired_export_limit_w=export_limit_default_w,
     )
 
@@ -272,8 +285,8 @@ def _build_schedule(
     load_hourly_w: dict[int, float] | None = None,
     *,
     capacity_kwh: float = 10.0,
-    min_soc: float = 20.0,
-    max_soc: float = 90.0,
+    min_soc: float = 15.0,
+    max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan with a battery-SOC projection.
@@ -315,6 +328,11 @@ def _build_schedule(
         worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
 
         price_high = slot.total_import_price >= view.mean_price and (slot.export_value or 0) > 0
+        deficit_kwh = max(load_kwh - solar_kwh, 0.0)
+        # Exporting at a KNOWN zero/negative price costs money, so never export then
+        # — charge the battery, cover the house, otherwise curtail. Unknown export
+        # value is treated as sellable (don't curtail on missing data).
+        worthless_export = slot.export_value is not None and slot.export_value <= 0
         if (
             profile.sell_solar_at_peak
             and surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH
@@ -326,14 +344,26 @@ def _build_schedule(
             soc_kwh = min(max_kwh, soc_kwh + TRICKLE_CHARGE_KWH)
             action = "EXPORT"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
+            # Surplus with room in the battery: charge it (prioritised over export,
+            # especially valuable when the export price is zero/negative).
             soc_kwh = min(max_kwh, soc_kwh + surplus_kwh)
             action = "SOLAR_CHARGE"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
-            action = "EXPORT"  # battery full, sell the surplus
+            # Battery full + surplus: sell it, unless exporting is worthless or
+            # would cost money — then curtail to house-only instead.
+            action = "LIMIT_EXPORT" if worthless_export else "EXPORT"
+        elif deficit_kwh > 0.05 and soc_kwh > floor_kwh + 0.05:
+            # Self-consumption first: cover the house deficit from stored solar
+            # through the evening AND night, down to the reserve floor (which
+            # protects the morning). Comes BEFORE grid-charge so we use the
+            # battery rather than buying; the peak is covered first (earlier).
+            drain = min(deficit_kwh, soc_kwh - floor_kwh)
+            soc_kwh -= drain
+            action = "DISCHARGE"
         elif is_cheap and worthwhile and soc_kwh < max_kwh - 0.05:
-            # Only grid-charge if the forecast solar before the next expensive
-            # window won't already fill the battery — don't pay the grid for
-            # energy the sun will deliver for free.
+            # Top up from cheap grid only when the battery can't cover the deficit
+            # itself — and only if the forecast solar before the next expensive
+            # window won't already fill it (don't pay for free sun).
             future_solar = 0.0
             for (s2, _sk, _lk, surp2, _hp) in info[i + 1:]:
                 if s2.start in view.expensive_starts:
@@ -344,13 +374,6 @@ def _build_schedule(
             else:
                 soc_kwh = min(max_kwh, soc_kwh + SCHEDULE_CHARGE_RATE_KWH)
                 action = "GRID_CHARGE"
-        elif is_expensive and soc_kwh > floor_kwh + 0.05:
-            # Reserve the battery for the expensive hours: discharge to cover the
-            # load deficit (down to the floor) only at peak prices, not all day.
-            deficit_kwh = max(load_kwh - solar_kwh, 0.0)
-            drain = min(max(deficit_kwh, 0.5), soc_kwh - floor_kwh)
-            soc_kwh -= drain
-            action = "DISCHARGE"
         elif slot.export_value is not None and slot.export_value < 0:
             action = "LIMIT_EXPORT"
         else:
@@ -506,15 +529,16 @@ def build_battery_plan(
             False,
         )
 
-    battery_full = state.battery_soc_pct >= max_soc
+    known_worthless_export = state.current_sell_price is not None and state.current_sell_price <= 0
+    sell_when_full = state.battery_soc_pct >= max_soc and not known_worthless_export
     return (
         BatteryPlan(
             strategy="IDLE",
             reason="No strong battery action required right now",
             desired_grid_charge=False,
-            desired_solar_sell=battery_full,
+            desired_solar_sell=sell_when_full,
             desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-            desired_limit_control_mode="Selling first" if battery_full else "Zero export to CT",
+            desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         ),
         False,
@@ -845,8 +869,8 @@ def build_control_plan(
     battery_mode: str = BATTERY_MODE_BLUE,
     load_hourly_w: dict[int, float] | None = None,
     capacity_kwh: float = 10.0,
-    min_soc: float = 20.0,
-    max_soc: float = 90.0,
+    min_soc: float = 15.0,
+    max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
