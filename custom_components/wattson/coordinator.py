@@ -476,6 +476,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
             export_limit_default_w=self._default_export_limit_w,
             learned_reserve_pct=learned_reserve_pct,
+            capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
+            load_hourly_w=self.load_profile.hourly_w if self.load_profile else None,
         )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.

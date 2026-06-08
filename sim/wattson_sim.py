@@ -680,10 +680,11 @@ def test_a2_planning():
         )
         return bp
 
-    # Self-consumption first: a cheap night hour with a usable battery covers the
-    # house (DISCHARGE); only a near-empty battery tops up from the cheap grid.
+    # Planning engine: at the cheapest night hour the battery is NOT drained to
+    # cover the house (that energy is saved for the pricey evening); a usable
+    # battery tops up from the cheap grid instead, and a near-empty one likewise.
     checks.append(("cheap night, low SOC -> GRID_CHARGE", plan_at(at(3), 18).strategy == "GRID_CHARGE", plan_at(at(3), 18).strategy))
-    checks.append(("cheap night, usable SOC -> DISCHARGE (self-consume)", plan_at(at(3), 50).strategy == "DISCHARGE_TO_LOAD", plan_at(at(3), 50).strategy))
+    checks.append(("cheap night, usable SOC -> NOT discharge (save for peak)", plan_at(at(3), 50).strategy != "DISCHARGE_TO_LOAD", plan_at(at(3), 50).strategy))
     checks.append(("expensive evening -> DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy == "DISCHARGE_TO_LOAD", plan_at(at(19), 60).strategy))
     checks.append(("cheap but battery full -> not GRID_CHARGE", plan_at(at(3), 95).strategy != "GRID_CHARGE", plan_at(at(3), 95).strategy))
     checks.append(("expensive but at min SOC -> not DISCHARGE", plan_at(at(19), 18).strategy != "DISCHARGE_TO_LOAD", plan_at(at(19), 18).strategy))
@@ -1095,6 +1096,76 @@ def test_self_consumption_schedule():
     checks.append(("evening 21 -> DISCHARGE", sched[21].action == "DISCHARGE", sched[21].action))
     checks.append(("discharge continues into the night past the peak", sched[22].action == "DISCHARGE", sched[22].action))
     checks.append(("discharges down toward the 15% floor", min(t.projected_soc_pct for t in cp.schedule) <= 20, str(min(t.projected_soc_pct for t in cp.schedule))))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# 11c. Planning engine — price-rationed discharge (battery's limited energy is
+#      spent on the most expensive deficit hours; cheap hours go to the grid).
+# --------------------------------------------------------------------------- #
+def test_planning_engine():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 10, h, 0, tzinfo=TZ)
+
+    # Cheap night, mid day, expensive evening peak. Flat 1 kWh/h load, no solar
+    # -> every hour is a 1 kWh deficit, so the budget maths is unambiguous.
+    prices = {h: 0.20 for h in range(6)}
+    prices.update({h: 0.50 for h in range(6, 16)})
+    prices.update({16: 1.0, 17: 1.2, 18: 1.4, 19: 1.6, 20: 1.8, 21: 1.5, 22: 1.0, 23: 0.8})
+    day = [models.PriceSlot(start=at(h), spot_price=prices[h], tariff=0.0,
+                            total_import_price=prices[h], export_value=0.30) for h in range(24)]
+    load_hourly = {h: 1000.0 for h in range(24)}
+
+    def make_state(now, soc):
+        return models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=1000.0, load_includes_ev=False,
+            grid_power_w=1000.0, grid_import_power_w=1000.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=prices[now.hour], current_sell_price=0.30,
+            forecast_today_kwh=0.0, price_slots=day, solar_slots=[],
+        )
+
+    def plan(mode, now, soc, lh=load_hourly):
+        bp, _ = planner.build_battery_plan(
+            make_state(now, soc), battery_mode=mode, min_soc=10, max_soc=100,
+            cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
+            allow_negative_export=False, export_limit_default_w=6000.0,
+            capacity_kwh=10.0, load_hourly_w=lh,
+        )
+        return bp
+
+    # 1. Scarce battery at a MID-price deficit hour: do NOT discharge — that
+    #    1.5 kWh above the floor is worth more in the evening peak.
+    checks.append(("scarce battery rations a mid-price hour (no discharge)",
+                   plan("blue", at(12), 25).strategy != "DISCHARGE_TO_LOAD", plan("blue", at(12), 25).strategy))
+    # 2. FULL battery at the SAME hour/price: discharge — the budget now covers
+    #    every deficit hour, so there is no pricier use to save it for.
+    checks.append(("full battery spends freely at the same mid-price hour (discharge)",
+                   plan("blue", at(12), 95).strategy == "DISCHARGE_TO_LOAD", plan("blue", at(12), 95).strategy))
+    # 3. The genuine evening peak is funded first even when the battery is scarce.
+    checks.append(("scarce battery still discharges at the peak hour",
+                   plan("blue", at(20), 25).strategy == "DISCHARGE_TO_LOAD", plan("blue", at(20), 25).strategy))
+    # 4. A cheap night hour never drains the battery, even at high SOC (peak ahead).
+    checks.append(("cheap night hour never discharges (even near-full)",
+                   plan("blue", at(2), 95).strategy != "DISCHARGE_TO_LOAD", plan("blue", at(2), 95).strategy))
+    # 5. Self-sufficiency (Grøn) ignores price rationing and always covers the house.
+    checks.append(("Green covers the house at a mid hour (ignores rationing)",
+                   plan("green", at(12), 40).strategy == "DISCHARGE_TO_LOAD", plan("green", at(12), 40).strategy))
+    checks.append(("Blue rations the same mid hour Green covers",
+                   plan("blue", at(12), 40).strategy != "DISCHARGE_TO_LOAD", plan("blue", at(12), 40).strategy))
+    # 6. No learned load profile -> conservative above-average-price gate: a cheap
+    #    hour still holds, a peak hour still discharges.
+    checks.append(("no load profile: cheap hour still held (mean gate)",
+                   plan("blue", at(2), 60, lh=None).strategy != "DISCHARGE_TO_LOAD", plan("blue", at(2), 60, lh=None).strategy))
+    checks.append(("no load profile: peak hour still discharges (mean gate)",
+                   plan("blue", at(20), 60, lh=None).strategy == "DISCHARGE_TO_LOAD", plan("blue", at(20), 60, lh=None).strategy))
 
     return checks
 
@@ -1534,6 +1605,7 @@ def main():
                          ("PHASE C · SMARTCHARGE", test_c_smartcharge),
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
                          ("SELF-CONSUMPTION SCHEDULE (100/15)", test_self_consumption_schedule),
+                         ("PLANNING ENGINE · PRICE-RATIONED DISCHARGE", test_planning_engine),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

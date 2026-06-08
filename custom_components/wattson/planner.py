@@ -37,6 +37,11 @@ SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
 # projection in the schedule, so it knows roughly how fast grid-charging fills.
 SCHEDULE_CHARGE_RATE_KWH = 5.0
 
+# Minimum house deficit (W) before the battery is tapped to cover the load. A
+# small deadband above zero stops the planner micro-cycling around the
+# solar/load crossover (brief clouds, fridge cycling) for negligible benefit.
+DISCHARGE_DEADBAND_W = 150.0
+
 # Peak-solar-export (export-friendly profiles): in sunny hours priced above the
 # day's average, sell the surplus and only trickle-charge the battery at this
 # current (~0.5 kWh/h on a ~50V LV battery), saving the bulk charge for the
@@ -138,6 +143,74 @@ def _horizon_view(state: SiteState, profile: ProfileWeights) -> _HorizonView | N
     return view
 
 
+def discharge_price_threshold(
+    slots: list,
+    *,
+    soc_kwh: float,
+    floor_kwh: float,
+    max_kwh: float,
+    profile: ProfileWeights,
+    solar_by_start: dict,
+    load_hourly_w: dict[int, float] | None,
+    mean_price: float,
+) -> float:
+    """The lowest import price (DKK/kWh) at which it pays to discharge NOW.
+
+    This is the heart of the planning engine. The battery's usable energy (the
+    SOC above the reserve floor) is a *limited budget*; spending it on the most
+    expensive deficit hours first maximises the saving. The threshold is the
+    price at which that budget runs out — so we discharge only in hours priced
+    at or above it, leaving cheap-hour deficits to the (cheap) grid and saving
+    the stored energy for the genuine peak.
+
+    The budget is allocated only over the current "discharge episode": deficit
+    hours up to the point where forecast solar would refill the battery again
+    (after that it is a fresh budget, so tomorrow's peak must not starve
+    tonight's). Re-evaluated every tick, the policy self-corrects: a near-empty
+    battery rations hard (high threshold, peak only); a full battery spends
+    freely (low threshold), which also makes room for incoming solar.
+
+    Returns ``-inf`` (always discharge to cover the house) for self-sufficiency
+    profiles or when there is no priced deficit ahead, and ``+inf`` (never) when
+    there is nothing to spend. With no learned load profile it degrades to a
+    conservative above-average-price gate (``mean_price``).
+    """
+    if profile.self_consumption_first:
+        return float("-inf")
+    budget_kwh = max(0.0, soc_kwh - floor_kwh)
+    if budget_kwh <= 0.0:
+        return float("inf")
+    if not load_hourly_w:
+        return mean_price
+    avg_load_w = sum(load_hourly_w.values()) / len(load_hourly_w)
+    remaining_to_full = max(0.0, max_kwh - soc_kwh)
+    deficits: list[tuple[float, float]] = []
+    cum_net_kwh = 0.0
+    for slot in slots:
+        load_kwh = load_hourly_w.get(slot.start.hour, avg_load_w) / 1000.0
+        pv = solar_by_start.get(slot.start)
+        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
+        net = solar_kwh - load_kwh
+        if net < 0:
+            deficits.append((slot.total_import_price, -net))
+        cum_net_kwh += net
+        # Once forecast solar has refilled the pack, later deficits belong to a
+        # new budget episode — stop competing for tonight's stored energy.
+        if deficits and cum_net_kwh >= remaining_to_full:
+            break
+    if not deficits:
+        return float("-inf")
+    deficits.sort(key=lambda pd: pd[0], reverse=True)
+    accumulated = 0.0
+    threshold = deficits[-1][0]
+    for price, kwh in deficits:
+        accumulated += kwh
+        if accumulated >= budget_kwh:
+            threshold = price
+            break
+    return threshold
+
+
 def _parse_windows(raw: str) -> list[tuple[time, time]]:
     windows: list[tuple[time, time]] = []
     for part in [segment.strip() for segment in raw.split(",") if segment.strip()]:
@@ -173,6 +246,8 @@ def _horizon_battery_plan(
     allow_grid_charge: bool,
     export_limit_default_w: float | None,
     learned_reserve_pct: float = 0.0,
+    capacity_kwh: float = 10.0,
+    load_hourly_w: dict[int, float] | None = None,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -214,18 +289,38 @@ def _horizon_battery_plan(
             desired_discharge_current_a=0.0,
         )
 
-    # 2. Self-consumption first: cover the house from the battery whenever PV can't,
-    #    through the evening AND night, down to the reserve floor (which protects the
-    #    morning). Also discharge to SELL at a genuine peak (sell-at-peak profiles,
-    #    when export pays) even with no house deficit. This comes BEFORE grid-charge
-    #    so stored solar is used for the house rather than buying from the grid.
+    # 2. Self-consumption with price-rationing (the planning engine): cover the
+    #    house from the battery whenever PV can't — BUT only when this hour's price
+    #    clears the discharge threshold, i.e. the limited stored energy is best
+    #    spent here rather than saved for a pricier hour still ahead. Cheap-hour
+    #    deficits are left to the (cheap) grid so the battery is kept for the peak.
+    #    Self-sufficiency profiles (Grøn) get a -inf threshold (always cover the
+    #    house); a near-full pack gets a low threshold (big budget) so it spends
+    #    freely and leaves room for incoming solar. Also discharge to SELL at a
+    #    genuine peak (sell-at-peak profiles, when export pays). Comes BEFORE
+    #    grid-charge so stored solar is used for the house rather than the grid.
+    capacity = max(0.1, capacity_kwh)
+    threshold = discharge_price_threshold(
+        view.slots,
+        soc_kwh=state.battery_soc_pct / 100.0 * capacity,
+        floor_kwh=discharge_floor / 100.0 * capacity,
+        max_kwh=max_soc / 100.0 * capacity,
+        profile=profile,
+        solar_by_start={s.start: s for s in state.solar_slots},
+        load_hourly_w=load_hourly_w,
+        mean_price=view.mean_price,
+    )
     house_deficit = state.load_power_w - state.pv_power_w
     sell = is_expensive and profile.sell_at_peak and (current.export_value or 0) > 0
-    if state.battery_soc_pct > discharge_floor and (house_deficit > 50 or sell):
+    worth_discharging = price >= threshold
+    if state.battery_soc_pct > discharge_floor and (
+        sell or (house_deficit > DISCHARGE_DEADBAND_W and worth_discharging)
+    ):
         peak = "peak " if is_expensive else ""
+        gate = "" if threshold == float("-inf") else f", worth more than the {threshold:.2f} discharge floor"
         return BatteryPlan(
             strategy="DISCHARGE_TO_LOAD",
-            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f})",
+            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f}{gate})",
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
@@ -360,11 +455,21 @@ def _build_schedule(
             # Battery full + surplus: sell it, unless exporting is worthless or
             # would cost money — then curtail to house-only instead.
             action = "LIMIT_EXPORT" if worthless_export else "EXPORT"
-        elif deficit_kwh > 0.05 and soc_kwh > floor_kwh + 0.05:
-            # Self-consumption first: cover the house deficit from stored solar
-            # through the evening AND night, down to the reserve floor (which
-            # protects the morning). Comes BEFORE grid-charge so we use the
-            # battery rather than buying; the peak is covered first (earlier).
+        elif deficit_kwh > 0.05 and soc_kwh > floor_kwh + 0.05 and slot.total_import_price >= discharge_price_threshold(
+            [entry[0] for entry in info[i:]],
+            soc_kwh=soc_kwh,
+            floor_kwh=floor_kwh,
+            max_kwh=max_kwh,
+            profile=profile,
+            solar_by_start=solar_by_start,
+            load_hourly_w=load_hourly_w,
+            mean_price=view.mean_price,
+        ):
+            # Price-rationed self-consumption (same engine as live control): cover
+            # the house deficit from stored energy, but only when this hour clears
+            # the discharge threshold — the limited charge is spent on the most
+            # expensive deficit hours of the episode, leaving cheap hours to the
+            # grid and saving the battery for the peak. Comes BEFORE grid-charge.
             drain = min(deficit_kwh, soc_kwh - floor_kwh)
             soc_kwh -= drain
             action = "DISCHARGE"
@@ -415,6 +520,8 @@ def build_battery_plan(
     allow_negative_export: bool,
     export_limit_default_w: float | None,
     learned_reserve_pct: float = 0.0,
+    capacity_kwh: float = 10.0,
+    load_hourly_w: dict[int, float] | None = None,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -475,6 +582,8 @@ def build_battery_plan(
                 allow_grid_charge=allow_grid_charge,
                 export_limit_default_w=export_limit_default_w,
                 learned_reserve_pct=learned_reserve_pct,
+                capacity_kwh=capacity_kwh,
+                load_hourly_w=load_hourly_w,
             ),
             False,
         )
