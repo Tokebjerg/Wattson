@@ -21,6 +21,9 @@ from .const import (
 
 # Hour-of-day options shown as clock times in the scheduled-window dropdowns.
 HOUR_OPTIONS = [f"{hour:02d}:00" for hour in range(24)]
+# Ready-by deadline dropdown: same clock times plus an explicit "off".
+READY_OFF_LABEL = "Ingen frist"
+READY_OPTIONS = [READY_OFF_LABEL] + HOUR_OPTIONS
 
 
 def _hour_to_option(hour: int) -> str:
@@ -42,6 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             WattsonBatteryModeSelect(coordinator, entry),
             WattsonEVWindowStartSelect(coordinator, entry),
             WattsonEVWindowEndSelect(coordinator, entry),
+            WattsonEVReadyTimeSelect(coordinator, entry),
             WattsonBatteryOverrideSelect(coordinator, entry),
             WattsonEVOverrideSelect(coordinator, entry),
         ]
@@ -181,4 +185,28 @@ class WattsonEVWindowEndSelect(_BaseSelect):
     async def async_select_option(self, option: str) -> None:
         if option in HOUR_OPTIONS:
             await self._coordinator.async_set_ev_window_end(_option_to_hour(option))
+            self.async_write_ha_state()
+
+
+class WattsonEVReadyTimeSelect(_BaseSelect):
+    """"Klar-til-tid" deadline for scheduled_cheapest — charge the cheapest hours
+    up to this time. "Ingen frist" disables the deadline (legacy window behaviour)."""
+
+    _attr_options = READY_OPTIONS
+    _attr_icon = "mdi:car-clock"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "EV Ready By", "ev_ready_hour")
+
+    @property
+    def current_option(self) -> str | None:
+        hour = int(self._coordinator.ev_ready_hour)
+        return _hour_to_option(hour) if 0 <= hour <= 23 else READY_OFF_LABEL
+
+    async def async_select_option(self, option: str) -> None:
+        if option == READY_OFF_LABEL:
+            await self._coordinator.async_set_ev_ready_hour(-1)
+            self.async_write_ha_state()
+        elif option in HOUR_OPTIONS:
+            await self._coordinator.async_set_ev_ready_hour(_option_to_hour(option))
             self.async_write_ha_state()

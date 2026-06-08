@@ -204,5 +204,19 @@
         }
       }
     }
+  },
+  "issues": {
+    "missing_entities": {
+      "title": "Wattson: required entities missing",
+      "description": "Wattson cannot run active control because these required entities are unavailable: {entities}. Check the integration configuration and that the devices are online."
+    },
+    "controller_contention": {
+      "title": "Wattson: a competing controller was detected",
+      "description": "Another automation or app appears to be writing the same inverter/charger settings as Wattson ({entities}). Wattson has backed off to avoid fighting it. Stop the other controller, or turn off Wattson's master lock if this is expected."
+    },
+    "degraded_writes": {
+      "title": "Wattson: a setting did not take effect",
+      "description": "Wattson wrote these settings but the device never confirmed the change: {entities}. The device may be offline or rejecting commands."
+    }
   }
 }

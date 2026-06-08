@@ -38,6 +38,8 @@ CONF_EV_SOLAR_BATTERY_PRIORITY = "ev_solar_battery_priority"
 CONF_EV_REQUIRED_HOURS = "ev_required_hours"
 CONF_EV_WINDOW_START = "ev_window_start"
 CONF_EV_WINDOW_END = "ev_window_end"
+CONF_EV_READY_HOUR = "ev_ready_hour"
+CONF_PRICE_VAT_MULTIPLIER = "price_vat_multiplier"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 CONF_BATTERY_CAPACITY_KWH = "battery_capacity_kwh"
@@ -97,6 +99,16 @@ DEFAULT_EV_REQUIRED_HOURS = 4
 # Scheduled charging window (whole hours, local time). 00:00-06:00 by default.
 DEFAULT_EV_WINDOW_START = 0
 DEFAULT_EV_WINDOW_END = 6
+# "Klar-til-tid" deadline (whole hour, local) for scheduled_cheapest: the car
+# should be charged by this hour, so the cheapest hours are chosen from now up to
+# the deadline. -1 = no deadline (legacy behaviour: cheapest hours in the window).
+DEFAULT_EV_READY_HOUR = -1
+EV_READY_HOUR_OFF = -1
+# VAT/moms multiplier applied uniformly to import & export prices in the horizon.
+# 1.0 = off (prices used as-is). Uniform scaling does NOT change battery/EV
+# decisions (rankings preserved) — it only makes the savings/price figures match
+# the user's actual VAT-inclusive bill. DK standard would be 1.25.
+DEFAULT_PRICE_VAT_MULTIPLIER = 1.0
 DEFAULT_BATTERY_MIN_SOC = 15       # use the battery down to 15%
 DEFAULT_BATTERY_MAX_SOC = 100      # charge all the way to 100%
 DEFAULT_BATTERY_CAPACITY_KWH = 10.0
@@ -117,6 +129,25 @@ LEARNING_RESERVE_MAX_PCT = 15.0    # cap the learned reserve so the battery is s
                                    # used down toward min_soc, keeping only a small
                                    # morning buffer rather than locking ~half the pack
 LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
+
+# Phase D: solar-forecast bias-correction. Wattson accumulates, per day, the
+# actual PV energy produced vs the forecast for the elapsed daylight hours, then
+# learns a clamped correction factor (median of recent days) applied to the
+# Solcast forecast used in planning. Tightly clamped so a bad day can't distort
+# the plan, and neutral (1.0) until enough days are seen.
+CONF_SOLAR_BIAS_HISTORY = "solar_bias_history"      # persisted list of daily ratios
+SOLAR_BIAS_MIN_DAYS = 3            # days of history before the factor leaves 1.0
+SOLAR_BIAS_MAX_DAYS = 14           # rolling window of daily ratios kept
+SOLAR_BIAS_MIN_FACTOR = 0.7        # clamp: never trust the correction beyond ±30%
+SOLAR_BIAS_MAX_FACTOR = 1.3
+SOLAR_BIAS_MIN_FORECAST_W = 300.0  # only sample hours with a meaningful forecast
+
+# Derived-load robustness: when the whole-site load is derived from the power
+# balance (pv+grid+battery), fast transients can spike it briefly. Median-filter
+# it over this window and reject physically impossible values so the planner's
+# deficit/surplus maths isn't thrown off by a single bad tick.
+LOAD_SMOOTH_SECONDS = 60
+DERIVED_LOAD_MAX_W = 25000.0
 
 # Phase F: cap a single value-accumulation tick so restart/sleep gaps don't
 # inflate the daily savings figure.

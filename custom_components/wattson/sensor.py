@@ -142,6 +142,16 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         else None,
     ),
     WattsonSensorDescription(
+        key="solar_forecast_bias",
+        name="Solar Forecast Bias",
+        icon="mdi:sun-wireless-outline",
+        value_fn=lambda c: round(getattr(c, "solar_bias_factor", 1.0), 3),
+        attrs_fn=lambda c: {
+            "days_observed": len(getattr(c, "solar_bias_history", []) or []),
+            "recent_ratios": list(getattr(c, "solar_bias_history", []) or [])[-7:],
+        },
+    ),
+    WattsonSensorDescription(
         key="next_cheap_window",
         name="Next Cheap Window",
         icon="mdi:cash-clock",
@@ -279,7 +289,9 @@ class WattsonSavingsTotalSensor(CoordinatorEntity, RestoreSensor):
     _attr_icon = "mdi:cash-multiple"
     _attr_native_unit_of_measurement = "DKK"
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    # MONETARY rejects TOTAL_INCREASING in HA; TOTAL is the valid cumulative class
+    # (utility_meter sources still work) and stops the per-restart log warning.
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
         super().__init__(coordinator)

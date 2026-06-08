@@ -204,5 +204,19 @@
         }
       }
     }
+  },
+  "issues": {
+    "missing_entities": {
+      "title": "Wattson: påkrævede entiteter mangler",
+      "description": "Wattson kan ikke køre aktiv styring, fordi disse påkrævede entiteter er utilgængelige: {entities}. Tjek integrationens opsætning, og at enhederne er online."
+    },
+    "controller_contention": {
+      "title": "Wattson: en konkurrerende controller blev opdaget",
+      "description": "En anden automatisering eller app ser ud til at skrive de samme inverter-/laderindstillinger som Wattson ({entities}). Wattson har trukket sig for ikke at kæmpe imod. Stop den anden controller, eller slå Wattsons master-lås fra, hvis det er forventet."
+    },
+    "degraded_writes": {
+      "title": "Wattson: en indstilling fik ikke effekt",
+      "description": "Wattson skrev disse indstillinger, men enheden bekræftede aldrig ændringen: {entities}. Enheden er muligvis offline eller afviser kommandoer."
+    }
   }
 }

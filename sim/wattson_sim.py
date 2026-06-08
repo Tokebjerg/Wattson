@@ -1171,6 +1171,73 @@ def test_planning_engine():
 
 
 # --------------------------------------------------------------------------- #
+# 11d. Remaining parity gaps: EV ready-time (#10), solar bias (#14),
+#      weekday/weekend learning.
+# --------------------------------------------------------------------------- #
+def test_phase_gaps():
+    from datetime import date, datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 10, h, 0, tzinfo=TZ)
+
+    # ---- #10 EV "klar-til-tid" deadline ------------------------------------ #
+    # Hours 3,4 are cheapest BEFORE a 05:00 deadline; hours 10,11 are globally
+    # cheapest. The deadline must pick 3,4 (be ready by 5), not the cheaper late hours.
+    prices = {0: 0.50, 1: 0.45, 2: 0.40, 3: 0.30, 4: 0.35, 5: 0.55,
+              6: 0.60, 7: 0.62, 8: 0.50, 9: 0.50, 10: 0.05, 11: 0.10}
+    day = [models.PriceSlot(start=at(h), spot_price=prices[h], tariff=0.0,
+                            total_import_price=prices[h], export_value=0.5) for h in range(12)]
+
+    def ev_state(now):
+        return models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=50.0,
+            battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+            easee_status="charging", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+            current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0, price_slots=day, solar_slots=[])
+
+    def sched(now_h, ready_hour=-1):
+        return planner.build_ev_plan(
+            ev_state(at(now_h)), ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2, ev_ready_hour=ready_hour)
+
+    checks.append(("ready-by: charges at the cheapest pre-deadline hour", sched(3, 5).desired_action == "resume", sched(3, 5).reason))
+    checks.append(("ready-by: forces an hour the global plan skips (be ready by 05:00)",
+                   sched(4, 5).desired_action == "resume" and sched(4, -1).desired_action == "pause",
+                   f"{sched(4, 5).desired_action}/{sched(4, -1).desired_action}"))
+    checks.append(("no deadline: picks the globally cheapest hour", sched(10, -1).desired_action == "resume", sched(10, -1).reason))
+    checks.append(("ready-by: reason names the deadline", "before 05:00" in sched(3, 5).reason, sched(3, 5).reason))
+
+    # ---- #14 solar-forecast bias-correction (pure factor) ------------------ #
+    sbf = learning.solar_bias_factor
+    checks.append(("solar bias neutral until enough days", sbf([0.8, 0.9], min_days=3, lo=0.7, hi=1.3) == 1.0, "n<min"))
+    checks.append(("solar bias = clamped median of daily ratios", abs(sbf([0.8, 0.85, 0.9], min_days=3, lo=0.7, hi=1.3) - 0.85) < 1e-9, "median"))
+    checks.append(("solar bias clamps a runaway over-production", sbf([2.0, 2.0, 2.0], min_days=3, lo=0.7, hi=1.3) == 1.3, "hi clamp"))
+    checks.append(("solar bias clamps a snowed-over panel day", sbf([0.1, 0.1, 0.1], min_days=3, lo=0.7, hi=1.3) == 0.7, "lo clamp"))
+
+    # ---- weekday/weekend load learning ------------------------------------- #
+    samples = []
+    for d in range(1, 22):  # 3 weeks; weekday=2000W, weekend=500W (by actual weekday)
+        dt = datetime(2026, 6, d, 18, 0, tzinfo=TZ)
+        samples.append((dt, 500.0 if dt.weekday() >= 5 else 2000.0))
+    prof = learning.build_load_profile(samples)
+    checks.append(("weekday bucket learned (2000W @18)", abs(prof.weekday_hourly_w[18] - 2000) < 1e-6, str(prof.weekday_hourly_w.get(18))))
+    checks.append(("weekend bucket learned (500W @18)", abs(prof.weekend_hourly_w[18] - 500) < 1e-6, str(prof.weekend_hourly_w.get(18))))
+    checks.append(("combined mean is between the two", 500 < prof.hourly_w[18] < 2000, str(round(prof.hourly_w[18]))))
+    for d in (date(2026, 6, 8), date(2026, 6, 13)):
+        expected = prof.weekend_hourly_w if d.weekday() >= 5 else prof.weekday_hourly_w
+        checks.append((f"hourly_for({d}) uses its day-type bucket", prof.hourly_for(d).get(18) == expected.get(18), str(prof.hourly_for(d).get(18))))
+    # Empty buckets fall back to the combined profile (degrades safely).
+    fallback = models.LoadProfile(hourly_w={18: 1234.0}, days_observed=1, confidence=0.1)
+    checks.append(("hourly_for falls back when a bucket is empty", fallback.hourly_for(date(2026, 6, 13)).get(18) == 1234.0, "fallback"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 12b. Phase E — timed manual override (forced action, auto-resume).
 # --------------------------------------------------------------------------- #
 def test_e_override():
@@ -1606,6 +1673,7 @@ def main():
                          ("PHASE D · CONSUMPTION LEARNING", test_d_learning),
                          ("SELF-CONSUMPTION SCHEDULE (100/15)", test_self_consumption_schedule),
                          ("PLANNING ENGINE · PRICE-RATIONED DISCHARGE", test_planning_engine),
+                         ("PARITY GAPS · EV READY-TIME / SOLAR BIAS / WEEKDAY-WEEKEND", test_phase_gaps),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

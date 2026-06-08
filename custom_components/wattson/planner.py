@@ -1,7 +1,7 @@
 """Planning logic for Wattson."""
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import math
 
 from .const import (
@@ -693,6 +693,7 @@ def build_ev_plan(
     can_reclaim_battery_charge: bool = False,
     ev_solar_battery_threshold: float = 0.0,
     ev_required_hours: int = 4,
+    ev_ready_hour: int = -1,
     solar_surplus_override: float | None = None,
 ) -> EvPlan:
     if state.easee_status is None:
@@ -798,11 +799,28 @@ def build_ev_plan(
 
     if ev_mode == EV_MODE_SCHEDULED_CHEAPEST:
         windows = _parse_windows(ev_windows)
-        in_window = _in_windows(state.timestamp, windows) if windows else True
+        # "Klar-til-tid": when a ready-hour deadline is set, the car must be done
+        # by then, so pick the cheapest hours from now UP TO the deadline (the next
+        # occurrence of that hour) rather than across the whole window. Slots after
+        # the deadline are not eligible. With no deadline, keep the window behaviour.
+        deadline = None
+        if ev_ready_hour is not None and 0 <= int(ev_ready_hour) <= 23:
+            deadline = state.timestamp.replace(
+                hour=int(ev_ready_hour), minute=0, second=0, microsecond=0
+            )
+            if deadline <= state.timestamp:
+                deadline += timedelta(days=1)
+        # A deadline fully governs the charging period [now, deadline] and
+        # overrides the start/end window; otherwise the window applies as before.
+        if deadline is not None:
+            in_window = state.timestamp < deadline
+        else:
+            in_window = _in_windows(state.timestamp, windows) if windows else True
         horizon_slots = [
             slot
             for slot in remaining_price_slots(state.price_slots, state.timestamp)
-            if not windows or _in_windows(slot.start, windows)
+            if (deadline is not None or not windows or _in_windows(slot.start, windows))
+            and (deadline is None or slot.start < deadline)
         ]
         if horizon_slots:
             wanted = max(1, int(ev_required_hours))
@@ -810,9 +828,10 @@ def build_ev_plan(
             cheapest_starts = {s.start for s in cheapest}
             current = current_price_slot(state.price_slots, state.timestamp)
             if in_window and current is not None and current.start in cheapest_starts:
+                until = f" before {int(ev_ready_hour):02d}:00" if deadline is not None else ""
                 return EvPlan(
                     mode=ev_mode,
-                    reason=f"Within the {wanted} cheapest allowed hours ({current.total_import_price:.2f})",
+                    reason=f"Within the {wanted} cheapest allowed hours{until} ({current.total_import_price:.2f})",
                     desired_enabled=True,
                     desired_amps=int(ev_max_amps),
                     desired_action="resume",

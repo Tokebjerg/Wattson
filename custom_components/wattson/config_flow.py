@@ -30,6 +30,8 @@ from .const import (
     CONF_BATTERY_GRID_CHARGE_CURRENT_NUMBER,
     CONF_BATTERY_MAX_SOC,
     CONF_BATTERY_CAPACITY_KWH,
+    CONF_PRICE_VAT_MULTIPLIER,
+    DEFAULT_PRICE_VAT_MULTIPLIER,
     CONF_EV_REQUIRED_HOURS,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MODE_DEFAULT,
@@ -251,6 +253,7 @@ def _options_battery_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_CHEAP_PRICE_THRESHOLD, default=defaults[CONF_CHEAP_PRICE_THRESHOLD]): _number(-5, 10, 0.05),
             vol.Required(CONF_EXPENSIVE_PRICE_THRESHOLD, default=defaults[CONF_EXPENSIVE_PRICE_THRESHOLD]): _number(-5, 20, 0.05),
             vol.Required(CONF_BATTERY_CAPACITY_KWH, default=defaults[CONF_BATTERY_CAPACITY_KWH]): _number(1, 100, 0.5),
+            vol.Required(CONF_PRICE_VAT_MULTIPLIER, default=defaults[CONF_PRICE_VAT_MULTIPLIER]): _number(1.0, 2.0, 0.05),
         }
     )
 
@@ -437,6 +440,7 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_CHEAP_PRICE_THRESHOLD: entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD),
             CONF_EXPENSIVE_PRICE_THRESHOLD: entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD),
             CONF_BATTERY_CAPACITY_KWH: entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH),
+            CONF_PRICE_VAT_MULTIPLIER: entry_value(self.config_entry, CONF_PRICE_VAT_MULTIPLIER, DEFAULT_PRICE_VAT_MULTIPLIER),
             CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
             CONF_EV_CONTROL_ENABLED: entry_value(self.config_entry, CONF_EV_CONTROL_ENABLED, DEFAULT_EV_CONTROL_ENABLED),
             CONF_EV_MODE_DEFAULT: entry_value(self.config_entry, CONF_EV_MODE_DEFAULT, DEFAULT_EV_MODE),

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -55,13 +55,30 @@ class LoadProfile:
     """Phase D: learned house-load profile by hour-of-day (local time).
 
     ``hourly_w`` maps hour 0-23 to the mean house load in W observed at that
-    hour over the learning window; ``confidence`` ramps 0->1 as more days are
-    observed (full after ~4 weeks, like SunMate's 3-4 week optimisation ramp).
+    hour over the learning window (across ALL days); ``confidence`` ramps 0->1 as
+    more days are observed (full after ~4 weeks, like SunMate's 3-4 week ramp).
+    ``weekday_hourly_w`` / ``weekend_hourly_w`` hold the same per-hour means split
+    by day type, so planning a Saturday uses the weekend pattern.
     """
 
     hourly_w: dict[int, float]
     days_observed: int
     confidence: float
+    weekday_hourly_w: dict[int, float] = field(default_factory=dict)
+    weekend_hourly_w: dict[int, float] = field(default_factory=dict)
+
+    def hourly_for(self, day: "datetime | date | None") -> dict[int, float]:
+        """Per-hour load map for the given day, falling back to the all-days mean.
+
+        Saturdays/Sundays use the weekend pattern when learned; weekdays use the
+        weekday pattern. Either falls back to the combined ``hourly_w`` when its
+        bucket has not been observed yet, so behaviour degrades safely.
+        """
+        if day is None:
+            return self.hourly_w
+        weekday = day.weekday()
+        bucket = self.weekend_hourly_w if weekday >= 5 else self.weekday_hourly_w
+        return bucket or self.hourly_w
 
 
 @dataclass(frozen=True)

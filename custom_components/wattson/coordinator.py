@@ -31,6 +31,18 @@ from .const import (
     CONF_EV_SOLAR_BATTERY_THRESHOLD,
     CONF_EV_SOLAR_BATTERY_PRIORITY,
     CONF_EV_REQUIRED_HOURS,
+    CONF_EV_READY_HOUR,
+    DEFAULT_EV_READY_HOUR,
+    CONF_PRICE_VAT_MULTIPLIER,
+    DEFAULT_PRICE_VAT_MULTIPLIER,
+    CONF_SOLAR_BIAS_HISTORY,
+    SOLAR_BIAS_MIN_DAYS,
+    SOLAR_BIAS_MAX_DAYS,
+    SOLAR_BIAS_MIN_FACTOR,
+    SOLAR_BIAS_MAX_FACTOR,
+    SOLAR_BIAS_MIN_FORECAST_W,
+    LOAD_SMOOTH_SECONDS,
+    DERIVED_LOAD_MAX_W,
     CONF_EV_WINDOW_START,
     CONF_EV_WINDOW_END,
     CONF_EV_WINDOWS,
@@ -98,7 +110,7 @@ from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
 from .horizon import current_price_slot
-from .learning import build_load_profile, predicted_load_kwh
+from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
     build_battery_plan,
@@ -173,8 +185,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._value_last_tick: datetime | None = None
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
         self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
+        self.ev_ready_hour = int(entry_value(entry, CONF_EV_READY_HOUR, DEFAULT_EV_READY_HOUR))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
+        self._solar_accum_day = None
+        self._solar_actual_wh: float = 0.0
+        self._solar_forecast_wh: float = 0.0
+        self._solar_last_tick: datetime | None = None
+        self._load_samples: list[tuple[datetime, float]] = []
+        self._repairs_state: dict[str, list] = {}
+        self._solar_bias_factor: float = solar_bias_factor(
+            entry_value(entry, CONF_SOLAR_BIAS_HISTORY, []) or [],
+            min_days=SOLAR_BIAS_MIN_DAYS, lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
+        )
 
     async def async_startup(self) -> None:
         await self._async_update_load_profile()
@@ -256,6 +279,145 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         )
         self.value_today_kr += inc
         self.value_total_kr += inc
+
+    def _current_solar_forecast_w(self) -> float:
+        """Raw (uncorrected) Solcast forecast for the current hour, in average W."""
+        state = self.site_state
+        if state is None or not state.solar_slots:
+            return 0.0
+        hour_start = dt_util.as_local(dt_util.utcnow()).replace(minute=0, second=0, microsecond=0)
+        for slot in state.solar_slots:
+            if dt_util.as_local(slot.start).replace(minute=0, second=0, microsecond=0) == hour_start:
+                return max(0.0, slot.pv_estimate_kwh) * 1000.0
+        return 0.0
+
+    def _accumulate_solar_bias(self) -> None:
+        """Phase D: learn a Solcast correction factor from local production.
+
+        Accumulates actual vs forecast PV energy through each day (meaningful-
+        forecast hours only); on the day rollover it appends the day's
+        actual/forecast ratio to a persisted history and re-derives the clamped
+        median correction factor applied to future forecasts in planning.
+        """
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._solar_accum_day is None:
+            self._solar_accum_day = today
+        elif self._solar_accum_day != today:
+            if self._solar_forecast_wh >= SOLAR_BIAS_MIN_FORECAST_W and self._solar_actual_wh > 0:
+                ratio = self._solar_actual_wh / self._solar_forecast_wh
+                history = list(entry_value(self.config_entry, CONF_SOLAR_BIAS_HISTORY, []) or [])
+                history.append(round(ratio, 4))
+                history = history[-SOLAR_BIAS_MAX_DAYS:]
+                update_entry_options(self.hass, self.config_entry, **{CONF_SOLAR_BIAS_HISTORY: history})
+                self._solar_bias_factor = solar_bias_factor(
+                    history, min_days=SOLAR_BIAS_MIN_DAYS,
+                    lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
+                )
+            self._solar_accum_day = today
+            self._solar_actual_wh = 0.0
+            self._solar_forecast_wh = 0.0
+            self._solar_last_tick = None
+        forecast_w = self._current_solar_forecast_w()
+        last = self._solar_last_tick
+        self._solar_last_tick = now
+        if last is None or forecast_w < SOLAR_BIAS_MIN_FORECAST_W:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return  # skip restart/sleep gaps
+        self._solar_actual_wh += max(0.0, state.pv_power_w) * dt_hours
+        self._solar_forecast_wh += forecast_w * dt_hours
+
+    def _despike_derived_load(self) -> None:
+        """Median-filter the derived whole-site load so a single bad tick (the
+        pv+grid+battery balance spikes during fast transients) doesn't distort the
+        planner's deficit/surplus maths. Only touches the derived-load case; a
+        steady reading passes through unchanged."""
+        state = self.site_state
+        if state is None or not state.load_includes_ev:
+            return
+        now = dt_util.utcnow()
+        self._load_samples.append((now, state.load_power_w))
+        cutoff = now - timedelta(seconds=LOAD_SMOOTH_SECONDS)
+        self._load_samples = [(t, v) for (t, v) in self._load_samples if t >= cutoff]
+        values = sorted(v for _, v in self._load_samples)
+        n = len(values)
+        median = values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2.0
+        smoothed = min(max(0.0, median), DERIVED_LOAD_MAX_W)
+        if smoothed != state.load_power_w:
+            self.site_state = replace(self.site_state, load_power_w=smoothed)
+
+    def _apply_price_vat(self) -> None:
+        """Scale horizon + current prices by the configured VAT multiplier (1.0 =
+        off). Uniform scaling preserves all rankings, so decisions are unchanged;
+        only the savings/price figures match a VAT-inclusive bill."""
+        vat = float(entry_value(self.config_entry, CONF_PRICE_VAT_MULTIPLIER, DEFAULT_PRICE_VAT_MULTIPLIER))
+        state = self.site_state
+        if state is None or vat == 1.0:
+            return
+        self.site_state = replace(
+            state,
+            current_buy_price=state.current_buy_price * vat if state.current_buy_price is not None else None,
+            current_sell_price=state.current_sell_price * vat if state.current_sell_price is not None else None,
+            price_slots=[
+                replace(
+                    p,
+                    spot_price=p.spot_price * vat,
+                    tariff=p.tariff * vat,
+                    total_import_price=p.total_import_price * vat,
+                    export_value=p.export_value * vat if p.export_value is not None else None,
+                )
+                for p in state.price_slots
+            ],
+        )
+
+    def _apply_solar_bias(self) -> None:
+        """Scale the (raw) Solcast forecast slots by the learned correction factor
+        so planning uses bias-corrected production. Call AFTER _accumulate_solar_bias
+        (which must see the raw forecast)."""
+        state = self.site_state
+        factor = self._solar_bias_factor
+        if state is None or factor == 1.0 or not state.solar_slots:
+            return
+        self.site_state = replace(
+            state,
+            solar_slots=[replace(s, pv_estimate_kwh=s.pv_estimate_kwh * factor) for s in state.solar_slots],
+        )
+
+    def _sync_repairs(self) -> None:
+        """Phase F: surface Wattson problems in Settings → Repairs and clear them
+        when resolved. Only fires create/delete on a transition to avoid churn."""
+        try:
+            from homeassistant.helpers import issue_registry as ir
+        except Exception:  # noqa: BLE001
+            return
+        state = self.site_state
+        conditions: dict[str, list] = {
+            "missing_entities": sorted(state.missing_entities) if state else [],
+            "controller_contention": sorted(self.contended_entities or []),
+            "degraded_writes": sorted(getattr(self._klatremis, "degraded_entities", []) or []),
+        }
+        severities = {
+            "missing_entities": ir.IssueSeverity.ERROR,
+            "controller_contention": ir.IssueSeverity.WARNING,
+            "degraded_writes": ir.IssueSeverity.WARNING,
+        }
+        for key, entities in conditions.items():
+            issue_id = f"{key}_{self.config_entry.entry_id}"
+            if entities and self._repairs_state.get(key) != entities:
+                ir.async_create_issue(
+                    self.hass, DOMAIN, issue_id,
+                    is_fixable=False, severity=severities[key], translation_key=key,
+                    translation_placeholders={"entities": ", ".join(entities)},
+                )
+                self._repairs_state[key] = entities
+            elif not entities and key in self._repairs_state:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                self._repairs_state.pop(key, None)
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
@@ -386,6 +548,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_WINDOW_END: int(hour)})
         await self.async_request_refresh()
 
+    async def async_set_ev_ready_hour(self, hour: int) -> None:
+        self.ev_ready_hour = int(hour)
+        self._last_ev_fp = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_READY_HOUR: int(hour)})
+        await self.async_request_refresh()
+
     async def async_set_ev_solar_battery_priority(self, enabled: bool) -> None:
         self.ev_solar_battery_priority = bool(enabled)
         self._last_ev_fp = None
@@ -456,7 +624,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             invert_battery_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_BATTERY_POWER_SIGN, DEFAULT_INVERT_BATTERY_POWER_SIGN)),
         )
 
+        # Telemetry/price corrections before anything consumes the state.
+        self._despike_derived_load()
+        self._apply_price_vat()
         self._accumulate_value()
+        # Learn the solar bias from the RAW forecast, then apply the correction
+        # so the planner/schedule see bias-corrected production.
+        self._accumulate_solar_bias()
+        self._apply_solar_bias()
 
         # Phase D: refresh the learned load profile at most every few hours and
         # derive how much SOC to reserve for predicted self-use.
@@ -477,7 +652,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             export_limit_default_w=self._default_export_limit_w,
             learned_reserve_pct=learned_reserve_pct,
             capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
-            load_hourly_w=self.load_profile.hourly_w if self.load_profile else None,
+            load_hourly_w=self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None,
         )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.
@@ -502,6 +677,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             can_reclaim_battery_charge=self.battery_control_enabled,
             ev_solar_battery_threshold=effective_battery_threshold,
             ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
+            ev_ready_hour=self.ev_ready_hour,
             solar_surplus_override=averaged_surplus,
         )
 
@@ -624,7 +800,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             safe_reasons=safe_reasons,
             negative_price_active=negative_price_active,
             battery_mode=self.battery_mode,
-            load_hourly_w=self.load_profile.hourly_w if self.load_profile else None,
+            load_hourly_w=self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None,
             capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
             min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
             max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
@@ -635,6 +811,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             await self._async_apply_plan(self.control_plan, dt_util.utcnow())
         else:
             self.last_actions = []
+        self._sync_repairs()
         return self.control_plan
 
     async def _async_apply_plan(self, plan: ControlPlan, now: datetime) -> None:
@@ -739,3 +916,11 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
     @property
     def display_name(self) -> str:
         return str(entry_value(self.config_entry, "name", DEFAULT_NAME))
+
+    @property
+    def solar_bias_factor(self) -> float:
+        return self._solar_bias_factor
+
+    @property
+    def solar_bias_history(self) -> list:
+        return list(entry_value(self.config_entry, CONF_SOLAR_BIAS_HISTORY, []) or [])
