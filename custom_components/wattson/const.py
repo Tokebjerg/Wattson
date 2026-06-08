@@ -41,6 +41,7 @@ CONF_EV_WINDOW_END = "ev_window_end"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 CONF_BATTERY_CAPACITY_KWH = "battery_capacity_kwh"
+CONF_BATTERY_DISCHARGE_CURRENT_A = "battery_discharge_current_a"
 CONF_CHEAP_PRICE_THRESHOLD = "cheap_price_threshold"
 CONF_EXPENSIVE_PRICE_THRESHOLD = "expensive_price_threshold"
 CONF_ALLOW_GRID_CHARGE = "allow_grid_charge"
@@ -99,6 +100,12 @@ DEFAULT_EV_WINDOW_END = 6
 DEFAULT_BATTERY_MIN_SOC = 15       # use the battery down to 15%
 DEFAULT_BATTERY_MAX_SOC = 100      # charge all the way to 100%
 DEFAULT_BATTERY_CAPACITY_KWH = 10.0
+# Battery discharge-current limit (A) Wattson sets when the battery should cover
+# the house ("Aflad til hus"). It is a LIMIT, so the battery only delivers what
+# the house needs — but it must be > 0 or the house falls back to the grid.
+# Adjustable; raise it if the battery should cover bigger load peaks.
+DEFAULT_BATTERY_DISCHARGE_CURRENT_A = 70.0
+BATTERY_DISCHARGE_CURRENT_MAX = 250.0
 
 # Phase D learning parameters.
 LEARNING_WINDOW_DAYS = 28          # how far back to read load history

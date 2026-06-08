@@ -19,6 +19,8 @@ from .const import (
     CONF_BATTERY_CONTROL_ENABLED,
     CONF_BATTERY_MAX_SOC,
     CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_DISCHARGE_CURRENT_A,
+    DEFAULT_BATTERY_DISCHARGE_CURRENT_A,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MODE_DEFAULT,
     CONF_CHEAP_PRICE_THRESHOLD,
@@ -157,7 +159,6 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.contended_entities: list[str] = []
         self.master_lock_enabled = bool(entry_value(entry, CONF_MASTER_LOCK_ENABLED, DEFAULT_MASTER_LOCK_ENABLED))
         self._default_export_limit_w: float | None = None
-        self._default_discharge_current_a: float | None = None
         self._default_charge_current_a: float | None = None
         self._ev_solar_hold_until: datetime | None = None
         # Keeps EV-solar priority engaged through brief charger dips so the battery
@@ -348,6 +349,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MAX_SOC: float(value)})
         await self.async_request_refresh()
 
+    @property
+    def battery_discharge_current(self) -> float:
+        return float(entry_value(self.config_entry, CONF_BATTERY_DISCHARGE_CURRENT_A, DEFAULT_BATTERY_DISCHARGE_CURRENT_A))
+
+    async def async_set_battery_discharge_current(self, value: float) -> None:
+        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_DISCHARGE_CURRENT_A: float(value)})
+        await self.async_request_refresh()
+
     async def async_set_master_lock_enabled(self, enabled: bool) -> None:
         self.master_lock_enabled = bool(enabled)
         if not enabled:
@@ -432,13 +441,6 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     self._default_export_limit_w = float(export_limit_state.state)
                 except (TypeError, ValueError):
                     self._default_export_limit_w = None
-        if self._default_discharge_current_a is None and self.mapping.battery_discharge_current_number:
-            discharge_limit_state = self.hass.states.get(self.mapping.battery_discharge_current_number)
-            if discharge_limit_state is not None:
-                try:
-                    self._default_discharge_current_a = float(discharge_limit_state.state)
-                except (TypeError, ValueError):
-                    self._default_discharge_current_a = None
         if self._default_charge_current_a is None and self.mapping.battery_charge_current_number:
             charge_limit_state = self.hass.states.get(self.mapping.battery_charge_current_number)
             if charge_limit_state is not None:
@@ -571,12 +573,15 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_discharge_current_a=0.0,
                 )
 
-        # Restore the normal discharge / max-charge currents when the plan left
-        # them unset (charge current keeps a trickle if peak-solar-export asked).
-        if self._default_discharge_current_a is not None and battery_plan.desired_discharge_current_a is None:
+        # Set a healthy discharge-current limit whenever the plan didn't explicitly
+        # set one, so "Aflad til hus" actually discharges the battery to cover the
+        # house instead of importing from the grid. (EV-solar priority, force-charge
+        # and hold set it to 0 explicitly and are preserved.) The configured value
+        # is a LIMIT, not a setpoint — the battery only delivers what the house needs.
+        if battery_plan.desired_discharge_current_a is None:
             battery_plan = replace(
                 battery_plan,
-                desired_discharge_current_a=self._default_discharge_current_a,
+                desired_discharge_current_a=self.battery_discharge_current,
             )
         if self._default_charge_current_a is not None and battery_plan.desired_max_charge_current_a is None:
             battery_plan = replace(
@@ -591,7 +596,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 self.battery_override,
                 export_limit_default_w=self._default_export_limit_w,
                 default_charge_current_a=self._default_charge_current_a,
-                default_discharge_current_a=self._default_discharge_current_a,
+                default_discharge_current_a=self.battery_discharge_current,
             )
             if forced_battery is not None:
                 battery_plan = forced_battery

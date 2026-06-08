@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, NAME, OVERRIDE_MAX_MINUTES, OVERRIDE_MIN_MINUTES
+from .const import BATTERY_DISCHARGE_CURRENT_MAX, DOMAIN, NAME, OVERRIDE_MAX_MINUTES, OVERRIDE_MIN_MINUTES
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -20,6 +20,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             WattsonOverrideMinutesNumber(coordinator, entry),
             WattsonBatteryMinSocNumber(coordinator, entry),
             WattsonBatteryMaxSocNumber(coordinator, entry),
+            WattsonBatteryDischargeCurrentNumber(coordinator, entry),
         ]
     )
 
@@ -137,4 +138,36 @@ class WattsonBatteryMaxSocNumber(_BaseSocNumber):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_battery_max_soc(float(value))
+        self.async_write_ha_state()
+
+
+class WattsonBatteryDischargeCurrentNumber(NumberEntity):
+    """Discharge-current limit (A) used when the battery covers the house."""
+
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:battery-arrow-down"
+    _attr_native_min_value = 0
+    _attr_native_max_value = BATTERY_DISCHARGE_CURRENT_MAX
+    _attr_native_step = 5
+    _attr_native_unit_of_measurement = "A"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._attr_name = "Battery Discharge Current"
+        self._attr_unique_id = f"{entry.entry_id}_battery_discharge_current"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    @property
+    def native_value(self) -> float:
+        return float(self._coordinator.battery_discharge_current)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.async_set_battery_discharge_current(float(value))
         self.async_write_ha_state()
