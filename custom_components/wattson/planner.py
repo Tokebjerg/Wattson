@@ -143,6 +143,43 @@ def _horizon_view(state: SiteState, profile: ProfileWeights) -> _HorizonView | N
     return view
 
 
+def tou_setpoint(
+    plan: BatteryPlan,
+    *,
+    soc_pct: float,
+    min_soc: float,
+    discharge_floor: float,
+    max_soc: float,
+) -> tuple[float | None, bool | None]:
+    """Deye TOU time-point setpoint (capacity SOC%, grid-charge-enable) for a plan.
+
+    The Deye treats each TOU time-point's "capacity" as the SOC it may discharge
+    DOWN TO in that slot — i.e. a hard discharge floor that otherwise silently
+    overrides Wattson. So Wattson sets it to exactly the SOC it currently allows
+    discharge to:
+      - actively covering the house (DISCHARGE_TO_LOAD / force-discharge) -> the
+        real discharge floor, so the battery serves the load down to it;
+      - holding (idle/sell-solar/self-consumption/EV-solar): the CURRENT SOC
+        (rounded up to 5%), so TOU enforces the planning engine's price-rationed
+        hold instead of leaking the battery during cheap hours;
+      - grid-charging: the charge target (max_soc) + enable charging.
+    Degraded/safety strategies (HOLD/PROTECT/BLOCK_NEGATIVE_EXPORT) return
+    (None, None) so TOU is left untouched.
+    """
+    if plan.strategy in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
+        return (None, None)
+    if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
+        return (float(max_soc), True)
+    if plan.strategy == "OVERRIDE_DISCHARGE":
+        return (float(min_soc), False)
+    if plan.strategy == "DISCHARGE_TO_LOAD" and (plan.desired_discharge_current_a or 0) > 0:
+        return (float(discharge_floor), False)
+    # Hold: never discharge below the current SOC (round up to a 5% step so a
+    # drifting SOC doesn't churn the register).
+    held = min(float(max_soc), max(float(min_soc), math.ceil(soc_pct / 5.0) * 5.0))
+    return (held, False)
+
+
 def discharge_price_threshold(
     slots: list,
     *,

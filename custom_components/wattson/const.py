@@ -68,6 +68,12 @@ CONF_BATTERY_DISCHARGE_CURRENT_NUMBER = "battery_discharge_current_number"
 CONF_BATTERY_GRID_CHARGE_CURRENT_NUMBER = "battery_grid_charge_current_number"
 CONF_EXPORT_LIMIT_NUMBER = "export_limit_number"
 CONF_TOU_ENABLE_SWITCH = "tou_enable_switch"
+# Deye TOU time-point register naming. Wattson manages the per-slot SOC target
+# ("capacity") + grid-charge-enable for all N points so the active slot always
+# reflects its current discharge floor. Empty prefix = TOU management inactive.
+CONF_TOU_TIME_POINT_PREFIX = "tou_time_point_prefix"
+DEFAULT_TOU_TIME_POINT_PREFIX = "klatremishw_deye_time_point"
+TOU_TIME_POINT_COUNT = 6
 
 CONF_EASEE_DEVICE_ID = "easee_device_id"
 CONF_EASEE_ENABLE_SWITCH = "easee_enable_switch"

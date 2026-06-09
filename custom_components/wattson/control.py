@@ -152,6 +152,15 @@ class KlatremisController:
         await do(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a, self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
         await do(mapping.battery_charge_current_number, plan.desired_max_charge_current_a, self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
         await do(mapping.battery_discharge_current_number, plan.desired_discharge_current_a, self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
+        # Deye TOU management: keep all time-points identical to the plan's intent,
+        # so the (unknown) active slot always carries Wattson's discharge floor /
+        # charge target instead of a stale manual value that silently blocks it.
+        if plan.desired_tou_capacity_pct is not None:
+            for entity_id in mapping.tou_capacity_numbers:
+                await do(entity_id, plan.desired_tou_capacity_pct, self._set_number(entity_id, plan.desired_tou_capacity_pct))
+        if plan.desired_tou_charge_enable is not None:
+            for entity_id in mapping.tou_charge_enable_switches:
+                await do(entity_id, plan.desired_tou_charge_enable, self._set_switch(entity_id, plan.desired_tou_charge_enable))
         return actions
 
 

@@ -33,6 +33,10 @@ class EntityMapping:
     buy_price_entity: str | None
     sell_price_entity: str | None
     forecast_today_entity: str | None
+    # Deye TOU time-point registers Wattson manages (all kept identical so the
+    # active slot always reflects current intent). Empty = feature inactive.
+    tou_capacity_numbers: tuple[str, ...] = ()
+    tou_charge_enable_switches: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -176,6 +180,11 @@ class BatteryPlan:
     desired_charge_current_a: float | None = None
     desired_discharge_current_a: float | None = None
     desired_max_charge_current_a: float | None = None
+    # Deye Time-of-Use management: the SOC% the inverter may discharge down to in
+    # the current slot (Wattson's effective floor), applied to all TOU time-points,
+    # plus whether to grid-charge in them. None = leave TOU untouched.
+    desired_tou_capacity_pct: float | None = None
+    desired_tou_charge_enable: bool | None = None
 
 
 @dataclass(frozen=True)

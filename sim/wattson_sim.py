@@ -1238,6 +1238,77 @@ def test_phase_gaps():
 
 
 # --------------------------------------------------------------------------- #
+# 11e. Deye TOU management — the inverter's per-slot SOC floor follows the plan's
+#      intent (fixes the battery being held at a stale TOU target in the evening).
+# --------------------------------------------------------------------------- #
+def test_tou_management():
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    P = models.BatteryPlan
+    ss = planner.tou_setpoint
+    kw = dict(min_soc=15, discharge_floor=20, max_soc=100)
+
+    # Pure setpoint logic.
+    disc = P(strategy="DISCHARGE_TO_LOAD", reason="", desired_discharge_current_a=70.0)
+    checks.append(("TOU: discharge -> discharge floor", ss(disc, soc_pct=55, **kw) == (20.0, False), str(ss(disc, soc_pct=55, **kw))))
+    idle = P(strategy="IDLE", reason="", desired_discharge_current_a=70.0)
+    checks.append(("TOU: hold -> current SOC (ceil 5%), no discharge below now", ss(idle, soc_pct=53, **kw) == (55.0, False), str(ss(idle, soc_pct=53, **kw))))
+    gc = P(strategy="GRID_CHARGE", reason="", desired_grid_charge=True, desired_discharge_current_a=0.0)
+    checks.append(("TOU: grid-charge -> max_soc + charge enabled", ss(gc, soc_pct=40, **kw) == (100.0, True), str(ss(gc, soc_pct=40, **kw))))
+    sell = P(strategy="SELL_SOLAR_PEAK", reason="", desired_discharge_current_a=0.0)
+    checks.append(("TOU: sell-solar holds the pack (no drain)", ss(sell, soc_pct=90, **kw) == (90.0, False), str(ss(sell, soc_pct=90, **kw))))
+    checks.append(("TOU: override charge -> max + enable", ss(P(strategy="OVERRIDE_CHARGE", reason=""), soc_pct=50, **kw) == (100.0, True), "oc"))
+    checks.append(("TOU: override discharge -> min_soc (full discharge)", ss(P(strategy="OVERRIDE_DISCHARGE", reason=""), soc_pct=50, **kw) == (15.0, False), "od"))
+    for degraded in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
+        checks.append((f"TOU: {degraded} leaves TOU untouched (None)", ss(P(strategy=degraded, reason=""), soc_pct=50, **kw) == (None, None), degraded))
+
+    # Control write: the plan's TOU values are written to ALL 6 time-points.
+    class _State:
+        def __init__(self, v): self.state = str(v)
+
+    class _States:
+        def __init__(self, init): self._m = {k: _State(v) for k, v in init.items()}
+        def get(self, eid): return self._m.get(eid)
+        def set(self, eid, v): self._m[eid] = _State(v)
+
+    class _Services:
+        def __init__(self, states): self.states = states; self.calls = []
+        async def async_call(self, domain, service, data, blocking=False):
+            self.calls.append((domain, service, data)); eid = data["entity_id"]
+            if domain == "switch": self.states.set(eid, "on" if service == "turn_on" else "off")
+            elif domain == "number": self.states.set(eid, data["value"])
+
+    class _Hass:
+        def __init__(self, s, sv): self.states = s; self.services = sv
+
+    mp = mapping.build_entity_mapping(BASE_CONFIG)
+    checks.append(("TOU mapping built 6 capacity + 6 charge-enable registers",
+                   len(mp.tou_capacity_numbers) == 6 and len(mp.tou_charge_enable_switches) == 6,
+                   f"{len(mp.tou_capacity_numbers)}/{len(mp.tou_charge_enable_switches)}"))
+
+    init = {eid: "99" for eid in mp.tou_capacity_numbers}
+    init.update({eid: "on" for eid in mp.tou_charge_enable_switches})
+    states = _States(init)
+    ctrl = control.KlatremisController(_Hass(states, _Services(states)))
+    plan = P(strategy="DISCHARGE_TO_LOAD", reason="", desired_tou_capacity_pct=15.0, desired_tou_charge_enable=False)
+    asyncio.run(ctrl.apply_battery_plan(mp, plan, datetime(2026, 6, 9, 21, 0, tzinfo=timezone(timedelta(hours=2)))))
+    caps_written = all(abs(float(states.get(eid).state) - 15.0) < 0.1 for eid in mp.tou_capacity_numbers)
+    enables_off = all(states.get(eid).state == "off" for eid in mp.tou_charge_enable_switches)
+    checks.append(("TOU write: all 6 capacities set to the plan floor (15%)", caps_written, str([states.get(e).state for e in mp.tou_capacity_numbers])))
+    checks.append(("TOU write: all 6 charge-enables set off", enables_off, str([states.get(e).state for e in mp.tou_charge_enable_switches])))
+
+    # A plan with no TOU intent (None) must NOT touch the TOU registers.
+    states2 = _States(init)
+    ctrl2 = control.KlatremisController(_Hass(states2, _Services(states2)))
+    asyncio.run(ctrl2.apply_battery_plan(mp, P(strategy="HOLD", reason=""), datetime(2026, 6, 9, 21, 1, tzinfo=timezone(timedelta(hours=2)))))
+    checks.append(("TOU write: None intent leaves the registers untouched", all(states2.get(e).state == "99" for e in mp.tou_capacity_numbers), "untouched"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 12b. Phase E — timed manual override (forced action, auto-resume).
 # --------------------------------------------------------------------------- #
 def test_e_override():
@@ -1674,6 +1745,7 @@ def main():
                          ("SELF-CONSUMPTION SCHEDULE (100/15)", test_self_consumption_schedule),
                          ("PLANNING ENGINE · PRICE-RATIONED DISCHARGE", test_planning_engine),
                          ("PARITY GAPS · EV READY-TIME / SOLAR BIAS / WEEKDAY-WEEKEND", test_phase_gaps),
+                         ("DEYE TOU MANAGEMENT · DISCHARGE-FLOOR FOLLOWS PLAN", test_tou_management),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

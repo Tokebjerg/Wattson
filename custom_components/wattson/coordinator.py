@@ -121,7 +121,9 @@ from .planner import (
     effective_solar_surplus_w,
     ev_current_within_deadband,
     ev_drawing_real_power,
+    profile_for,
     should_prioritize_ev_solar,
+    tou_setpoint,
     value_increment_kr,
 )
 
@@ -792,6 +794,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             safe_reasons.append(f"Paused until {self.pause_until.isoformat()}")
         if self.ev_control_enabled and self.site_state.easee_online is False:
             safe_reasons.append("Easee reports offline")
+
+        # Deye TOU management: align the inverter's per-slot SOC floors with the
+        # plan's intent so a stale TOU target can't silently block discharge (or
+        # leak the battery during a price-rationed hold). Only the discharge floor
+        # is profile-shaped; the capacity tracks current SOC when holding.
+        min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
+        max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+        discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct)
+        tou_cap, tou_charge = tou_setpoint(
+            battery_plan, soc_pct=self.site_state.battery_soc_pct,
+            min_soc=min_soc, discharge_floor=discharge_floor, max_soc=max_soc,
+        )
+        battery_plan = replace(battery_plan, desired_tou_capacity_pct=tou_cap, desired_tou_charge_enable=tou_charge)
 
         self.control_plan = build_control_plan(
             self.site_state,

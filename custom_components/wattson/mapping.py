@@ -35,6 +35,9 @@ from .const import (
     CONF_SELL_PRICE_ENTITY,
     CONF_SOLAR_SELL_SWITCH,
     CONF_TOU_ENABLE_SWITCH,
+    CONF_TOU_TIME_POINT_PREFIX,
+    DEFAULT_TOU_TIME_POINT_PREFIX,
+    TOU_TIME_POINT_COUNT,
     KNOWN_DEFAULTS,
 )
 from .horizon import build_price_slots, build_solar_slots
@@ -88,7 +91,20 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
         buy_price_entity=config.get(CONF_BUY_PRICE_ENTITY),
         sell_price_entity=config.get(CONF_SELL_PRICE_ENTITY),
         forecast_today_entity=config.get(CONF_FORECAST_TODAY_ENTITY),
+        tou_capacity_numbers=_tou_registers(config, "number", "capacity"),
+        tou_charge_enable_switches=_tou_registers(config, "switch", "charge_enable"),
     )
+
+
+def _tou_registers(config: dict[str, Any], domain: str, suffix: str) -> tuple[str, ...]:
+    """Build the N TOU time-point register entity_ids from the configured prefix.
+
+    e.g. number.<prefix>_1_capacity .. _N_capacity. Empty prefix -> no TOU
+    management (the feature degrades to inactive)."""
+    prefix = config.get(CONF_TOU_TIME_POINT_PREFIX, DEFAULT_TOU_TIME_POINT_PREFIX)
+    if not prefix:
+        return ()
+    return tuple(f"{domain}.{prefix}_{n}_{suffix}" for n in range(1, TOU_TIME_POINT_COUNT + 1))
 
 
 def build_capabilities(mapping: EntityMapping) -> Capabilities:
