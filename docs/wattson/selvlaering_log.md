@@ -9,6 +9,25 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret fix — 2026-06-09 (efter Dag 2) — v0.12.0 SELVFORBRUG FØRST
+
+To morgen-observationer fra brugeren:
+1. **"Dagens plan for SoC burde have første prioritet fremfor EV. Den har ikke ladet batteriet."** Bekræftet i data: SOC drænede 28%→20% i nat (dækkede huset — fint), men fra ~07:03 gik den i SELL_SOLAR_PEAK og **solgte morgenoverskuddet i stedet for at genoplade** det tomme batteri → kom aldrig op igen.
+2. **"Vi har købt for meget strøm trods konservativ. Batteriet skal kunne aflade hvis huset pludselig har uventet behov, så vi ikke køber net."** Pris-rationeringen (v0.9.0) holdt batteriet i billige timer + v0.11.0's TOU-cap=SOC under hold blokerede afladning under nuværende SOC → grid blev købt.
+
+**Diagnose:** begge skyldes at pris-arbitrage blev prioriteret over selvforbrug. I et solrigt anlæg der genoplades dagligt er det at dække huset fra batteriet altid bedre end at købe net; rationeringen var over-konservativ.
+
+**Fix (v0.12.0, bruger-styret, eksplicit deploy-godkendelse):** SELVFORBRUG FØRST.
+- planner: ny **SOC-plan charge-priority**-gren FØRST (under `CONF_SOLAR_CHARGE_PRIORITY_SOC`, default 50%, lader sol-overskud OP i batteriet før SELL_SOLAR_PEAK/EV). DISCHARGE_TO_LOAD dækker nu huset ved ethvert underskud over gulvet — **ingen pris-gate**. _build_schedule spejler begge.
+- tou_setpoint: hold/idle/sell bruger nu **afladningsgulvet** (ikke nuværende SOC), så inverteren altid kan dække et pludseligt husforbrug ned til gulvet uden at vente på Wattsons næste tick. Fjernede den nu-ubrugte `discharge_price_threshold()`.
+- coordinator: EV-sol-gaten venter nu på at hjemmebatteriet når charge-priority-SOC (batteri før EV). Options-flow-knap tilføjet.
+- BEVARET: ingen batteri-eksport (undt. Rød spids/override), reserve-gulv inkl. lært morgenreserve, GRID_CHARGE-timing, fremad-plan.
+- **Reverserer** v0.9.0's pris-rationering af HUS-DÆKNING (var årsag til morgen-net-køb). sim 203/203 (omskrev planlægnings-test → selvforbrug+charge-priority; opdaterede billig-nat- og TOU-hold-assertions til ny hensigt — ingen tests svækket).
+
+**Risiko/klassificering:** STRUKTUREL kontrol-sti — men BRUGER-STYRET med eksplicit "deploy automatisk", så deployet (ikke autonom loop-pick). Deployet main HEAD 937c49d. **VERIFICERET LIVE (10:34):** SOC 29% (genoprejst fra 20% i morges), solar_sell=off, energy_priority=Battery first, batteri −410 W (oplader), beslutning "House battery 29% below 50% threshold; filling home battery before solar EV charging" (EV gated, batteri-først). TOU-caps = alle 30 (= afladningsgulv m. lært morgenreserve) → inverteren dækker huset ned til gulvet ved pludseligt forbrug. site=ready, ingen kodefejl (kun opstarts-dashboard-template-støj). Begge observationer adresseret.
+
+---
+
 ## Dag 2 — 2026-06-09 07:14 (cron fyrede om morgenen, ~5 min efter v0.11.0-deploy)
 
 **Kill-switch:** on → kørte. (Den daglige + 6t-tjekket fyrede sammen; dækket af denne ene rapport.)
