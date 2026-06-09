@@ -1185,6 +1185,35 @@ def test_self_consumption_priority():
     checks.append(("only sell-at-peak trickles the charge current",
                    sell_pk.desired_max_charge_current_a == planner.TRICKLE_CHARGE_A, str(sell_pk.desired_max_charge_current_a)))
 
+    # --- Refill-based peak-sell: a morning hour SELLS the surplus (even below the
+    #     daily average) when there's cheaper sun later today to refill the battery;
+    #     the cheapest hour itself charges (nothing cheaper ahead to refill from).
+    def rslot(h, p):
+        return models.PriceSlot(start=at(h), spot_price=p, tariff=0.0, total_import_price=p, export_value=0.50)
+    rday = ([rslot(h, 0.40) for h in range(6, 10)] + [rslot(h, 0.05) for h in range(12, 15)]
+            + [rslot(h, 1.50) for h in (18, 19, 20)])
+    rsolar = [models.SolarSlot(start=at(h), pv_estimate_kwh=6.0) for h in (12, 13, 14)] + [models.SolarSlot(start=at(8), pv_estimate_kwh=3.0)]
+
+    def rstate(now):
+        return models.SiteState(
+            timestamp=now, pv_power_w=3000.0, load_power_w=400.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=2600.0, battery_soc_pct=30.0,
+            battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+            easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+            current_buy_price=0.40, current_sell_price=0.50, forecast_today_kwh=0.0, price_slots=rday, solar_slots=rsolar)
+
+    def rplan(now):
+        bp, _ = planner.build_battery_plan(
+            rstate(now), battery_mode="blue", min_soc=10, max_soc=100, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0, capacity_kwh=10.0, load_hourly_w={h: 400 for h in range(24)},
+            solar_charge_priority_soc=50)
+        return bp
+    checks.append(("refill: morning hour SELLS (cheaper midday sun ahead to refill), not charge",
+                   rplan(at(8)).strategy == "SELL_SOLAR_PEAK", rplan(at(8)).strategy))
+    checks.append(("refill: the cheapest hour does NOT sell (nothing cheaper ahead -> charge)",
+                   rplan(at(13)).strategy != "SELL_SOLAR_PEAK", rplan(at(13)).strategy))
+
     return checks
 
 
