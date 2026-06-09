@@ -9,6 +9,52 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Dag 2 — 2026-06-09 07:14 (cron fyrede om morgenen, ~5 min efter v0.11.0-deploy)
+
+**Kill-switch:** on → kørte. (Den daglige + 6t-tjekket fyrede sammen; dækket af denne ene rapport.)
+
+**Vigtig timing:** v0.11.0 (TOU-gulv-styringen fra Dag 1) blev deployet kl. 07:09 i morges. Kørslen fyrer kl. 07:14 — dvs. **aftenspidsen (17–21) under den nye kode er endnu ikke sket.** Der findes ingen post-fix aften-data at evaluere endnu.
+
+**Sundhedstjek af v0.11.0 (live nu):** site=ready, competing_controller=off, ingen wattson-ERROR (kun forbigående opstarts-dashboard-template-fejl). De 6 TOU-capacities styres = ensartet 20 % (var 15/10/25/85/55/15). Aktuelt SELL_SOLAR_PEAK @ SOC 20 %: cap=SOC=20 (hold, korrekt), sælger sol-overskud (grid −470 W), batteri −7 W (dræner ikke), trickle 10A. Ingen TOU-skrive-churn/kontention. → v0.11.0 kører rent.
+
+**Baseline (gårsdag, pre-fix, til sammenligning i morgen):** 06-08 aften faldt SOC 93 %→~62 % (17→19:40), stoppede så ved 55 % (TP5) og stod fast under spidsen mens nettet importerede; de sidste 55→20 % blev givet i de BILLIGE nattetimer — omvendt arbitrage. Det er præcis det v0.11.0 skal vende.
+
+**Valgt handling i dag: VERIFIKATION + HOLD — INGEN ny ændring, INGEN deploy.** Som ansvarlig arkitekt: at deploye en ny ændring nu ville stable en uverificeret ændring oven på en anden (umuligt at attribuere effekt + øget risiko). Dagens højest-værdi-handling er at lade v0.11.0 bevise sig i aftenspidsen før vi rører mere. Sim ikke kørt (ingen kodeændring).
+
+**Verifikation der mangler (følges op):** i aften 17–21 skal batteriet nu aflade til gulvet i den dyre spids (ikke holde på en TOU-værdi). Fanges af 6t-tjekket efter spidsen + Dag 3-kørslen. Sammenlign mod baseline ovenfor.
+
+**Køede kandidater (IKKE deployet — vurderes når v0.11.0 er bekræftet):**
+1. Peak-sell ved meget lav SOC: i morges sælges sol-overskud @0,72 + trickle mens SOC kun er 20 % og EV venter på 25 %-tærsklen — batteriet fyldes kun langsomt. Måske bør bulk-opladning prioriteres når SOC er meget lav, selv ved over-gennemsnitlig pris. Kræver en hel dags data.
+2. EV-strøm-stabilitet over en solrig EV-dag (åben siden Dag 0) — kræver en dag med faktisk sol-EV-opladning.
+
+---
+
+## Dag 1 — 2026-06-08 21:10 (manuelt udløst; cron'en fyrede ikke pga. session-idle)
+
+**Kill-switch:** on → kørte.
+
+**Analyse (live + 4t historik):**
+- **Energiflow/tegn-audit (Dag 0-opgave) → AFKLARET, ingen tegn-bug.** Historikken viser korrekte tegn: midt-på-dagen eksport ned til −4566 W (grid negativ), aften import positiv; effektbalancen `pv+grid+batteri−hus` = +2 W lige nu. Brugerens "ser helt forkert ud" skyldes IKKE et tegn-problem.
+- **HØJVÆRDI-FUND — batteriet aflader IKKE i den dyre aften, selvom Wattson beder om det.** Kl. 21:10: strategi=DISCHARGE_TO_LOAD, SOC=55%, "Load first" + "Zero export to CT" + max-afladning 70 A + grid_charge off (alt korrekt sat af Wattson), MEN batteri=8 W (i ro) og nettet importerer 1416 W til at dække huset (1584 W) ved købspris 0,925. Batteriet faldt jævnt 93%→55% i løbet af eftermiddag/aften og **stoppede præcis ved 55%**.
+- **Rodårsag: Deye TOU (`switch.klatremishw_deye_time_of_use` = on).** De 6 TOU-tidspunkters SOC-mål (TP1-6 = 15/10/25/**85**/**55**/15 %, alle charge_enable=off) fungerer som afladnings-GULVE som Wattson IKKE styrer. Batteriet stoppede ved 55 % = TP5's mål. Wattsons egen min_soc=15 % og "Load first" overtrumfes af TOU-skemaet. (TP-tiderne eksponeres ikke af klatremis-integrationen, så aktivt tidspunkt kunne ikke aflæses direkte — men stop-ved-55%=TP5 er stærkt indicium.)
+- **Tabt besparelse:** ~55→15 % × 10 kWh ≈ 4 kWh tilbageholdt i aftenspidsen hver aften → køb fra nettet ~0,9–1,2 kr/kWh i stedet for selvforbrug ≈ **~4 kr/aften tabt**. Det er sandsynligvis også forklaringen på at energiflow-kortet "ser forkert ud" (net→hus mens et halvt batteri står stille).
+- **EV-stabilitet (Dag 0-opgave):** uafklaret i aften — bilen er `awaiting_start`/0 W (ingen sol-session om aftenen). Vurderes på en dag med sol-EV-opladning.
+
+**Valgt forbedring (ÉN):** Wattson skal forholde sig til Deye-TOU, så TOU-SOC-målene ikke blokerer selvforbrug. To mulige tilgange (kræver brugerens designvalg):
+  (A) Wattson sætter TOU-tidspunkternes capacity = sin egen afladningsgulv (min_soc + reserve), så Deye'en aflader dertil; eller
+  (B) Wattson slår TOU fra under selvforbrug og kun til ved reel net-opladning.
+**Forventet gevinst:** ~4 kr/aften (~1.400 kr/år) + energiflow-kortet kommer til at se rigtigt ud.
+
+**Risikoklassificering: STRUKTUREL — rører kontrol-/skrive-stien (nye TOU-register-writes / mode-styring).** Per sikkerhedsgulvet §4 = **IKKE auto-deploy.** Jeg skrev heller IKKE autonomt til Deye'ens TOU-registre (live hardware). 
+
+**Handling i dag:** INGEN deploy, INGEN inverter-write. Diagnose dokumenteret, bruger notificeret (HA persistent_notification + chat), afventer brugerens valg af tilgang (A/B) før jeg bygger + sim'er + (efter godkendelse) deployer. Sim ikke kørt (ingen kodeændring i dag).
+
+**Quick-mitigation brugeren kan gøre nu uden kode:** sæt Deye TOU-tidspunkternes capacity (især TP4=85%, TP5=55%) ned til 15 % — så aflader batteriet selvforbrug i aften med det samme.
+
+**OPDATERING (samme aften):** Brugeren valgte tilgang (A). BYGGET v0.11.0: `planner.tou_setpoint()` (ren) + `BatteryPlan.desired_tou_capacity_pct`/`_charge_enable` + `EntityMapping.tou_capacity_numbers`/`_charge_enable_switches` (fra `CONF_TOU_TIME_POINT_PREFIX`, default `klatremishw_deye_time_point`, 6 punkter) + control skriver alle 6 ens (write-on-change) + coordinator afleder setpunkt fra den endelige plan + SOC + gulv. Indsigt: TOU-capacity = "afladningsgulv", så Wattson sætter den til floor ved DISCHARGE_TO_LOAD, til nuværende SOC ved hold (så planlægningsmotorens pris-rationering nu håndhæves på hardware), til max_soc+enable ved GRID_CHARGE, og rører den ikke ved degraded/PROTECT/HOLD/BLOCK. **sim 203/203 grøn** (+13 TOU-tests). STRUKTUREL kontrol-sti-ændring → staged på branch `feat/tou-floor-management` (518b0a9). **DEPLOYET med brugerens godkendelse** (main HEAD 518b0a9, HACS, genstart). VERIFICERET LIVE (morgen 2026-06-09): alle 6 TOU-capacities nu = 20 % (var 15/10/25/85/55/15) — Wattson styrer dem; aktuelt SELL_SOLAR_PEAK holder cap=SOC=20, sælger sol-overskud, dræner ikke batteriet; site=ready; ingen exceptions fra ny kode (kun forbigående opstarts-dashboard-template-fejl). Bekræftelse af aften-afladningen sker kl. 17–21 (6t-tjek + 21:00-kørsel). NB: natten viste at TOU holdt i den DYRE aften (TP5=55%) men afladede i de BILLIGE nattetimer (lavere slot-capacity) — omvendt af optimalt; fixet retter netop dette ved at lade Wattsons dynamiske hensigt styre gulvet.
+
+---
+
 ## Dag 0 — 2026-06-08 (baseline / opsætning)
 **Status:** Loop opsat. Sikkerhedsgulv + kill-switch + daglig cron (~21:00) etableret.
 **Udgangspunkt (v0.7.9):** Fase A+B+C+D live, peak-sol-eksport, timed override (Fase E del 1),
