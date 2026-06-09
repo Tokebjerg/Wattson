@@ -9,6 +9,21 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Sæson-backtest + v0.15.0 — 2026-06-09 ~22:00 (bruger-styret)
+
+Byggede en **backtest-motor** (`sim/wattson_backtest.py`) der replayer en historisk dag time-for-time gennem den RIGTIGE planner, simulerer SOC, og sammenligner mod intet-batteri / dumt-batteri / perfekt-foresight DP-orakel. Databegrænsning (verificeret, ikke gættet): elpris-LTS rækker til maj 2025, men **Deye PV+forbrug kun fra ~21. marts 2026** → forår+sommer på RIGTIGE data, vinter+efterår med rigtige priser + modelleret sol/forbrug (dansk årstids-sol). Filer i `sim/backtest_data/`.
+
+**Dominerende fund (alle 4 årstider): Wattson tømmer batteriet på billigt selvforbrug FØR dagens dyre spids og køber så net dyrt i spidsen.** Klarest efterår: aflod ved 1,2 kr om natten → tomt → købte ved 2,9 kr i morgenspidsen. Det er SunMate-reserven vi fjernede i v0.12.0; backtesten kvantificerede prisen (~1-8 kr/dag).
+
+**BYGGET + DEPLOYET v0.15.0 (bruger-godkendt, deploy automatisk, main daea64f):**
+- **A — `planner.peak_reserve_pct`:** hold ekstra SOC til en kommende samme-dags spids der er dyrere end nu med `required_spread`-marginen (så den ALDRIG holder dyrt for at spare til billigt — v0.9.0-fejlen). Reserven = forventet underskud i spidstimerne minus sol der genoplader før spidsen; falder til 0 PÅ spidsen (aflader fuldt). Hæver afladningsgulvet + TOU-gulvet (coordinator) så inverteren faktisk holder den.
+- **B — for-opladning:** grid-lad op til reserven ved under-gennemsnit-timer når en profitabel spids er forude (ikke kun de rang-billigste timer).
+- **C (sælg batteri i aftenspids) IKKE rørt** — bevidst, da batteriet kun er 10 kWh (brugerens beslutning).
+
+**Backtest-forbedring (før→nu):** forår +7,65 (EV-forurenet, optimistisk), efterår +1,12, vinter +1,09, **sommer +0,00 (ingen skade** — dens gap er eksport-arbitrage = C, urørt). ~+9,9 kr over de 4 dage. Bagudkompatibel: `peak_reserve` defaulter 0,0 → eksisterende scenarier uændrede. **sim 238/238** (+7). Health-check §6 bestået live (site=ready, competing=off, ingen integrations-exceptions). NB: backtesten bruger perfekt sol/forbrugs-foresight; live er prognoserne upræcise, så realistisk gevinst er lavere (~1-3 kr/dag).
+
+---
+
 ## Dag 2 — 2026-06-09 ~20:10 (manuelt udløst af bruger; cron fyrede ikke — se note)
 
 **Kill-switch:** on → kørte.
