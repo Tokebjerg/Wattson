@@ -1519,6 +1519,54 @@ def test_e2_master_lock():
 
 
 # --------------------------------------------------------------------------- #
+# 12c2. Anti-hunt mode dwell (rate-limit inverter-mode changes).
+# --------------------------------------------------------------------------- #
+def test_mode_dwell():
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone.utc
+    t0 = datetime(2026, 6, 8, 18, 0, tzinfo=TZ)
+    D = const.BATTERY_MODE_DWELL_SECONDS
+    A, B = "MODE_A", "MODE_B"
+
+    # first mode always applies and is recorded
+    applied, prev, at = planner.apply_mode_dwell(None, None, A, t0, D, exempt=False)
+    checks.append(("first mode applies + records time", applied == A and prev == A and at == t0, f"{applied}/{at}"))
+
+    # unchanged mode keeps the original change time so the window can still elapse
+    applied2, prev2, at2 = planner.apply_mode_dwell(prev, at, A, t0 + timedelta(seconds=5), D, exempt=False)
+    checks.append(("unchanged mode keeps change time", applied2 == A and at2 == t0, f"at={at2}"))
+
+    # a non-exempt change arriving inside the dwell window is HELD (previous returned)
+    held, prev_h, at_h = planner.apply_mode_dwell(A, t0, B, t0 + timedelta(seconds=D - 10), D, exempt=False)
+    checks.append(("rapid non-exempt change is held to previous mode", held == A and prev_h == A and at_h == t0, f"{held}"))
+
+    # a change after the dwell window has elapsed applies and re-stamps the time
+    chg, prev_c, at_c = planner.apply_mode_dwell(A, t0, B, t0 + timedelta(seconds=D + 1), D, exempt=False)
+    checks.append(("change after dwell applies", chg == B and prev_c == B and at_c == t0 + timedelta(seconds=D + 1), f"{chg}"))
+
+    # a safety/override change bypasses the dwell entirely
+    ex, _, _ = planner.apply_mode_dwell(A, t0, B, t0 + timedelta(seconds=1), D, exempt=True)
+    checks.append(("exempt (safety/override) change bypasses dwell", ex == B, f"{ex}"))
+
+    # anti-flap: a plan flipping A<->B every 20s must not flip the APPLIED mode every
+    # tick -- at most one applied change per dwell window (~4 over 600s, vs 30 desired).
+    prev_mode, prev_at, last_applied, flips = A, t0, A, 0
+    for i in range(1, 31):
+        desired = B if i % 2 else A
+        applied, prev_mode, prev_at = planner.apply_mode_dwell(
+            prev_mode, prev_at, desired, t0 + timedelta(seconds=20 * i), D, exempt=False
+        )
+        if applied != last_applied:
+            flips += 1
+            last_applied = applied
+    checks.append((f"20s flip damped to <=6 applied changes over 600s (got {flips})", flips <= 6, f"{flips}"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 12d. Inverter-mode coherence (no charge-vs-sell hunting).
 # --------------------------------------------------------------------------- #
 def test_mode_coherence():
@@ -1815,6 +1863,7 @@ def main():
                          ("DEYE TOU MANAGEMENT · DISCHARGE-FLOOR FOLLOWS PLAN", test_tou_management),
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
+                         ("ANTI-HUNT MODE DWELL", test_mode_dwell),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

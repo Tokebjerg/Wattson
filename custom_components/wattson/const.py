@@ -215,6 +215,15 @@ EV_CURRENT_RETUNE_SECONDS = 90
 INVERTER_WRITE_COOLDOWN_SECONDS = 30
 EV_WRITE_COOLDOWN_SECONDS = 10
 
+# Anti-hunt: the battery inverter mode (solar_sell + limit-control + energy-priority
+# + discharge current + grid-charge) may change at most once per this many seconds.
+# A plan that flips strategy every tick (e.g. IDLE<->DISCHARGE at full battery, or
+# EV_SOLAR_PRIORITY<->DISCHARGE while the car cycles) would otherwise make the Deye
+# physically hunt (battery swinging +/-4kW charge<->discharge). Rapid mode changes are
+# held to the previous mode; safety/override strategies and changes after a stable
+# period apply immediately. Must be > INVERTER_WRITE_COOLDOWN_SECONDS to actually damp.
+BATTERY_MODE_DWELL_SECONDS = 120
+
 # Phase E part 2: master-controller lock. The battery plan is re-asserted every
 # tick (idempotent — only writes on drift); if Wattson has to correct the SAME
 # inverter control this many times within the window, a competing controller is

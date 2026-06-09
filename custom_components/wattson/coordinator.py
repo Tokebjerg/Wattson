@@ -100,6 +100,7 @@ from .const import (
     CONF_MASTER_LOCK_ENABLED,
     DEFAULT_MASTER_LOCK_ENABLED,
     INVERTER_WRITE_COOLDOWN_SECONDS,
+    BATTERY_MODE_DWELL_SECONDS,
     EV_WRITE_COOLDOWN_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
@@ -117,6 +118,7 @@ from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
+    apply_mode_dwell,
     build_battery_plan,
     build_control_plan,
     build_ev_plan,
@@ -172,6 +174,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
+        # Anti-hunt: the last APPLIED battery inverter-mode tuple + when it changed,
+        # plus the strategy label that produced it (so the sensor stays coherent
+        # while a rapid flip is held). See planner.apply_mode_dwell.
+        self._battery_mode_applied: tuple[Any, ...] | None = None
+        self._battery_mode_at: datetime | None = None
+        self._battery_mode_strategy: str | None = None
         self._battery_contended_until: datetime | None = None
         self.battery_contended = False
         self.contended_entities: list[str] = []
@@ -806,6 +814,48 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             )
             if forced_battery is not None:
                 battery_plan = forced_battery
+
+        # Anti-hunt mode dwell: a plan that flips strategy every tick (IDLE<->DISCHARGE
+        # at a full battery, or EV_SOLAR_PRIORITY<->DISCHARGE while the car cycles) would
+        # toggle the inverter mode fast enough to make the Deye physically hunt (battery
+        # swinging +/-4kW charge<->discharge). Rate-limit non-safety mode changes to one
+        # per BATTERY_MODE_DWELL_SECONDS: when a change comes too soon, hold the previous
+        # mode (and its strategy label) so control writes nothing new and the inverter
+        # settles. Safety/override strategies and changes after a stable period apply now.
+        _exempt_dwell = battery_plan.strategy in (
+            "HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT",
+            "OVERRIDE_CHARGE", "OVERRIDE_DISCHARGE", "OVERRIDE_HOLD",
+        )
+        _desired_mode = (
+            battery_plan.desired_solar_sell,
+            battery_plan.desired_limit_control_mode,
+            battery_plan.desired_energy_priority,
+            battery_plan.desired_discharge_current_a,
+            battery_plan.desired_max_charge_current_a,
+            battery_plan.desired_grid_charge,
+        )
+        _apply_mode, self._battery_mode_applied, self._battery_mode_at = apply_mode_dwell(
+            self._battery_mode_applied,
+            self._battery_mode_at,
+            _desired_mode,
+            dt_util.utcnow(),
+            BATTERY_MODE_DWELL_SECONDS,
+            exempt=_exempt_dwell,
+        )
+        if _apply_mode == _desired_mode:
+            self._battery_mode_strategy = battery_plan.strategy
+        else:
+            battery_plan = replace(
+                battery_plan,
+                strategy=self._battery_mode_strategy or battery_plan.strategy,
+                desired_solar_sell=_apply_mode[0],
+                desired_limit_control_mode=_apply_mode[1],
+                desired_energy_priority=_apply_mode[2],
+                desired_discharge_current_a=_apply_mode[3],
+                desired_max_charge_current_a=_apply_mode[4],
+                desired_grid_charge=_apply_mode[5],
+                reason=f"{battery_plan.reason} | inverter-mode held {BATTERY_MODE_DWELL_SECONDS}s (anti-hunt)",
+            )
 
         safe_reasons: list[str] = []
         if self.site_state.missing_entities:

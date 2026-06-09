@@ -203,6 +203,36 @@ def tou_setpoint(
     return (float(discharge_floor), False)
 
 
+def apply_mode_dwell(
+    prev_mode,
+    prev_mode_at: datetime | None,
+    desired_mode,
+    now: datetime,
+    dwell_seconds: float,
+    *,
+    exempt: bool,
+):
+    """Anti-hunt rate-limit on the battery inverter-mode tuple.
+
+    Returns ``(mode_to_apply, new_prev_mode, new_prev_mode_at)``. A NON-exempt mode
+    change that arrives less than ``dwell_seconds`` after the previous applied change
+    is HELD — the previous mode is returned, so control writes nothing new. This stops
+    a plan that flips strategy every tick (IDLE<->DISCHARGE at full battery, or
+    EV_SOLAR_PRIORITY<->DISCHARGE while the car cycles) from making the inverter
+    physically hunt (battery swinging charge<->discharge). Exempt (safety / user
+    override) changes, and changes after a stable period (>= dwell since the last
+    applied change), apply immediately so legitimate single transitions aren't delayed.
+    """
+    if prev_mode is None:
+        return desired_mode, desired_mode, now
+    if desired_mode == prev_mode:
+        # Unchanged: keep the original change time so the dwell window can elapse.
+        return desired_mode, prev_mode, prev_mode_at
+    if exempt or prev_mode_at is None or (now - prev_mode_at).total_seconds() >= dwell_seconds:
+        return desired_mode, desired_mode, now
+    return prev_mode, prev_mode, prev_mode_at
+
+
 def _parse_windows(raw: str) -> list[tuple[time, time]]:
     windows: list[tuple[time, time]] = []
     for part in [segment.strip() for segment in raw.split(",") if segment.strip()]:
