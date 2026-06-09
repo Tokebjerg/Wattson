@@ -1472,6 +1472,18 @@ def test_e2_master_lock():
     detected = ctrl.contended_entities(t0 + timedelta(seconds=40 * threshold))
     checks.append(("competing controller detected after repeated re-asserts", eid in detected, str(detected)))
 
+    # Self-oscillation immunity: Wattson alternating its OWN value (on/off/on...)
+    # many times is NOT a competing controller (the full-battery sell<->discharge
+    # flip). apply=True so each flip writes a different value -> both recorded.
+    states_osc = _States()
+    ctrl_osc = control.KlatremisController(_Hass(states_osc, _Services(states_osc, apply=True)))
+    for i in range(threshold * 2 + 2):
+        flip = models.BatteryPlan(strategy="x", reason="x", desired_grid_charge=(i % 2 == 0))
+        asyncio.run(ctrl_osc.apply_battery_plan(mp, flip, t0 + timedelta(seconds=40 * i)))
+    checks.append(("self-oscillation (2 distinct values) is NOT flagged as a competitor",
+                   ctrl_osc.contended_entities(t0 + timedelta(seconds=40 * (threshold * 2 + 2))) == [],
+                   str(ctrl_osc.contended_entities(t0 + timedelta(seconds=40 * (threshold * 2 + 2))))))
+
     # Healthy device: the value sticks after one write -> never flagged.
     states2 = _States()
     ctrl2 = control.KlatremisController(_Hass(states2, _Services(states2, apply=True)))
@@ -1562,6 +1574,16 @@ def test_mode_coherence():
     # coordinator to set (so the battery covers load but never exports).
     disc = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=2000.0))
     checks.append(("Blue DISCHARGE covers house, no export", disc.strategy == "DISCHARGE_TO_LOAD" and disc.desired_solar_sell is False and disc.desired_limit_control_mode == "Zero export to CT" and disc.desired_discharge_current_a is None, f"{disc.strategy}/{disc.desired_solar_sell}/{disc.desired_limit_control_mode}/{disc.desired_discharge_current_a}"))
+    # Anti-churn at a FULL battery (soc==max=90): a small deficit must NOT flip to
+    # DISCHARGE (stays idle/sell — stops the sell<->discharge oscillation that
+    # tripped the false 'competing controller'); a large deficit still discharges.
+    full_small = plan("blue", make_state(at(7), 90, asc, pv=0.0, load=300.0))
+    full_big = plan("blue", make_state(at(7), 90, asc, pv=0.0, load=1500.0))
+    checks.append(("full battery: small deficit does NOT flip to DISCHARGE (anti-churn)", full_small.strategy != "DISCHARGE_TO_LOAD", full_small.strategy))
+    checks.append(("full battery: large deficit still discharges", full_big.strategy == "DISCHARGE_TO_LOAD", full_big.strategy))
+    # A non-full battery keeps the normal small deadband (covers small deficits).
+    notfull_small = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=300.0))
+    checks.append(("non-full battery: small deficit still discharges (normal deadband)", notfull_small.strategy == "DISCHARGE_TO_LOAD", notfull_small.strategy))
 
     # INVARIANT: never sell while charging the battery ("Battery first").
     violations = []

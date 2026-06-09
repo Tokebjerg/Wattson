@@ -48,17 +48,31 @@ class KlatremisController:
         self._write_history[key] = history
 
     def contended_entities(self, now: datetime) -> list[str]:
-        """Control entities Wattson has had to re-assert the SAME value too often
-        (likely a competing controller reverting it). Prunes history as a side
-        effect."""
-        contended: set[str] = set()
+        """Control entities a competing controller is likely reverting. Prunes
+        history as a side effect.
+
+        Contention = Wattson re-asserting ONE value over and over because something
+        keeps reverting it. If Wattson itself wrote 2+ DISTINCT values to the entity
+        within the window (each more than once), that's WATTSON oscillating its own
+        intent — NOT a competitor — so it is never flagged. This stops a false
+        'competing controller' alarm when e.g. the strategy flips
+        IDLE(sell)<->DISCHARGE at a full battery, toggling solar_sell / limit mode."""
+        by_entity: dict[str, list[list[datetime]]] = {}
         for key, history in list(self._write_history.items()):
             pruned = prune_history(history, now, CONTENTION_WINDOW_SECONDS)
-            self._write_history[key] = pruned
             if not pruned:
                 del self._write_history[key]
-            elif is_contended(pruned, now, CONTENTION_WINDOW_SECONDS, CONTENTION_WRITE_THRESHOLD):
-                contended.add(key[0])
+                continue
+            self._write_history[key] = pruned
+            by_entity.setdefault(key[0], []).append(pruned)
+        contended: set[str] = set()
+        for entity_id, histories in by_entity.items():
+            # Wattson flip-flopping its own value (2+ distinct values each written
+            # more than once) -> self-oscillation, not a competing controller.
+            if sum(1 for h in histories if len(h) >= 2) >= 2:
+                continue
+            if any(is_contended(h, now, CONTENTION_WINDOW_SECONDS, CONTENTION_WRITE_THRESHOLD) for h in histories):
+                contended.add(entity_id)
         return sorted(contended)
 
     def reset_write_history(self) -> None:
