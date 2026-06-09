@@ -17,6 +17,8 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 sim 207/207. Deployet main HEAD 16d233e.
 
+**OPDATERING v0.13.1 (refill-baseret salg — #3 FULDT løst, bruger valgte det):** peak-export-triggeren kræver ikke længere pris>=gennemsnit; den sælger nu også når der er nok forecast SENERE sol i dag TIL EN LAVERE PRIS til at genoplade batteriet (future_solar_surplus_kwh, kun billigere senere-slots, >= headroom × SELL_REFILL_MARGIN 1.2). Så morgensolen (7-9) sælges og batteriet fyldes på den billigere/rigelige middagssol; den billigste time selv lader (intet billigere forude); sælger aldrig ved ≤0 eksportpris; morgenreserven er stadig bund. SELL flyttet før charge-priority i _horizon_battery_plan; samme i _build_schedule. sim 209/209 (+2). Deployet main HEAD 40d38c4.
+
 ---
 
 ## Bruger-styret fix — 2026-06-09 13:5x — v0.12.1 LADESTRØM FAST PÅ TRICKLE (PV-begrænsning)
