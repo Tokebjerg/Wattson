@@ -1574,16 +1574,14 @@ def test_mode_coherence():
     # coordinator to set (so the battery covers load but never exports).
     disc = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=2000.0))
     checks.append(("Blue DISCHARGE covers house, no export", disc.strategy == "DISCHARGE_TO_LOAD" and disc.desired_solar_sell is False and disc.desired_limit_control_mode == "Zero export to CT" and disc.desired_discharge_current_a is None, f"{disc.strategy}/{disc.desired_solar_sell}/{disc.desired_limit_control_mode}/{disc.desired_discharge_current_a}"))
-    # Anti-churn at a FULL battery (soc==max=90): a small deficit must NOT flip to
-    # DISCHARGE (stays idle/sell — stops the sell<->discharge oscillation that
-    # tripped the false 'competing controller'); a large deficit still discharges.
+    # Self-consumption at a FULL battery: cover the house from the battery for ANY
+    # real deficit (don't buy grid when the pack is full). The false-competitor
+    # oscillation is handled by the master-lock self-oscillation immunity, NOT by
+    # refusing to discharge (which would harm self-consumption).
     full_small = plan("blue", make_state(at(7), 90, asc, pv=0.0, load=300.0))
     full_big = plan("blue", make_state(at(7), 90, asc, pv=0.0, load=1500.0))
-    checks.append(("full battery: small deficit does NOT flip to DISCHARGE (anti-churn)", full_small.strategy != "DISCHARGE_TO_LOAD", full_small.strategy))
-    checks.append(("full battery: large deficit still discharges", full_big.strategy == "DISCHARGE_TO_LOAD", full_big.strategy))
-    # A non-full battery keeps the normal small deadband (covers small deficits).
-    notfull_small = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=300.0))
-    checks.append(("non-full battery: small deficit still discharges (normal deadband)", notfull_small.strategy == "DISCHARGE_TO_LOAD", notfull_small.strategy))
+    checks.append(("full battery: small deficit covered from battery (self-consumption)", full_small.strategy == "DISCHARGE_TO_LOAD", full_small.strategy))
+    checks.append(("full battery: large deficit covered from battery", full_big.strategy == "DISCHARGE_TO_LOAD", full_big.strategy))
 
     # INVARIANT: never sell while charging the battery ("Battery first").
     violations = []

@@ -42,13 +42,6 @@ SCHEDULE_CHARGE_RATE_KWH = 5.0
 # solar/load crossover (brief clouds, fridge cycling) for negligible benefit.
 DISCHARGE_DEADBAND_W = 150.0
 
-# At a FULL battery the surplus/deficit hovers around zero, which would flip the
-# strategy IDLE(sell-surplus) <-> DISCHARGE_TO_LOAD(cover-deficit) every tick and
-# churn solar_sell / limit_control. Require a clearly larger sustained deficit at a
-# full pack before switching to discharge mode (small deficits stay in sell mode;
-# the grid covers them — and the pack starts discharging once the real deficit grows).
-FULL_BATTERY_DISCHARGE_DEADBAND_W = 800.0
-
 # Peak-export refill rule: sell the solar surplus now (rather than store it) when
 # there is at least this multiple of the battery headroom forecast as LATER solar
 # surplus today — i.e. enough sun coming to refill the pack, so we sell the
@@ -327,9 +320,7 @@ def _horizon_battery_plan(
     #    (sell-at-peak profiles, when export pays). Comes BEFORE grid-charge.
     house_deficit = state.load_power_w - state.pv_power_w
     sell = is_expensive and profile.sell_at_peak and (current.export_value or 0) > 0
-    # Wider deadband at a full pack so a tiny deficit doesn't flip sell<->discharge.
-    deficit_deadband = FULL_BATTERY_DISCHARGE_DEADBAND_W if state.battery_soc_pct >= max_soc else DISCHARGE_DEADBAND_W
-    if state.battery_soc_pct > discharge_floor and (sell or house_deficit > deficit_deadband):
+    if state.battery_soc_pct > discharge_floor and (sell or house_deficit > DISCHARGE_DEADBAND_W):
         peak = "peak " if is_expensive else ""
         return BatteryPlan(
             strategy="DISCHARGE_TO_LOAD",
