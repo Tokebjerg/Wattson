@@ -33,6 +33,8 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 **OPDATERING (samme aften): Brugeren valgte (A) fuld absorption — batteri + tving EV. BYGGET v0.14.0.** Verifikationen reddede en dyr fejl: EDS leverer **spot** i `raw_today.price` + tarifferne separat (time-tarif 0,08–0,32 + flat 0,15). Sand totalpris i dag kl. 14 = spot −0,80 + 0,12 + 0,15 = **−0,53 (ægte negativ → betal)**, men i MORGEN kl. 12 = spot −0,17 + 0,12 + 0,15 = **+0,10 (positiv → ville KOSTE)**. Derfor: trigger på `slot.total_import_price < 0`, IKKE spot/`current_buy_price` (som er spot-only). Implementering: (1) `planner.build_battery_plan` — ny gren FØR BLOCK_NEGATIVE_EXPORT: total-importpris < `NEGATIVE_IMPORT_ABSORB_THRESHOLD` (0,0) + soc<max + allow_grid_charge → GRID_CHARGE (fyld pakken, eksport stadig blokeret); (2) `coordinator` — samme betingelse tving-lader EV på max (respekterer manuel override, kun når tilsluttet, alle EV-modes). **sim 231/231** (+5, inkl. den tarif-løftede ikke-trigger-case). **STRUKTUREL → staged på `feat/negative-price-absorption` (origin), IKKE deployet** (sikkerhedsgulv §4 + bruger godkendte build, ikke deploy). main forbliver 0.13.6. Afventer brugerens deploy-godkendelse.
 
+**OPDATERING 2 — DEPLOYET (bruger-godkendt):** merged feat→main (HEAD e3a6756), push, HACS, genstart. Health-check (§6) bestået: `site=ready`, `competing=off`, sammenhængende DISCHARGE_TO_LOAD dækker huset (grid≈0), ingen integrations-ERROR (kun de kendte forbigående opstarts-dashboard-template-fejl `int('unknown')`). Aften/positiv pris → negativ-import-absorption korrekt dvalende. main = **v0.14.0** live. Effekten observeres på næste ægte-negative-total dag.
+
 ---
 
 ## Bruger-styret fix — 2026-06-09 ~19:1x — v0.13.6 DST/SOMMERTID (lokaltid i state.timestamp)
