@@ -9,6 +9,30 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Dag 2 — 2026-06-09 ~20:10 (manuelt udløst af bruger; cron fyrede ikke — se note)
+
+**Kill-switch:** on → kørte.
+
+**Scheduler-note (hvorfor cron'en ikke kørte 21:00 i går):** Både `CronList` (harness-cron) og `scheduled-tasks` er TOMME. De daglige jobs blev sat op som session-bundne CronCreate-jobs i en tidligere session; de fyrer kun mens den session + appen kører på fyringstidspunktet og overlever ikke sessionsskift → derfor fyrede de aldrig pålideligt (Dag 1 var også manuelt udløst). Afventer brugerens valg af varig scheduler (scheduled-tasks routine) — kræver under alle omstændigheder at Mac'en er vågen kl. 21.
+
+**Analyse (24t — delvist kontamineret af dagens debugging: hunting + DST + 6 genstarter ~17:45–19:15):**
+- **Dagens reelle højværdi-arbejde = to fixes der allerede er deployet:** anti-hunt mode-dwell (v0.13.4/5) + DST-lokaltid (v0.13.6). Begge løste reelle bugs (skadelig ±4 kW hunting; EV-tid 1-2t forskudt).
+- **Negativ-pris-håndtering VERIFICERET KORREKT:** i det dybt negative middagsvindue (13:00–15:30 lokal, total-pris −0,77 til −0,80 kr) kørte Wattson `BLOCK_NEGATIVE_EXPORT` stabilt med grid ≈ 0 (±185 W) → **ingen eksport med tab**; solen ladede batteriet, resten curtailet. Det er korrekt.
+- **Formiddagens strategi-flippen** (SOLAR_SELF_CONSUMPTION↔GRID_CHARGE↔HOLD hvert ~10 sek, 10:30–13:00) er den oscillation som dagens dwell-fix (v0.13.4/5) nu dæmper — pre-fix artefakt.
+- **Besparelse i dag: 9,18 kr** (vs. ~4 kr/aften TABT før TOU-fixet). Sol i dag 51,5 kWh; **i morgen 68,8 kWh + stejl aftenspids (20:00 = 1,39 kr, 19:00 = 0,97, 21:00 = 1,10) + let-negativ middag**.
+
+**Valgt forbedring (ÉN): aggressiv absorption ved DYBT negative priser — "få betalt for at forbruge".** I dag *blokerede* Wattson kun eksport ved −0,80; den **importerede ikke aktivt** for at (a) lade batteriet til 100 % og (b) tvinge EV-opladning, selvom man får BETALT ~0,80 kr/kWh for at importere — OG en fuld-ladet batteri står klar til aftenspidsen (1,39 kr i morgen). Best practice (predictive control): ved total-importpris < ~0 bør batteri grid-lades til fuld + EV køre, frem for at curtaile. **Forventet gevinst:** på en dyb-negativ dag (som i dag/i morgen) ~import-betaling 0,5–0,8 kr/kWh × det batteriet/EV kan optage + sikrer fuld pakke til aften-arbitrage (op mod ~10–20 kr/dag på de stejleste dage).
+
+**Risikoklassificering: STRUKTUREL** — ny grid-charge-/EV-trigger på kontrol-stien (planner-beslutning + muligvis coordinator EV-gate). Per sikkerhedsgulvet §4 = **IKKE auto-deploy**. Desuden: 3 deploys allerede i dag + kontamineret data → byg ikke forhastet i aften.
+
+**Handling i dag:** INGEN deploy, INGEN inverter-write. Diagnose + valgt forbedring dokumenteret, bruger notificeret. Afventer brugerens designvalg før build+sim+stage:
+  (A) tærskel for "dyb negativ" (fx total-importpris < 0,00 eller < −0,10 kr);
+  (B) skal EV også tvang-lades ved negativ (selv hvis "done"/idle), eller kun batteri-grid-charge;
+  (C) loft (kun til max_soc; stop ved positiv pris).
+**VERIFICÉR ved build (kW/W-lektien):** bekræft at total-importpris (spot+tarif) faktisk er negativ ved de timer (ikke kun spot), før grid-charge-ved-negativ aktiveres. Sim ikke kørt (ingen kodeændring i aften).
+
+---
+
 ## Bruger-styret fix — 2026-06-09 ~19:1x — v0.13.6 DST/SOMMERTID (lokaltid i state.timestamp)
 
 Bruger spurgte: "har du indtænkt sommertid i hele systemet? Bor jo i Danmark." Audit (verificeret live, ikke gættet):
