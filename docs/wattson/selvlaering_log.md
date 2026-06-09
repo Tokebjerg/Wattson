@@ -15,6 +15,8 @@ Bruger fik "competing controller"-notifikation. Diagnose: INGEN ekstern konkurre
 
 **Fix (v0.13.2, bruger-godkendt, main 46449fe):** (1) control.contended_entities immun over for self-oscillation: skrev Wattson ≥2 DISTINKTE værdier til en entitet i vinduet (hver >1) = egen vippen → flag ALDRIG; en ægte konkurrent viser sig som ÉN gen-asserteret værdi og fanges stadig. (2) planner: bredere afladnings-deadband (FULL_BATTERY_DISCHARGE_DEADBAND_W 800W vs 150W) når soc>=max_soc, så et lille underskud ved fuldt batteri ikke flipper sælg↔aflad; pakken aflader stadig når underskuddet vokser. sim 213/213 (+4). Genstart nulstiller også kontentions-state.
 
+**OPDATERING v0.13.3 (rullede Fix 2 tilbage):** Live efter v0.13.2 viste SOC 100% + 616 W husunderskud = IDLE og nettet købte ~640 W i stedet for at batteriet dækkede huset — 800 W full-battery-deadbandet var for groft og brød selvforbrugs-prioriteten (dæk huset fra batteriet, køb ikke net). Den falske konkurrent-alarm håndteres FULDT af master-lås-self-oscillation-immuniteten (Fix 1, beholdt). Så deadbandet er FJERNET: batteriet dækker igen ethvert reelt underskud (>150 W) ved fuldt batteri. Den marginale fuldt-batteri sælg↔aflad-toggling kan stadig ske kortvarigt, men er nu uskadelig (flagges ikke som kontention). sim 212/212. Deployet main d0bffc2.
+
 ---
 
 ## 6t-tjek 2026-06-09 16:17
