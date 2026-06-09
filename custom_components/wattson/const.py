@@ -118,6 +118,10 @@ DEFAULT_PRICE_VAT_MULTIPLIER = 1.0
 DEFAULT_BATTERY_MIN_SOC = 15       # use the battery down to 15%
 DEFAULT_BATTERY_MAX_SOC = 100      # charge all the way to 100%
 DEFAULT_BATTERY_CAPACITY_KWH = 10.0
+# Home-battery SOC plan has first priority: while SOC is below this, solar surplus
+# CHARGES the battery before it is sold at a peak or handed to the EV. 0 = off.
+CONF_SOLAR_CHARGE_PRIORITY_SOC = "solar_charge_priority_soc"
+DEFAULT_SOLAR_CHARGE_PRIORITY_SOC = 50.0
 # Battery discharge-current limit (A) Wattson sets when the battery should cover
 # the house ("Aflad til hus"). It is a LIMIT, so the battery only delivers what
 # the house needs — but it must be > 0 or the house falls back to the grid.

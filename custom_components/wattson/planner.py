@@ -155,16 +155,17 @@ def tou_setpoint(
 
     The Deye treats each TOU time-point's "capacity" as the SOC it may discharge
     DOWN TO in that slot — i.e. a hard discharge floor that otherwise silently
-    overrides Wattson. So Wattson sets it to exactly the SOC it currently allows
-    discharge to:
-      - actively covering the house (DISCHARGE_TO_LOAD / force-discharge) -> the
-        real discharge floor, so the battery serves the load down to it;
-      - holding (idle/sell-solar/self-consumption/EV-solar): the CURRENT SOC
-        (rounded up to 5%), so TOU enforces the planning engine's price-rationed
-        hold instead of leaking the battery during cheap hours;
-      - grid-charging: the charge target (max_soc) + enable charging.
-    Degraded/safety strategies (HOLD/PROTECT/BLOCK_NEGATIVE_EXPORT) return
-    (None, None) so TOU is left untouched.
+    overrides Wattson. Self-consumption first: Wattson keeps the floor at its own
+    discharge floor for every non-charging strategy, so the inverter can ALWAYS
+    cover the house from the battery down to that floor (incl. a sudden,
+    unexpected load) instead of importing — no waiting for Wattson's next tick.
+      - covering the house / holding / idle / sell-solar / EV-solar -> the
+        discharge floor (min_soc + reserve);
+      - grid-charging / force-charge -> the charge target (max_soc) + enable;
+      - force-discharge -> min_soc (drain fully);
+      - degraded/safety (HOLD/PROTECT/BLOCK_NEGATIVE_EXPORT) -> (None, None),
+        leave TOU untouched.
+    ``soc_pct`` is accepted for interface stability but no longer gates the floor.
     """
     if plan.strategy in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
         return (None, None)
@@ -172,80 +173,8 @@ def tou_setpoint(
         return (float(max_soc), True)
     if plan.strategy == "OVERRIDE_DISCHARGE":
         return (float(min_soc), False)
-    if plan.strategy == "DISCHARGE_TO_LOAD" and (plan.desired_discharge_current_a or 0) > 0:
-        return (float(discharge_floor), False)
-    # Hold: never discharge below the current SOC (round up to a 5% step so a
-    # drifting SOC doesn't churn the register).
-    held = min(float(max_soc), max(float(min_soc), math.ceil(soc_pct / 5.0) * 5.0))
-    return (held, False)
-
-
-def discharge_price_threshold(
-    slots: list,
-    *,
-    soc_kwh: float,
-    floor_kwh: float,
-    max_kwh: float,
-    profile: ProfileWeights,
-    solar_by_start: dict,
-    load_hourly_w: dict[int, float] | None,
-    mean_price: float,
-) -> float:
-    """The lowest import price (DKK/kWh) at which it pays to discharge NOW.
-
-    This is the heart of the planning engine. The battery's usable energy (the
-    SOC above the reserve floor) is a *limited budget*; spending it on the most
-    expensive deficit hours first maximises the saving. The threshold is the
-    price at which that budget runs out — so we discharge only in hours priced
-    at or above it, leaving cheap-hour deficits to the (cheap) grid and saving
-    the stored energy for the genuine peak.
-
-    The budget is allocated only over the current "discharge episode": deficit
-    hours up to the point where forecast solar would refill the battery again
-    (after that it is a fresh budget, so tomorrow's peak must not starve
-    tonight's). Re-evaluated every tick, the policy self-corrects: a near-empty
-    battery rations hard (high threshold, peak only); a full battery spends
-    freely (low threshold), which also makes room for incoming solar.
-
-    Returns ``-inf`` (always discharge to cover the house) for self-sufficiency
-    profiles or when there is no priced deficit ahead, and ``+inf`` (never) when
-    there is nothing to spend. With no learned load profile it degrades to a
-    conservative above-average-price gate (``mean_price``).
-    """
-    if profile.self_consumption_first:
-        return float("-inf")
-    budget_kwh = max(0.0, soc_kwh - floor_kwh)
-    if budget_kwh <= 0.0:
-        return float("inf")
-    if not load_hourly_w:
-        return mean_price
-    avg_load_w = sum(load_hourly_w.values()) / len(load_hourly_w)
-    remaining_to_full = max(0.0, max_kwh - soc_kwh)
-    deficits: list[tuple[float, float]] = []
-    cum_net_kwh = 0.0
-    for slot in slots:
-        load_kwh = load_hourly_w.get(slot.start.hour, avg_load_w) / 1000.0
-        pv = solar_by_start.get(slot.start)
-        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
-        net = solar_kwh - load_kwh
-        if net < 0:
-            deficits.append((slot.total_import_price, -net))
-        cum_net_kwh += net
-        # Once forecast solar has refilled the pack, later deficits belong to a
-        # new budget episode — stop competing for tonight's stored energy.
-        if deficits and cum_net_kwh >= remaining_to_full:
-            break
-    if not deficits:
-        return float("-inf")
-    deficits.sort(key=lambda pd: pd[0], reverse=True)
-    accumulated = 0.0
-    threshold = deficits[-1][0]
-    for price, kwh in deficits:
-        accumulated += kwh
-        if accumulated >= budget_kwh:
-            threshold = price
-            break
-    return threshold
+    # Every other state covers the house down to the discharge floor.
+    return (float(discharge_floor), False)
 
 
 def _parse_windows(raw: str) -> list[tuple[time, time]]:
@@ -285,6 +214,7 @@ def _horizon_battery_plan(
     learned_reserve_pct: float = 0.0,
     capacity_kwh: float = 10.0,
     load_hourly_w: dict[int, float] | None = None,
+    solar_charge_priority_soc: float = 0.0,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -303,8 +233,30 @@ def _horizon_battery_plan(
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
-    # 1. Sell the solar surplus at an above-average price, trickle-charging only,
-    #    so the bulk charge waits for the cheap midday sun.
+    # 1. SOC plan has first priority: while the home battery is below the
+    #    charge-priority SOC, solar surplus CHARGES the battery — before it is sold
+    #    at a peak or handed to the EV. Only once the pack is healthily charged do
+    #    we sell the surplus. (Fixes "the battery never recharged because it kept
+    #    selling the morning surplus while sitting at 20%".)
+    if (
+        state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
+        and solar_charge_priority_soc > 0
+        and state.battery_soc_pct < solar_charge_priority_soc
+        and state.battery_soc_pct < max_soc
+    ):
+        return BatteryPlan(
+            strategy="SOLAR_SELF_CONSUMPTION",
+            reason=f"[{profile.name}] charging the home battery first (SOC {state.battery_soc_pct:.0f}% < {solar_charge_priority_soc:.0f}% priority) before selling or EV",
+            desired_grid_charge=False,
+            desired_solar_sell=False,
+            desired_energy_priority="Battery first",
+            desired_limit_control_mode="Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+        )
+
+    # 2. Sell the solar surplus at an above-average price (battery already past the
+    #    charge-priority SOC), trickle-charging only so the bulk charge waits for the
+    #    cheap midday sun.
     if (
         profile.sell_solar_at_peak
         and price >= view.mean_price
@@ -322,42 +274,24 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=TRICKLE_CHARGE_A,
             # Only the SOLAR surplus is sold here — never drain the battery into the
-            # grid (that's saved for the evening). So block battery discharge.
+            # grid. So block battery discharge.
             desired_discharge_current_a=0.0,
         )
 
-    # 2. Self-consumption with price-rationing (the planning engine): cover the
-    #    house from the battery whenever PV can't — BUT only when this hour's price
-    #    clears the discharge threshold, i.e. the limited stored energy is best
-    #    spent here rather than saved for a pricier hour still ahead. Cheap-hour
-    #    deficits are left to the (cheap) grid so the battery is kept for the peak.
-    #    Self-sufficiency profiles (Grøn) get a -inf threshold (always cover the
-    #    house); a near-full pack gets a low threshold (big budget) so it spends
-    #    freely and leaves room for incoming solar. Also discharge to SELL at a
-    #    genuine peak (sell-at-peak profiles, when export pays). Comes BEFORE
-    #    grid-charge so stored solar is used for the house rather than the grid.
-    capacity = max(0.1, capacity_kwh)
-    threshold = discharge_price_threshold(
-        view.slots,
-        soc_kwh=state.battery_soc_pct / 100.0 * capacity,
-        floor_kwh=discharge_floor / 100.0 * capacity,
-        max_kwh=max_soc / 100.0 * capacity,
-        profile=profile,
-        solar_by_start={s.start: s for s in state.solar_slots},
-        load_hourly_w=load_hourly_w,
-        mean_price=view.mean_price,
-    )
+    # 3. Self-consumption FIRST: cover the house from the battery whenever PV can't,
+    #    down to the reserve floor — at ANY price. In a solar-rich setup the pack
+    #    refills daily, so using stored energy for the house always beats buying
+    #    from the grid; the floor (incl. the learned morning reserve) is the only
+    #    thing held back. This guarantees the battery covers a sudden/unexpected
+    #    house load instead of importing. Also discharge to SELL at a genuine peak
+    #    (sell-at-peak profiles, when export pays). Comes BEFORE grid-charge.
     house_deficit = state.load_power_w - state.pv_power_w
     sell = is_expensive and profile.sell_at_peak and (current.export_value or 0) > 0
-    worth_discharging = price >= threshold
-    if state.battery_soc_pct > discharge_floor and (
-        sell or (house_deficit > DISCHARGE_DEADBAND_W and worth_discharging)
-    ):
+    if state.battery_soc_pct > discharge_floor and (sell or house_deficit > DISCHARGE_DEADBAND_W):
         peak = "peak " if is_expensive else ""
-        gate = "" if threshold == float("-inf") else f", worth more than the {threshold:.2f} discharge floor"
         return BatteryPlan(
             strategy="DISCHARGE_TO_LOAD",
-            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f}{gate})",
+            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f})",
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
@@ -428,6 +362,7 @@ def _build_schedule(
     min_soc: float = 15.0,
     max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
+    solar_charge_priority_soc: float = 0.0,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan with a battery-SOC projection.
 
@@ -473,14 +408,18 @@ def _build_schedule(
         # — charge the battery, cover the house, otherwise curtail. Unknown export
         # value is treated as sellable (don't curtail on missing data).
         worthless_export = slot.export_value is not None and slot.export_value <= 0
+        soc_pct_now = soc_kwh / capacity_kwh * 100.0
         if (
             profile.sell_solar_at_peak
             and surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH
             and price_high
+            and soc_pct_now >= solar_charge_priority_soc
             and soc_kwh < max_kwh - 0.05
         ):
-            # Above-average price + sun: sell the surplus, trickle-charge only,
-            # and save the bulk battery charge for the cheap midday sun.
+            # Above-average price + sun AND the home battery is past its charge
+            # priority: sell the surplus, trickle-charge only, saving the bulk
+            # charge for the cheap midday sun. (Below the priority SOC this falls
+            # through to SOLAR_CHARGE so the battery fills first.)
             soc_kwh = min(max_kwh, soc_kwh + TRICKLE_CHARGE_KWH)
             action = "EXPORT"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
@@ -492,21 +431,10 @@ def _build_schedule(
             # Battery full + surplus: sell it, unless exporting is worthless or
             # would cost money — then curtail to house-only instead.
             action = "LIMIT_EXPORT" if worthless_export else "EXPORT"
-        elif deficit_kwh > 0.05 and soc_kwh > floor_kwh + 0.05 and slot.total_import_price >= discharge_price_threshold(
-            [entry[0] for entry in info[i:]],
-            soc_kwh=soc_kwh,
-            floor_kwh=floor_kwh,
-            max_kwh=max_kwh,
-            profile=profile,
-            solar_by_start=solar_by_start,
-            load_hourly_w=load_hourly_w,
-            mean_price=view.mean_price,
-        ):
-            # Price-rationed self-consumption (same engine as live control): cover
-            # the house deficit from stored energy, but only when this hour clears
-            # the discharge threshold — the limited charge is spent on the most
-            # expensive deficit hours of the episode, leaving cheap hours to the
-            # grid and saving the battery for the peak. Comes BEFORE grid-charge.
+        elif deficit_kwh > 0.05 and soc_kwh > floor_kwh + 0.05:
+            # Self-consumption first: cover the house deficit from stored energy
+            # down to the reserve floor, at any price (the pack refills from solar
+            # daily, so this always beats buying grid). Comes BEFORE grid-charge.
             drain = min(deficit_kwh, soc_kwh - floor_kwh)
             soc_kwh -= drain
             action = "DISCHARGE"
@@ -559,6 +487,7 @@ def build_battery_plan(
     learned_reserve_pct: float = 0.0,
     capacity_kwh: float = 10.0,
     load_hourly_w: dict[int, float] | None = None,
+    solar_charge_priority_soc: float = 0.0,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -621,6 +550,7 @@ def build_battery_plan(
                 learned_reserve_pct=learned_reserve_pct,
                 capacity_kwh=capacity_kwh,
                 load_hourly_w=load_hourly_w,
+                solar_charge_priority_soc=solar_charge_priority_soc,
             ),
             False,
         )
@@ -1047,6 +977,7 @@ def build_control_plan(
     min_soc: float = 15.0,
     max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
+    solar_charge_priority_soc: float = 0.0,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -1057,6 +988,7 @@ def build_control_plan(
     schedule, next_cheap_window, next_expensive_window = _build_schedule(
         state, profile_for(battery_mode), load_hourly_w,
         capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
+        solar_charge_priority_soc=solar_charge_priority_soc,
     )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:

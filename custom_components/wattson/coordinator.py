@@ -35,6 +35,8 @@ from .const import (
     DEFAULT_EV_READY_HOUR,
     CONF_PRICE_VAT_MULTIPLIER,
     DEFAULT_PRICE_VAT_MULTIPLIER,
+    CONF_SOLAR_CHARGE_PRIORITY_SOC,
+    DEFAULT_SOLAR_CHARGE_PRIORITY_SOC,
     CONF_SOLAR_BIAS_HISTORY,
     SOLAR_BIAS_MIN_DAYS,
     SOLAR_BIAS_MAX_DAYS,
@@ -641,6 +643,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         if profile_age is None or profile_age >= timedelta(seconds=LEARNING_REBUILD_SECONDS):
             await self._async_update_load_profile()
         learned_reserve_pct = self._learned_reserve_pct()
+        solar_charge_priority = float(entry_value(self.config_entry, CONF_SOLAR_CHARGE_PRIORITY_SOC, DEFAULT_SOLAR_CHARGE_PRIORITY_SOC))
 
         battery_plan, negative_price_active = build_battery_plan(
             self.site_state,
@@ -655,6 +658,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             learned_reserve_pct=learned_reserve_pct,
             capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
             load_hourly_w=self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None,
+            solar_charge_priority_soc=solar_charge_priority,
         )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.
@@ -667,7 +671,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # Phase C UI: scheduled window is built from the start/end hour numbers;
         # the house-battery threshold only applies when the priority toggle is on.
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
-        effective_battery_threshold = self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0
+        # The home-battery SOC plan has priority over EV solar charging: the car
+        # waits for solar until the house battery reaches the charge-priority SOC
+        # (and the user's own EV house-battery threshold, when that toggle is on).
+        effective_battery_threshold = max(
+            self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0,
+            solar_charge_priority,
+        )
 
         ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_plan = build_ev_plan(
@@ -820,6 +830,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
             max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
             learned_reserve_pct=learned_reserve_pct,
+            solar_charge_priority_soc=solar_charge_priority,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:
