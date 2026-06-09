@@ -9,6 +9,22 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret fix — 2026-06-09 ~18:0x–18:5x — v0.13.4 + v0.13.5 ANTI-HUNT MODE-DWELL
+
+Bruger: "der er et eller andet som kører helt galt det seneste kvarter." Diagnose fra direkte inverter-sensorer (17:45–18:03): **systemet huntede** — batteri ±4 kW (oplad −4.475 W ↔ aflad +3.519 W hvert ~minut), PV 0↔6 kW, net 0↔13 kW, strategien flippede `DISCHARGE_TO_LOAD ↔ IDLE ↔ EV_SOLAR_PRIORITY` hvert ~20-60 sek. **Rodårsag (egen regression):** v0.13.2 gjorde master-låsen immun over for egen oscillation (fjernede dæmpningen) + v0.13.3 fjernede deadbandet (flippet kom igen) → uhæmmet hunting der togglede inverter-tilstanden fysisk.
+
+**Akut mitigation (sikker, reversibel):** trykkede `button.wattson_pause_1_hour` → safe_mode → Wattson holdt op med at toggle → inverteren faldt straks til ro (PV stabil, batteri mildt, grid≈0). Hunting er IKKE harmløs (slider på batteri/inverter), så stop først, byg bagefter.
+
+**Fix v0.13.4 (bruger-godkendt, main ba706fc):** `planner.apply_mode_dwell()` — rate-limit på inverter-tilstands-tuplen (solar_sell, limit_control, energy_priority, afladnings-/ladestrøm, grid_charge) til ÉT skift pr. `BATTERY_MODE_DWELL_SECONDS=120s`; for hurtige skift HOLDES forrige tilstand (+ strategi-label) så control intet skriver og inverteren sætter sig. sim 218/218 (+6; flip hvert 20s → 4 reelle skift over 600s).
+
+**Fix v0.13.5 (bruger-godkendt, main 8c1cb67):** v0.13.4 holdt HELE tilstanden i 120s — så da `SELL_SOLAR_PEAK` låste på en kort PV-stigning og forbruget steg, stod batteriet på afladning=0 og nettet importerede (brød selvforbrugs-prioriteten). Fix: asymmetrisk dwell via `planner.mode_dwell_exempt()`. **DISCHARGE_TO_LOAD (dæk huset) + EV_SOLAR_PRIORITY (egen 150s-sticky) + sikkerhed/override er EXEMPT** (slår igennem straks, holdes aldrig); kun skift *ind i* sælg/oplad/idle (SELL_SOLAR_PEAK, IDLE, SOLAR_SELF_CONSUMPTION, GRID_CHARGE) dæmpes. DISCHARGE_TO_LOAD (Load first + Zero export) er også den stabile tilstand der balancerer overskud↔underskud uden at toggle flag, så at gøre den til sticky-default er netop det der stopper hunting'en OG garanterer at huset altid dækkes. sim 223/223 (+5).
+
+**VERIFICERET LIVE (v0.13.5, 18:43–18:53):** mode knaldstabil (EV_SOLAR_PRIORITY i 3,5 min uden ét skift; tidligere DISCHARGE-periode holdt grid≈0 med batteriet ~2 kW), ingen ±4 kW-pendling, `competing=off`. Da bilen blev færdig: ren overgang til DISCHARGE_TO_LOAD, maxdis gendannet 70 A, batteri dækker huset (1.437 W), grid=99 W.
+
+**LÆRING — kW vs W (vigtig, undgå gentagelse):** Under verifikationen fejllæste jeg `sensor.ehut8c3w_power` som Watt og troede bilen stod i `awaiting_start`/~0 W men holdt EV_SOLAR_PRIORITY → mistænkte en sekundær net-import-bug. Sensorens `unit_of_measurement` er **kW** — bilen ladede reelt ved 1,6–10,9 kW. De "grid-spikes" (op til 12.615 W) var bilen der ladede ved ~10 kW på sol+net mens hjemmebatteriet korrekt blev skånet (EV-solar-priority = dræn ikke huset-batteriet ned i bilen). INGEN sekundær bug. **Tjek altid `unit_of_measurement` før effekt-tal tolkes** (Easee-power er kW, Deye-sensorer er W). Master-låsens self-oscillation-immunitet (v0.13.2) blev beholdt — den falske-konkurrent-fix står stadig; dwell'en er den manglende dæmpning.
+
+---
+
 ## Bruger-styret fix — 2026-06-09 ~17:4x — v0.13.2 FALSK KONKURRENT (selv-oscillation)
 
 Bruger fik "competing controller"-notifikation. Diagnose: INGEN ekstern konkurrent — Wattson kæmpede mod sig selv. Contended: select.klatremishw_deye_limit_control_mode + switch.klatremishw_deye_solar_sell. Ved FULDT batteri (100%) tæt på sol/forbrug-balancen vippede strategien IDLE(sælg-når-fuld) ↔ DISCHARGE_TO_LOAD hvert ~30-60s og togglede solar_sell + limit_control. Master-låsen talte den gentagne gen-skrivning af hver værdi som kontention (≥5 pr. værdi i 600s-vinduet) og bakkede ud af batteristyringen i 10 min. (Logbog + strategi-sensor flippede i takt → bekræftede self-oscillation, ikke ekstern.)
