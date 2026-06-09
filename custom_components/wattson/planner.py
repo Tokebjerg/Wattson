@@ -42,6 +42,15 @@ SCHEDULE_CHARGE_RATE_KWH = 5.0
 # solar/load crossover (brief clouds, fridge cycling) for negligible benefit.
 DISCHARGE_DEADBAND_W = 150.0
 
+# Negative-price absorption: when the TOTAL import price (spot + tariff + flat) is
+# below this, you are literally PAID to import — so grid-charge the battery to full
+# (and the coordinator force-charges the EV). This both earns the import payment and
+# readies a full pack for the evening peak. Uses the slot's TOTAL price, NOT spot:
+# tariffs (esp. the 17-20 peak tariff + the ~0.15 flat) can lift a negative spot back
+# above zero, where importing would COST instead of pay. 0.0 = exploit every hour the
+# all-in price is genuinely negative.
+NEGATIVE_IMPORT_ABSORB_THRESHOLD = 0.0
+
 # Peak-export refill rule: sell the solar surplus now (rather than store it) when
 # there is at least this multiple of the battery headroom forecast as LATER solar
 # surplus today — i.e. enough sun coming to refill the pack, so we sell the
@@ -603,6 +612,32 @@ def build_battery_plan(
 
     if state.issues or state.stale_required_entities or state.missing_entities:
         return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
+
+    # Negative TOTAL import price (spot + tariff): you are PAID to import. Grid-charge
+    # the battery to full AND block export (selling is negative too) — earns the import
+    # payment now and readies a full pack for the evening peak. Uses the current slot's
+    # TOTAL price (not the spot-only current_buy_price), since tariffs can lift a
+    # negative spot back above zero where importing would cost. Comes before
+    # BLOCK_NEGATIVE_EXPORT (which would only block export, not absorb the paid energy).
+    _neg_slot = current_price_slot(state.price_slots, state.timestamp) if state.price_slots else None
+    if (
+        allow_grid_charge
+        and _neg_slot is not None
+        and _neg_slot.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD
+        and state.battery_soc_pct < max_soc
+    ):
+        return (
+            BatteryPlan(
+                strategy="GRID_CHARGE",
+                reason=f"paid to import (total {_neg_slot.total_import_price:.2f} kr/kWh < 0) — grid-charging the battery, export blocked",
+                desired_grid_charge=True,
+                desired_solar_sell=False,
+                desired_energy_priority="Battery first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=0.0,
+            ),
+            True,
+        )
 
     if negative_export_active and not allow_negative_export:
         return (
