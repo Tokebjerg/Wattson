@@ -9,6 +9,20 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret fix — 2026-06-09 ~19:1x — v0.13.6 DST/SOMMERTID (lokaltid i state.timestamp)
+
+Bruger spurgte: "har du indtænkt sommertid i hele systemet? Bor jo i Danmark." Audit (verificeret live, ikke gættet):
+- **DST-sikkert allerede:** Energi Data Service leverer tz-aware `Europe/Copenhagen`-tidsstempler (bekræftet live: `raw_today` kl. 12 = `ZoneInfo('Europe/Copenhagen')`), så `slot.start.hour` er lokal time → tarif-opslag (nøglet på lokal time) + forbrugs-opslag korrekte. Pris-/horisont-sammenligninger sker på instant (begge tz-aware). 24t-skemaet itererer de FAKTISKE pris-slots (23/24/25 på overgangsdage), ingen hardkodet `range(24)`. Forbrugslæring bucket'er via `as_local`. Solprognose matches på instant. Pause/override/dwell/cooldowns = ren varigheds-matematik på UTC-instants.
+- **REEL FEJL fundet:** `build_site_state` stemplede `state.timestamp = dt_util.utcnow()` (UTC). Planneren læser tidspunkt-på-døgnet derfra til **EV-ladevinduer** (`_in_windows`) og **"klar kl. HH:00"-deadline** (`.replace(hour=...)`) → begge forskudt med UTC-offset: **+1 t vinter (CET), +2 t sommer (CEST)**. "Klar kl. 07:00" blev reelt 09:00 lokal om sommeren. Plus intern inkonsistens: slot-udvælgelse (linje 889) brugte lokal `slot.start`, mens in-window/deadline brugte UTC. (Dvalende uden sat vindue/ready-hour, men forkert ved brug — og ready-hour er en feature vi byggede, #10.)
+
+**Fix (v0.13.6, bruger-godkendt, main b0d0378):** `state.timestamp = dt_util.now()` (lokal zoneinfo Europe/Copenhagen). Alle øvrige forbrugere sammenligner på instant → lige korrekt; zoneinfo-aritmetik gør `deadline + timedelta(days=1)` lokal-væg-time-korrekt hen over en DST-overgang. sim 226/226 (+3: `test_dst_local_time` tvinger now() til +02:00 og verificerer at build_site_state stempler LOKALT + at `_in_windows` følger lokal væg-tid; simen stubber nu `dt_util.now`/`as_local`). VERIFICERET LIVE: opstart ren, `19:15 +0200`, DISCHARGE_TO_LOAD dækker huset (grid≈4 W), competing=off.
+
+**LÆRING — verificér tz/enhed LIVE før konklusion:** efter kW/W-fejlen tjekkede jeg EDS-tidsstemplernes faktiske `tzinfo`/`unit` via template i stedet for at antage. Hold fast i det.
+
+**Cron-note:** `CronList` (denne session) = tom, så de daglige selvlærings-jobs (lavet i forrige session) kan ikke verificeres herfra — sørg for at 21:00-tidspunktet er sat i lokaltid.
+
+---
+
 ## Bruger-styret fix — 2026-06-09 ~18:0x–18:5x — v0.13.4 + v0.13.5 ANTI-HUNT MODE-DWELL
 
 Bruger: "der er et eller andet som kører helt galt det seneste kvarter." Diagnose fra direkte inverter-sensorer (17:45–18:03): **systemet huntede** — batteri ±4 kW (oplad −4.475 W ↔ aflad +3.519 W hvert ~minut), PV 0↔6 kW, net 0↔13 kW, strategien flippede `DISCHARGE_TO_LOAD ↔ IDLE ↔ EV_SOLAR_PRIORITY` hvert ~20-60 sek. **Rodårsag (egen regression):** v0.13.2 gjorde master-låsen immun over for egen oscillation (fjernede dæmpningen) + v0.13.3 fjernede deadbandet (flippet kom igen) → uhæmmet hunting der togglede inverter-tilstanden fysisk.
