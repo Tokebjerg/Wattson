@@ -121,6 +121,8 @@ from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     apply_mode_dwell,
     mode_dwell_exempt,
+    peak_reserve_pct,
+    required_spread,
     build_battery_plan,
     build_control_plan,
     build_ev_plan,
@@ -661,20 +663,33 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         learned_reserve_pct = self._learned_reserve_pct()
         solar_charge_priority = float(entry_value(self.config_entry, CONF_SOLAR_CHARGE_PRIORITY_SOC, DEFAULT_SOLAR_CHARGE_PRIORITY_SOC))
 
+        _min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
+        _max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+        _capacity = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        _load_hourly = self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None
+        # Forecast peak reserve (A): SOC% to hold for an upcoming markedly-more-expensive
+        # peak today, so the pack isn't drained cheap and then importing at the peak.
+        peak_reserve = peak_reserve_pct(
+            self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
+            _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
+            margin=required_spread(profile_for(self.battery_mode)),
+        )
+
         battery_plan, negative_price_active = build_battery_plan(
             self.site_state,
             battery_mode=self.battery_mode,
-            min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
-            max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
+            min_soc=_min_soc,
+            max_soc=_max_soc,
             cheap_threshold=float(entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD)),
             expensive_threshold=float(entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD)),
             allow_grid_charge=bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE)),
             allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
             export_limit_default_w=self._default_export_limit_w,
             learned_reserve_pct=learned_reserve_pct,
-            capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
-            load_hourly_w=self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None,
+            capacity_kwh=_capacity,
+            load_hourly_w=_load_hourly,
             solar_charge_priority_soc=solar_charge_priority,
+            peak_reserve=peak_reserve,
         )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.
@@ -906,7 +921,10 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # is profile-shaped; the capacity tracks current SOC when holding.
         min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
         max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-        discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct)
+        # Include the forecast peak reserve (A) so the inverter's TOU floor actually
+        # HOLDS the reserve (won't discharge below it) during the pre-peak hold; it
+        # falls to 0 at the peak itself, so the pack then discharges fully into it.
+        discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
         tou_cap, tou_charge = tou_setpoint(
             battery_plan, soc_pct=self.site_state.battery_soc_pct,
             min_soc=min_soc, discharge_floor=discharge_floor, max_soc=max_soc,

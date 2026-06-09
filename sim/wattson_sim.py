@@ -1920,6 +1920,59 @@ def test_negative_import_absorb():
     return checks
 
 
+def test_peak_reserve():
+    """Forecast peak-reserve (A) + cheap-hour pre-charge (B): hold/charge for a
+    markedly-dearer peak instead of draining cheap then importing at the peak.
+    Backtest showed this is the #1 cross-season win."""
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 1, 15, h, 0, tzinfo=TZ)
+
+    prices = {h: 0.25 for h in range(24)}
+    prices[18] = 1.50  # single clear evening peak
+    slots = [models.PriceSlot(start=at(h), spot_price=prices[h], tariff=0.0,
+                              total_import_price=prices[h], export_value=0.5) for h in range(24)]
+    load_hourly = {h: 600.0 for h in range(24)}
+    load_hourly[18] = 3000.0
+    margin = planner.required_spread(planner.profile_for("blue"))
+
+    pr3 = planner.peak_reserve_pct(slots, at(3), [], load_hourly, capacity_kwh=10, min_soc=20, max_soc=95, margin=margin)
+    checks.append((f"reserve >0 when a dearer peak is ahead (got {pr3:.0f}%)", 20 < pr3 < 45, f"{pr3:.1f}"))
+    pr18 = planner.peak_reserve_pct(slots, at(18), [], load_hourly, capacity_kwh=10, min_soc=20, max_soc=95, margin=margin)
+    checks.append((f"reserve ~0 AT the peak (got {pr18:.0f}%)", pr18 < 1.0, f"{pr18:.1f}"))
+    pr_big = planner.peak_reserve_pct(slots, at(3), [], load_hourly, capacity_kwh=10, min_soc=20, max_soc=95, margin=5.0)
+    checks.append(("reserve 0 when gap below margin (never hold for a near-equal peak)", pr_big == 0.0, f"{pr_big}"))
+
+    def plan_at(hour, soc, pr_val):
+        st = models.SiteState(
+            timestamp=at(hour), pv_power_w=0.0, load_power_w=2500.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=soc,
+            battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+            easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+            current_buy_price=prices[hour], current_sell_price=0.5, forecast_today_kwh=0.0,
+            price_slots=slots, solar_slots=[])
+        bp, _ = planner.build_battery_plan(
+            st, battery_mode="blue", min_soc=20, max_soc=95, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0, capacity_kwh=10, load_hourly_w=load_hourly, peak_reserve=pr_val)
+        return bp
+
+    checks.append(("below reserve at a cheap hour -> GRID_CHARGE (pre-charge for peak), not drain",
+                   plan_at(3, 30, pr3).strategy == "GRID_CHARGE" and plan_at(3, 30, pr3).desired_grid_charge is True,
+                   plan_at(3, 30, pr3).strategy))
+    checks.append(("above reserve -> DISCHARGE_TO_LOAD (use the surplus above the reserve)",
+                   plan_at(3, 80, pr3).strategy == "DISCHARGE_TO_LOAD", plan_at(3, 80, pr3).strategy))
+    checks.append(("AT the peak -> DISCHARGE_TO_LOAD (reserve released, drain fully)",
+                   plan_at(18, 60, pr3).strategy == "DISCHARGE_TO_LOAD", plan_at(18, 60, pr3).strategy))
+    checks.append(("NO reserve (0%) -> normal self-consumption still discharges at low SOC",
+                   plan_at(3, 30, 0.0).strategy == "DISCHARGE_TO_LOAD", plan_at(3, 30, 0.0).strategy))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -1959,6 +2012,7 @@ def main():
                          ("ANTI-HUNT MODE DWELL", test_mode_dwell),
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
                          ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),
+                         ("FORECAST PEAK-RESERVE (A+B)", test_peak_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

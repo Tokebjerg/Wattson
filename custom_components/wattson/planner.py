@@ -178,6 +178,56 @@ def future_solar_surplus_kwh(slots, solar_by_start, load_hourly_w, after_start, 
     return total
 
 
+def peak_reserve_pct(
+    price_slots,
+    now: datetime,
+    solar_slots,
+    load_hourly_w,
+    *,
+    capacity_kwh: float,
+    min_soc: float,
+    max_soc: float,
+    margin: float,
+) -> float:
+    """SOC% to HOLD BACK now for upcoming same-day hours that are markedly more
+    expensive than the current hour (> price_now + ``margin``).
+
+    Backtests showed Wattson drains the pack on cheap-hour self-consumption and is
+    then empty when the day's expensive peak arrives — importing at the peak instead.
+    This reserves enough charge to cover the forecast DEFICIT during those peak hours,
+    minus the solar surplus that refills the pack BEFORE the first peak, capped at the
+    usable band. The ``margin`` (the profitable-cycle spread) means it only holds back
+    for a genuinely more-expensive peak — never importing dear to save for cheap (the
+    failure mode of the old flat price-rationing). Returns 0 when no profitable peak is
+    ahead, so ordinary self-consumption is untouched.
+    """
+    current = current_price_slot(price_slots, now)
+    if current is None:
+        return 0.0
+    price_now = current.total_import_price
+    later = [s for s in price_slots
+             if s.start > current.start and s.start.date() == current.start.date()]
+    peaks = [s for s in later if s.total_import_price > price_now + margin]
+    if not peaks:
+        return 0.0
+    first_peak = min(s.start for s in peaks)
+    solar_by_start = {s.start: s for s in solar_slots}
+
+    def _solar(slot) -> float:
+        pv = solar_by_start.get(slot.start)
+        return pv.pv_estimate_kwh if pv else 0.0
+
+    def _load(hour: int) -> float:
+        return (load_hourly_w.get(hour, 0.0) / 1000.0) if load_hourly_w else 0.0
+
+    reserve_kwh = sum(max(0.0, _load(s.start.hour) - _solar(s)) for s in peaks)
+    refill_before = sum(max(0.0, _solar(s) - _load(s.start.hour))
+                        for s in later if s.start < first_peak)
+    net = max(0.0, reserve_kwh - refill_before)
+    usable_pct = max(0.0, max_soc - min_soc)
+    return min(net / max(0.1, capacity_kwh) * 100.0, usable_pct)
+
+
 def tou_setpoint(
     plan: BatteryPlan,
     *,
@@ -309,6 +359,7 @@ def _horizon_battery_plan(
     capacity_kwh: float = 10.0,
     load_hourly_w: dict[int, float] | None = None,
     solar_charge_priority_soc: float = 0.0,
+    peak_reserve: float = 0.0,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -326,6 +377,11 @@ def _horizon_battery_plan(
     # Discharge floor = profile reserve, raised to also cover the learned reserve
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
+    # Forecast peak reserve (A): hold extra charge for a markedly-more-expensive peak
+    # later today so we don't drain the pack cheap and then import at the peak. Zero
+    # while the current hour IS the peak (so it discharges fully then). The coordinator
+    # mirrors this into the TOU floor so the inverter actually holds the reserve.
+    reserve_floor = discharge_floor if is_expensive else max(discharge_floor, min_soc + peak_reserve)
 
     # 1. Sell the solar surplus when it pays AND the battery can be refilled later
     #    today: either the price is above average, OR there's enough forecast LATER
@@ -388,11 +444,12 @@ def _horizon_battery_plan(
     #    (sell-at-peak profiles, when export pays). Comes BEFORE grid-charge.
     house_deficit = state.load_power_w - state.pv_power_w
     sell = is_expensive and profile.sell_at_peak and (current.export_value or 0) > 0
-    if state.battery_soc_pct > discharge_floor and (sell or house_deficit > DISCHARGE_DEADBAND_W):
+    if state.battery_soc_pct > reserve_floor and (sell or house_deficit > DISCHARGE_DEADBAND_W):
+        held = "" if reserve_floor <= discharge_floor + 0.01 else f", holding {reserve_floor - discharge_floor:.0f}% for a coming peak"
         peak = "peak " if is_expensive else ""
         return BatteryPlan(
             strategy="DISCHARGE_TO_LOAD",
-            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f})",
+            reason=f"[{profile.name}] covering the house from the battery ({peak}price {price:.2f}{held})",
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
@@ -400,18 +457,29 @@ def _horizon_battery_plan(
             desired_export_limit_w=export_limit_default_w,
         )
 
-    # 3. Top up from cheap grid only when the battery is at/near its floor and can't
-    #    cover the upcoming expensive window itself (rare in a solar-rich setup).
+    # 4. Top up from cheap grid: either this is one of the day's cheapest hours
+    #    (B: rank-based arbitrage), OR the pack is below the peak reserve and the
+    #    current hour is below-average AND a profitable peak is ahead — pre-charge at
+    #    the cheap hours so a full pack meets the expensive peak (the backtest fix for
+    #    "empty battery at the peak -> import dear").
+    need_reserve_charge = (
+        peak_reserve > 0.0
+        and state.battery_soc_pct < min_soc + peak_reserve
+        and worthwhile
+        and price <= view.mean_price
+    )
     if (
         allow_grid_charge
-        and is_cheap
-        and worthwhile
         and state.battery_soc_pct < max_soc
         and state.solar_surplus_w < SOLAR_CHARGE_BLOCK_W
+        and ((is_cheap and worthwhile) or need_reserve_charge)
     ):
+        why = (f"pre-charging for a {max_after:.2f} peak (reserve {peak_reserve:.0f}%)"
+               if need_reserve_charge and not (is_cheap and worthwhile)
+               else f"total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window")
         return BatteryPlan(
             strategy="GRID_CHARGE",
-            reason=f"[{profile.name}] total price {price:.2f} is among the cheapest hours; charging before a {max_after:.2f} window",
+            reason=f"[{profile.name}] {why}",
             desired_grid_charge=True,
             desired_solar_sell=False,
             desired_energy_priority="Battery first",
@@ -597,6 +665,7 @@ def build_battery_plan(
     capacity_kwh: float = 10.0,
     load_hourly_w: dict[int, float] | None = None,
     solar_charge_priority_soc: float = 0.0,
+    peak_reserve: float = 0.0,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -686,6 +755,7 @@ def build_battery_plan(
                 capacity_kwh=capacity_kwh,
                 load_hourly_w=load_hourly_w,
                 solar_charge_priority_soc=solar_charge_priority_soc,
+                peak_reserve=peak_reserve,
             ),
             False,
         )
