@@ -9,6 +9,24 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret fix — 2026-06-09 13:5x — v0.12.1 LADESTRØM FAST PÅ TRICKLE (PV-begrænsning)
+
+Bruger spurgte hvorfor solen begrænses. Live-diagnose (13:41): NEGATIV spotpris −0,77 kr → Wattson blokerer (korrekt) eksport (BLOCK_NEGATIVE_EXPORT, Zero export). Eneste aftager = batteriet, MEN max ladestrøm sad fast på **10 A** (TRICKLE_CHARGE_A, rest fra morgenens sælg-spids) → batteri kun ~0,7 kW. Solcast forventede ~5,0 kW, faktisk PV kun ~1,2 kW → **~3,7 kW gratis (negativt prissat!) sol begrænset**.
+
+Rodårsag = samme klasse som v0.8.2 (afladningsstrøm sad fast på 0): coordinator cachede "normal" ladestrøm fra live-værdien ved opstart; en forbigående trickle (10 A) forurenede cachen og blev hængende.
+
+**Fix (v0.12.1, bruger-godkendt deploy, main ce4ebc3):** eksplicit konfigurerbar fuld ladestrøm `CONF_BATTERY_CHARGE_CURRENT_A` (default 100 A ≈ 5 kW loft) via coordinator.battery_charge_current + number.bryggers_wattson_battery_charge_current. Coordinator gendanner DENNE værdi når en plan ikke selv sætter ladestrøm (charge-priority/selvforbrug/BLOCK_NEGATIVE_EXPORT suger overskuddet ved fuld rate); kun SELL_SOLAR_PEAK sætter de 10 A trickle. Fjernede den forurenelige live-cache. sim 205/205 (+2). **VERIFICERET LIVE:** max ladestrøm nu 100 A (var 10); PV 1,2→2,65 kW (ramper op), batteri 0,7→1,9 kW. Resterende gap til 5 kW = gradvis Zero-export-ramp + evt. batteriets ladeaccept-loft ved 46 % SOC (hardware, ikke Wattson) — begrænsning ~halveret og faldende.
+
+---
+
+## 6t-tjek 2026-06-09 10:38
+
+OK overordnet — sundt efter v0.12.0. Batteriet OPLADER (Battery first, ~−720 W, SOC 29 %), ingen batteri-eksport, ingen ±kW-oscillation, competing=off, site=ready, bias=1.0 (neutral), savings akkumulerer (3,93 kr). TOU-gulve = alle 30 % (afladningsgulv).
+OBS (ikke akut → til 21:00-kørslen): EV-status cykler stadig awaiting_start↔charging ~8 gange/time mens bilen er gated under den nye 50 % charge-priority (ev_power ~0 W; kendt Niro-egen-cykling, destabiliserer ikke batteri/inverter/master-lås). Vurdér om den nye 50 %-gate øger EV-cyklingen — evt. en EV-pause-hysterese.
+Mindre: korte net-import-spikes (2–7 kW, enkelte samples) mens SOC står ved 30 %-gulvet og genoplader — forventet (batteriet må ikke aflade under gulvet); ikke vedvarende.
+
+---
+
 ## Bruger-styret fix — 2026-06-09 (efter Dag 2) — v0.12.0 SELVFORBRUG FØRST
 
 To morgen-observationer fra brugeren:
