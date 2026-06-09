@@ -118,6 +118,7 @@ from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
+    NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     apply_mode_dwell,
     mode_dwell_exempt,
     build_battery_plan,
@@ -783,6 +784,34 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_limit_control_mode="Selling first" if sell_surplus else "Zero export to CT",
                     desired_discharge_current_a=0.0,
                 )
+
+        # Negative TOTAL import price (spot + tariff): you are PAID to import, so
+        # force the EV to charge at max — it's the biggest controllable load and soaks
+        # up the paid energy (the battery plan already grid-charges in parallel). Uses
+        # the slot's TOTAL price, not spot. Respects a manual EV override and only acts
+        # when the charger is connected. Applies in every EV mode.
+        _neg_slot = (
+            current_price_slot(self.site_state.price_slots, self.site_state.timestamp)
+            if self.site_state.price_slots
+            else None
+        )
+        negative_import_active = (
+            _neg_slot is not None and _neg_slot.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD
+        )
+        if (
+            negative_import_active
+            and not ev_override_active
+            and self.ev_control_enabled
+            and (self.site_state.easee_status or "").lower()
+            not in ("disconnected", "", "unknown", "unavailable")
+        ):
+            ev_plan = replace(
+                ev_plan,
+                reason=f"paid to import (total {_neg_slot.total_import_price:.2f} kr/kWh < 0) — force-charging the EV to absorb it",
+                desired_enabled=True,
+                desired_amps=ev_max_amps,
+                desired_action="resume",
+            )
 
         # Set a healthy discharge-current limit whenever the plan didn't explicitly
         # set one, so "Aflad til hus" actually discharges the battery to cover the

@@ -1873,6 +1873,53 @@ def test_dst_local_time():
     return checks
 
 
+def test_negative_import_absorb():
+    """Negative TOTAL import price -> grid-charge the battery (paid to import). MUST
+    use the slot's TOTAL price (spot+tariff), so a negative SPOT that tariffs lift
+    back above zero does NOT trigger paying-to-import."""
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h):
+        return datetime(2026, 6, 9, h, 0, tzinfo=TZ)
+
+    def slots(total_at_14):
+        out = []
+        for h in range(10, 22):
+            tot = total_at_14 if h == 14 else 0.40
+            out.append(models.PriceSlot(start=at(h), spot_price=tot, tariff=0.0,
+                                        total_import_price=tot, export_value=(-0.16 if h <= 16 else 0.5)))
+        return out
+
+    def plan(total_at_14, soc=50.0, allow_gc=True):
+        st = models.SiteState(
+            timestamp=at(14), pv_power_w=3000.0, load_power_w=800.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=soc,
+            battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+            easee_status="charging", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+            current_buy_price=total_at_14, current_sell_price=-0.16, forecast_today_kwh=0.0,
+            price_slots=slots(total_at_14), solar_slots=[])
+        bp, neg = planner.build_battery_plan(
+            st, battery_mode="blue", min_soc=20, max_soc=90, cheap_threshold=0.75,
+            expensive_threshold=1.80, allow_grid_charge=allow_gc, allow_negative_export=False,
+            export_limit_default_w=6000.0)
+        return bp
+
+    p_neg = plan(-0.53)
+    checks.append(("negative TOTAL import -> GRID_CHARGE (paid to import)", p_neg.strategy == "GRID_CHARGE" and p_neg.desired_grid_charge is True and "paid to import" in p_neg.reason, f"{p_neg.strategy}/{p_neg.reason}"))
+    checks.append(("paid-import charge still BLOCKS export", p_neg.desired_solar_sell is False and p_neg.desired_limit_control_mode == "Zero export to CT", p_neg.desired_limit_control_mode))
+    # tariff-lifted: negative SPOT but positive TOTAL must NOT pay to import (the bug we avoided)
+    p_pos = plan(0.10)
+    checks.append(("tariff-lifted positive total -> NOT paid-import grid-charge", "paid to import" not in p_pos.reason, f"{p_pos.strategy}/{p_pos.reason}"))
+    # battery full -> can't absorb
+    checks.append(("negative import but full battery -> not paid-import charge", "paid to import" not in plan(-0.53, soc=90.0).reason, plan(-0.53, soc=90.0).strategy))
+    # grid-charge disabled -> respect it
+    checks.append(("negative import but grid-charge disabled -> not", "paid to import" not in plan(-0.53, allow_gc=False).reason, plan(-0.53, allow_gc=False).strategy))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -1911,6 +1958,7 @@ def main():
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("ANTI-HUNT MODE DWELL", test_mode_dwell),
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
+                         ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
