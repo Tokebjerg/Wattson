@@ -206,6 +206,7 @@ class PlanTask:
     action: str  # SOLAR_CHARGE | GRID_CHARGE | DISCHARGE | EXPORT | LIMIT_EXPORT | IDLE
     total_import_price: float
     pv_estimate_kwh: float | None = None
+    load_estimate_kwh: float | None = None  # expected house consumption this hour
     projected_soc_pct: float | None = None
     reason: str = ""
 

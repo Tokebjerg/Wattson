@@ -233,16 +233,17 @@ def _horizon_battery_plan(
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
 
-    # 1. SOC plan has first priority: while the home battery is below the
-    #    charge-priority SOC, solar surplus CHARGES the battery — before it is sold
-    #    at a peak or handed to the EV. Only once the pack is healthily charged do
-    #    we sell the surplus. (Fixes "the battery never recharged because it kept
-    #    selling the morning surplus while sitting at 20%".)
+    # 1. SOC plan has first priority AT CHEAP HOURS: while the home battery is below
+    #    the charge-priority SOC, solar surplus CHARGES the battery (before the EV).
+    #    BUT only at below-average prices — at an above-average price we'd rather
+    #    SELL the surplus now (branch 2) and bulk-charge the battery later at the
+    #    cheap midday sun. So this defers to peak-export when price >= mean.
     if (
         state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
         and solar_charge_priority_soc > 0
         and state.battery_soc_pct < solar_charge_priority_soc
         and state.battery_soc_pct < max_soc
+        and price < view.mean_price
     ):
         return BatteryPlan(
             strategy="SOLAR_SELF_CONSUMPTION",
@@ -408,18 +409,16 @@ def _build_schedule(
         # — charge the battery, cover the house, otherwise curtail. Unknown export
         # value is treated as sellable (don't curtail on missing data).
         worthless_export = slot.export_value is not None and slot.export_value <= 0
-        soc_pct_now = soc_kwh / capacity_kwh * 100.0
         if (
             profile.sell_solar_at_peak
             and surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH
             and price_high
-            and soc_pct_now >= solar_charge_priority_soc
             and soc_kwh < max_kwh - 0.05
         ):
-            # Above-average price + sun AND the home battery is past its charge
-            # priority: sell the surplus, trickle-charge only, saving the bulk
-            # charge for the cheap midday sun. (Below the priority SOC this falls
-            # through to SOLAR_CHARGE so the battery fills first.)
+            # Above-average price + sun: SELL the surplus, trickle-charge only, and
+            # save the bulk battery charge for the cheap (below-average) hours.
+            # Charge-priority deliberately does NOT apply here — at an above-average
+            # price we sell now and fill the battery later when power is cheap.
             soc_kwh = min(max_kwh, soc_kwh + TRICKLE_CHARGE_KWH)
             action = "EXPORT"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
@@ -463,6 +462,7 @@ def _build_schedule(
                 action=action,
                 total_import_price=round(slot.total_import_price, 4),
                 pv_estimate_kwh=round(solar_kwh, 3) if has_pv else None,
+                load_estimate_kwh=round(load_kwh, 3) if load_kwh else None,
                 projected_soc_pct=round(soc_kwh / capacity_kwh * 100.0),
             )
         )

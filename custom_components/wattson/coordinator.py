@@ -684,6 +684,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0,
             solar_charge_priority,
         )
+        # EXCEPTION — negative price: export is blocked, so surplus the battery
+        # can't absorb would otherwise be CURTAILED. Let the EV soak it up instead
+        # (if connected & not full), even below the charge-priority SOC. The battery
+        # still charges first via its own plan; the EV only gets the true excess.
+        if negative_price_active:
+            effective_battery_threshold = 0.0
 
         ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_plan = build_ev_plan(

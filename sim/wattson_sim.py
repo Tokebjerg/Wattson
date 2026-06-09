@@ -704,6 +704,7 @@ def test_a2_planning():
     checks.append(("next_expensive_window set", cp.next_expensive_window is not None, f"{cp.next_expensive_window}"))
     h12 = next((t for t in cp.schedule if t.start == at(12)), None)
     checks.append(("schedule carries solar estimate @12", h12 is not None and h12.pv_estimate_kwh == 7.0, f"{getattr(h12, 'pv_estimate_kwh', None)}"))
+    checks.append(("schedule carries expected load @12 (1.5 kWh)", h12 is not None and h12.load_estimate_kwh == 1.5, f"{getattr(h12, 'load_estimate_kwh', None)}"))
 
     # Peak-solar-export in the forward schedule: expensive sunny morning sells
     # the surplus (trickle only), then the cheap midday sun does the bulk charge.
@@ -899,6 +900,13 @@ def test_c_smartcharge():
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
     )
     checks.append(("solar threshold: battery 60% >= 50% -> resume", above.desired_action == "resume", above.reason))
+    # Negative-price relaxation: the coordinator drops the gate to 0 so the EV
+    # absorbs surplus (that would otherwise be curtailed) even at a low battery SOC.
+    neg_gate = planner.build_ev_plan(
+        ev_state(at(12), soc=40, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=0,
+    )
+    checks.append(("threshold=0 (negative price): low-SOC battery still lets EV absorb surplus", neg_gate.desired_action == "resume", neg_gate.reason))
 
     # --- 2-minute averaged surplus override plumbing ---
     base = ev_state(at(12), pv=0, load=0)  # instantaneous surplus 0
@@ -1154,21 +1162,23 @@ def test_self_consumption_priority():
     checks.append(("at the floor: does NOT discharge (reserve protected)",
                    plan("blue", at(20), 10).strategy != "DISCHARGE_TO_LOAD", plan("blue", at(20), 10).strategy))
 
-    # --- Charge priority: below the priority SOC, solar surplus CHARGES the battery
-    #     first; above it, an above-average price sells the surplus.
-    checks.append(("charge-priority: below priority + surplus -> charge battery (not sell)",
-                   plan("blue", at(20), 30, pv=3000, load=500, charge_priority=50).strategy == "SOLAR_SELF_CONSUMPTION",
+    # --- Charge priority ONLY at below-average prices: at a CHEAP hour (at(12)=0.50,
+    #     below the remaining-horizon mean) the surplus charges the battery first.
+    #     At an ABOVE-average hour (at(20)=1.80) we SELL the surplus instead and
+    #     fill the battery later at the cheap sun.
+    checks.append(("charge-priority: cheap hour, below priority + surplus -> charge battery (not sell)",
+                   plan("blue", at(12), 30, pv=3000, load=500, charge_priority=50).strategy == "SOLAR_SELF_CONSUMPTION",
+                   plan("blue", at(12), 30, pv=3000, load=500, charge_priority=50).strategy))
+    checks.append(("peak hour: sell the surplus even at low SOC (charge later at cheap sun)",
+                   plan("blue", at(20), 30, pv=3000, load=500, charge_priority=50).strategy == "SELL_SOLAR_PEAK",
                    plan("blue", at(20), 30, pv=3000, load=500, charge_priority=50).strategy))
-    checks.append(("charge-priority: above priority + surplus + peak price -> sell surplus",
+    checks.append(("peak hour + above priority + surplus -> sell surplus",
                    plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50).strategy == "SELL_SOLAR_PEAK",
                    plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50).strategy))
-    checks.append(("charge-priority OFF (0): sells at peak even at low SOC (old behaviour)",
-                   plan("blue", at(20), 30, pv=3000, load=500, charge_priority=0).strategy == "SELL_SOLAR_PEAK",
-                   plan("blue", at(20), 30, pv=3000, load=500, charge_priority=0).strategy))
     # Charge-current intent: charge-priority does NOT cap the charge rate (None ->
     # coordinator fills the full configured current, so the battery absorbs the
     # surplus instead of curtailing PV); only sell-at-peak trickles.
-    chg_pri = plan("blue", at(20), 30, pv=3000, load=500, charge_priority=50)
+    chg_pri = plan("blue", at(12), 30, pv=3000, load=500, charge_priority=50)
     sell_pk = plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50)
     checks.append(("charge-priority charges at full rate (no trickle cap)",
                    chg_pri.desired_max_charge_current_a is None, str(chg_pri.desired_max_charge_current_a)))
