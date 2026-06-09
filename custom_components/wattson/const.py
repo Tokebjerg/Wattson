@@ -128,6 +128,13 @@ DEFAULT_SOLAR_CHARGE_PRIORITY_SOC = 50.0
 # Adjustable; raise it if the battery should cover bigger load peaks.
 DEFAULT_BATTERY_DISCHARGE_CURRENT_A = 70.0
 BATTERY_DISCHARGE_CURRENT_MAX = 250.0
+# Battery charge-current limit (A) Wattson sets for normal/bulk charging. It is a
+# LIMIT (ceiling) — the inverter/BMS only draws what's safe. Must be high enough
+# to absorb the solar surplus, or PV gets curtailed when export is blocked (e.g.
+# negative prices). "Sell-at-peak" deliberately trickles at TRICKLE_CHARGE_A.
+CONF_BATTERY_CHARGE_CURRENT_A = "battery_charge_current_a"
+DEFAULT_BATTERY_CHARGE_CURRENT_A = 100.0
+BATTERY_CHARGE_CURRENT_MAX = 250.0
 
 # Phase D learning parameters.
 LEARNING_WINDOW_DAYS = 28          # how far back to read load history

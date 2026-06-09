@@ -1165,6 +1165,15 @@ def test_self_consumption_priority():
     checks.append(("charge-priority OFF (0): sells at peak even at low SOC (old behaviour)",
                    plan("blue", at(20), 30, pv=3000, load=500, charge_priority=0).strategy == "SELL_SOLAR_PEAK",
                    plan("blue", at(20), 30, pv=3000, load=500, charge_priority=0).strategy))
+    # Charge-current intent: charge-priority does NOT cap the charge rate (None ->
+    # coordinator fills the full configured current, so the battery absorbs the
+    # surplus instead of curtailing PV); only sell-at-peak trickles.
+    chg_pri = plan("blue", at(20), 30, pv=3000, load=500, charge_priority=50)
+    sell_pk = plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50)
+    checks.append(("charge-priority charges at full rate (no trickle cap)",
+                   chg_pri.desired_max_charge_current_a is None, str(chg_pri.desired_max_charge_current_a)))
+    checks.append(("only sell-at-peak trickles the charge current",
+                   sell_pk.desired_max_charge_current_a == planner.TRICKLE_CHARGE_A, str(sell_pk.desired_max_charge_current_a)))
 
     return checks
 
