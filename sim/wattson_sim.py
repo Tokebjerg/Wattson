@@ -58,6 +58,11 @@ def _install_ha_stubs() -> None:
     ha_util = types.ModuleType("homeassistant.util")
     ha_util_dt = types.ModuleType("homeassistant.util.dt")
     ha_util_dt.utcnow = lambda: datetime.now(timezone.utc)
+    # now() = LOCAL tz-aware, same instant as utcnow (production uses HA's
+    # Europe/Copenhagen). build_site_state stamps state.timestamp with this so the
+    # planner reads local wall-clock for EV windows / ready-by deadline.
+    ha_util_dt.now = lambda: datetime.now(timezone.utc).astimezone()
+    ha_util_dt.as_local = lambda dt: dt.astimezone()
 
     ha.const = ha_const
     ha.core = ha_core
@@ -1835,6 +1840,39 @@ def test_soc_schedule():
     return checks
 
 
+def test_dst_local_time():
+    """DST/sommertid: build_site_state must stamp state.timestamp with LOCAL
+    wall-clock (dt_util.now()), not UTC (dt_util.utcnow()) — otherwise EV charge
+    windows + 'ready by HH:00' deadlines are off by the UTC offset (1h CET / 2h
+    CEST). Guards the actual bug site by forcing now() to a known non-UTC offset.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    checks = []
+    CEST = timezone(timedelta(hours=2))
+    dtmod = sys.modules["homeassistant.util.dt"]
+    saved_now = dtmod.now
+    try:
+        # Real instant, but represented at +02:00 so the offset is unambiguous on
+        # any machine (CI may run in UTC). utcnow() stays real/UTC.
+        dtmod.now = lambda: datetime.now(timezone.utc).astimezone(CEST)
+        st, _ = simulate_tick(SCENARIOS[0][1], SCENARIOS[0][2])
+    finally:
+        dtmod.now = saved_now
+
+    off = st.timestamp.utcoffset()
+    checks.append(("state.timestamp is tz-aware", st.timestamp.tzinfo is not None, str(st.timestamp.tzinfo)))
+    checks.append(("state.timestamp uses LOCAL now() not utcnow() (offset +02:00, not 0)",
+                   off == timedelta(hours=2), f"utcoffset={off}"))
+
+    # Planner honours the timestamp's LOCAL wall-clock for windows: a 03:00-05:00
+    # window contains local hour 04 even though that instant is 02:00 UTC.
+    in_local = planner._in_windows(datetime(2026, 7, 1, 4, 0, tzinfo=CEST),
+                                   planner._parse_windows("03:00-05:00"))
+    checks.append(("_in_windows uses local wall-clock (04:00 local in 03-05 window)", in_local is True, str(in_local)))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -1872,6 +1910,7 @@ def main():
                          ("PHASE E · TIMED OVERRIDE", test_e_override),
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("ANTI-HUNT MODE DWELL", test_mode_dwell),
+                         ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

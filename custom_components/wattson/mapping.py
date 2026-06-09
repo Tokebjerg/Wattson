@@ -345,7 +345,15 @@ def build_site_state(
         issues.append("Inverter reports offline")
 
     return SiteState(
-        timestamp=dt_util.utcnow(),
+        # LOCAL tz-aware (Europe/Copenhagen), NOT utcnow(). The planner extracts the
+        # time-of-day from this (EV charge windows + "ready by HH:00" deadline via
+        # _in_windows / .replace(hour=...)), so it MUST be local wall-clock or those
+        # would be off by the UTC offset (1h CET / 2h CEST). All other consumers
+        # (price-slot/horizon selection, contention/age math) compare by instant, so
+        # a local tz-aware value is equally correct there. zoneinfo arithmetic also
+        # makes `deadline + timedelta(days=1)` land on the right wall-clock hour
+        # across a DST transition.
+        timestamp=dt_util.now(),
         pv_power_w=pv_power,
         load_power_w=load_power,
         load_includes_ev=load_includes_ev,
