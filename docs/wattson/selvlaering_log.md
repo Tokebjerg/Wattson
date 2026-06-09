@@ -9,6 +9,22 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret fix — 2026-06-09 ~17:4x — v0.13.2 FALSK KONKURRENT (selv-oscillation)
+
+Bruger fik "competing controller"-notifikation. Diagnose: INGEN ekstern konkurrent — Wattson kæmpede mod sig selv. Contended: select.klatremishw_deye_limit_control_mode + switch.klatremishw_deye_solar_sell. Ved FULDT batteri (100%) tæt på sol/forbrug-balancen vippede strategien IDLE(sælg-når-fuld) ↔ DISCHARGE_TO_LOAD hvert ~30-60s og togglede solar_sell + limit_control. Master-låsen talte den gentagne gen-skrivning af hver værdi som kontention (≥5 pr. værdi i 600s-vinduet) og bakkede ud af batteristyringen i 10 min. (Logbog + strategi-sensor flippede i takt → bekræftede self-oscillation, ikke ekstern.)
+
+**Fix (v0.13.2, bruger-godkendt, main 46449fe):** (1) control.contended_entities immun over for self-oscillation: skrev Wattson ≥2 DISTINKTE værdier til en entitet i vinduet (hver >1) = egen vippen → flag ALDRIG; en ægte konkurrent viser sig som ÉN gen-asserteret værdi og fanges stadig. (2) planner: bredere afladnings-deadband (FULL_BATTERY_DISCHARGE_DEADBAND_W 800W vs 150W) når soc>=max_soc, så et lille underskud ved fuldt batteri ikke flipper sælg↔aflad; pakken aflader stadig når underskuddet vokser. sim 213/213 (+4). Genstart nulstiller også kontentions-state.
+
+---
+
+## 6t-tjek 2026-06-09 16:17
+
+Overordnet sundt: site=ready, competing=off, ingen batteri-eksport, ingen oscillation, bias=1.0, savings akkumulerer (4,15 kr), EV disconnected (ingen EV-issue).
+OBS (ikke akut → til 21:00-kørslen): ved NEGATIV importpris (køb −0,52, slot −0,25) er strategien DISCHARGE_TO_LOAD og batteriet aflader ~195 W for at dække huset (SOC 100%). Ved negativ importpris får man BETALT for at importere → batteriet burde holde og lade nettet dække huset (og evt. blive ladet), ikke aflade. Selvforbrug-først-grenen ("dæk huset ved enhver pris") undtager ikke negative importpriser. Lille tab nu (fuldt batteri, lav effekt), men systematisk på negativ-pris-timer. Forslag til 21:00: gat DISCHARGE_TO_LOAD på `import-pris > 0` (eller > et lille gulv) — ved ≤0 hold/lad nettet dække. (NB: eksport er IKKE blokeret her, så eksportprisen er ≥0; kun købsprisen er negativ.)
+Mindre: øjebliks-effektbalance gik ikke helt op (pv424+grid688+batt195 vs hus749) — sandsynligvis derived-load/sensor-transient, ikke vedvarende.
+
+---
+
 ## Bruger-styret — 2026-06-09 ~14:xx — v0.13.0 (3 forbedringer)
 
 1. **Forventet forbrug i Automatiseringsopgaver:** PlanTask.load_estimate_kwh (fra lært profil) i plan_schedule-attr + ny 🏠-kolonne i dashboard-markdown. Motoren brugte det allerede i SOC-projektionen. VERIFICERET: plan viser forbrug pr. time.
