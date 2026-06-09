@@ -1563,6 +1563,14 @@ def test_mode_dwell():
             last_applied = applied
     checks.append((f"20s flip damped to <=6 applied changes over 600s (got {flips})", flips <= 6, f"{flips}"))
 
+    # exempt classification: covering the house + EV-solar + safety/override bypass the
+    # dwell (never stranded in a sell mode on a sudden deficit); sell/charge/idle dwelled.
+    checks.append(("DISCHARGE_TO_LOAD exempt (always cover house now)", planner.mode_dwell_exempt("DISCHARGE_TO_LOAD") is True, "discharge"))
+    checks.append(("EV_SOLAR_PRIORITY exempt (own 150s sticky)", planner.mode_dwell_exempt("EV_SOLAR_PRIORITY") is True, "ev"))
+    checks.append(("HOLD/PROTECT/BLOCK + overrides exempt", all(planner.mode_dwell_exempt(s) for s in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT", "OVERRIDE_CHARGE", "OVERRIDE_DISCHARGE", "OVERRIDE_HOLD")), "safety"))
+    checks.append(("SELL_SOLAR_PEAK dwelled (rate-limit entering export)", planner.mode_dwell_exempt("SELL_SOLAR_PEAK") is False, "sell"))
+    checks.append(("IDLE / SOLAR_SELF_CONSUMPTION / GRID_CHARGE dwelled", not any(planner.mode_dwell_exempt(s) for s in ("IDLE", "SOLAR_SELF_CONSUMPTION", "GRID_CHARGE")), "charge/idle"))
+
     return checks
 
 

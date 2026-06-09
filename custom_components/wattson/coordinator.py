@@ -119,6 +119,7 @@ from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
     apply_mode_dwell,
+    mode_dwell_exempt,
     build_battery_plan,
     build_control_plan,
     build_ev_plan,
@@ -816,16 +817,15 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 battery_plan = forced_battery
 
         # Anti-hunt mode dwell: a plan that flips strategy every tick (IDLE<->DISCHARGE
-        # at a full battery, or EV_SOLAR_PRIORITY<->DISCHARGE while the car cycles) would
-        # toggle the inverter mode fast enough to make the Deye physically hunt (battery
-        # swinging +/-4kW charge<->discharge). Rate-limit non-safety mode changes to one
-        # per BATTERY_MODE_DWELL_SECONDS: when a change comes too soon, hold the previous
-        # mode (and its strategy label) so control writes nothing new and the inverter
-        # settles. Safety/override strategies and changes after a stable period apply now.
-        _exempt_dwell = battery_plan.strategy in (
-            "HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT",
-            "OVERRIDE_CHARGE", "OVERRIDE_DISCHARGE", "OVERRIDE_HOLD",
-        )
+        # at a full battery) would toggle the inverter mode fast enough to make the Deye
+        # physically hunt (battery swinging +/-4kW charge<->discharge). Rate-limit changes
+        # INTO a sell/charge/idle mode to one per BATTERY_MODE_DWELL_SECONDS: when one
+        # comes too soon, hold the previous mode (and its strategy label) so control
+        # writes nothing new and the inverter settles. Covering the house
+        # (DISCHARGE_TO_LOAD), EV-solar priority, safety and override strategies are
+        # exempt and apply immediately — the battery must never be stranded in a sell
+        # mode while the house draws (no grid import on a sudden deficit).
+        _exempt_dwell = mode_dwell_exempt(battery_plan.strategy)
         _desired_mode = (
             battery_plan.desired_solar_sell,
             battery_plan.desired_limit_control_mode,

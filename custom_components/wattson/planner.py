@@ -203,6 +203,35 @@ def tou_setpoint(
     return (float(discharge_floor), False)
 
 
+# Strategies that bypass the anti-hunt dwell — they apply immediately, never held:
+#   - safety / degraded states must react now;
+#   - user overrides are explicit actions;
+#   - DISCHARGE_TO_LOAD covers the house: self-consumption is the top priority, so
+#     the battery must ALWAYS be free to cover a sudden deficit (never buy grid while
+#     stranded in a sell/charge mode). It is also the stable mode that naturally
+#     balances surplus<->deficit (Load first + Zero export) without toggling flags,
+#     so holding it is exactly what stops the hunt;
+#   - EV_SOLAR_PRIORITY has its own 150s sticky hold (EV_ACTIVE_HOLD_SECONDS), so the
+#     EV logic already self-damps; leave it untouched.
+# Everything else (SELL_SOLAR_PEAK, IDLE, SOLAR_SELF_CONSUMPTION, GRID_CHARGE) is
+# rate-limited: switching INTO one of these too soon after a change is held.
+DWELL_EXEMPT_STRATEGIES = frozenset({
+    "HOLD",
+    "PROTECT",
+    "BLOCK_NEGATIVE_EXPORT",
+    "OVERRIDE_CHARGE",
+    "OVERRIDE_DISCHARGE",
+    "OVERRIDE_HOLD",
+    "DISCHARGE_TO_LOAD",
+    "EV_SOLAR_PRIORITY",
+})
+
+
+def mode_dwell_exempt(strategy: str) -> bool:
+    """True if ``strategy`` bypasses the anti-hunt mode dwell (applies immediately)."""
+    return strategy in DWELL_EXEMPT_STRATEGIES
+
+
 def apply_mode_dwell(
     prev_mode,
     prev_mode_at: datetime | None,
