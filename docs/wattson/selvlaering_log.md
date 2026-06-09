@@ -9,6 +9,16 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Bruger-styret — 2026-06-09 ~14:xx — v0.13.0 (3 forbedringer)
+
+1. **Forventet forbrug i Automatiseringsopgaver:** PlanTask.load_estimate_kwh (fra lært profil) i plan_schedule-attr + ny 🏠-kolonne i dashboard-markdown. Motoren brugte det allerede i SOC-projektionen. VERIFICERET: plan viser forbrug pr. time.
+2. **Negativ pris → EV suger overskud:** coordinator dropper EV-sol-SOC-gaten til 0 i negativ-pris-vinduer, så bilen (hvis tilsluttet/ikke fuld) optager overskuddet i stedet for at PV begrænses. Batteri beholder første prioritet. sim-testet (gate=0 → resume ved lav SOC). Live-verifikation afventer solrig negativ-pris-time m. tilsluttet EV (nu: overskyet, intet overskud, batteri fuldt).
+3. **Sælg morgen / lad billig middag (DELVIST):** charge-priority gated til UNDER-gennemsnit-priser, så over-gennemsnit-timer sælger. VERIFICERET i morgendagens plan: 07:00 (0.63) = EXPORT (sælger nu — var SOLAR_CHARGE). MEN 08:00 (0.59) + 09:00 (0.39) = stadig SOLAR_CHARGE fordi de er på/under det rullende horisont-gennemsnit (~0.6). For at sælge HELE 7-9 kræves en refill-baseret trigger (sælg når prognosens senere sol kan genoplade batteriet) — afventer brugerens accept af forecast-afhængigheds-tradeoff.
+
+sim 207/207. Deployet main HEAD 16d233e.
+
+---
+
 ## Bruger-styret fix — 2026-06-09 13:5x — v0.12.1 LADESTRØM FAST PÅ TRICKLE (PV-begrænsning)
 
 Bruger spurgte hvorfor solen begrænses. Live-diagnose (13:41): NEGATIV spotpris −0,77 kr → Wattson blokerer (korrekt) eksport (BLOCK_NEGATIVE_EXPORT, Zero export). Eneste aftager = batteriet, MEN max ladestrøm sad fast på **10 A** (TRICKLE_CHARGE_A, rest fra morgenens sælg-spids) → batteri kun ~0,7 kW. Solcast forventede ~5,0 kW, faktisk PV kun ~1,2 kW → **~3,7 kW gratis (negativt prissat!) sol begrænset**.
