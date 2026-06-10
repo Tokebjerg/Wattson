@@ -9,6 +9,19 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Oprydning af åbne punkter — 2026-06-10 ~20:30 — v0.18.1 + varig scheduler
+
+Bruger: "fiks alt det der stadig er åbent og deploy." Alle 5 punkter lukket:
+1. **Curtailment-telemetri (v0.18.1, main 63ccf7c):** ny `sensor.bryggers_wattson_curtailed_solar_today` (kWh, ENERGY/TOTAL, restored) = bias-korrigeret prognose minus faktisk PV mens der ikke var nogen aftager (batteri fuldt + solar_sell off). Attributter deler negativ-pris-andelen (bevidst) fra utilsigtet rest (= regressions-alarm for 10/6-fejlklassen). Lukker selv-evaluerings-blindheden fra konfig-gennemgangen.
+2. **Bias-eksklusion:** `_accumulate_solar_bias` springer curtailment-mulige ticks over (delt gate `_curtailment_possible()`) — målt PV er strubet dér, ikke hvad panelerne kunne, og ville forgifte bias-faktoren ("panelerne yder 25%").
+3. **Uge/måneds-besparelse: VAR ALDRIG I STYKKER.** Helpers hedder `savings_weekly/_monthly/_yearly` (40,36/41,50/41,49 kr) og dashboardets Økonomi-kort bruger de RIGTIGE id'er — "unknown" i gennemgangen var mine egne opslag på ikke-eksisterende `_week/_month`. Læring: tjek entity-id'er før noget erklæres defekt.
+4. **Dashboard-opstartsfejl:** de tre wattson-energi KPI-templates (`|int` uden default) rettet til `|int(0)` via dashboard-transform. NB: fejl gentager sig indtil åbne klienter (telefon/tablet) genindlæser dashboard-siden — de gen-abonnerer de gamle template-strenge. Faser-templaten i fejlloggen er IKKE Wattsons (andet dashboard/stale klient).
+5. **VARIG SCHEDULER:** `scheduled-tasks`-routine `wattson-daglig-selvlaering` oprettet — dagligt ~21:00 lokal, fuld policy + brugerens hårde regler (konstant Zero export/Load first, EV-logik urørt, 70 A-loft, §4-sikkerhedsgulv) indbygget i prompten. Erstatter de session-bundne crons der aldrig fyrede selv. Kræver at Mac'en/appen er åben; første kørsel i aften. Ved første kørsel kan værktøjs-godkendelser skulle gives én gang.
+
+**Deploy + health-check:** HACS, genstart, `site=ready`, `competing=off`, konstanterne står fast — og lille live-bevis på v0.18.0-adfærden: hus 428 W > PV 359 W → batteriet afladede 53 W og dækkede underskuddet, grid 3 W (Zero export + Load first). sim 264/264.
+
+---
+
 ## Arkitektur-aften — 2026-06-10 ~19:00-20:30 — v0.17.0 PLAN-MOTOR + v0.18.0 KONSTANT INVERTER-TILSTAND
 
 Bruger var utilfreds med ugens kørsel og bad om fuld konfig-gennemgang. De hårde tal gav ham ret: **salget kollapsede 20→0,2 kWh/dag** da zero-export-biased modes tog over 9-10/6, mens besparelses-sensoren viste positive tal (blind for offeromkostning). Bruger valgte den strukturelle løsning (masterplanens Fase A).
