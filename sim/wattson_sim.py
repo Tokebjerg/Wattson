@@ -843,9 +843,21 @@ def test_b_profiles():
     st7 = make_state(at(11), 60, midday_day, pv=6000.0, load=1000.0)
     checks.append(("Blue does NOT peak-sell below average price", plan("blue", st7).strategy != "SELL_SOLAR_PEAK", plan("blue", st7).strategy))
 
-    # 8. Battery full: nothing left to trickle-charge, so don't enter peak-sell.
+    # 8. Battery full + exportable surplus: SELL it, never curtail. (Previously this
+    #    asserted "don't sell when full" — but at a full pack that meant Zero-export,
+    #    i.e. throttling the panels: the real bug behind a sunny day yielding far less
+    #    than forecast. Now: full + surplus + positive export -> sell, no trickle, no
+    #    battery drain to grid.)
     st8 = make_state(at(7), 90, peak_day, pv=6000.0, load=1000.0)
-    checks.append(("Blue does NOT peak-sell when battery full", plan("blue", st8).strategy != "SELL_SOLAR_PEAK", plan("blue", st8).strategy))
+    blue8 = plan("blue", st8)
+    checks.append(("Blue SELLS surplus at a full battery (never curtail a positive-priced surplus)",
+                   blue8.strategy == "SELL_SOLAR_PEAK" and blue8.desired_solar_sell is True
+                   and blue8.desired_limit_control_mode == "Selling first", f"{blue8.strategy}/{blue8.desired_limit_control_mode}"))
+    checks.append(("full-battery sell does not drain the battery to grid (discharge=0)",
+                   blue8.desired_discharge_current_a == 0.0, str(blue8.desired_discharge_current_a)))
+    # 8b. Full battery but NEGATIVE export -> do NOT sell (curtail/block is correct then).
+    st8neg = make_state(at(7), 90, [pslot(h, peak_totals[h], exp=-0.1) for h in range(7, 24)], pv=6000.0, load=1000.0)
+    checks.append(("full battery + NEGATIVE export -> not SELL_SOLAR_PEAK", plan("blue", st8neg).strategy != "SELL_SOLAR_PEAK", plan("blue", st8neg).strategy))
 
     return checks
 

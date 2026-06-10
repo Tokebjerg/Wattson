@@ -383,6 +383,29 @@ def _horizon_battery_plan(
     # mirrors this into the TOU floor so the inverter actually holds the reserve.
     reserve_floor = discharge_floor if is_expensive else max(discharge_floor, min_soc + peak_reserve)
 
+    # 0. FULL BATTERY: a surplus can't be stored, so SELL it whenever export pays —
+    #    NEVER sit in Zero-export and curtail the panels. Fires for ANY positive export
+    #    price (storing is not an option at a full pack) and holds "Selling first"
+    #    across sub-minute load wiggles, so the export mode doesn't flip and throttle
+    #    PV. The plain sell branch below (which needs soc<max + price>=mean) can't cover
+    #    a full pack — that gap is exactly what curtailed ~45 kWh on a sunny day.
+    if (
+        profile.sell_solar_at_peak
+        and state.battery_soc_pct >= max_soc
+        and (current.export_value or 0) > 0
+        and state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W
+    ):
+        return BatteryPlan(
+            strategy="SELL_SOLAR_PEAK",
+            reason=f"[{profile.name}] battery full — selling the surplus (export {current.export_value:.2f}) instead of curtailing",
+            desired_grid_charge=False,
+            desired_solar_sell=True,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Selling first",
+            desired_export_limit_w=export_limit_default_w,
+            desired_discharge_current_a=0.0,
+        )
+
     # 1. Sell the solar surplus when it pays AND the battery can be refilled later
     #    today: either the price is above average, OR there's enough forecast LATER
     #    sun to recharge the pack (so we sell the valuable morning surplus and
