@@ -9,6 +9,25 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Dag 3 — 2026-06-10 ~19:00 (manuelt; bruger fandt en STOR bug) — v0.16.0 + v0.16.1 SOL-CURTAILMENT
+
+Bruger: "købt for meget, solgt for lidt, EV fik for lidt sol — og Solcast kan ikke ramme så meget ved siden af; Wattson begrænser solproduktionen." **Brugeren havde 100% ret.** Jeg fejlfortolkede først 14,8 kWh vs 59,9 kWh prognose som "skyet dag" — men det var **curtailment**:
+- `limit_control_mode` oscillerede "Selling first" ↔ "Zero export to CT" hvert ~30 sek–2 min hele dagen.
+- Eftermiddagens PV ≈ husforbrug time-for-time (846/859, 962/901, 981/957) = klassisk curtailment-signatur (panelerne strubet til at matche forbruget).
+- **Salgsprisen var POSITIV hele dagen** (0,34–0,77 midt på dagen, op til 1,43 aften) → den BURDE have solgt; i stedet curtailede den ~45 kWh (~20–40 kr tabt på én solrig dag).
+
+**Rodårsag:** `SELL_SOLAR_PEAK` kræver `soc < max`, så ved FULDT batteri forsvinder salgs-stien → eneste vej er skrøbelig IDLE-sælg-når-fuld, som taber til ethvert kortvarigt underskud → `DISCHARGE_TO_LOAD` → "Zero export". Og DISCHARGE er **dwell-undtaget** (v0.13.5), så den slår "Zero export" igennem ØJEBLIKKELIGT → struber al samtidig PV. Rammer alle 3 observationer: intet at sælge (#2), intet overskud til EV (#3), og spild der ligner "købt for meget" relativt til det mulige (#1).
+
+**Fix (bruger-godkendt, deploy):**
+- **v0.16.0 (main defa923):** ny gren — fuldt batteri + overskud>500W + positiv eksport → SELL_SOLAR_PEAK (Selling first). Fangede kun rene-overskuds-tilfælde; live-aften viste at flippet bestod (DISCHARGE↔Zero-export ved pv≈hus-krydset).
+- **v0.16.1 (main ee25715):** **afkobl eksport-tilstanden fra batteri-handlingen** — ved soc>=max_soc + positiv eksport tvinges "Selling first" + solar_sell UANSET strategi (afladningsstrøm urørt, så batteriet dækker stadig huset). Springer HOLD/PROTECT/BLOCK_NEGATIVE_EXPORT + grid-charge over (negativ eksport blokerer korrekt stadig). Eksport-tilstanden er nu STABIL hen over IDLE↔DISCHARGE-flippet → PV curtailes aldrig mens den kan sælges.
+
+**sim 242/242** (opdaterede den gamle "sælg ikke når fuld"-assertion — den kodede netop curtailment-bugen — til korrekt intent + negativ-eksport-no-sell + fuldt-batteri-underskud-holder-Selling-first). **Live bekræftet:** ved fuldt batteri + salgspris 1,10 står den nu stabilt "Selling first" + solar_sell on (var "Zero export" + solar_sell off før). **Curtailment-gevinsten verificeres ved solrig middag (i morgen).** competing=off, ingen exceptions.
+
+**LÆRING:** Lyt til brugerens fysiske intuition. En 4× "prognosefejl" på en enkelt dag er et rødt flag for curtailment, ikke vejr — tjek `limit_control_mode`-historik + om PV sporer forbruget. Solcast var ikke skyld.
+
+---
+
 ## Sæson-backtest + v0.15.0 — 2026-06-09 ~22:00 (bruger-styret)
 
 Byggede en **backtest-motor** (`sim/wattson_backtest.py`) der replayer en historisk dag time-for-time gennem den RIGTIGE planner, simulerer SOC, og sammenligner mod intet-batteri / dumt-batteri / perfekt-foresight DP-orakel. Databegrænsning (verificeret, ikke gættet): elpris-LTS rækker til maj 2025, men **Deye PV+forbrug kun fra ~21. marts 2026** → forår+sommer på RIGTIGE data, vinter+efterår med rigtige priser + modelleret sol/forbrug (dansk årstids-sol). Filer i `sim/backtest_data/`.
