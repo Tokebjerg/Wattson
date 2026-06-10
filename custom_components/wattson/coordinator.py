@@ -120,6 +120,8 @@ from .models import LoadProfile
 from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     apply_mode_dwell,
+    build_day_plan,
+    execute_slot,
     mode_dwell_exempt,
     peak_reserve_pct,
     required_spread,
@@ -184,6 +186,13 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._battery_mode_applied: tuple[Any, ...] | None = None
         self._battery_mode_at: datetime | None = None
         self._battery_mode_strategy: str | None = None
+        # Fase A plan engine: the committed day plan + rebuild fingerprint, the
+        # one-way sell->self-consume demotion marker for the current slot, and a
+        # consecutive-deficit tick counter that triggers it.
+        self._day_plan = None
+        self._day_plan_fp: tuple[Any, ...] | None = None
+        self._sell_demoted_slot: datetime | None = None
+        self._sell_deficit_ticks = 0
         self._battery_contended_until: datetime | None = None
         self.battery_contended = False
         self.contended_entities: list[str] = []
@@ -666,31 +675,95 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         _min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
         _max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
         _capacity = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        _allow_grid_charge = bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE))
+        _allow_neg_export = bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT))
         _load_hourly = self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None
-        # Forecast peak reserve (A): SOC% to hold for an upcoming markedly-more-expensive
-        # peak today, so the pack isn't drained cheap and then importing at the peak.
-        peak_reserve = peak_reserve_pct(
-            self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
-            _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
-            margin=required_spread(profile_for(self.battery_mode)),
-        )
 
-        battery_plan, negative_price_active = build_battery_plan(
-            self.site_state,
-            battery_mode=self.battery_mode,
-            min_soc=_min_soc,
-            max_soc=_max_soc,
-            cheap_threshold=float(entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD)),
-            expensive_threshold=float(entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD)),
-            allow_grid_charge=bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE)),
-            allow_negative_export=bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT)),
-            export_limit_default_w=self._default_export_limit_w,
-            learned_reserve_pct=learned_reserve_pct,
-            capacity_kwh=_capacity,
-            load_hourly_w=_load_hourly,
-            solar_charge_priority_soc=solar_charge_priority,
-            peak_reserve=peak_reserve,
+        # ---- Fase A plan engine: the day plan is the boss. Rebuild only when ----
+        # missing/expired, the horizon grew (tomorrow's prices arrived), the SOC has
+        # deviated far from the plan's projection, or the battery config changed.
+        _now_local = self.site_state.timestamp
+        _plan_fp = (self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge)
+        _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
+        _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
+        _soc_far_off = (
+            _slot is not None
+            and _slot.projected_soc_pct is not None
+            and abs(self.site_state.battery_soc_pct - _slot.projected_soc_pct) > 20.0
         )
+        if (
+            self._day_plan is None
+            or _slot is None
+            or self._day_plan_fp != _plan_fp
+            or _soc_far_off
+            or (
+                _latest_price_start is not None
+                and self._day_plan.slots
+                and self._day_plan.slots[-1].start < _latest_price_start
+            )
+        ):
+            self._day_plan = build_day_plan(
+                self.site_state,
+                battery_mode=self.battery_mode,
+                min_soc=_min_soc,
+                max_soc=_max_soc,
+                capacity_kwh=_capacity,
+                load_hourly_w=_load_hourly,
+                learned_reserve_pct=learned_reserve_pct,
+                solar_charge_priority_soc=solar_charge_priority,
+            )
+            self._day_plan_fp = _plan_fp
+            self._sell_demoted_slot = None
+            self._sell_deficit_ticks = 0
+            _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
+
+        if _slot is not None:
+            # One-way intra-slot demotion: a sustained deficit during a sell slot
+            # (discharge blocked there) must not import at an above-average price.
+            # 3 consecutive ticks (~30s) > 500 W -> self-consume for the rest of
+            # the slot. Never promoted back within the slot, so no oscillation.
+            if _slot.intent == "SELL_SURPLUS" and self._sell_demoted_slot != _slot.start:
+                if (self.site_state.load_power_w - self.site_state.pv_power_w) > 500.0:
+                    self._sell_deficit_ticks += 1
+                else:
+                    self._sell_deficit_ticks = 0
+                if self._sell_deficit_ticks >= 3:
+                    self._sell_demoted_slot = _slot.start
+            battery_plan, negative_price_active = execute_slot(
+                _slot,
+                self.site_state,
+                battery_mode=self.battery_mode,
+                min_soc=_min_soc,
+                max_soc=_max_soc,
+                allow_grid_charge=_allow_grid_charge,
+                allow_negative_export=_allow_neg_export,
+                export_limit_default_w=self._default_export_limit_w,
+                learned_reserve_pct=learned_reserve_pct,
+                sell_demoted=(self._sell_demoted_slot == _slot.start),
+            )
+        else:
+            # Legacy reactive fallback (no price horizon): unchanged behaviour.
+            peak_reserve = peak_reserve_pct(
+                self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
+                _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
+                margin=required_spread(profile_for(self.battery_mode)),
+            )
+            battery_plan, negative_price_active = build_battery_plan(
+                self.site_state,
+                battery_mode=self.battery_mode,
+                min_soc=_min_soc,
+                max_soc=_max_soc,
+                cheap_threshold=float(entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD)),
+                expensive_threshold=float(entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD)),
+                allow_grid_charge=_allow_grid_charge,
+                allow_negative_export=_allow_neg_export,
+                export_limit_default_w=self._default_export_limit_w,
+                learned_reserve_pct=learned_reserve_pct,
+                capacity_kwh=_capacity,
+                load_hourly_w=_load_hourly,
+                solar_charge_priority_soc=solar_charge_priority,
+                peak_reserve=peak_reserve,
+            )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.
         sample_now = dt_util.utcnow()
@@ -921,10 +994,16 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # is profile-shaped; the capacity tracks current SOC when holding.
         min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
         max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-        # Include the forecast peak reserve (A) so the inverter's TOU floor actually
-        # HOLDS the reserve (won't discharge below it) during the pre-peak hold; it
-        # falls to 0 at the peak itself, so the pack then discharges fully into it.
-        discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
+        # The TOU floor follows the CURRENT PLAN SLOT (incl. its peak reserve), so the
+        # inverter itself holds the reserve pre-peak and releases it at the peak. The
+        # legacy fallback derives the same floor reactively.
+        if _slot is not None:
+            discharge_floor = max(
+                min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct),
+                _slot.tou_floor_pct,
+            )
+        else:
+            discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
         tou_cap, tou_charge = tou_setpoint(
             battery_plan, soc_pct=self.site_state.battery_soc_pct,
             min_soc=min_soc, discharge_floor=discharge_floor, max_soc=max_soc,

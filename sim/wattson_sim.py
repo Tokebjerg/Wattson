@@ -1995,6 +1995,151 @@ def test_peak_reserve():
     return checks
 
 
+def _plan_engine_day():
+    """Shared fixture for the Fase A plan-engine tests: a full synthetic day with a
+    cheap night, expensive morning, cheap sunny midday incl. one negative-total hour
+    and one negative-export hour, and a steep evening peak."""
+    from datetime import datetime, timedelta, timezone
+
+    TZ = timezone(timedelta(hours=2))
+
+    def at(h, m=0):
+        return datetime(2026, 6, 11, h, m, tzinfo=TZ)
+
+    total = {**{h: 0.30 for h in range(0, 6)}, 6: 0.80, 7: 0.85, 8: 0.80, 9: 0.40,
+             **{h: 0.15 for h in range(10, 16)}, 13: -0.20, 16: 0.45, 17: 0.90,
+             18: 1.60, 19: 1.70, 20: 1.60, 21: 0.80, 22: 0.60, 23: 0.45}
+    export = {h: 0.50 for h in range(24)}
+    export[12] = -0.05
+    export[13] = -0.10
+    slots = [models.PriceSlot(start=at(h), spot_price=total[h], tariff=0.0,
+                              total_import_price=total[h], export_value=export[h]) for h in range(24)]
+    sun = {**{h: 0.0 for h in range(24)}, 7: 1.0, 8: 2.0, 9: 3.0, 10: 4.5, 11: 5.5,
+           12: 6.0, 13: 6.0, 14: 5.5, 15: 4.5, 16: 3.0, 17: 1.5, 18: 0.3}
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=sun[h]) for h in range(24)]
+    load_hourly = {**{h: 600.0 for h in range(24)}, 18: 2500.0, 19: 2500.0, 20: 2500.0}
+
+    def state(h, *, soc=40.0, pv=0.0, load=600.0, sell_price=0.5, issues=None):
+        return models.SiteState(
+            timestamp=at(h), pv_power_w=pv, load_power_w=load, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True,
+            inverter_status="normal", easee_online=True, easee_status="disconnected",
+            easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+            current_buy_price=total[h], current_sell_price=sell_price,
+            forecast_today_kwh=sum(sun.values()), price_slots=slots, solar_slots=solar,
+            issues=list(issues or []),
+        )
+
+    return at, slots, solar, load_hourly, state
+
+
+def test_day_plan():
+    """Fase A: build_day_plan structure — sell whenever export pays, absorb negative
+    totals, block negative export, hold a reserve pre-peak and release it AT the peak."""
+    checks = []
+    at, slots, solar, load_hourly, state = _plan_engine_day()
+
+    dp = planner.build_day_plan(
+        state(0), battery_mode="blue", min_soc=20, max_soc=95,
+        capacity_kwh=10, load_hourly_w=load_hourly,
+    )
+    checks.append(("plan built with 24 slots", dp is not None and len(dp.slots) == 24, f"{dp and len(dp.slots)}"))
+    if dp is None:
+        return checks
+    by_hour = {s.start.hour: s for s in dp.slots}
+
+    checks.append(("negative TOTAL hour -> ABSORB_NEGATIVE + grid charge", by_hour[13].intent == "ABSORB_NEGATIVE" and by_hour[13].grid_charge is True, by_hour[13].intent))
+    checks.append(("negative EXPORT hour -> never sell", by_hour[12].sell is False, f"{by_hour[12].intent}/{by_hour[12].sell}"))
+    pos_sellable = [s for s in dp.slots if (s.export_value or 0) > 0 and s.intent in ("SELF_CONSUME", "SELL_SURPLUS")]
+    checks.append(("every positive-export self-consume/sell slot has sell=True (anti-curtailment principle)",
+                   all(s.sell for s in pos_sellable), f"{sum(not s.sell for s in pos_sellable)} without sell"))
+    gc_slots = [s for s in dp.slots if s.intent in ("GRID_CHARGE", "ABSORB_NEGATIVE")]
+    checks.append(("grid-charge/absorb slots never sell", all(not s.sell for s in gc_slots), f"{len(gc_slots)} slots"))
+    base_floor = 20.0
+    pre_peak_max = max(by_hour[h].tou_floor_pct for h in range(14, 18))
+    checks.append((f"pre-peak afternoon holds a reserve floor > base (got {pre_peak_max:.0f}%)", pre_peak_max > base_floor + 5, f"{pre_peak_max}"))
+    checks.append(("reserve RELEASED at the expensive peak slots (floor = base)",
+                   all(abs(by_hour[h].tou_floor_pct - base_floor) < 0.6 for h in (18, 19, 20)),
+                   f"{[by_hour[h].tou_floor_pct for h in (18, 19, 20)]}"))
+    sell_slots = [s for s in dp.slots if s.intent == "SELL_SURPLUS"]
+    checks.append(("sell-surplus slots trickle-charge", all(s.charge_current_a == 10 for s in sell_slots), f"{len(sell_slots)} slots"))
+    checks.append(("slot_for finds the running slot mid-hour", dp.slot_for(at(13, 30)).start.hour == 13, str(dp.slot_for(at(13, 30)))))
+    return checks
+
+
+def test_plan_execution():
+    """Fase A: execute_slot — constant inverter tuple within a slot (labels may move,
+    hardware writes may not), safety deviations, one-way sell demotion."""
+    checks = []
+    at, slots, solar, load_hourly, state = _plan_engine_day()
+
+    def run(slot, st, **kw):
+        plan, neg = planner.execute_slot(
+            slot, st, battery_mode="blue", min_soc=20, max_soc=95,
+            allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0, **kw,
+        )
+        return plan, neg
+
+    def tup(p):
+        return (p.desired_solar_sell, p.desired_limit_control_mode, p.desired_energy_priority,
+                p.desired_grid_charge, p.desired_max_charge_current_a, p.desired_discharge_current_a)
+
+    sc = models.SlotPlan(start=at(10), intent="SELF_CONSUME", sell=True, grid_charge=False,
+                         tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=0.5)
+    # 12 ticks wiggling around the PV/load crossover: tuple must be IDENTICAL each tick.
+    tuples, labels = [], []
+    for i in range(12):
+        pv, load = (2000.0, 1400.0) if i % 2 == 0 else (1400.0, 2000.0)
+        p, _ = run(sc, state(10, soc=60, pv=pv, load=load))
+        tuples.append(tup(p))
+        labels.append(p.strategy)
+    checks.append(("SELF_CONSUME: inverter tuple constant across 12 crossover ticks (no hunting by construction)",
+                   len(set(tuples)) == 1, f"{len(set(tuples))} distinct tuples"))
+    checks.append(("SELF_CONSUME: labels follow the deficit for visibility",
+                   "DISCHARGE_TO_LOAD" in labels and len(set(labels)) >= 2, f"{set(labels)}"))
+    checks.append(("SELF_CONSUME sell slot -> Selling first + solar_sell on", tuples[0][0] is True and tuples[0][1] == "Selling first", str(tuples[0])))
+
+    sc_nosell = models.SlotPlan(start=at(12), intent="SELF_CONSUME", sell=False, grid_charge=False,
+                                tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=-0.05)
+    p, _ = run(sc_nosell, state(12, soc=60, pv=2000.0, load=600.0))
+    checks.append(("SELF_CONSUME no-sell slot -> Zero export", p.desired_limit_control_mode == "Zero export to CT", p.desired_limit_control_mode))
+
+    ss = models.SlotPlan(start=at(7), intent="SELL_SURPLUS", sell=True, grid_charge=False,
+                         tou_floor_pct=20.0, charge_current_a=10.0, total_import_price=0.80, export_value=0.5)
+    p, _ = run(ss, state(7, soc=50, pv=4000.0, load=600.0))
+    checks.append(("SELL_SURPLUS -> SELL_SOLAR_PEAK, trickle, discharge blocked",
+                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == 10.0 and p.desired_discharge_current_a == 0.0,
+                   f"{p.strategy}/{p.desired_max_charge_current_a}/{p.desired_discharge_current_a}"))
+    p, _ = run(ss, state(7, soc=50, pv=500.0, load=2500.0), sell_demoted=True)
+    checks.append(("demoted sell slot -> self-consume: discharge restored, STILL Selling first (no curtail)",
+                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Selling first",
+                   f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
+
+    gc = models.SlotPlan(start=at(3), intent="GRID_CHARGE", sell=False, grid_charge=True,
+                         tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.30, export_value=0.5)
+    p, _ = run(gc, state(3, soc=40))
+    checks.append(("GRID_CHARGE slot -> grid charge + Zero export + Battery first",
+                   p.strategy == "GRID_CHARGE" and p.desired_grid_charge is True and p.desired_limit_control_mode == "Zero export to CT",
+                   p.strategy))
+    p, _ = run(gc, state(3, soc=95))
+    checks.append(("GRID_CHARGE at full battery -> demoted to self-consume (no pointless charge)",
+                   p.desired_grid_charge in (False, None), f"{p.strategy}/{p.desired_grid_charge}"))
+
+    ab = models.SlotPlan(start=at(13), intent="ABSORB_NEGATIVE", sell=False, grid_charge=True,
+                         tou_floor_pct=20.0, charge_current_a=None, total_import_price=-0.20, export_value=-0.10)
+    p, neg = run(ab, state(13, soc=40, sell_price=-0.10))
+    checks.append(("ABSORB_NEGATIVE -> paid-to-import grid charge", "paid to import" in p.reason and p.desired_grid_charge is True, p.reason[:60]))
+
+    p, _ = run(sc, state(10, soc=60, pv=2000.0, load=600.0, issues=["x"]))
+    checks.append(("degraded runtime -> HOLD wins over the plan", p.strategy == "HOLD", p.strategy))
+    p, neg = run(sc, state(10, soc=60, pv=2000.0, load=600.0, sell_price=-0.2))
+    checks.append(("LIVE negative export price beats a stale sell slot -> BLOCK",
+                   p.strategy == "BLOCK_NEGATIVE_EXPORT" and neg is True, p.strategy))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -2035,6 +2180,8 @@ def main():
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
                          ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),
                          ("FORECAST PEAK-RESERVE (A+B)", test_peak_reserve),
+                         ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
+                         ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

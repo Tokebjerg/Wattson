@@ -168,6 +168,56 @@ def run_wattson(day, spot, sell, pv, load, *, use_reserve=True):
     return rows, cost
 
 
+def run_wattson_planned(day, spot, sell, pv, load):
+    """Fase A plan engine: build the day plan once, execute slot-by-slot (with the
+    coordinator's one-way sell demotion approximated at hour granularity)."""
+    slots = build_day_slots(day, spot, sell)
+    load_hourly = {h: load[h] * 1000.0 for h in range(24)}
+    solar_slots = [models.SolarSlot(start=day.replace(hour=k), pv_estimate_kwh=pv[k]) for k in range(24)]
+
+    def state_at(h, soc_pct):
+        return models.SiteState(
+            timestamp=day.replace(hour=h), pv_power_w=pv[h] * 1000.0, load_power_w=load[h] * 1000.0,
+            load_includes_ev=False, grid_power_w=0.0, grid_import_power_w=0.0,
+            grid_export_power_w=0.0, battery_soc_pct=soc_pct, battery_power_w=0.0,
+            inverter_online=True, inverter_status="normal", easee_online=True,
+            easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=spot[h],
+            current_sell_price=(sell[h] if sell else spot[h]), forecast_today_kwh=sum(pv),
+            price_slots=slots, solar_slots=solar_slots,
+        )
+
+    dp = planner.build_day_plan(
+        state_at(0, START_SOC), battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
+        capacity_kwh=CAPACITY_KWH, load_hourly_w=load_hourly,
+    )
+    soc_kwh = START_SOC / 100.0 * CAPACITY_KWH
+    rows, cost = [], 0.0
+    for h in range(24):
+        soc_pct = soc_kwh / CAPACITY_KWH * 100.0
+        st = state_at(h, soc_pct)
+        slot = dp.slot_for(st.timestamp) if dp else None
+        if slot is None:
+            plan, _ = planner.build_battery_plan(
+                st, battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
+                cheap_threshold=0.75, expensive_threshold=1.80, allow_grid_charge=True,
+                allow_negative_export=False, export_limit_default_w=6000.0,
+                capacity_kwh=CAPACITY_KWH, load_hourly_w=load_hourly)
+            floor_kwh = MIN_SOC / 100.0 * CAPACITY_KWH
+        else:
+            demoted = slot.intent == "SELL_SURPLUS" and (load[h] - pv[h]) > 0.5
+            plan, _ = planner.execute_slot(
+                slot, st, battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
+                allow_grid_charge=True, allow_negative_export=False,
+                export_limit_default_w=6000.0, sell_demoted=demoted)
+            floor_kwh = max(MIN_SOC, slot.tou_floor_pct) / 100.0 * CAPACITY_KWH
+        soc_kwh, gi, ge, d = step_with_plan(plan, pv[h], load[h], soc_kwh, floor_kwh)
+        c = gi * total_import(spot[h], h) - ge * (sell[h] if sell else spot[h])
+        cost += c
+        rows.append({"h": h, "strat": plan.strategy, "soc": round(soc_kwh / CAPACITY_KWH * 100), "gi": gi, "ge": ge, "d": d, "cost": c})
+    return rows, cost
+
+
 def run_no_battery(spot, sell, pv, load):
     cost = 0.0
     for h in range(24):
@@ -241,8 +291,9 @@ def evaluate(path):
     pv = [w / 1000.0 for w in day["pv_w"]]
     load = [w / 1000.0 for w in day["load_w"]]
 
-    rows, w_cost = run_wattson(d, spot, sell, pv, load, use_reserve=True)
+    _, w_cost = run_wattson(d, spot, sell, pv, load, use_reserve=True)
     _, w_old = run_wattson(d, spot, sell, pv, load, use_reserve=False)
+    rows, w_plan = run_wattson_planned(d, spot, sell, pv, load)
     nb = run_no_battery(spot, sell, pv, load)
     dumb = run_dumb_battery(spot, sell, pv, load)
     orac = run_oracle(spot, sell, pv, load)
@@ -270,20 +321,20 @@ def evaluate(path):
     print(f"  DAGENS NETTO-OMKOSTNING (kr, lavere=bedre):")
     print(f"    Ingen batteri (kun sol+net)      : {nb:+7.2f}")
     print(f"    Dumt batteri (selvforbrug, pris-blind): {dumb:+7.2f}")
-    print(f"    WATTSON FØR (uden reserve)       : {w_old:+7.2f}")
-    print(f"    WATTSON NU (med peak-reserve A+B): {w_cost:+7.2f}   [forbedring {w_old - w_cost:+.2f} kr]")
+    print(f"    WATTSON reaktiv (uden reserve)   : {w_old:+7.2f}")
+    print(f"    WATTSON reaktiv (med reserve)    : {w_cost:+7.2f}")
+    print(f"    WATTSON PLAN-MOTOR (Fase A)      : {w_plan:+7.2f}   [vs reaktiv {w_cost - w_plan:+.2f} kr]")
     print(f"    Orakel (perfekt foresight, optimal): {orac:+7.2f}")
-    nb_save = nb - w_cost
+    nb_save = nb - w_plan
     orac_save = nb - orac
-    dumb_save = nb - dumb
     eff = (nb_save / orac_save * 100) if abs(orac_save) > 1e-6 else 100.0
-    print(f"  Wattson sparer vs intet batteri  : {nb_save:+.2f} kr")
-    print(f"  Wattson vs dumt batteri (smart-præmie): {dumb - w_cost:+.2f} kr")
-    print(f"  Orakel-loft (vs intet batteri)   : {orac_save:+.2f} kr")
-    print(f"  Wattson-effektivitet vs orakel   : {eff:.0f}%  (headroom {w_cost - orac:+.2f} kr)")
+    print(f"  PLAN-MOTOR sparer vs intet batteri: {nb_save:+.2f} kr")
+    print(f"  Plan-motor vs dumt batteri        : {dumb - w_plan:+.2f} kr")
+    print(f"  Orakel-loft (vs intet batteri)    : {orac_save:+.2f} kr")
+    print(f"  Plan-motor-effektivitet vs orakel : {eff:.0f}%  (headroom {w_plan - orac:+.2f} kr)")
     return {"season": day["season"], "date": day["date"], "real": day.get("real", False),
-            "nb": nb, "dumb": dumb, "wattson": w_cost, "w_old": w_old, "oracle": orac,
-            "nb_save": nb_save, "eff": eff, "headroom": w_cost - orac}
+            "nb": nb, "dumb": dumb, "wattson": w_plan, "w_old": w_cost, "oracle": orac,
+            "nb_save": nb_save, "eff": eff, "headroom": w_plan - orac}
 
 
 def main(paths):
@@ -291,14 +342,14 @@ def main(paths):
     print("\n" + "=" * 92)
     print("TVÆRS-SÆSON OPSUMMERING".center(92))
     print("=" * 92)
-    print(f"  {'sæson':<8}{'dato':<12}{'type':<7}{'før kr':>9}{'nu kr':>9}{'forbedring':>12}{'headroom':>10}")
+    print(f"  {'sæson':<8}{'dato':<12}{'type':<7}{'reaktiv kr':>11}{'plan kr':>9}{'forbedring':>12}{'headroom':>10}")
     tot_imp = 0.0
     for s in summary:
         imp = s["w_old"] - s["wattson"]
         tot_imp += imp
         print(f"  {s['season']:<8}{s['date']:<12}{'real' if s['real'] else 'model':<7}"
-              f"{s['w_old']:>9.2f}{s['wattson']:>9.2f}{imp:>+12.2f}{s['headroom']:>10.2f}")
-    print(f"  {'':<27}{'SUM forbedring (4 dage):':>30}{tot_imp:>+8.2f} kr")
+              f"{s['w_old']:>11.2f}{s['wattson']:>9.2f}{imp:>+12.2f}{s['headroom']:>10.2f}")
+    print(f"  {'':<27}{'SUM plan-motor-forbedring (4 dage):':>41}{tot_imp:>+8.2f} kr")
     return 0
 
 

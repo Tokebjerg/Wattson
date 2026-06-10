@@ -212,6 +212,49 @@ class PlanTask:
 
 
 @dataclass(frozen=True)
+class SlotPlan:
+    """One hour of the COMMITTED day plan (Fase A plan engine).
+
+    Unlike PlanTask (informational), SlotPlan is what the executor actually runs:
+    the inverter mode is derived from this and stays CONSTANT within the slot, so
+    instantaneous PV/load wiggles can no longer flip export modes (the root cause
+    of the hunting/curtailment bug class).
+    """
+
+    start: datetime
+    intent: str  # SELF_CONSUME | SELL_SURPLUS | GRID_CHARGE | ABSORB_NEGATIVE | BLOCK_EXPORT
+    sell: bool                      # Selling first + solar_sell vs Zero export
+    grid_charge: bool
+    tou_floor_pct: float            # discharge floor (incl. peak reserve) for this slot
+    charge_current_a: float | None  # None = configured ceiling; trickle while selling
+    total_import_price: float
+    export_value: float | None = None
+    projected_soc_pct: float | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class DayPlan:
+    """The committed plan for the (local) day: built by build_day_plan, executed
+    slot-by-slot. Rebuilt only on day change / horizon growth / large deviation."""
+
+    built_at: datetime
+    day: object  # datetime.date of the plan's first slot
+    slots: tuple[SlotPlan, ...] = ()
+
+    def slot_for(self, now: datetime) -> SlotPlan | None:
+        current = None
+        for slot in self.slots:
+            if slot.start <= now:
+                current = slot
+            else:
+                break
+        if current is not None and (now - current.start).total_seconds() < 3600:
+            return current
+        return None
+
+
+@dataclass(frozen=True)
 class ControlPlan:
     battery: BatteryPlan
     ev: EvPlan

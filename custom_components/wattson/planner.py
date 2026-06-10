@@ -24,7 +24,16 @@ from .const import (
     LEGACY_BATTERY_MODE_MAP,
 )
 from .horizon import current_price_slot, remaining_price_slots
-from .models import BatteryPlan, ControlPlan, EvPlan, PlanTask, ProfileWeights, SiteState
+from .models import (
+    BatteryPlan,
+    ControlPlan,
+    DayPlan,
+    EvPlan,
+    PlanTask,
+    ProfileWeights,
+    SiteState,
+    SlotPlan,
+)
 
 SCHEDULE_MAX_HOURS = 24
 
@@ -320,6 +329,243 @@ def apply_mode_dwell(
     if exempt or prev_mode_at is None or (now - prev_mode_at).total_seconds() >= dwell_seconds:
         return desired_mode, desired_mode, now
     return prev_mode, prev_mode, prev_mode_at
+
+
+# --------------------------------------------------------------------------- #
+# Fase A: plan-driven execution. The day plan is the boss — built from the price
+# horizon + solar forecast + load profile, executed slot-by-slot. The inverter
+# mode is a function of the SLOT (slow loop), not of instantaneous PV/load (fast
+# loop), so the export mode can no longer flip at the solar/load crossover — the
+# root cause of the hunting/curtailment bug class. Within a slot the only changes
+# are safety deviations and ONE-WAY demotions (sell -> self-consume), never
+# oscillation.
+# --------------------------------------------------------------------------- #
+
+def negative_export_flags(state: SiteState) -> tuple[bool, bool]:
+    """(negative-price window, actively-at-risk-of-negative-export) — shared by
+    the legacy reactive path and the plan executor so they cannot diverge."""
+    window = bool(
+        (state.current_sell_price is not None and state.current_sell_price < 0)
+        or (state.current_sell_price is None and state.current_buy_price is not None and state.current_buy_price < 0)
+    )
+    active = bool(window and (state.grid_export_power_w > 10 or state.pv_power_w > 100))
+    return window, active
+
+
+def build_day_plan(
+    state: SiteState,
+    *,
+    battery_mode: str,
+    min_soc: float,
+    max_soc: float,
+    capacity_kwh: float = 10.0,
+    load_hourly_w: dict[int, float] | None = None,
+    learned_reserve_pct: float = 0.0,
+    solar_charge_priority_soc: float = 0.0,
+) -> DayPlan | None:
+    """Build the committed slot plan for the remaining horizon.
+
+    Reuses the same schedule logic that feeds the dashboard ("Automatiseringsopgaver"),
+    so what the user sees IS what the executor runs, then enriches each slot with:
+      - sell: "Selling first" whenever the slot's export value is positive (in Load
+        first the battery still gets the surplus FIRST — only what it can't absorb is
+        exported instead of curtailed). Zero-export is reserved for negative prices.
+      - tou_floor_pct: the discharge floor incl. the forecast peak reserve, released
+        at the expensive slots themselves.
+      - charge_current_a: trickle during sell-surplus slots (fill on cheaper sun later).
+    Returns None when no price horizon is available (caller falls back to the
+    reactive planner).
+    """
+    profile = profile_for(battery_mode)
+    view = _horizon_view(state, profile)
+    if view is None:
+        return None
+    tasks, _, _ = _build_schedule(
+        state, profile, load_hourly_w,
+        capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
+        learned_reserve_pct=learned_reserve_pct,
+        solar_charge_priority_soc=solar_charge_priority_soc,
+    )
+    if not tasks:
+        return None
+    margin = required_spread(profile)
+    base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
+    slots_by_start = {s.start: s for s in view.slots}
+    plan_slots: list[SlotPlan] = []
+    for task in tasks:
+        price_slot = slots_by_start.get(task.start)
+        export_value = price_slot.export_value if price_slot else None
+        sell_ok = (export_value or 0) > 0
+        # Reserve floor: hold charge for upcoming markedly-dearer peaks; release it
+        # at the expensive slots themselves so the pack drains fully into the peak.
+        if task.start in view.expensive_starts:
+            floor = base_floor
+        else:
+            reserve = peak_reserve_pct(
+                view.slots, task.start, state.solar_slots, load_hourly_w,
+                capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, margin=margin,
+            )
+            floor = max(base_floor, min_soc + reserve)
+        if task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD:
+            intent, sell, grid_charge, charge_a = "ABSORB_NEGATIVE", False, True, None
+        elif task.action == "GRID_CHARGE":
+            intent, sell, grid_charge, charge_a = "GRID_CHARGE", False, True, None
+        elif task.action == "LIMIT_EXPORT" or (task.action == "EXPORT" and not sell_ok):
+            intent, sell, grid_charge, charge_a = "BLOCK_EXPORT", False, False, None
+        elif task.action == "EXPORT":
+            intent, sell, grid_charge, charge_a = "SELL_SURPLUS", True, False, float(TRICKLE_CHARGE_A)
+        else:  # SOLAR_CHARGE / DISCHARGE / IDLE -> one stable self-consumption mode
+            intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
+        plan_slots.append(SlotPlan(
+            start=task.start,
+            intent=intent,
+            sell=sell,
+            grid_charge=grid_charge,
+            tou_floor_pct=round(min(floor, max_soc), 1),
+            charge_current_a=charge_a,
+            total_import_price=task.total_import_price,
+            export_value=export_value,
+            projected_soc_pct=task.projected_soc_pct,
+            reason=task.action,
+        ))
+    return DayPlan(built_at=state.timestamp, day=plan_slots[0].start.date(), slots=tuple(plan_slots))
+
+
+def execute_slot(
+    slot: SlotPlan,
+    state: SiteState,
+    *,
+    battery_mode: str,
+    min_soc: float,
+    max_soc: float,
+    allow_grid_charge: bool,
+    allow_negative_export: bool,
+    export_limit_default_w: float | None,
+    learned_reserve_pct: float = 0.0,
+    sell_demoted: bool = False,
+) -> tuple[BatteryPlan, bool]:
+    """Translate the CURRENT plan slot into a BatteryPlan (same contract as
+    build_battery_plan, so control/dwell/TOU layers are unchanged).
+
+    The inverter tuple is constant within the slot; only the strategy LABEL follows
+    the instantaneous deficit (labels don't write to hardware). Deviations allowed:
+    degraded -> HOLD, live negative-export guard, grid-charge no longer possible ->
+    self-consume, and the coordinator's ONE-WAY sell->self-consume demotion after a
+    sustained deficit (``sell_demoted``).
+    """
+    profile = profile_for(battery_mode)
+    window, negative_export_active = negative_export_flags(state)
+
+    if state.issues or state.stale_required_entities or state.missing_entities:
+        return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
+
+    intent = slot.intent
+    # Live demotions (one-way within the slot, or forced by live conditions):
+    if intent == "ABSORB_NEGATIVE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
+        intent = "BLOCK_EXPORT" if window else "SELF_CONSUME"
+    if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
+        intent = "SELF_CONSUME"
+    if intent == "SELL_SURPLUS" and sell_demoted:
+        intent = "SELF_CONSUME"
+    # Live negative-export guard beats a stale plan (prices are hourly; cheap check).
+    if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE",):
+        return (
+            BatteryPlan(
+                strategy="BLOCK_NEGATIVE_EXPORT",
+                reason="Negative export window active, disabling export where possible",
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_limit_control_mode="Zero export to CT",
+                desired_energy_priority="Load first",
+                desired_export_limit_w=0.0,
+            ),
+            True,
+        )
+
+    if intent == "ABSORB_NEGATIVE":
+        return (
+            BatteryPlan(
+                strategy="GRID_CHARGE",
+                reason=f"paid to import (total {slot.total_import_price:.2f} kr/kWh < 0) — grid-charging the battery, export blocked",
+                desired_grid_charge=True,
+                desired_solar_sell=False,
+                desired_energy_priority="Battery first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=0.0,
+            ),
+            True,
+        )
+
+    if intent == "GRID_CHARGE":
+        return (
+            BatteryPlan(
+                strategy="GRID_CHARGE",
+                reason=f"[plan] charging at one of the day's cheapest hours ({slot.total_import_price:.2f})",
+                desired_grid_charge=True,
+                desired_solar_sell=False,
+                desired_energy_priority="Battery first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
+                desired_discharge_current_a=0.0,
+            ),
+            negative_export_active,
+        )
+
+    if intent == "BLOCK_EXPORT":
+        return (
+            BatteryPlan(
+                strategy="BLOCK_NEGATIVE_EXPORT",
+                reason=f"[plan] export value {slot.export_value if slot.export_value is not None else 0:.2f} <= 0 — zero-export this hour",
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_limit_control_mode="Zero export to CT",
+                desired_energy_priority="Load first",
+                desired_export_limit_w=0.0,
+            ),
+            negative_export_active,
+        )
+
+    if intent == "SELL_SURPLUS":
+        return (
+            BatteryPlan(
+                strategy="SELL_SOLAR_PEAK",
+                reason=f"[plan] selling the surplus (export {slot.export_value if slot.export_value is not None else 0:.2f}) and trickle-charging — bulk-fill on cheaper sun later",
+                desired_grid_charge=False,
+                desired_solar_sell=True,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Selling first",
+                desired_export_limit_w=export_limit_default_w,
+                desired_max_charge_current_a=slot.charge_current_a or float(TRICKLE_CHARGE_A),
+                # Only the SOLAR surplus is sold — never drain the pack into the grid.
+                desired_discharge_current_a=0.0,
+            ),
+            negative_export_active,
+        )
+
+    # SELF_CONSUME: one stable mode for charge/cover/idle. The inverter itself
+    # balances surplus<->deficit (Load first); the label follows the deficit for
+    # visibility but the written tuple does not change with it.
+    floor = max(min_soc + max(profile.reserve_soc_offset, learned_reserve_pct), slot.tou_floor_pct)
+    deficit = state.load_power_w - state.pv_power_w
+    if state.battery_soc_pct > floor and deficit > DISCHARGE_DEADBAND_W:
+        label, why = "DISCHARGE_TO_LOAD", f"covering the house from the battery (price {slot.total_import_price:.2f})"
+    elif state.solar_surplus_w > SOLAR_CHARGE_BLOCK_W and state.battery_soc_pct < max_soc:
+        label, why = "SOLAR_SELF_CONSUMPTION", "charging the battery from the solar surplus"
+    else:
+        label, why = "IDLE", "no strong battery action required right now"
+    sell = bool(slot.sell)
+    return (
+        BatteryPlan(
+            strategy=label,
+            reason=f"[plan] {why}" + (" | surplus exports (Selling first)" if sell else ""),
+            desired_grid_charge=False,
+            desired_solar_sell=sell,
+            desired_energy_priority="Load first" if state.battery_soc_pct > floor else "Battery first",
+            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+        ),
+        negative_export_active,
+    )
 
 
 def _parse_windows(raw: str) -> list[tuple[time, time]]:
