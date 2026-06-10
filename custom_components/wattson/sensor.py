@@ -203,6 +203,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities: list[Any] = [WattsonSensor(coordinator, entry, description) for description in SENSORS]
     entities.append(WattsonSavingsSensor(coordinator, entry))
     entities.append(WattsonSavingsTotalSensor(coordinator, entry))
+    entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -280,6 +281,63 @@ class WattsonSavingsSensor(CoordinatorEntity, RestoreSensor):
     @property
     def native_value(self) -> float:
         return round(self.coordinator.value_today_kr, 2)
+
+
+class WattsonCurtailedSolarSensor(CoordinatorEntity, RestoreSensor):
+    """Telemetry: estimated PV kWh the inverter throttled today (forecast minus
+    actual while battery full + solar_sell off). Makes curtailment VISIBLE — the
+    June-10 bug class cost ~45 kWh in silence because no metric could see it.
+    The negative-price share (intentional, cheaper than paying to export) is an
+    attribute; the remainder is a regression alarm."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Curtailed Solar Today"
+    _attr_icon = "mdi:solar-power-variant-outline"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_curtailed_solar_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        try:
+            value = float(last_state.state)
+        except (TypeError, ValueError):
+            return
+        if dt_util.as_local(last_state.last_updated).date() == dt_util.now().date():
+            self.coordinator.curtailed_today_kwh = value
+            self.coordinator._curtail_day = dt_util.now().date()
+            neg = last_state.attributes.get("negative_price_kwh")
+            try:
+                self.coordinator.curtailed_negative_kwh = float(neg)
+            except (TypeError, ValueError):
+                pass
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.curtailed_today_kwh, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        total = self.coordinator.curtailed_today_kwh
+        neg = self.coordinator.curtailed_negative_kwh
+        return {
+            "negative_price_kwh": round(neg, 2),
+            "unintended_kwh": round(max(0.0, total - neg), 2),
+            "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm.",
+        }
 
 
 class WattsonSavingsTotalSensor(CoordinatorEntity, RestoreSensor):

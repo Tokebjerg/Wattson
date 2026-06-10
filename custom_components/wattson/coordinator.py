@@ -214,6 +214,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._solar_actual_wh: float = 0.0
         self._solar_forecast_wh: float = 0.0
         self._solar_last_tick: datetime | None = None
+        # Curtailment telemetry: estimated PV kWh the inverter throttled today
+        # (forecast minus actual while there was no sink). Restored by its sensor.
+        self.curtailed_today_kwh: float = 0.0
+        self.curtailed_negative_kwh: float = 0.0
+        self._curtail_day = None
+        self._curtail_last_tick: datetime | None = None
         self._load_samples: list[tuple[datetime, float]] = []
         self._repairs_state: dict[str, list] = {}
         self._solar_bias_factor: float = solar_bias_factor(
@@ -351,8 +357,61 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         dt_hours = (now - last).total_seconds() / 3600.0
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return  # skip restart/sleep gaps
+        # Curtailment exclusion: while the inverter has no sink (battery full +
+        # solar_sell off, e.g. negative-price blocks) the measured PV is THROTTLED,
+        # not what the panels could deliver — learning the ratio from such ticks
+        # would poison the bias factor ("the panels underdeliver 4x"). Skip them.
+        if self._curtailment_possible():
+            return
         self._solar_actual_wh += max(0.0, state.pv_power_w) * dt_hours
         self._solar_forecast_wh += forecast_w * dt_hours
+
+    def _curtailment_possible(self) -> bool:
+        """True while the inverter may be throttling PV: the LAST applied plan had
+        solar_sell off and the battery is (near) full, so the surplus has no sink."""
+        state = self.site_state
+        prev = self.control_plan.battery if self.control_plan else None
+        if state is None or prev is None:
+            return False
+        if prev.strategy in ("GRID_CHARGE",):  # charging IS a sink
+            return False
+        max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+        return (not bool(prev.desired_solar_sell)) and state.battery_soc_pct >= max_soc - 0.5
+
+    def _accumulate_curtailment(self) -> None:
+        """Telemetry: estimated PV energy the inverter throttled today (kWh) =
+        bias-corrected forecast minus actual while there was no sink. At negative
+        prices this is INTENTIONAL (cheaper than paying to export) and tracked in
+        ``curtailed_negative_kwh``; any other contribution is a regression alarm
+        (the June-10 bug class: a sunny day silently yielding a quarter of forecast).
+        An estimate — forecast error and curtailment cannot be fully separated."""
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._curtail_day != today:
+            self._curtail_day = today
+            self.curtailed_today_kwh = 0.0
+            self.curtailed_negative_kwh = 0.0
+            self._curtail_last_tick = None
+        last = self._curtail_last_tick
+        self._curtail_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        if not self._curtailment_possible():
+            return
+        forecast_w = self._current_solar_forecast_w() * self._solar_bias_factor
+        lost_w = max(0.0, forecast_w - max(0.0, state.pv_power_w))
+        if lost_w < 100.0:
+            return  # noise floor
+        inc = lost_w * dt_hours / 1000.0
+        self.curtailed_today_kwh += inc
+        if state.current_sell_price is not None and state.current_sell_price <= 0:
+            self.curtailed_negative_kwh += inc
 
     def _despike_derived_load(self) -> None:
         """Median-filter the derived whole-site load so a single bad tick (the
@@ -658,6 +717,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # Learn the solar bias from the RAW forecast, then apply the correction
         # so the planner/schedule see bias-corrected production.
         self._accumulate_solar_bias()
+        self._accumulate_curtailment()
         self._apply_solar_bias()
 
         # Phase D: refresh the learned load profile at most every few hours and
