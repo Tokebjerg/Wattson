@@ -570,7 +570,7 @@ def execute_slot(
     return (
         BatteryPlan(
             strategy=label,
-            reason=f"[plan] {why}" + (" | surplus exports (Selling first)" if sell else ""),
+            reason=f"[plan] {why}" + (" | surplus may export (solar_sell on)" if sell else ""),
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
