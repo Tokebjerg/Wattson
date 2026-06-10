@@ -2051,9 +2051,17 @@ def test_day_plan():
 
     checks.append(("negative TOTAL hour -> ABSORB_NEGATIVE + grid charge", by_hour[13].intent == "ABSORB_NEGATIVE" and by_hour[13].grid_charge is True, by_hour[13].intent))
     checks.append(("negative EXPORT hour -> never sell", by_hour[12].sell is False, f"{by_hour[12].intent}/{by_hour[12].sell}"))
-    pos_sellable = [s for s in dp.slots if (s.export_value or 0) > 0 and s.intent in ("SELF_CONSUME", "SELL_SURPLUS")]
-    checks.append(("every positive-export self-consume/sell slot has sell=True (anti-curtailment principle)",
-                   all(s.sell for s in pos_sellable), f"{sum(not s.sell for s in pos_sellable)} without sell"))
+    # Anti-curtailment where it matters: positive-export SURPLUS-forecast hours sell;
+    # deficit-forecast hours stay Zero-export (empirically the Deye does not discharge
+    # the battery to the house under "Selling first", and there is nothing to curtail
+    # when PV < load anyway).
+    surplus_hours = [h for h in range(10, 16) if h != 13 and by_hour[h].intent in ("SELF_CONSUME", "SELL_SURPLUS")]
+    checks.append(("positive-export SURPLUS midday hours sell=True (anti-curtailment)",
+                   len(surplus_hours) >= 3 and all(by_hour[h].sell for h in surplus_hours if h != 12),
+                   f"{[(h, by_hour[h].sell) for h in surplus_hours]}"))
+    checks.append(("DEFICIT evening/night hours -> Zero export so the battery covers the house",
+                   all(by_hour[h].sell is False for h in (0, 3, 18, 19, 20, 22) if by_hour[h].intent == "SELF_CONSUME"),
+                   f"{[(h, by_hour[h].intent, by_hour[h].sell) for h in (18, 19, 20)]}"))
     gc_slots = [s for s in dp.slots if s.intent in ("GRID_CHARGE", "ABSORB_NEGATIVE")]
     checks.append(("grid-charge/absorb slots never sell", all(not s.sell for s in gc_slots), f"{len(gc_slots)} slots"))
     base_floor = 20.0
@@ -2112,10 +2120,21 @@ def test_plan_execution():
     checks.append(("SELL_SURPLUS -> SELL_SOLAR_PEAK, trickle, discharge blocked",
                    p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == 10.0 and p.desired_discharge_current_a == 0.0,
                    f"{p.strategy}/{p.desired_max_charge_current_a}/{p.desired_discharge_current_a}"))
-    p, _ = run(ss, state(7, soc=50, pv=500.0, load=2500.0), sell_demoted=True)
-    checks.append(("demoted sell slot -> self-consume: discharge restored, STILL Selling first (no curtail)",
-                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Selling first",
+    # Sustained deficit in a sell slot -> flip to Zero export: empirically the Deye
+    # does NOT discharge the battery to the house under "Selling first", so covering
+    # the house REQUIRES Zero export (and there is no surplus to curtail in deficit).
+    p, _ = run(ss, state(7, soc=50, pv=500.0, load=2500.0), sell_live=False)
+    checks.append(("deficit-flipped sell slot -> self-consume: discharge restored + Zero export (battery covers house)",
+                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Zero export to CT",
                    f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
+    # The opposite flip: a no-sell slot with a big surplus the battery can't absorb
+    # is promoted to Selling first instead of curtailing.
+    sc_promote = models.SlotPlan(start=at(11), intent="SELF_CONSUME", sell=False, grid_charge=False,
+                                 tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=0.4)
+    p, _ = run(sc_promote, state(11, soc=95, pv=5000.0, load=600.0), sell_live=True)
+    checks.append(("surplus-flipped no-sell slot -> Selling first (anti-curtailment promotion)",
+                   p.desired_limit_control_mode == "Selling first" and p.desired_solar_sell is True,
+                   f"{p.strategy}/{p.desired_limit_control_mode}"))
 
     gc = models.SlotPlan(start=at(3), intent="GRID_CHARGE", sell=False, grid_charge=True,
                          tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.30, export_value=0.5)

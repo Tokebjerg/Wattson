@@ -414,8 +414,20 @@ def build_day_plan(
             intent, sell, grid_charge, charge_a = "BLOCK_EXPORT", False, False, None
         elif task.action == "EXPORT":
             intent, sell, grid_charge, charge_a = "SELL_SURPLUS", True, False, float(TRICKLE_CHARGE_A)
-        else:  # SOLAR_CHARGE / DISCHARGE / IDLE -> one stable self-consumption mode
-            intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
+        else:
+            # SELF_CONSUME (SOLAR_CHARGE/DISCHARGE/IDLE): one stable mode, but the
+            # export mode follows the slot's FORECAST energy balance, not only the
+            # price. EMPIRICAL Deye behaviour (observed two evenings in a row):
+            # under "Selling first" the battery does NOT discharge to cover the
+            # house — the grid imports instead; under "Zero export to CT" it
+            # discharges fine. So: surplus-forecast hours -> Selling first (surplus
+            # beyond the battery's intake exports instead of being curtailed — the
+            # v0.16 anti-curtailment fix preserved); deficit-forecast hours -> Zero
+            # export (nothing to curtail when PV < load, and the battery must cover
+            # the house). A wrong forecast is corrected live by the coordinator's
+            # one-flip-per-slot sell correction.
+            surplus_forecast = (task.pv_estimate_kwh or 0.0) > (task.load_estimate_kwh or 0.0)
+            intent, sell, grid_charge, charge_a = "SELF_CONSUME", (sell_ok and surplus_forecast), False, None
         plan_slots.append(SlotPlan(
             start=task.start,
             intent=intent,
@@ -442,7 +454,7 @@ def execute_slot(
     allow_negative_export: bool,
     export_limit_default_w: float | None,
     learned_reserve_pct: float = 0.0,
-    sell_demoted: bool = False,
+    sell_live: bool | None = None,
 ) -> tuple[BatteryPlan, bool]:
     """Translate the CURRENT plan slot into a BatteryPlan (same contract as
     build_battery_plan, so control/dwell/TOU layers are unchanged).
@@ -450,8 +462,10 @@ def execute_slot(
     The inverter tuple is constant within the slot; only the strategy LABEL follows
     the instantaneous deficit (labels don't write to hardware). Deviations allowed:
     degraded -> HOLD, live negative-export guard, grid-charge no longer possible ->
-    self-consume, and the coordinator's ONE-WAY sell->self-consume demotion after a
-    sustained deficit (``sell_demoted``).
+    self-consume, and the coordinator's one-flip-per-slot sell correction
+    (``sell_live``): False when a sell slot turned out to be a sustained deficit
+    (the battery must discharge -> Zero export on this Deye), True when a no-sell
+    slot turned out to be a big surplus that would otherwise curtail.
     """
     profile = profile_for(battery_mode)
     window, negative_export_active = negative_export_flags(state)
@@ -465,8 +479,8 @@ def execute_slot(
         intent = "BLOCK_EXPORT" if window else "SELF_CONSUME"
     if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
         intent = "SELF_CONSUME"
-    if intent == "SELL_SURPLUS" and sell_demoted:
-        intent = "SELF_CONSUME"
+    if intent == "SELL_SURPLUS" and sell_live is False:
+        intent = "SELF_CONSUME"  # sustained deficit -> battery must cover the house
     # Live negative-export guard beats a stale plan (prices are hourly; cheap check).
     if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE",):
         return (
@@ -553,7 +567,7 @@ def execute_slot(
         label, why = "SOLAR_SELF_CONSUMPTION", "charging the battery from the solar surplus"
     else:
         label, why = "IDLE", "no strong battery action required right now"
-    sell = bool(slot.sell)
+    sell = bool(slot.sell if sell_live is None else sell_live)
     return (
         BatteryPlan(
             strategy=label,

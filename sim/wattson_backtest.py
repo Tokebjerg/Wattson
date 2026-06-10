@@ -205,11 +205,16 @@ def run_wattson_planned(day, spot, sell, pv, load):
                 capacity_kwh=CAPACITY_KWH, load_hourly_w=load_hourly)
             floor_kwh = MIN_SOC / 100.0 * CAPACITY_KWH
         else:
-            demoted = slot.intent == "SELL_SURPLUS" and (load[h] - pv[h]) > 0.5
+            # Hourly approximation of the live one-flip-per-slot sell correction.
+            sell_live = None
+            if slot.sell and (load[h] - pv[h]) > 0.5:
+                sell_live = False
+            elif not slot.sell and (pv[h] - load[h]) > 0.5 and slot.intent == "SELF_CONSUME":
+                sell_live = True
             plan, _ = planner.execute_slot(
                 slot, st, battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
                 allow_grid_charge=True, allow_negative_export=False,
-                export_limit_default_w=6000.0, sell_demoted=demoted)
+                export_limit_default_w=6000.0, sell_live=sell_live)
             floor_kwh = max(MIN_SOC, slot.tou_floor_pct) / 100.0 * CAPACITY_KWH
         soc_kwh, gi, ge, d = step_with_plan(plan, pv[h], load[h], soc_kwh, floor_kwh)
         c = gi * total_import(spot[h], h) - ge * (sell[h] if sell else spot[h])
