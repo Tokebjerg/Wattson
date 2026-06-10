@@ -850,9 +850,9 @@ def test_b_profiles():
     #    battery drain to grid.)
     st8 = make_state(at(7), 90, peak_day, pv=6000.0, load=1000.0)
     blue8 = plan("blue", st8)
-    checks.append(("Blue SELLS surplus at a full battery (never curtail a positive-priced surplus)",
+    checks.append(("Blue SELLS surplus at a full battery (solar_sell on; mode stays Zero export to CT)",
                    blue8.strategy == "SELL_SOLAR_PEAK" and blue8.desired_solar_sell is True
-                   and blue8.desired_limit_control_mode == "Selling first", f"{blue8.strategy}/{blue8.desired_limit_control_mode}"))
+                   and blue8.desired_limit_control_mode == "Zero export to CT", f"{blue8.strategy}/{blue8.desired_limit_control_mode}"))
     checks.append(("full-battery sell does not drain the battery to grid (discharge=0)",
                    blue8.desired_discharge_current_a == 0.0, str(blue8.desired_discharge_current_a)))
     # 8b. Full battery but NEGATIVE export -> do NOT sell (curtail/block is correct then).
@@ -860,14 +860,15 @@ def test_b_profiles():
     checks.append(("full battery + NEGATIVE export -> not SELL_SOLAR_PEAK", plan("blue", st8neg).strategy != "SELL_SOLAR_PEAK", plan("blue", st8neg).strategy))
 
     # 8c. Full battery + DEFICIT (load>pv) + positive export: cover the house from the
-    #     battery (DISCHARGE), but the export mode must STAY "Selling first" — never
-    #     flip to Zero-export and curtail concurrent PV. (The decoupling safety net.)
+    #     battery (DISCHARGE) with solar_sell kept ON (harmless in deficit, and any PV
+    #     spike exports instead of curtailing). The inverter mode is a CONSTANT
+    #     "Zero export to CT" + "Load first" (user's hard rule).
     st8def = make_state(at(7), 90, peak_day, pv=1000.0, load=3000.0)  # deficit 2000W, full pack, export 0.5
     blue8def = plan("blue", st8def)
     checks.append(("full battery + deficit still covers house from battery (discharge enabled)",
                    blue8def.strategy == "DISCHARGE_TO_LOAD" and blue8def.desired_discharge_current_a != 0.0, f"{blue8def.strategy}/{blue8def.desired_discharge_current_a}"))
-    checks.append(("full battery + deficit does NOT curtail: export mode = Selling first (not Zero-export)",
-                   blue8def.desired_limit_control_mode == "Selling first" and blue8def.desired_solar_sell is True, f"{blue8def.desired_limit_control_mode}/{blue8def.desired_solar_sell}"))
+    checks.append(("full battery + deficit: solar_sell on + constant Zero export to CT",
+                   blue8def.desired_limit_control_mode == "Zero export to CT" and blue8def.desired_solar_sell is True, f"{blue8def.desired_limit_control_mode}/{blue8def.desired_solar_sell}"))
 
     return checks
 
@@ -1651,7 +1652,7 @@ def test_mode_coherence():
     # IDLE, battery full: surplus may be sold — but ONLY the solar surplus, never
     # the battery (discharge blocked), and DISCHARGE covers the house with no export.
     idlefull = plan("blue", make_state(at(4), 90, asc))
-    checks.append(("IDLE (full) allows sell", idlefull.strategy == "IDLE" and idlefull.desired_solar_sell is True and idlefull.desired_limit_control_mode == "Selling first", f"{idlefull.strategy}/{idlefull.desired_solar_sell}/{idlefull.desired_limit_control_mode}"))
+    checks.append(("IDLE (full) allows sell via solar_sell (mode constant Zero export to CT)", idlefull.strategy == "IDLE" and idlefull.desired_solar_sell is True and idlefull.desired_limit_control_mode == "Zero export to CT", f"{idlefull.strategy}/{idlefull.desired_solar_sell}/{idlefull.desired_limit_control_mode}"))
     checks.append(("IDLE (full) sells solar only, not the battery (discharge=0)", idlefull.desired_discharge_current_a == 0.0, str(idlefull.desired_discharge_current_a)))
     # Blue DISCHARGE_TO_LOAD covers the house: zero export + discharge left for the
     # coordinator to set (so the battery covers load but never exports).
@@ -2059,8 +2060,8 @@ def test_day_plan():
     checks.append(("positive-export SURPLUS midday hours sell=True (anti-curtailment)",
                    len(surplus_hours) >= 3 and all(by_hour[h].sell for h in surplus_hours if h != 12),
                    f"{[(h, by_hour[h].sell) for h in surplus_hours]}"))
-    checks.append(("DEFICIT evening/night hours -> Zero export so the battery covers the house",
-                   all(by_hour[h].sell is False for h in (0, 3, 18, 19, 20, 22) if by_hour[h].intent == "SELF_CONSUME"),
+    checks.append(("sell follows the export-price sign (on in positive-price deficit hours too — harmless under constant Zero export)",
+                   all(by_hour[h].sell is True for h in (18, 19, 20) if by_hour[h].intent == "SELF_CONSUME"),
                    f"{[(h, by_hour[h].intent, by_hour[h].sell) for h in (18, 19, 20)]}"))
     gc_slots = [s for s in dp.slots if s.intent in ("GRID_CHARGE", "ABSORB_NEGATIVE")]
     checks.append(("grid-charge/absorb slots never sell", all(not s.sell for s in gc_slots), f"{len(gc_slots)} slots"))
@@ -2107,7 +2108,7 @@ def test_plan_execution():
                    len(set(tuples)) == 1, f"{len(set(tuples))} distinct tuples"))
     checks.append(("SELF_CONSUME: labels follow the deficit for visibility",
                    "DISCHARGE_TO_LOAD" in labels and len(set(labels)) >= 2, f"{set(labels)}"))
-    checks.append(("SELF_CONSUME sell slot -> Selling first + solar_sell on", tuples[0][0] is True and tuples[0][1] == "Selling first", str(tuples[0])))
+    checks.append(("SELF_CONSUME sell slot -> solar_sell on + constant Zero export to CT", tuples[0][0] is True and tuples[0][1] == "Zero export to CT", str(tuples[0])))
 
     sc_nosell = models.SlotPlan(start=at(12), intent="SELF_CONSUME", sell=False, grid_charge=False,
                                 tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=-0.05)
@@ -2128,12 +2129,12 @@ def test_plan_execution():
                    p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Zero export to CT",
                    f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
     # The opposite flip: a no-sell slot with a big surplus the battery can't absorb
-    # is promoted to Selling first instead of curtailing.
+    # turns solar_sell on instead of curtailing (mode stays constant).
     sc_promote = models.SlotPlan(start=at(11), intent="SELF_CONSUME", sell=False, grid_charge=False,
                                  tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=0.4)
     p, _ = run(sc_promote, state(11, soc=95, pv=5000.0, load=600.0), sell_live=True)
-    checks.append(("surplus-flipped no-sell slot -> Selling first (anti-curtailment promotion)",
-                   p.desired_limit_control_mode == "Selling first" and p.desired_solar_sell is True,
+    checks.append(("surplus-flipped no-sell slot -> solar_sell on (anti-curtailment promotion)",
+                   p.desired_limit_control_mode == "Zero export to CT" and p.desired_solar_sell is True,
                    f"{p.strategy}/{p.desired_limit_control_mode}"))
 
     gc = models.SlotPlan(start=at(3), intent="GRID_CHARGE", sell=False, grid_charge=True,

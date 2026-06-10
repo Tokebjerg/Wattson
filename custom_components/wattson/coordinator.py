@@ -186,13 +186,9 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._battery_mode_applied: tuple[Any, ...] | None = None
         self._battery_mode_at: datetime | None = None
         self._battery_mode_strategy: str | None = None
-        # Fase A plan engine: the committed day plan + rebuild fingerprint, plus the
-        # one-flip-per-slot live sell correction (slot start, corrected sell) and the
-        # consecutive-contrary-evidence tick counter that triggers it.
+        # Fase A plan engine: the committed day plan + its rebuild fingerprint.
         self._day_plan = None
         self._day_plan_fp: tuple[Any, ...] | None = None
-        self._slot_sell_flip: tuple[datetime, bool] | None = None
-        self._sell_flip_ticks = 0
         self._battery_contended_until: datetime | None = None
         self.battery_contended = False
         self.contended_entities: list[str] = []
@@ -713,40 +709,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 solar_charge_priority_soc=solar_charge_priority,
             )
             self._day_plan_fp = _plan_fp
-            self._slot_sell_flip = None
-            self._sell_flip_ticks = 0
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
 
         if _slot is not None:
-            # One-flip-per-slot live sell correction (the slot's forecast can be
-            # wrong): a SELL slot in sustained deficit must go Zero-export so the
-            # battery actually discharges (empirical Deye: no discharge-to-load
-            # under "Selling first"); a NO-SELL slot with a big sustained surplus
-            # the battery can't absorb must go Selling-first instead of curtailing.
-            # 3 consecutive ticks (~30s) of contrary evidence; at most ONE flip per
-            # slot, so no oscillation.
-            _eff_sell: bool | None = None
-            if self._slot_sell_flip is not None and self._slot_sell_flip[0] == _slot.start:
-                _eff_sell = self._slot_sell_flip[1]
-            else:
-                _surplus_now = self.site_state.pv_power_w - self.site_state.load_power_w
-                _planned_sell = _slot.sell and _slot.intent in ("SELF_CONSUME", "SELL_SURPLUS")
-                if _planned_sell and _surplus_now < -500.0:
-                    self._sell_flip_ticks += 1
-                elif (
-                    not _planned_sell
-                    and _slot.intent == "SELF_CONSUME"
-                    and (_slot.export_value or 0) > 0
-                    and _surplus_now > 500.0
-                    and (self.site_state.battery_soc_pct >= _max_soc or _surplus_now > 4000.0)
-                ):
-                    self._sell_flip_ticks += 1
-                else:
-                    self._sell_flip_ticks = 0
-                if self._sell_flip_ticks >= 3:
-                    self._slot_sell_flip = (_slot.start, not _planned_sell)
-                    self._sell_flip_ticks = 0
-                    _eff_sell = self._slot_sell_flip[1]
+            # The inverter mode is CONSTANT (Zero export to CT + Load first — the
+            # user's hard rule, the battery always covers the house first), so no
+            # intra-slot sell correction is needed: solar_sell=on during a deficit is
+            # harmless (no surplus to export), and sell is only off at non-positive
+            # prices where exporting is undesired anyway.
             battery_plan, negative_price_active = execute_slot(
                 _slot,
                 self.site_state,
@@ -757,7 +727,6 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 allow_negative_export=_allow_neg_export,
                 export_limit_default_w=self._default_export_limit_w,
                 learned_reserve_pct=learned_reserve_pct,
-                sell_live=_eff_sell,
             )
         else:
             # Legacy reactive fallback (no price horizon): unchanged behaviour.
@@ -887,7 +856,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_grid_charge=False,
                     desired_solar_sell=sell_surplus,
                     desired_energy_priority="Load first",
-                    desired_limit_control_mode="Selling first" if sell_surplus else "Zero export to CT",
+                    desired_limit_control_mode="Zero export to CT",
                     desired_discharge_current_a=0.0,
                 )
 

@@ -367,9 +367,12 @@ def build_day_plan(
 
     Reuses the same schedule logic that feeds the dashboard ("Automatiseringsopgaver"),
     so what the user sees IS what the executor runs, then enriches each slot with:
-      - sell: "Selling first" whenever the slot's export value is positive (in Load
-        first the battery still gets the surplus FIRST — only what it can't absorb is
-        exported instead of curtailed). Zero-export is reserved for negative prices.
+      - sell: the solar_sell switch — ON whenever the slot's export value is positive
+        (only the true SURPLUS exports), OFF at non-positive prices. NOTE the
+        inverter mode itself is a CONSTANT: always "Zero export to CT" + "Load
+        first" (user's hard rule — house consumption first, always; "Selling first"
+        empirically makes the Deye serve the house from the grid instead of the
+        battery). Export volume is governed by solar_sell + the export limit.
       - tou_floor_pct: the discharge floor incl. the forecast peak reserve, released
         at the expensive slots themselves.
       - charge_current_a: trickle during sell-surplus slots (fill on cheaper sun later).
@@ -415,19 +418,15 @@ def build_day_plan(
         elif task.action == "EXPORT":
             intent, sell, grid_charge, charge_a = "SELL_SURPLUS", True, False, float(TRICKLE_CHARGE_A)
         else:
-            # SELF_CONSUME (SOLAR_CHARGE/DISCHARGE/IDLE): one stable mode, but the
-            # export mode follows the slot's FORECAST energy balance, not only the
-            # price. EMPIRICAL Deye behaviour (observed two evenings in a row):
-            # under "Selling first" the battery does NOT discharge to cover the
-            # house — the grid imports instead; under "Zero export to CT" it
-            # discharges fine. So: surplus-forecast hours -> Selling first (surplus
-            # beyond the battery's intake exports instead of being curtailed — the
-            # v0.16 anti-curtailment fix preserved); deficit-forecast hours -> Zero
-            # export (nothing to curtail when PV < load, and the battery must cover
-            # the house). A wrong forecast is corrected live by the coordinator's
-            # one-flip-per-slot sell correction.
-            surplus_forecast = (task.pv_estimate_kwh or 0.0) > (task.load_estimate_kwh or 0.0)
-            intent, sell, grid_charge, charge_a = "SELF_CONSUME", (sell_ok and surplus_forecast), False, None
+            # SELF_CONSUME (SOLAR_CHARGE/DISCHARGE/IDLE): one stable mode. Per the
+            # user's hard rule the inverter ALWAYS runs "Zero export to CT" + "Load
+            # first" (house covered first, always — "Selling first" empirically makes
+            # the Deye serve the house from the GRID instead of the battery). ``sell``
+            # therefore only gates the solar_sell switch: ON at any positive export
+            # value (only the true SURPLUS — beyond house + battery intake — exports,
+            # up to the export limit), OFF at non-positive prices. Harmless during
+            # deficits (there is no surplus to sell).
+            intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
         plan_slots.append(SlotPlan(
             start=task.start,
             intent=intent,
@@ -503,7 +502,7 @@ def execute_slot(
                 reason=f"paid to import (total {slot.total_import_price:.2f} kr/kWh < 0) — grid-charging the battery, export blocked",
                 desired_grid_charge=True,
                 desired_solar_sell=False,
-                desired_energy_priority="Battery first",
+                desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=0.0,
             ),
@@ -517,7 +516,7 @@ def execute_slot(
                 reason=f"[plan] charging at one of the day's cheapest hours ({slot.total_import_price:.2f})",
                 desired_grid_charge=True,
                 desired_solar_sell=False,
-                desired_energy_priority="Battery first",
+                desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
                 desired_discharge_current_a=0.0,
@@ -547,7 +546,7 @@ def execute_slot(
                 desired_grid_charge=False,
                 desired_solar_sell=True,
                 desired_energy_priority="Load first",
-                desired_limit_control_mode="Selling first",
+                desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
                 desired_max_charge_current_a=slot.charge_current_a or float(TRICKLE_CHARGE_A),
                 # Only the SOLAR surplus is sold — never drain the pack into the grid.
@@ -574,8 +573,8 @@ def execute_slot(
             reason=f"[plan] {why}" + (" | surplus exports (Selling first)" if sell else ""),
             desired_grid_charge=False,
             desired_solar_sell=sell,
-            desired_energy_priority="Load first" if state.battery_soc_pct > floor else "Battery first",
-            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         ),
         negative_export_active,
@@ -644,12 +643,11 @@ def _horizon_battery_plan(
     # mirrors this into the TOU floor so the inverter actually holds the reserve.
     reserve_floor = discharge_floor if is_expensive else max(discharge_floor, min_soc + peak_reserve)
 
-    # 0. FULL BATTERY: a surplus can't be stored, so SELL it whenever export pays —
-    #    NEVER sit in Zero-export and curtail the panels. Fires for ANY positive export
-    #    price (storing is not an option at a full pack) and holds "Selling first"
-    #    across sub-minute load wiggles, so the export mode doesn't flip and throttle
-    #    PV. The plain sell branch below (which needs soc<max + price>=mean) can't cover
-    #    a full pack — that gap is exactly what curtailed ~45 kWh on a sunny day.
+    # 0. FULL BATTERY: a surplus can't be stored, so solar_sell must be ON whenever
+    #    export pays — with it off the panels get throttled (that gap curtailed
+    #    ~45 kWh on a sunny day). The inverter mode is CONSTANT (Zero export to CT +
+    #    Load first, user's hard rule); only the sell switch + export limit govern
+    #    export, and only the true surplus leaves the house.
     if (
         profile.sell_solar_at_peak
         and state.battery_soc_pct >= max_soc
@@ -662,7 +660,7 @@ def _horizon_battery_plan(
             desired_grid_charge=False,
             desired_solar_sell=True,
             desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_discharge_current_a=0.0,
         )
@@ -692,7 +690,7 @@ def _horizon_battery_plan(
             desired_grid_charge=False,
             desired_solar_sell=True,
             desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=TRICKLE_CHARGE_A,
             # Only the SOLAR surplus is sold here — never drain the battery into the
@@ -714,7 +712,7 @@ def _horizon_battery_plan(
             reason=f"[{profile.name}] charging the home battery first (SOC {state.battery_soc_pct:.0f}% < {solar_charge_priority_soc:.0f}% priority, no cheaper refill ahead) before the EV",
             desired_grid_charge=False,
             desired_solar_sell=False,
-            desired_energy_priority="Battery first",
+            desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         )
@@ -737,7 +735,7 @@ def _horizon_battery_plan(
             desired_grid_charge=False,
             desired_solar_sell=sell,
             desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         )
 
@@ -766,7 +764,7 @@ def _horizon_battery_plan(
             reason=f"[{profile.name}] {why}",
             desired_grid_charge=True,
             desired_solar_sell=False,
-            desired_energy_priority="Battery first",
+            desired_energy_priority="Load first",
             # Coherent mode while charging: never leave the inverter in "sell"
             # mode, or it hunts between charging and exporting.
             desired_limit_control_mode="Zero export to CT",
@@ -780,7 +778,7 @@ def _horizon_battery_plan(
             reason=f"[{profile.name}] solar surplus available, prioritizing self-consumption",
             desired_grid_charge=False,
             desired_solar_sell=False,
-            desired_energy_priority="Battery first",
+            desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
         )
@@ -796,8 +794,8 @@ def _horizon_battery_plan(
         reason="No strong battery action required right now",
         desired_grid_charge=False,
         desired_solar_sell=sell_when_full,
-        desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-        desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
+        desired_energy_priority="Load first",
+        desired_limit_control_mode="Zero export to CT",
         desired_export_limit_w=export_limit_default_w,
         # When selling surplus at a full battery, only the SOLAR surplus is sold —
         # block battery discharge so the pack isn't drained into the grid. Otherwise
@@ -985,7 +983,7 @@ def build_battery_plan(
                 reason=f"paid to import (total {_neg_slot.total_import_price:.2f} kr/kWh < 0) — grid-charging the battery, export blocked",
                 desired_grid_charge=True,
                 desired_solar_sell=False,
-                desired_energy_priority="Battery first",
+                desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=0.0,
             ),
@@ -1040,28 +1038,24 @@ def build_battery_plan(
             solar_charge_priority_soc=solar_charge_priority_soc,
             peak_reserve=peak_reserve,
         )
-        # Anti-curtailment safety net: at a FULL battery with a positive export price,
-        # the inverter must NEVER sit in "Zero export to CT" — that throttles the
-        # panels (no storage room + no export path). DISCHARGE_TO_LOAD forces
-        # Zero-export to cover a brief deficit and is dwell-exempt, so it flips the
-        # export mode and curtails any concurrent PV. Decouple the export mode from the
-        # battery action: when full + export pays, force "Selling first" + solar_sell
-        # regardless of strategy (discharge current is untouched, so the pack still
-        # covers the house). Stable across the IDLE<->DISCHARGE flip, so PV is never
-        # curtailed while it can be sold.
+        # Anti-curtailment safety net: at a FULL battery with a positive export price
+        # the solar_sell switch must be ON, whatever strategy fired — a full pack
+        # can't absorb the surplus, so with solar_sell off the panels get throttled.
+        # The inverter mode is constant ("Zero export to CT" + "Load first" — user's
+        # hard rule), so this only touches the sell switch; the battery still covers
+        # the house, and only the true surplus exports up to the export limit.
         cur = horizon.current
         if (
             state.battery_soc_pct >= max_soc
             and (cur.export_value or 0) > 0
-            and hplan.desired_limit_control_mode == "Zero export to CT"
+            and not hplan.desired_solar_sell
             and hplan.strategy not in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT")
             and not hplan.desired_grid_charge
         ):
             hplan = replace(
                 hplan,
-                desired_limit_control_mode="Selling first",
                 desired_solar_sell=True,
-                reason=f"{hplan.reason} | full battery + export {cur.export_value:.2f} — selling, not curtailing",
+                reason=f"{hplan.reason} | full battery + export {cur.export_value:.2f} — selling the surplus, not curtailing",
             )
         return (hplan, False)
 
@@ -1082,7 +1076,7 @@ def build_battery_plan(
                 reason=f"[{profile.name}] import price {state.current_buy_price:.3f} at or below cheap threshold",
                 desired_grid_charge=True,
                 desired_solar_sell=False,
-                desired_energy_priority="Battery first",
+                desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
                 desired_discharge_current_a=0.0,
@@ -1104,7 +1098,7 @@ def build_battery_plan(
                 desired_grid_charge=False,
                 desired_solar_sell=sell,
                 desired_energy_priority="Load first",
-                desired_limit_control_mode="Selling first" if sell else "Zero export to CT",
+                desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
             ),
             False,
@@ -1117,7 +1111,7 @@ def build_battery_plan(
                 reason=f"[{profile.name}] solar surplus available, prioritizing self-consumption",
                 desired_grid_charge=False,
                 desired_solar_sell=False,
-                desired_energy_priority="Battery first",
+                desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
             ),
@@ -1132,8 +1126,8 @@ def build_battery_plan(
             reason="No strong battery action required right now",
             desired_grid_charge=False,
             desired_solar_sell=sell_when_full,
-            desired_energy_priority="Load first" if state.battery_soc_pct > discharge_floor else "Battery first",
-            desired_limit_control_mode="Selling first" if sell_when_full else "Zero export to CT",
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_discharge_current_a=(0.0 if sell_when_full else None),
         ),
@@ -1370,7 +1364,7 @@ def build_override_battery_plan(
             reason="Manual override: forced grid charge",
             desired_grid_charge=True,
             desired_solar_sell=False,
-            desired_energy_priority="Battery first",
+            desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=default_charge_current_a,
@@ -1383,7 +1377,7 @@ def build_override_battery_plan(
             desired_grid_charge=False,
             desired_solar_sell=True,
             desired_energy_priority="Load first",
-            desired_limit_control_mode="Selling first",
+            desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_discharge_current_a=default_discharge_current_a,
         )
