@@ -9,6 +9,28 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Arkitektur-aften — 2026-06-10 ~19:00-20:30 — v0.17.0 PLAN-MOTOR + v0.18.0 KONSTANT INVERTER-TILSTAND
+
+Bruger var utilfreds med ugens kørsel og bad om fuld konfig-gennemgang. De hårde tal gav ham ret: **salget kollapsede 20→0,2 kWh/dag** da zero-export-biased modes tog over 9-10/6, mens besparelses-sensoren viste positive tal (blind for offeromkostning). Bruger valgte den strukturelle løsning (masterplanens Fase A).
+
+**v0.17.0 — PLAN-DREVET MOTOR (main db8e5d4):** `models.SlotPlan/DayPlan` + `planner.build_day_plan` (genbruger skema-logikken → dashboard == virkelighed) + `planner.execute_slot` (konstant inverter-tuple inden for et slot; etiketter følger underskuddet, hardware gør ikke). Coordinator genplanlægger kun ved døgnskifte/horisont-vækst/SOC>20% afvigelse/konfig-ændring; reaktiv sti = fallback uden horisont. Backtest ±par med reaktiv (idealiseret model kan ikke repræsentere hunting/curtailment — det er dér værdien ligger). sim 262/262.
+
+**v0.17.1 — hotfix efter live-verifikation:** ved aftenspidsen stod batteriet stille under "Selling first" mens nettet købte ved 1,44 kr (fuldt batteri, alle kommandoer korrekte).
+
+**v0.18.0 — BRUGERENS HÅRDE REGEL (main 46682d1): inverter-tilstanden er en KONSTANT.** Bruger: "Der vil aldrig være et scenarie der heller 'selling first' ift. vores husforbrug... Den skal altid stå på 'Zero export to CT'. Ligeledes skal energy priority altid være 'Load first'." Implementeret overalt (planner horisont + legacy + executor + overrides + coordinator EV-gren): begge selects skrives som konstanter og kan ALDRIG flippe igen → hele hunting/curtailment-via-mode-flip-fejlklassen er strukturelt død. **Eksport styres alene af `solar_sell`-kontakten** (on ved positiv eksportværdi — kun ægte overskud ud over hus+batteri eksporterer, op til eksport-grænsen 6000 W; off ellers) **+ eksport-grænsen** (0 ved negative priser/absorb, som BLOCK altid har gjort). v0.17.1's forecast-balance-gate + flip-korrektion fjernet (overflødige under konstant tilstand). sim 264/264.
+
+**EMPIRISK DEYE-MODEL (vigtig institutionel viden):**
+- "Selling first" = salgs-prioritet: batteriet aflader IKKE til huset — nettet dækker (observeret 2 aftener; forklarer "Wattson køber hele tiden fra nettet").
+- "Zero export to CT" + export_limit 6000 + solar_sell on = hus først, batteri dækker huset, KUN overskud eksporterer (op til grænsen). Det er derfor BLOCK_NEGATIVE_EXPORT altid har sat export_limit=0 eksplicit — selve mode'en blokerer ikke alt.
+- solar_sell OFF + fuldt batteri + overskud = curtailment (10/6-fundet).
+- energy_priority styrer kun PV-routing; grid-charge styres af grid_charge-kontakten → "Load first" altid er sikkert, også under natopladning.
+
+**Verifikation 20:11:** v0.18.0 live, `Zero export to CT` + `Load first` står fast, solar_sell on, competing=off, `[plan]`-beslutning. Batteri-afladning ved underskud verificeres når solen er helt nede (~20:15+) — kombinationen er den historisk beviste.
+
+**LÆRING:** (1) Lyt til brugerens hardware-intuition — to gange i dag pegede han rigtigt hvor jeg fejlfortolkede. (2) "Økonomisk neutral i idealiseret backtest" ≠ værdiløs: fjernelse af en fejlklasse måles ikke i en model uden fejlene. (3) Inverter-semantik skal verificeres EMPIRISK pr. felt (Selling first-opdagelsen) — antag aldrig symmetri mellem modes.
+
+---
+
 ## Dag 3 — 2026-06-10 ~19:00 (manuelt; bruger fandt en STOR bug) — v0.16.0 + v0.16.1 SOL-CURTAILMENT
 
 Bruger: "købt for meget, solgt for lidt, EV fik for lidt sol — og Solcast kan ikke ramme så meget ved siden af; Wattson begrænser solproduktionen." **Brugeren havde 100% ret.** Jeg fejlfortolkede først 14,8 kWh vs 59,9 kWh prognose som "skyet dag" — men det var **curtailment**:
