@@ -1,6 +1,7 @@
 """Planning logic for Wattson."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, time, timedelta
 import math
 
@@ -765,23 +766,44 @@ def build_battery_plan(
     # behaviour degrades safely if the price entity stops exposing hourly data).
     horizon = _horizon_view(state, profile)
     if horizon is not None:
-        return (
-            _horizon_battery_plan(
-                state,
-                horizon,
-                profile=profile,
-                min_soc=min_soc,
-                max_soc=max_soc,
-                allow_grid_charge=allow_grid_charge,
-                export_limit_default_w=export_limit_default_w,
-                learned_reserve_pct=learned_reserve_pct,
-                capacity_kwh=capacity_kwh,
-                load_hourly_w=load_hourly_w,
-                solar_charge_priority_soc=solar_charge_priority_soc,
-                peak_reserve=peak_reserve,
-            ),
-            False,
+        hplan = _horizon_battery_plan(
+            state,
+            horizon,
+            profile=profile,
+            min_soc=min_soc,
+            max_soc=max_soc,
+            allow_grid_charge=allow_grid_charge,
+            export_limit_default_w=export_limit_default_w,
+            learned_reserve_pct=learned_reserve_pct,
+            capacity_kwh=capacity_kwh,
+            load_hourly_w=load_hourly_w,
+            solar_charge_priority_soc=solar_charge_priority_soc,
+            peak_reserve=peak_reserve,
         )
+        # Anti-curtailment safety net: at a FULL battery with a positive export price,
+        # the inverter must NEVER sit in "Zero export to CT" — that throttles the
+        # panels (no storage room + no export path). DISCHARGE_TO_LOAD forces
+        # Zero-export to cover a brief deficit and is dwell-exempt, so it flips the
+        # export mode and curtails any concurrent PV. Decouple the export mode from the
+        # battery action: when full + export pays, force "Selling first" + solar_sell
+        # regardless of strategy (discharge current is untouched, so the pack still
+        # covers the house). Stable across the IDLE<->DISCHARGE flip, so PV is never
+        # curtailed while it can be sold.
+        cur = horizon.current
+        if (
+            state.battery_soc_pct >= max_soc
+            and (cur.export_value or 0) > 0
+            and hplan.desired_limit_control_mode == "Zero export to CT"
+            and hplan.strategy not in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT")
+            and not hplan.desired_grid_charge
+        ):
+            hplan = replace(
+                hplan,
+                desired_limit_control_mode="Selling first",
+                desired_solar_sell=True,
+                reason=f"{hplan.reason} | full battery + export {cur.export_value:.2f} — selling, not curtailing",
+            )
+        return (hplan, False)
 
     # Legacy fallback (no horizon): flat absolute thresholds, profile-shaped.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)

@@ -859,6 +859,16 @@ def test_b_profiles():
     st8neg = make_state(at(7), 90, [pslot(h, peak_totals[h], exp=-0.1) for h in range(7, 24)], pv=6000.0, load=1000.0)
     checks.append(("full battery + NEGATIVE export -> not SELL_SOLAR_PEAK", plan("blue", st8neg).strategy != "SELL_SOLAR_PEAK", plan("blue", st8neg).strategy))
 
+    # 8c. Full battery + DEFICIT (load>pv) + positive export: cover the house from the
+    #     battery (DISCHARGE), but the export mode must STAY "Selling first" — never
+    #     flip to Zero-export and curtail concurrent PV. (The decoupling safety net.)
+    st8def = make_state(at(7), 90, peak_day, pv=1000.0, load=3000.0)  # deficit 2000W, full pack, export 0.5
+    blue8def = plan("blue", st8def)
+    checks.append(("full battery + deficit still covers house from battery (discharge enabled)",
+                   blue8def.strategy == "DISCHARGE_TO_LOAD" and blue8def.desired_discharge_current_a != 0.0, f"{blue8def.strategy}/{blue8def.desired_discharge_current_a}"))
+    checks.append(("full battery + deficit does NOT curtail: export mode = Selling first (not Zero-export)",
+                   blue8def.desired_limit_control_mode == "Selling first" and blue8def.desired_solar_sell is True, f"{blue8def.desired_limit_control_mode}/{blue8def.desired_solar_sell}"))
+
     return checks
 
 
