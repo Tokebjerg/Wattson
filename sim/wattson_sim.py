@@ -1286,6 +1286,63 @@ def test_phase_gaps():
     checks.append(("no deadline: picks the globally cheapest hour", sched(10, -1).desired_action == "resume", sched(10, -1).reason))
     checks.append(("ready-by: reason names the deadline", "before 05:00" in sched(3, 5).reason, sched(3, 5).reason))
 
+    # ---- EV-forbedringer (helårs plug & play) ------------------------------- #
+    # Solar-only + deadline: grid-complete in the cheapest hours before the
+    # deadline when the sun can't deliver (winter/grey days) — without a deadline,
+    # solar-only still never grid-charges.
+    def solar(now_h, ready_hour=-1, surplus=0.0, soc=80.0, threshold=0.0):
+        st = ev_state(at(now_h))
+        st = replace_state(st, battery_soc_pct=soc)
+        return planner.build_ev_plan(
+            st, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2,
+            ev_ready_hour=ready_hour, ev_solar_battery_threshold=threshold,
+            solar_surplus_override=surplus)
+
+    import dataclasses as _dc
+    def replace_state(st, **kw):
+        return _dc.replace(st, **kw)
+
+    p_backup = solar(3, ready_hour=5, surplus=0.0)
+    checks.append(("solar-only + deadline + no sun -> grid-completes in a cheapest pre-deadline hour",
+                   p_backup.desired_action == "resume" and p_backup.desired_amps == 16 and "grid-completing" in p_backup.reason,
+                   f"{p_backup.desired_action}/{p_backup.reason[:60]}"))
+    p_backup_out = solar(0, ready_hour=5, surplus=0.0)
+    checks.append(("solar-only deadline backup pauses OUTSIDE the cheapest pre-deadline hours",
+                   p_backup_out.desired_action == "pause", f"{p_backup_out.desired_action}/{p_backup_out.reason[:50]}"))
+    p_nodeadline = solar(3, ready_hour=-1, surplus=0.0)
+    checks.append(("solar-only WITHOUT deadline still never grid-charges (unchanged)",
+                   p_nodeadline.desired_action == "pause", p_nodeadline.desired_action))
+    p_gated_backup = solar(3, ready_hour=5, surplus=0.0, soc=30.0, threshold=50.0)
+    checks.append(("deadline grid-backup bypasses the house-battery SOLAR gate (grid steals no sun)",
+                   p_gated_backup.desired_action == "resume", f"{p_gated_backup.desired_action}/{p_gated_backup.reason[:50]}"))
+    p_sun_first = solar(3, ready_hour=5, surplus=3000.0)
+    checks.append(("solar-only + deadline still prefers SUN when surplus exists",
+                   p_sun_first.desired_action == "resume" and "Solar surplus" in p_sun_first.reason, p_sun_first.reason[:50]))
+
+    # Cheapest-mode solar opportunism: outside the cheapest grid hours a surplus
+    # charges the car (cheaper than any import hour); below threshold it pauses.
+    def cheapest(now_h, surplus=0.0, threshold=0.0, soc=80.0):
+        st = replace_state(ev_state(at(now_h)), battery_soc_pct=soc)
+        return planner.build_ev_plan(
+            st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2,
+            ev_ready_hour=-1, ev_solar_battery_threshold=threshold,
+            solar_surplus_override=surplus)
+
+    p_opp = cheapest(7, surplus=5000.0)
+    checks.append(("cheapest-mode: solar surplus charges the car OUTSIDE the cheapest hours",
+                   p_opp.desired_action == "resume" and "Solar surplus" in p_opp.reason, f"{p_opp.desired_action}/{p_opp.reason[:50]}"))
+    p_opp_low = cheapest(7, surplus=800.0)
+    checks.append(("cheapest-mode: too little surplus outside cheap hours -> pause (unchanged)",
+                   p_opp_low.desired_action == "pause", p_opp_low.desired_action))
+    p_opp_gated = cheapest(7, surplus=5000.0, threshold=50.0, soc=30.0)
+    checks.append(("cheapest-mode opportunism respects the house-battery-first gate",
+                   p_opp_gated.desired_action == "pause", p_opp_gated.desired_action))
+    p_cheap_hour = cheapest(10, surplus=0.0)
+    checks.append(("cheapest-mode: cheapest grid hour still charges at max amps (unchanged)",
+                   p_cheap_hour.desired_action == "resume" and p_cheap_hour.desired_amps == 16, f"{p_cheap_hour.desired_action}/{p_cheap_hour.desired_amps}"))
+
     # ---- #14 solar-forecast bias-correction (pure factor) ------------------ #
     sbf = learning.solar_bias_factor
     checks.append(("solar bias neutral until enough days", sbf([0.8, 0.9], min_days=3, lo=0.7, hi=1.3) == 1.0, "n<min"))
