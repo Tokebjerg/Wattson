@@ -1382,6 +1382,33 @@ def test_phase_gaps():
                    (p_s1.desired_action, p_s1.reason) == (p_s2.desired_action, p_s2.reason),
                    f"{p_s1.desired_action} vs {p_s2.desired_action}"))
 
+    # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
+    def sched_min(now_h, soc, min_soc=35.0, windows=""):
+        st = ev_state(at(now_h))
+        if soc is not None:
+            st = replace_state(st, ev_soc_pct=soc)
+        return planner.build_ev_plan(
+            st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows=windows, ev_required_hours=2,
+            ev_ready_hour=-1, solar_surplus_override=0.0,
+            ev_target_soc=80.0, ev_min_soc=min_soc)
+
+    p_m1 = sched_min(7, 20.0)  # hour 7 = the DAY'S MOST EXPENSIVE (0.62)
+    checks.append(("min-SOC: below floor -> charges NOW at max amps even in the dearest hour",
+                   p_m1.desired_action == "resume" and p_m1.desired_amps == 16 and "regardless of price" in p_m1.reason,
+                   f"{p_m1.desired_action}/{p_m1.reason[:55]}"))
+    p_m2 = sched_min(7, 50.0)
+    checks.append(("min-SOC: above floor -> normal price optimization (dear hour pauses)",
+                   p_m2.desired_action == "pause", f"{p_m2.desired_action}/{p_m2.reason[:50]}"))
+    p_m3 = sched_min(7, None)
+    checks.append(("min-SOC: no car-SOC sensor -> floor cannot apply (graceful)",
+                   p_m3.desired_action == "pause", p_m3.desired_action))
+    # The scheduled WINDOW must be IGNORED in cheapest mode: a restrictive window
+    # ("13:00-14:00") must not stop charging in the globally cheapest hour (10).
+    p_w = sched_min(10, 50.0, windows="13:00-14:00")
+    checks.append(("cheapest-mode IGNORES the scheduled window (deadline alone governs)",
+                   p_w.desired_action == "resume", f"{p_w.desired_action}/{p_w.reason[:50]}"))
+
     # ---- #14 solar-forecast bias-correction (pure factor) ------------------ #
     sbf = learning.solar_bias_factor
     checks.append(("solar bias neutral until enough days", sbf([0.8, 0.9], min_days=3, lo=0.7, hi=1.3) == 1.0, "n<min"))

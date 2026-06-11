@@ -1223,6 +1223,7 @@ def build_ev_plan(
     solar_surplus_override: float | None = None,
     ev_target_soc: float = 0.0,
     ev_charge_speed_pct_h: float = 15.0,
+    ev_min_soc: float = 0.0,
 ) -> EvPlan:
     if state.easee_status is None:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
@@ -1368,6 +1369,16 @@ def build_ev_plan(
         # charge speed %/h). At/above target -> stop. No SOC reading (any other
         # car / sensor unavailable) -> the fixed ev_required_hours, as always.
         car_soc = state.ev_soc_pct
+        # Minimum-SOC floor: below it, charge NOW at max amps regardless of price
+        # ("never stranded"). Checked before any price optimization.
+        if car_soc is not None and ev_min_soc > 0 and car_soc < ev_min_soc:
+            return EvPlan(
+                mode=ev_mode,
+                reason=f"Car {car_soc:.0f}% below minimum {ev_min_soc:.0f}% — charging now regardless of price",
+                desired_enabled=True,
+                desired_amps=int(ev_max_amps),
+                desired_action="resume",
+            )
         wanted_hours = max(1, int(ev_required_hours))
         target_note = ""
         if car_soc is not None and ev_target_soc > 0:
@@ -1382,7 +1393,10 @@ def build_ev_plan(
                 (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
             )))
             target_note = f" (car {car_soc:.0f}% -> {ev_target_soc:.0f}%)"
-        windows = _parse_windows(ev_windows)
+        # The scheduled start/end WINDOW deliberately does not apply here (it
+        # belongs to scheduled_periods): cheapest-mode is governed by the optional
+        # "ready by" deadline alone — the optimizer picks the cheapest hours of
+        # the whole remaining horizon (or up to the deadline).
         # "Klar-til-tid": when a ready-hour deadline is set, the car must be done
         # by then, so pick the cheapest hours from now UP TO the deadline (the next
         # occurrence of that hour) rather than across the whole window. Slots after
@@ -1394,17 +1408,11 @@ def build_ev_plan(
             )
             if deadline <= state.timestamp:
                 deadline += timedelta(days=1)
-        # A deadline fully governs the charging period [now, deadline] and
-        # overrides the start/end window; otherwise the window applies as before.
-        if deadline is not None:
-            in_window = state.timestamp < deadline
-        else:
-            in_window = _in_windows(state.timestamp, windows) if windows else True
+        in_window = state.timestamp < deadline if deadline is not None else True
         horizon_slots = [
             slot
             for slot in remaining_price_slots(state.price_slots, state.timestamp)
-            if (deadline is not None or not windows or _in_windows(slot.start, windows))
-            and (deadline is None or slot.start < deadline)
+            if deadline is None or slot.start < deadline
         ]
         if horizon_slots:
             wanted = wanted_hours
@@ -1455,7 +1463,7 @@ def build_ev_plan(
         if in_window:
             return EvPlan(
                 mode=ev_mode,
-                reason="Within scheduled window (no price horizon for cheapest-hour selection)",
+                reason="No price horizon for cheapest-hour selection — charging (degraded mode)",
                 desired_enabled=True,
                 desired_amps=int(ev_max_amps),
                 desired_action="resume",

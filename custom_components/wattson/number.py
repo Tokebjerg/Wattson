@@ -18,6 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         [
             WattsonEVSolarBatteryThresholdNumber(coordinator, entry),
             WattsonEvTargetSocNumber(coordinator, entry),
+            WattsonEvMinSocNumber(coordinator, entry),
             WattsonOverrideMinutesNumber(coordinator, entry),
             WattsonBatteryMinSocNumber(coordinator, entry),
             WattsonBatteryMaxSocNumber(coordinator, entry),
@@ -91,6 +92,40 @@ class WattsonEvTargetSocNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_ev_target_soc(float(value))
+        self.async_write_ha_state()
+
+
+class WattsonEvMinSocNumber(NumberEntity):
+    """Minimum car SOC (%): below this, scheduled_cheapest charges IMMEDIATELY at
+    max amps regardless of price (never-stranded floor). 0 = off. Requires the
+    car-SOC sensor; the other EV modes never use it."""
+
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:battery-alert"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 5
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._attr_name = "EV Minimum SOC"
+        self._attr_unique_id = f"{entry.entry_id}_ev_min_soc"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    @property
+    def native_value(self) -> float:
+        return float(self._coordinator.ev_min_soc)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.async_set_ev_min_soc(float(value))
         self.async_write_ha_state()
 
 

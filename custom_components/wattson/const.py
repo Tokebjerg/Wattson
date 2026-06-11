@@ -47,6 +47,11 @@ CONF_EV_TARGET_SOC = "ev_target_soc"
 DEFAULT_EV_TARGET_SOC = 80.0
 CONF_EV_CHARGE_SPEED_PCT_H = "ev_charge_speed_pct_h"
 DEFAULT_EV_CHARGE_SPEED_PCT_H = 15.0
+# Minimum car SOC (scheduled_cheapest only): below this the car charges
+# IMMEDIATELY at max amps regardless of price — a never-stranded floor
+# (ev_smart_charging's "Minimum SOC"). 0 = off. Needs the car-SOC sensor.
+CONF_EV_MIN_SOC = "ev_min_soc"
+DEFAULT_EV_MIN_SOC = 30.0
 CONF_EV_WINDOW_START = "ev_window_start"
 CONF_EV_WINDOW_END = "ev_window_end"
 CONF_EV_READY_HOUR = "ev_ready_hour"
