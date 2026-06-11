@@ -120,8 +120,10 @@ from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
+    RESERVE_HOLD_MARGIN,
     TRICKLE_CHARGE_A,
     apply_mode_dwell,
+    battery_rate_kwh,
     build_day_plan,
     execute_slot,
     mode_dwell_exempt,
@@ -780,6 +782,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 load_hourly_w=_load_hourly,
                 learned_reserve_pct=learned_reserve_pct,
                 solar_charge_priority_soc=solar_charge_priority,
+                charge_current_a=self.battery_charge_current,
+                discharge_current_a=self.battery_discharge_current,
             )
             self._day_plan_fp = _plan_fp
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -806,7 +810,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             peak_reserve = peak_reserve_pct(
                 self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
                 _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
-                margin=required_spread(profile_for(self.battery_mode)),
+                margin=RESERVE_HOLD_MARGIN,
+                discharge_rate_kwh=battery_rate_kwh(self.battery_discharge_current),
             )
             battery_plan, negative_price_active = build_battery_plan(
                 self.site_state,
@@ -1083,6 +1088,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
             learned_reserve_pct=learned_reserve_pct,
             solar_charge_priority_soc=solar_charge_priority,
+            charge_current_a=self.battery_charge_current,
+            discharge_current_a=self.battery_discharge_current,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:

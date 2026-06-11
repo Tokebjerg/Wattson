@@ -45,7 +45,30 @@ SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
 
 # Assumed battery charge rate (kWh per hour) used only for the forward SOC
 # projection in the schedule, so it knows roughly how fast grid-charging fills.
-SCHEDULE_CHARGE_RATE_KWH = 5.0
+SCHEDULE_CHARGE_RATE_KWH = 5.0  # legacy fallback; callers now derive the real rate
+
+# Nominal LV battery pack voltage used to convert configured current limits (A)
+# into energy rates (kWh/h). 70 A x 51 V ~= 3.57 kWh/h. Deriving rates from the
+# CONFIGURED currents makes the planner self-adapting to any battery (plug &
+# play): the SOC projection schedules ENOUGH cheap charge hours instead of
+# over-promising (the old flat 5.0 kWh/h under-charged winter nights), and the
+# peak reserve never holds back more than the pack can physically deliver.
+BATTERY_NOMINAL_VOLTAGE = 51.0
+
+
+def battery_rate_kwh(current_a: float) -> float:
+    """Energy rate (kWh per hour) for a configured battery current limit."""
+    return max(0.1, float(current_a)) * BATTERY_NOMINAL_VOLTAGE / 1000.0
+
+
+# Margin (kr/kWh) a later peak must exceed the CURRENT hour by before stored
+# energy is HELD for it. Deliberately much smaller than the arbitrage spread
+# (profit_margin + wear): holding charge that is already in the pack costs no
+# extra cycle, so even a modestly dearer peak is worth waiting for. BUYING for
+# the reserve still requires the full profitable-cycle spread. (Winter backtest:
+# the full spread excluded the 1.39/1.26 kr evening hours from the reserve, so
+# the pack was spent at 0.86 kr and empty at the 1.26 kr hour.)
+RESERVE_HOLD_MARGIN = 0.15
 
 # Minimum house deficit (W) before the battery is tapped to cover the load. A
 # small deadband above zero stops the planner micro-cycling around the
@@ -198,6 +221,7 @@ def peak_reserve_pct(
     min_soc: float,
     max_soc: float,
     margin: float,
+    discharge_rate_kwh: float | None = None,
 ) -> float:
     """SOC% to HOLD BACK now for upcoming same-day hours that are markedly more
     expensive than the current hour (> price_now + ``margin``).
@@ -206,10 +230,14 @@ def peak_reserve_pct(
     then empty when the day's expensive peak arrives — importing at the peak instead.
     This reserves enough charge to cover the forecast DEFICIT during those peak hours,
     minus the solar surplus that refills the pack BEFORE the first peak, capped at the
-    usable band. The ``margin`` (the profitable-cycle spread) means it only holds back
-    for a genuinely more-expensive peak — never importing dear to save for cheap (the
-    failure mode of the old flat price-rationing). Returns 0 when no profitable peak is
-    ahead, so ordinary self-consumption is untouched.
+    usable band. Use RESERVE_HOLD_MARGIN as ``margin`` for holding decisions (a hold
+    costs no extra cycle); only buying for the reserve needs the full spread.
+
+    ``discharge_rate_kwh`` caps each peak hour's reservation at what the pack can
+    physically DELIVER in an hour (configured discharge current x pack voltage).
+    Without the cap, a single huge-deficit hour (e.g. a 10 kWh EV hour) reserved the
+    entire pack and froze cheap-night self-consumption — pointlessly, since the
+    battery could only ever deliver ~3.6 kWh of it.
     """
     current = current_price_slot(price_slots, now)
     if current is None:
@@ -230,7 +258,10 @@ def peak_reserve_pct(
     def _load(hour: int) -> float:
         return (load_hourly_w.get(hour, 0.0) / 1000.0) if load_hourly_w else 0.0
 
-    reserve_kwh = sum(max(0.0, _load(s.start.hour) - _solar(s)) for s in peaks)
+    rate_cap = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
+    reserve_kwh = sum(
+        min(max(0.0, _load(s.start.hour) - _solar(s)), rate_cap) for s in peaks
+    )
     refill_before = sum(max(0.0, _solar(s) - _load(s.start.hour))
                         for s in later if s.start < first_peak)
     net = max(0.0, reserve_kwh - refill_before)
@@ -362,6 +393,8 @@ def build_day_plan(
     load_hourly_w: dict[int, float] | None = None,
     learned_reserve_pct: float = 0.0,
     solar_charge_priority_soc: float = 0.0,
+    charge_current_a: float = 70.0,
+    discharge_current_a: float = 70.0,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -383,15 +416,18 @@ def build_day_plan(
     view = _horizon_view(state, profile)
     if view is None:
         return None
+    charge_rate = battery_rate_kwh(charge_current_a)
+    discharge_rate = battery_rate_kwh(discharge_current_a)
     tasks, _, _ = _build_schedule(
         state, profile, load_hourly_w,
         capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
         learned_reserve_pct=learned_reserve_pct,
         solar_charge_priority_soc=solar_charge_priority_soc,
+        charge_rate_kwh=charge_rate,
+        discharge_rate_kwh=discharge_rate,
     )
     if not tasks:
         return None
-    margin = required_spread(profile)
     base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
     slots_by_start = {s.start: s for s in view.slots}
     plan_slots: list[SlotPlan] = []
@@ -399,14 +435,17 @@ def build_day_plan(
         price_slot = slots_by_start.get(task.start)
         export_value = price_slot.export_value if price_slot else None
         sell_ok = (export_value or 0) > 0
-        # Reserve floor: hold charge for upcoming markedly-dearer peaks; release it
-        # at the expensive slots themselves so the pack drains fully into the peak.
+        # Reserve floor: hold charge for upcoming markedly-dearer peaks (HOLD margin,
+        # not the arbitrage spread — holding stored energy costs no extra cycle);
+        # released at the expensive slots themselves so the pack drains fully into
+        # the peak. Per-hour reservation capped at the pack's real discharge rate.
         if task.start in view.expensive_starts:
             floor = base_floor
         else:
             reserve = peak_reserve_pct(
                 view.slots, task.start, state.solar_slots, load_hourly_w,
-                capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, margin=margin,
+                capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
+                margin=RESERVE_HOLD_MARGIN, discharge_rate_kwh=discharge_rate,
             )
             floor = max(base_floor, min_soc + reserve)
         if task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD:
@@ -473,9 +512,16 @@ def execute_slot(
         return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
 
     intent = slot.intent
+    demoted_sell = False
     # Live demotions (one-way within the slot, or forced by live conditions):
     if intent == "ABSORB_NEGATIVE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
-        intent = "BLOCK_EXPORT" if window else "SELF_CONSUME"
+        # The pack can't absorb the paid import (full / charging disallowed). The
+        # IMPORT total being negative does not mean exporting is worthless — import
+        # and export carry different tariffs, so the EXPORT value is often still
+        # positive in these hours. If it pays, SELL the surplus instead of
+        # curtailing; only a genuinely negative export price blocks.
+        demoted_sell = (slot.export_value or 0) > 0
+        intent = "BLOCK_EXPORT" if (window and not demoted_sell) else "SELF_CONSUME"
     if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
         intent = "SELF_CONSUME"
     if intent == "SELL_SURPLUS" and sell_live is False:
@@ -566,7 +612,7 @@ def execute_slot(
         label, why = "SOLAR_SELF_CONSUMPTION", "charging the battery from the solar surplus"
     else:
         label, why = "IDLE", "no strong battery action required right now"
-    sell = bool(slot.sell if sell_live is None else sell_live)
+    sell = bool(slot.sell if sell_live is None else sell_live) or demoted_sell
     return (
         BatteryPlan(
             strategy=label,
@@ -814,6 +860,8 @@ def _build_schedule(
     max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
     solar_charge_priority_soc: float = 0.0,
+    charge_rate_kwh: float | None = None,
+    discharge_rate_kwh: float | None = None,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan with a battery-SOC projection.
 
@@ -834,6 +882,12 @@ def _build_schedule(
     soc_kwh = max(0.0, min(max_soc, state.battery_soc_pct)) / 100.0 * capacity_kwh
     max_kwh = max_soc / 100.0 * capacity_kwh
     floor_kwh = min(max_kwh, floor_pct / 100.0 * capacity_kwh)
+    # REALISTIC charge rate: derived from the configured charge current. The old
+    # flat 5.0 kWh/h over-promised (70 A x 51 V ~= 3.57), so the projection thought
+    # one cheap night hour filled the pack and scheduled too few charge hours —
+    # leaving the battery short at the evening peak on low-solar (winter) days.
+    rate_kwh = charge_rate_kwh if charge_rate_kwh is not None else SCHEDULE_CHARGE_RATE_KWH
+    dis_rate_kwh = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
 
     slots = view.slots[:SCHEDULE_MAX_HOURS]
     # Per-hour solar / load / surplus, precomputed so grid-charge can look ahead.
@@ -882,8 +936,9 @@ def _build_schedule(
             action = "EXPORT"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
             # Surplus with room in the battery: charge it (prioritised over export,
-            # especially valuable when the export price is zero/negative).
-            soc_kwh = min(max_kwh, soc_kwh + surplus_kwh)
+            # especially valuable when the export price is zero/negative). Capped at
+            # the pack's real intake rate — the rest exports (or curtails at <=0).
+            soc_kwh = min(max_kwh, soc_kwh + min(surplus_kwh, rate_kwh))
             action = "SOLAR_CHARGE"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH:
             # Battery full + surplus: sell it, unless exporting is worthless or
@@ -893,7 +948,7 @@ def _build_schedule(
             # Self-consumption first: cover the house deficit from stored energy
             # down to the reserve floor, at any price (the pack refills from solar
             # daily, so this always beats buying grid). Comes BEFORE grid-charge.
-            drain = min(deficit_kwh, soc_kwh - floor_kwh)
+            drain = min(deficit_kwh, soc_kwh - floor_kwh, dis_rate_kwh)
             soc_kwh -= drain
             action = "DISCHARGE"
         elif is_cheap and worthwhile and soc_kwh < max_kwh - 0.05:
@@ -908,7 +963,7 @@ def _build_schedule(
             if future_solar >= (max_kwh - soc_kwh):
                 action = "IDLE"
             else:
-                soc_kwh = min(max_kwh, soc_kwh + SCHEDULE_CHARGE_RATE_KWH)
+                soc_kwh = min(max_kwh, soc_kwh + rate_kwh)
                 action = "GRID_CHARGE"
         elif slot.export_value is not None and slot.export_value < 0:
             action = "LIMIT_EXPORT"
@@ -1482,6 +1537,8 @@ def build_control_plan(
     max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
     solar_charge_priority_soc: float = 0.0,
+    charge_current_a: float = 70.0,
+    discharge_current_a: float = 70.0,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -1493,6 +1550,8 @@ def build_control_plan(
         state, profile_for(battery_mode), load_hourly_w,
         capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
         solar_charge_priority_soc=solar_charge_priority_soc,
+        charge_rate_kwh=battery_rate_kwh(charge_current_a),
+        discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
     )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:

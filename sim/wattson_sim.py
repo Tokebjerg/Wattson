@@ -1993,6 +1993,39 @@ def test_peak_reserve():
                    plan_at(18, 60, pr3).strategy == "DISCHARGE_TO_LOAD", plan_at(18, 60, pr3).strategy))
     checks.append(("NO reserve (0%) -> normal self-consumption still discharges at low SOC",
                    plan_at(3, 30, 0.0).strategy == "DISCHARGE_TO_LOAD", plan_at(3, 30, 0.0).strategy))
+
+    # --- seasonal robustness (plug & play year-round) ------------------------- #
+    # A: the reserve is capped by the pack's real DISCHARGE rate — a single huge-
+    # deficit hour (10 kWh EV hour) must not freeze the whole pack (it can only
+    # ever deliver ~3.6 kWh of it anyway).
+    big = dict(load_hourly)
+    big[18] = 10000.0
+    rate = planner.battery_rate_kwh(70.0)  # ~3.57 kWh/h
+    pr_big_deficit = planner.peak_reserve_pct(
+        slots, at(3), [], big, capacity_kwh=10, min_soc=20, max_soc=95,
+        margin=planner.RESERVE_HOLD_MARGIN, discharge_rate_kwh=rate)
+    checks.append((f"reserve capped at the discharge RATE for a 10 kWh deficit hour (got {pr_big_deficit:.0f}%)",
+                   abs(pr_big_deficit - rate * 10.0) < 1.5, f"{pr_big_deficit:.1f} vs cap {rate*10:.1f}"))
+    # C: holding stored energy uses the LOW hold margin (no extra cycle), so a peak
+    # only ~0.3 kr dearer is still reserved — the full arbitrage spread would skip it.
+    mild = {h: 0.60 for h in range(24)}
+    mild[19] = 0.90  # +0.30 over now: > hold margin (0.15), < required_spread (~0.55)
+    mild_slots = [models.PriceSlot(start=at(h), spot_price=mild[h], tariff=0.0,
+                                   total_import_price=mild[h], export_value=0.5) for h in range(24)]
+    pr_hold = planner.peak_reserve_pct(
+        mild_slots, at(10), [], load_hourly, capacity_kwh=10, min_soc=20, max_soc=95,
+        margin=planner.RESERVE_HOLD_MARGIN, discharge_rate_kwh=rate)
+    pr_spread = planner.peak_reserve_pct(
+        mild_slots, at(10), [], load_hourly, capacity_kwh=10, min_soc=20, max_soc=95,
+        margin=planner.required_spread(planner.profile_for("blue")), discharge_rate_kwh=rate)
+    checks.append(("hold margin reserves for a modestly dearer peak (the arbitrage spread would not)",
+                   pr_hold > 0.0 and pr_spread == 0.0, f"hold={pr_hold:.1f} spread={pr_spread:.1f}"))
+    checks.append(("hold margin is well below the arbitrage spread",
+                   planner.RESERVE_HOLD_MARGIN < planner.required_spread(planner.profile_for("blue")) / 2,
+                   f"{planner.RESERVE_HOLD_MARGIN}"))
+    # B: the SOC projection charges at the REAL configured rate, not the old flat
+    # 5 kWh/h — one charge hour at 70 A on a 10 kWh pack lifts ~36%, not 50%.
+    checks.append((f"battery_rate_kwh(70) ~= 3.57 kWh/h (got {rate:.2f})", abs(rate - 3.57) < 0.05, f"{rate}"))
     return checks
 
 
@@ -2151,6 +2184,20 @@ def test_plan_execution():
                          tou_floor_pct=20.0, charge_current_a=None, total_import_price=-0.20, export_value=-0.10)
     p, neg = run(ab, state(13, soc=40, sell_price=-0.10))
     checks.append(("ABSORB_NEGATIVE -> paid-to-import grid charge", "paid to import" in p.reason and p.desired_grid_charge is True, p.reason[:60]))
+
+    # ABSORB at a FULL battery: the pack can't take the paid import, but the EXPORT
+    # value is still positive (import/export tariffs differ) -> SELL the surplus
+    # instead of curtailing.
+    ab_full = models.SlotPlan(start=at(13), intent="ABSORB_NEGATIVE", sell=False, grid_charge=True,
+                              tou_floor_pct=20.0, charge_current_a=None, total_import_price=-0.20, export_value=0.05)
+    p, _ = run(ab_full, state(13, soc=95, pv=6000.0, load=600.0, sell_price=0.05))
+    checks.append(("ABSORB at full battery + positive export -> sells the surplus (no curtail)",
+                   p.desired_solar_sell is True and p.desired_grid_charge in (False, None),
+                   f"{p.strategy}/{p.desired_solar_sell}"))
+    # ...but with a genuinely NEGATIVE export price it blocks instead.
+    p, _ = run(ab_full, state(13, soc=95, pv=6000.0, load=600.0, sell_price=-0.05))
+    checks.append(("ABSORB at full battery + negative export -> BLOCK (curtail is correct)",
+                   p.strategy == "BLOCK_NEGATIVE_EXPORT", p.strategy))
 
     p, _ = run(sc, state(10, soc=60, pv=2000.0, load=600.0, issues=["x"]))
     checks.append(("degraded runtime -> HOLD wins over the plan", p.strategy == "HOLD", p.strategy))
