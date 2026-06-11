@@ -9,6 +9,22 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Curtailment #2 — 2026-06-11 ~10:40 (bruger fandt den IGEN) — v0.18.2 EKSPORT-GRÆNSE FAST PÅ 0
+
+Bruger mistænkte curtailment ("Solcast viser væsentlig mere sol"). **Korrekt igen.** Kl. 10:37: Solcast 7.137 W, faktisk PV 1.232 W. Rygende pistol i live-data: `solar_sell=on` MEN **`number.klatremishw_deye_max_solar_sell_power = 0 W`** + ladestrøm 10 A (SELL-slottets trickle). Solens eneste aftagere = hus (548 W) + trickle (~700 W) → PV strubet til præcis det. **Tab: ~13 kWh alene 06-10:37** (forventet 18,2 / faktisk 4,8 kWh; solgt 0,0).
+
+**Rodårsag — TREDJE instans af live-cache-fejlklassen** (afladestrøm v0.8.2, ladestrøm v0.12.1): coordinatoren cachede `_default_export_limit_w` FRA den live registerværdi ved opstart. Negativ-pris-BLOCK satte registret til 0; en genstart mens det stod på 0 fik cachen til at adoptere 0 som "default" → alle efterfølgende planer "gendannede" 0. Advarselskommentaren om mønstret stod LIGE UNDER den fejlende kode. Maskeret før v0.18.0 ("Selling first" gatede ikke på registret); under konstant Zero-export-to-CT blev registret SELVE eksport-ventilen. Forklarer formentlig også dele af salgs-kollapset 9-10/6.
+
+**Hvorfor fangede curtailed-sensoren (v0.18.1) det ikke?** Gaten krævede `solar_sell off + batteri fuldt` — her var sell ON og soc 64%. Gaten var for snæver (viste 0,0 kWh midt i ~6 kW curtailment).
+
+**Fix v0.18.2 (main 34dd205, deployet):** (1) `const.DEFAULT_EXPORT_LIMIT_W = 6000.0` — eksplicit konstant, live-cache-fetch SLETTET; Wattson skrev selv 6000 tilbage ved første tick efter genstart. (2) `_curtailment_possible()` udvidet: eksport lukket = sell off ELLER eksport-grænse ≤ 0; batteri begrænset = nær-fuldt ELLER ladestrøm ≤ trickle. sim 264/264.
+
+**VERIFICERET LIVE:** grænse 0→6000 W automatisk; PV **1.232 → 7.907 W på 13 min** (OVER Solcasts 7.325!); grid eksporterer (−3.065 W og stigende); salg i gang. Bruger bekræftede.
+
+**LÆRING (3. gang — gør den til LOV):** Wattson må ALDRIG lære en "default" af en live inverter-registerværdi — transiente plan-værdier (0 A, 10 A, 0 W) sætter sig fast. Alle gendannelsesværdier skal være eksplicitte konstanter/konfiguration. Der er nu INGEN live-cachede defaults tilbage (aflade-/lade-strøm + eksport-grænse alle eksplicitte). Og: brugerens "der burde være mere sol"-intuition har været rigtig 2/2 gange — tag den ALTID alvorligt og tjek nu: Solcast power_now vs faktisk + de tre registre (solar_sell, eksport-grænse, ladestrøm).
+
+---
+
 ## Oprydning af åbne punkter — 2026-06-10 ~20:30 — v0.18.1 + varig scheduler
 
 Bruger: "fiks alt det der stadig er åbent og deploy." Alle 5 punkter lukket:
