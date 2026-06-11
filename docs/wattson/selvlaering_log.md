@@ -9,6 +9,24 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Sæson-robusthed — 2026-06-11 ~11:00-11:30 — v0.19.0 (bruger-bestilt: "komplet plug-and-play på årsbasis")
+
+Bruger bad om simulering af vinter/forår/sommer/efterår + forbedringer implementeret. Kørte 4-sæsons-backtesten mod den aktuelle plan-motor; time-for-time-analysen afslørede 4 strukturelle svagheder, alle fikset:
+
+**A — Reserve uden effekt-loft (forår):** peak-reserven reserverede HELE spidsens underskud (10 kWh EV-time!) selvom batteriet max kan levere ~3,6 kWh/t → frøs pakken på 50 % hele natten (import ved 0,42-0,55 mens reserven var fysisk meningsløs). Fix: per-time-reservation cappes ved `battery_rate_kwh(afladestrøm)`.
+
+**B — Urealistisk rate i SOC-projektionen (vinter):** flad 5,0 kWh/t antagelse vs reelt 3,57 (70 A × 51 V) → planen troede ÉN billig nattime fyldte pakken → planlagde for få ladetimer → købte 2,4 kWh ved 1,26 kr kl. 19 med tomt batteri. Fix: `battery_rate_kwh()` afledt af KONFIGUREREDE strømme, gennemtrådet til skema + day-plan + dashboard (plug-and-play: tilpasser sig ethvert batteri). Sol-ladning og afladning i projektionen er også rate-cappede nu.
+
+**C — Hold-margin ≠ arbitrage-spread (vinter):** at HOLDE allerede lagret energi koster ingen ekstra cyklus, men reserven krævede fuldt spread (0,55) → 1,39/1,26-aftentimerne blev ikke reserveret → pakken brugt ved 0,86 og tom ved 1,26. Fix: `RESERVE_HOLD_MARGIN = 0,15` for hold-beslutninger; KØB til reserven kræver stadig fuldt spread (v0.9.0-læringen står).
+
+**D — ABSORB ved fuldt batteri curtailede positivt-prissat overskud (sommer):** import-total kan være negativ (tariffer) mens EKSPORT-værdien stadig er positiv — ved fuldt batteri skal overskuddet sælges, ikke strubes (6+ kWh curtailet i backtesten). Fix: demotion sælger når eksport > 0; kun ægte negativ eksportpris blokerer.
+
+**Backtest (plan-motor før→efter):** vinter 14,41→13,84 (effektivitet 76→82 %), sommer −6,51→−7,00, efterår 15,50→15,44, forår ±0 (EV-forurenet; resterende gap = bevidst fravalgt batteri-eksport). +2,43 kr vs reaktiv over de 4 dage. **sim 270/270** (+6). Deployet som v0.19.0 (main f51f651).
+
+**Bemærk:** forbedringerne er multiplikative med årstiderne — vinter/efterår (lav sol, arbitrage-tunge) får mest; rate-afledningen gør motoren selvtilpassende til enhver batteristørrelse/strømgrænse via konfigurationen.
+
+---
+
 ## Curtailment #2 — 2026-06-11 ~10:40 (bruger fandt den IGEN) — v0.18.2 EKSPORT-GRÆNSE FAST PÅ 0
 
 Bruger mistænkte curtailment ("Solcast viser væsentlig mere sol"). **Korrekt igen.** Kl. 10:37: Solcast 7.137 W, faktisk PV 1.232 W. Rygende pistol i live-data: `solar_sell=on` MEN **`number.klatremishw_deye_max_solar_sell_power = 0 W`** + ladestrøm 10 A (SELL-slottets trickle). Solens eneste aftagere = hus (548 W) + trickle (~700 W) → PV strubet til præcis det. **Tab: ~13 kWh alene 06-10:37** (forventet 18,2 / faktisk 4,8 kWh; solgt 0,0).
