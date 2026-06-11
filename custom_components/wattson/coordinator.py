@@ -101,6 +101,7 @@ from .const import (
     DEFAULT_MASTER_LOCK_ENABLED,
     INVERTER_WRITE_COOLDOWN_SECONDS,
     BATTERY_MODE_DWELL_SECONDS,
+    DEFAULT_EXPORT_LIMIT_W,
     EV_WRITE_COOLDOWN_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
@@ -119,6 +120,7 @@ from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
 from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
+    TRICKLE_CHARGE_A,
     apply_mode_dwell,
     build_day_plan,
     execute_slot,
@@ -367,16 +369,26 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._solar_forecast_wh += forecast_w * dt_hours
 
     def _curtailment_possible(self) -> bool:
-        """True while the inverter may be throttling PV: the LAST applied plan had
-        solar_sell off and the battery is (near) full, so the surplus has no sink."""
+        """True while the inverter may be throttling PV — i.e. the surplus has no
+        full sink: the EXPORT path is closed (solar_sell off OR the export LIMIT is
+        0 — the sell switch alone is not enough, as the stuck-at-0 limit bug showed)
+        AND the BATTERY can't take the full surplus (near-full OR charge-limited to
+        the sell-slot trickle)."""
         state = self.site_state
         prev = self.control_plan.battery if self.control_plan else None
         if state is None or prev is None:
             return False
         if prev.strategy in ("GRID_CHARGE",):  # charging IS a sink
             return False
+        export_closed = (not bool(prev.desired_solar_sell)) or (
+            prev.desired_export_limit_w is not None and prev.desired_export_limit_w <= 0
+        )
         max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-        return (not bool(prev.desired_solar_sell)) and state.battery_soc_pct >= max_soc - 0.5
+        battery_limited = state.battery_soc_pct >= max_soc - 0.5 or (
+            prev.desired_max_charge_current_a is not None
+            and prev.desired_max_charge_current_a <= float(TRICKLE_CHARGE_A)
+        )
+        return export_closed and battery_limited
 
     def _accumulate_curtailment(self) -> None:
         """Telemetry: estimated PV energy the inverter throttled today (kWh) =
@@ -691,13 +703,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         config = merged_entry_config(self.config_entry)
         self.mapping = build_entity_mapping(config)
         self.capabilities = build_capabilities(self.mapping)
-        if self._default_export_limit_w is None and self.mapping.export_limit_number:
-            export_limit_state = self.hass.states.get(self.mapping.export_limit_number)
-            if export_limit_state is not None:
-                try:
-                    self._default_export_limit_w = float(export_limit_state.state)
-                except (TypeError, ValueError):
-                    self._default_export_limit_w = None
+        # The export limit (Deye "max solar sell power") is an EXPLICIT constant —
+        # NEVER cached from the live inverter value. Third strike of the same bug
+        # class (discharge current v0.8.2, charge current v0.12.1): a negative-price
+        # BLOCK sets the register to 0 W; a restart while it is 0 made the old cache
+        # adopt 0 as "the default", and every plan then *restored* 0 — silently
+        # curtailing the panels all morning (sell switch on, but sell LIMIT 0).
+        if self._default_export_limit_w is None:
+            self._default_export_limit_w = DEFAULT_EXPORT_LIMIT_W
         # NB: the normal/bulk charge current is a configured value
         # (self.battery_charge_current), NOT cached from the live inverter — caching
         # it let a transient "trickle" (10 A peak-sell) contaminate it and stick,

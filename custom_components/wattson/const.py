@@ -135,6 +135,12 @@ CONF_BATTERY_CHARGE_CURRENT_A = "battery_charge_current_a"
 DEFAULT_BATTERY_CHARGE_CURRENT_A = 70.0
 BATTERY_CHARGE_CURRENT_MAX = BATTERY_CURRENT_SAFETY_MAX
 
+# Default export limit (Deye "max solar sell power", W) restored by every
+# non-blocking plan. An EXPLICIT constant — never cached from the live register
+# (negative-price blocks set the register to 0 W; a restart while 0 would make a
+# live-cache adopt 0 as the default and silently curtail all PV export).
+DEFAULT_EXPORT_LIMIT_W = 6000.0
+
 # Phase D learning parameters.
 LEARNING_WINDOW_DAYS = 28          # how far back to read load history
 LEARNING_MIN_DAYS = 7              # min observed days before the reserve is applied
