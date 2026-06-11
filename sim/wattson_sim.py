@@ -1343,6 +1343,45 @@ def test_phase_gaps():
     checks.append(("cheapest-mode: cheapest grid hour still charges at max amps (unchanged)",
                    p_cheap_hour.desired_action == "resume" and p_cheap_hour.desired_amps == 16, f"{p_cheap_hour.desired_action}/{p_cheap_hour.desired_amps}"))
 
+    # ---- Mål-SOC (KUN scheduled_cheapest; ev_smart_charging-inspireret) ----- #
+    # hours = ceil((target - car_soc) / speed %/h); stop at target; no SOC sensor
+    # -> fixed hours (any car). The other modes never read the car SOC.
+    def sched_soc(now_h, soc, target=80.0, speed=15.0, hours=5):
+        st = ev_state(at(now_h))
+        if soc is not None:
+            st = replace_state(st, ev_soc_pct=soc)
+        return planner.build_ev_plan(
+            st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=hours,
+            ev_ready_hour=-1, solar_surplus_override=0.0,
+            ev_target_soc=target, ev_charge_speed_pct_h=speed)
+
+    # soc 50 -> 80 at 15%/h = 2 hours -> only the 2 globally cheapest (10, 11) charge
+    p_t1 = sched_soc(10, 50.0)
+    checks.append(("target-SOC: dynamic hours -> charges in a top-2 cheapest hour (reason names target)",
+                   p_t1.desired_action == "resume" and "50% -> 80%" in p_t1.reason, f"{p_t1.desired_action}/{p_t1.reason[:60]}"))
+    p_t2 = sched_soc(3, 50.0)  # 3rd-cheapest hour: fixed hours=5 would charge; dynamic 2 must NOT
+    checks.append(("target-SOC: dynamic hours SHRINK the plan (3rd-cheapest hour pauses)",
+                   p_t2.desired_action == "pause", f"{p_t2.desired_action}/{p_t2.reason[:50]}"))
+    p_t3 = sched_soc(3, None)  # no car-SOC sensor -> fixed 5 hours -> hour 3 charges (any car works)
+    checks.append(("target-SOC: NO car-SOC sensor -> fixed required-hours fallback (any car)",
+                   p_t3.desired_action == "resume", f"{p_t3.desired_action}/{p_t3.reason[:50]}"))
+    p_t4 = sched_soc(10, 82.0)
+    checks.append(("target-SOC: at/above target -> stop charging",
+                   p_t4.desired_action == "pause" and "target 80% reached" in p_t4.reason, f"{p_t4.desired_action}/{p_t4.reason[:50]}"))
+    # car-agnostic guarantee: solar_only's plan is IDENTICAL with and without car SOC
+    st_nosoc = ev_state(at(3))
+    st_soc = replace_state(st_nosoc, ev_soc_pct=15.0)
+    p_s1 = planner.build_ev_plan(st_nosoc, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+                                 ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2,
+                                 ev_ready_hour=-1, solar_surplus_override=0.0, ev_target_soc=80.0)
+    p_s2 = planner.build_ev_plan(st_soc, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+                                 ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2,
+                                 ev_ready_hour=-1, solar_surplus_override=0.0, ev_target_soc=80.0)
+    checks.append(("car-agnostic: solar_only identical with/without car SOC (never reads it)",
+                   (p_s1.desired_action, p_s1.reason) == (p_s2.desired_action, p_s2.reason),
+                   f"{p_s1.desired_action} vs {p_s2.desired_action}"))
+
     # ---- #14 solar-forecast bias-correction (pure factor) ------------------ #
     sbf = learning.solar_bias_factor
     checks.append(("solar bias neutral until enough days", sbf([0.8, 0.9], min_days=3, lo=0.7, hi=1.3) == 1.0, "n<min"))

@@ -35,6 +35,10 @@ from .const import (
     CONF_SOLAR_CHARGE_PRIORITY_SOC,
     DEFAULT_SOLAR_CHARGE_PRIORITY_SOC,
     CONF_EV_REQUIRED_HOURS,
+    CONF_EV_SOC_ENTITY,
+    DEFAULT_EV_SOC_ENTITY,
+    CONF_EV_CHARGE_SPEED_PCT_H,
+    DEFAULT_EV_CHARGE_SPEED_PCT_H,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MODE_DEFAULT,
     CONF_BATTERY_POWER_ENTITY,
@@ -269,6 +273,8 @@ def _options_ev_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_EV_MAX_AMPS, default=defaults[CONF_EV_MAX_AMPS]): _number(6, 32, 1),
             vol.Required(CONF_EV_SOLAR_MIN_SURPLUS_W, default=defaults[CONF_EV_SOLAR_MIN_SURPLUS_W]): _number(500, 20000, 100),
             vol.Required(CONF_EV_REQUIRED_HOURS, default=defaults[CONF_EV_REQUIRED_HOURS]): _number(1, 12, 1),
+            vol.Optional(CONF_EV_SOC_ENTITY, default=defaults.get(CONF_EV_SOC_ENTITY, "")): _entity("sensor"),
+            vol.Required(CONF_EV_CHARGE_SPEED_PCT_H, default=defaults.get(CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)): _number(5, 60, 0.5),
             vol.Required(CONF_EV_WINDOWS, default=defaults[CONF_EV_WINDOWS]): _text(),
         }
     )
@@ -446,6 +452,8 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_SOLAR_CHARGE_PRIORITY_SOC: entry_value(self.config_entry, CONF_SOLAR_CHARGE_PRIORITY_SOC, DEFAULT_SOLAR_CHARGE_PRIORITY_SOC),
             CONF_PRICE_VAT_MULTIPLIER: entry_value(self.config_entry, CONF_PRICE_VAT_MULTIPLIER, DEFAULT_PRICE_VAT_MULTIPLIER),
             CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
+            CONF_EV_SOC_ENTITY: entry_value(self.config_entry, CONF_EV_SOC_ENTITY, DEFAULT_EV_SOC_ENTITY),
+            CONF_EV_CHARGE_SPEED_PCT_H: entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H),
             CONF_EV_CONTROL_ENABLED: entry_value(self.config_entry, CONF_EV_CONTROL_ENABLED, DEFAULT_EV_CONTROL_ENABLED),
             CONF_EV_MODE_DEFAULT: entry_value(self.config_entry, CONF_EV_MODE_DEFAULT, DEFAULT_EV_MODE),
             CONF_EV_MAX_AMPS: entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS),

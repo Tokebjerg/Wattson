@@ -35,6 +35,10 @@ from .const import (
     CONF_EV_REQUIRED_HOURS,
     CONF_EV_READY_HOUR,
     DEFAULT_EV_READY_HOUR,
+    CONF_EV_TARGET_SOC,
+    DEFAULT_EV_TARGET_SOC,
+    CONF_EV_CHARGE_SPEED_PCT_H,
+    DEFAULT_EV_CHARGE_SPEED_PCT_H,
     CONF_PRICE_VAT_MULTIPLIER,
     DEFAULT_PRICE_VAT_MULTIPLIER,
     CONF_SOLAR_CHARGE_PRIORITY_SOC,
@@ -212,6 +216,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
         self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
         self.ev_ready_hour = int(entry_value(entry, CONF_EV_READY_HOUR, DEFAULT_EV_READY_HOUR))
+        self.ev_target_soc = float(entry_value(entry, CONF_EV_TARGET_SOC, DEFAULT_EV_TARGET_SOC))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
         self._solar_accum_day = None
@@ -663,6 +668,12 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_SOLAR_BATTERY_PRIORITY: bool(enabled)})
         await self.async_request_refresh()
 
+    async def async_set_ev_target_soc(self, percent: float) -> None:
+        self.ev_target_soc = float(percent)
+        self._last_ev_fp = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_TARGET_SOC: float(percent)})
+        await self.async_request_refresh()
+
     async def async_set_ev_solar_battery_threshold(self, percent: float) -> None:
         self.ev_solar_battery_threshold = float(percent)
         self._last_ev_fp = None
@@ -866,6 +877,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
             ev_ready_hour=self.ev_ready_hour,
             solar_surplus_override=averaged_surplus,
+            ev_target_soc=self.ev_target_soc,
+            ev_charge_speed_pct_h=float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
         )
 
         # Phase E: a manual EV override is an explicit user action and wins over

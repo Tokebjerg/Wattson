@@ -17,6 +17,7 @@ from .const import (
     CONF_EASEE_DEVICE_ID,
     CONF_EASEE_ENABLE_SWITCH,
     CONF_EASEE_ONLINE_ENTITY,
+    CONF_EV_SOC_ENTITY,
     CONF_EASEE_PHASE_MODE_ENTITY,
     CONF_EASEE_POWER_ENTITY,
     CONF_EASEE_SESSION_ENTITY,
@@ -88,6 +89,7 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
         easee_session_entity=config.get(CONF_EASEE_SESSION_ENTITY),
         easee_phase_mode_entity=config.get(CONF_EASEE_PHASE_MODE_ENTITY),
         easee_online_entity=config.get(CONF_EASEE_ONLINE_ENTITY),
+        ev_soc_entity=config.get(CONF_EV_SOC_ENTITY),
         buy_price_entity=config.get(CONF_BUY_PRICE_ENTITY),
         sell_price_entity=config.get(CONF_SELL_PRICE_ENTITY),
         forecast_today_entity=config.get(CONF_FORECAST_TODAY_ENTITY),
@@ -312,6 +314,11 @@ def build_site_state(
         load_power = max(0.0, pv_power + grid_power + battery_power)
         load_includes_ev = True
 
+    # Car SOC (scheduled_cheapest target charging only): fully optional — absent or
+    # stale never raises issues; the planner degrades to fixed required-hours.
+    ev_soc = _read_float(hass, mapping.ev_soc_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds * 20)
+    if ev_soc is not None and not (0.0 <= ev_soc <= 100.0):
+        ev_soc = None
     buy_price = _read_float(hass, mapping.buy_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
     sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
     forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
@@ -369,6 +376,7 @@ def build_site_state(
         easee_power_w=easee_power,
         easee_session_kwh=easee_session,
         easee_phase_mode=easee_phase_mode,
+        ev_soc_pct=ev_soc,
         current_buy_price=buy_price,
         current_sell_price=sell_price,
         forecast_today_kwh=forecast_today,

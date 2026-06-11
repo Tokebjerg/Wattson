@@ -33,6 +33,10 @@ class EntityMapping:
     buy_price_entity: str | None
     sell_price_entity: str | None
     forecast_today_entity: str | None
+    # Car SOC sensor for target-SOC charging (scheduled_cheapest ONLY; the other
+    # EV modes are car-agnostic). Optional — missing/unavailable degrades to the
+    # fixed required-hours behaviour.
+    ev_soc_entity: str | None = None
     # Deye TOU time-point registers Wattson manages (all kept identical so the
     # active slot always reflects current intent). Empty = feature inactive.
     tou_capacity_numbers: tuple[str, ...] = ()
@@ -153,6 +157,7 @@ class SiteState:
     current_buy_price: float | None
     current_sell_price: float | None
     forecast_today_kwh: float | None
+    ev_soc_pct: float | None = None
     stale_entities: list[str] = field(default_factory=list)
     stale_required_entities: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)

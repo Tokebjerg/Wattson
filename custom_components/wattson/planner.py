@@ -1221,6 +1221,8 @@ def build_ev_plan(
     ev_required_hours: int = 4,
     ev_ready_hour: int = -1,
     solar_surplus_override: float | None = None,
+    ev_target_soc: float = 0.0,
+    ev_charge_speed_pct_h: float = 15.0,
 ) -> EvPlan:
     if state.easee_status is None:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
@@ -1360,6 +1362,26 @@ def build_ev_plan(
         )
 
     if ev_mode == EV_MODE_SCHEDULED_CHEAPEST:
+        # Target-SOC charging (ev_smart_charging-inspired; THIS mode only — the
+        # other modes are deliberately car-agnostic): with a car-SOC reading and a
+        # target, the number of cheapest hours is DYNAMIC: ceil((target - soc) /
+        # charge speed %/h). At/above target -> stop. No SOC reading (any other
+        # car / sensor unavailable) -> the fixed ev_required_hours, as always.
+        car_soc = state.ev_soc_pct
+        wanted_hours = max(1, int(ev_required_hours))
+        target_note = ""
+        if car_soc is not None and ev_target_soc > 0:
+            if car_soc >= ev_target_soc:
+                return EvPlan(
+                    mode=ev_mode,
+                    reason=f"Car at {car_soc:.0f}% — target {ev_target_soc:.0f}% reached",
+                    desired_enabled=False,
+                    desired_action="pause",
+                )
+            wanted_hours = max(1, min(24, math.ceil(
+                (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+            )))
+            target_note = f" (car {car_soc:.0f}% -> {ev_target_soc:.0f}%)"
         windows = _parse_windows(ev_windows)
         # "Klar-til-tid": when a ready-hour deadline is set, the car must be done
         # by then, so pick the cheapest hours from now UP TO the deadline (the next
@@ -1385,7 +1407,7 @@ def build_ev_plan(
             and (deadline is None or slot.start < deadline)
         ]
         if horizon_slots:
-            wanted = max(1, int(ev_required_hours))
+            wanted = wanted_hours
             cheapest = sorted(horizon_slots, key=lambda s: s.total_import_price)[:wanted]
             cheapest_starts = {s.start for s in cheapest}
             current = current_price_slot(state.price_slots, state.timestamp)
@@ -1393,7 +1415,7 @@ def build_ev_plan(
                 until = f" before {int(ev_ready_hour):02d}:00" if deadline is not None else ""
                 return EvPlan(
                     mode=ev_mode,
-                    reason=f"Within the {wanted} cheapest allowed hours{until} ({current.total_import_price:.2f})",
+                    reason=f"Within the {wanted} cheapest allowed hours{until}{target_note} ({current.total_import_price:.2f})",
                     desired_enabled=True,
                     desired_amps=int(ev_max_amps),
                     desired_action="resume",

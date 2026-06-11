@@ -36,6 +36,17 @@ CONF_EV_SOLAR_MIN_SURPLUS_W = "ev_solar_min_surplus_w"
 CONF_EV_SOLAR_BATTERY_THRESHOLD = "ev_solar_battery_threshold"
 CONF_EV_SOLAR_BATTERY_PRIORITY = "ev_solar_battery_priority"
 CONF_EV_REQUIRED_HOURS = "ev_required_hours"
+# Target-SOC charging (ONLY for the scheduled_cheapest mode — the other modes are
+# deliberately car-agnostic). ev_smart_charging-style: hours needed =
+# (target - current SOC) / charge speed (%/h); cheapest hours picked to match;
+# stop at target. Empty/missing SOC entity -> graceful fallback to the fixed
+# ev_required_hours, so ANY car still works.
+CONF_EV_SOC_ENTITY = "ev_soc_entity"
+DEFAULT_EV_SOC_ENTITY = "sensor.niro_ev_battery_level"
+CONF_EV_TARGET_SOC = "ev_target_soc"
+DEFAULT_EV_TARGET_SOC = 80.0
+CONF_EV_CHARGE_SPEED_PCT_H = "ev_charge_speed_pct_h"
+DEFAULT_EV_CHARGE_SPEED_PCT_H = 15.0
 CONF_EV_WINDOW_START = "ev_window_start"
 CONF_EV_WINDOW_END = "ev_window_end"
 CONF_EV_READY_HOUR = "ev_ready_hour"
