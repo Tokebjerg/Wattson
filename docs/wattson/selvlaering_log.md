@@ -9,6 +9,16 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Min-SOC + UI-oprydning — 2026-06-11 ~12:45 — v0.22.0 (bruger-bestilt)
+
+1. **`number.bryggers_wattson_ev_minimum_soc`** (default 30 %, 0=fra): under gulvet lader bilen STRAKS på max ampere uanset pris ("aldrig strandet" — ev_smart_chargings Minimum SOC). Tjekkes før al prisoptimering; kræver bil-SOC-sensoren (ellers gracefuld no-op); kun scheduled_cheapest.
+2. **Vinduet fjernet fra cheapest-mode:** "Planlagt lade-periode" hører kun til scheduled_periods — cheapest styres af "Bil klar senest" alene (brugerens 13:00-14:00-vindue begrænsede faktisk optimeringen). No-horizon-fallback lader nu (degraderet) i stedet for vindue-gating.
+3. **Dashboard:** bruger havde selv slettet de to gamle faner (kun HQ/Plan/Kontrolrum tilbage — indeks-antagelser ramte ved siden af; ALTID fetch struktur før transform). Tilføjet: mål-SOC + minimum-SOC i Kontrolrums AI-profil-kort; "Planlagt lade-periode"-betingelse rettet til kun scheduled_periods; nyt betinget "Lade-mål (Billigste timer)"-kort i HQ's Elbil-sektion (mål/minimum/klar-senest — vises kun i den mode). NB: HA slugificerede "EV Minimum SOC" til `ev_minimum_soc` (ikke ev_min_soc).
+
+sim **288/288** (+4). Deployet main ea5183f; verificeret live (target 80 / min 30 / Niro 91 %; site=ready).
+
+---
+
 ## Mål-SOC for bilen — 2026-06-11 ~12:15 — v0.21.0 (bruger-bestilt; inspireret af jonasbkarlsson/ev_smart_charging)
 
 Bruger: mål-SOC KUN for "Planlagt billigste timer"; de tre andre modes skal forblive bil-agnostiske (enhver bil). Inspirationskilde verificeret via GitHub-README: timer = (mål − nuværende SOC) / ladehastighed (%/t); billigste intervaller før frist; stop ved mål.
