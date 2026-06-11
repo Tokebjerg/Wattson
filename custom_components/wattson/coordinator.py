@@ -915,7 +915,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 and self._ev_solar_hold_until is not None
                 and now < self._ev_solar_hold_until
             ):
+                # Re-assert the LAST-SENT values: the structural fingerprint and
+                # the currents stay identical, so the apply layer writes NOTHING
+                # during the dip (the old None-fields approach changed the
+                # fingerprint and triggered a write on every passing cloud).
                 ev_plan = replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
+                    desired_enabled=True,
+                    desired_amps=self._last_ev_amps,
+                    desired_circuit_currents=self._last_ev_currents,
+                    desired_phase_mode="auto_phase",
+                    desired_action="resume",
+                ) if self._last_ev_amps is not None else replace(
                     ev_plan,
                     reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
                     desired_enabled=None,
@@ -981,11 +993,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             and (self.site_state.easee_status or "").lower()
             not in ("disconnected", "", "unknown", "unavailable")
         ):
+            # A COMPLETE full-power plan: clear the solar plan's per-phase
+            # currents/phase-mode rather than inheriting them — otherwise the
+            # cloud-varying solar values keep flipping the structural fingerprint
+            # (phase_mode "auto_phase" <-> None) which bypasses the deadband AND
+            # the 90s retune gate, making the offered current bounce 6<->16 A and
+            # the car renegotiate constantly (observed: 22 changes in 40 min).
             ev_plan = replace(
                 ev_plan,
                 reason=f"paid to import (total {_neg_slot.total_import_price:.2f} kr/kWh < 0) — force-charging the EV to absorb it",
                 desired_enabled=True,
                 desired_amps=ev_max_amps,
+                desired_circuit_currents=None,
+                desired_phase_mode=None,
                 desired_action="resume",
             )
 
