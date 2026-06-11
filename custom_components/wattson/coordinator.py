@@ -72,6 +72,7 @@ from .const import (
     LEARNING_RESERVE_HOURS,
     LEARNING_RESERVE_MAX_PCT,
     LEARNING_REBUILD_SECONDS,
+    EXPORT_STUCK_GRID_W,
     VALUE_MAX_TICK_SECONDS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
@@ -127,6 +128,7 @@ from .models import LoadProfile
 from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     RESERVE_HOLD_MARGIN,
+    SELL_SAFE_CHARGE_A,
     TRICKLE_CHARGE_A,
     apply_mode_dwell,
     battery_rate_kwh,
@@ -380,10 +382,17 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
     def _curtailment_possible(self) -> bool:
         """True while the inverter may be throttling PV — i.e. the surplus has no
-        full sink: the EXPORT path is closed (solar_sell off OR the export LIMIT is
-        0 — the sell switch alone is not enough, as the stuck-at-0 limit bug showed)
-        AND the BATTERY can't take the full surplus (near-full OR charge-limited to
-        the sell-slot trickle)."""
+        full sink. Two ways there:
+
+        (a) intent: the EXPORT path is closed (solar_sell off OR the export LIMIT
+            is 0 — the sell switch alone is not enough, as the stuck-at-0 limit
+            bug showed) while the BATTERY can't take the full surplus (near-full
+            OR charge-limited to the trickle);
+        (b) outcome: export looks open on every register, yet the grid meter
+            shows no meaningful export while the battery is saturated — the
+            June-11 trickle+sell firmware stall hid behind exactly this gap
+            (sell on + limit 6000 + PV clamped to the house), so the sensor must
+            count by OUTCOME too, not only by intent."""
         state = self.site_state
         prev = self.control_plan.battery if self.control_plan else None
         if state is None or prev is None:
@@ -398,7 +407,15 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             prev.desired_max_charge_current_a is not None
             and prev.desired_max_charge_current_a <= float(TRICKLE_CHARGE_A)
         )
-        return export_closed and battery_limited
+        if export_closed and battery_limited:
+            return True
+        # (b): grid_power_w is negative when exporting; "no meaningful export"
+        # is anything above -EXPORT_STUCK_GRID_W. Real clouds with the house
+        # eating all PV also land here, but then actual PV tracks the forecast
+        # and the accumulator's (forecast - actual) increment is ~0, so the
+        # false-positive cost is bounded by forecast error (documented above).
+        export_stuck = battery_limited and state.grid_power_w > -EXPORT_STUCK_GRID_W
+        return export_stuck
 
     def _accumulate_curtailment(self) -> None:
         """Telemetry: estimated PV energy the inverter throttled today (kWh) =
@@ -970,6 +987,11 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                     desired_solar_sell=sell_surplus,
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Zero export to CT",
+                    # Full-rate charge register, always: the battery is the
+                    # absorber for what the car doesn't take, and a trickle
+                    # inherited from an earlier SELL slot would both starve the
+                    # absorber AND (with sell_surplus on) stall the Deye sell path.
+                    desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
                     desired_discharge_current_a=0.0,
                 )
 
@@ -1021,12 +1043,22 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             )
         # Set the full/bulk charge-current limit whenever the plan didn't set one,
         # so the battery can absorb the solar surplus (otherwise PV is curtailed
-        # when export is blocked). "Sell-at-peak" sets TRICKLE_CHARGE_A explicitly
-        # and is preserved; this is the configured ceiling, not a setpoint.
+        # when export is blocked). This is the configured ceiling, not a setpoint.
+        # Sell-safe invariant (June-11 firmware quirk): a trickle register must
+        # never accompany solar_sell=ON — sell-plans now set SELL_SAFE_CHARGE_A
+        # explicitly, and the floor below backstops any remaining path.
         if battery_plan.desired_max_charge_current_a is None:
             battery_plan = replace(
                 battery_plan,
                 desired_max_charge_current_a=self.battery_charge_current,
+            )
+        elif (
+            battery_plan.desired_solar_sell
+            and battery_plan.desired_max_charge_current_a < float(SELL_SAFE_CHARGE_A)
+        ):
+            battery_plan = replace(
+                battery_plan,
+                desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
             )
 
         # Phase E: a manual battery override is an explicit user action and wins

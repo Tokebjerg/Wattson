@@ -745,8 +745,12 @@ def test_a2_planning():
     blue_sched = pe_schedule(const.BATTERY_MODE_BLUE)
     green_sched = pe_schedule(const.BATTERY_MODE_GREEN)
     checks.append(("schedule: expensive sunny morning -> EXPORT (sell surplus)", blue_sched[7].action == "EXPORT", blue_sched[7].action))
-    checks.append(("schedule: morning export only trickle-charges (slow SOC rise)", blue_sched[7].projected_soc_pct <= blue_sched[6].projected_soc_pct + 6, f"{blue_sched[6].projected_soc_pct}->{blue_sched[7].projected_soc_pct}"))
-    checks.append(("schedule: cheap midday sun -> SOLAR_CHARGE (bulk fill)", blue_sched[11].action == "SOLAR_CHARGE", blue_sched[11].action))
+    # Sell-safe reality (June-11 Deye quirk): trickle+sell stalls the PV path, so
+    # sell hours run the full charge rate and "Load first" fills the pack BEFORE
+    # anything exports — the projection must show the fast SOC rise, not the old
+    # (unrealizable) trickle hold-back.
+    checks.append(("schedule: morning export also bulk-fills the pack (Load first before export)", blue_sched[7].projected_soc_pct >= blue_sched[6].projected_soc_pct + 15, f"{blue_sched[6].projected_soc_pct}->{blue_sched[7].projected_soc_pct}"))
+    checks.append(("schedule: cheap midday sun keeps a sink (charge or sell, never curtail at positive price)", blue_sched[11].action in ("SOLAR_CHARGE", "EXPORT"), blue_sched[11].action))
     checks.append(("schedule: Green keeps charging at sunny morning (no peak-sell)", green_sched[7].action == "SOLAR_CHARGE", green_sched[7].action))
 
     # Legacy fallback intact when no horizon present.
@@ -831,7 +835,7 @@ def test_b_profiles():
     st6 = make_state(at(7), 60, peak_day, pv=6000.0, load=1000.0)  # surplus 5000W, 1.20 > avg
     blue6, red6, green6 = plan("blue", st6), plan("red", st6), plan("green", st6)
     checks.append(("Blue sells solar at above-avg sunny hour", blue6.strategy == "SELL_SOLAR_PEAK", blue6.strategy))
-    checks.append(("Blue trickle-charges at 10A during peak export", blue6.desired_max_charge_current_a == 10, str(blue6.desired_max_charge_current_a)))
+    checks.append(("Blue charges at full sell-safe rate during peak export (trickle+sell stalls the Deye PV path)", blue6.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A, str(blue6.desired_max_charge_current_a)))
     checks.append(("Blue sells the surplus during peak export", blue6.desired_solar_sell is True, str(blue6.desired_solar_sell)))
     checks.append(("peak export does NOT drain battery (sells solar only, discharge=0)", blue6.desired_discharge_current_a == 0.0 and red6.desired_discharge_current_a == 0.0, f"{blue6.desired_discharge_current_a}/{red6.desired_discharge_current_a}"))
     checks.append(("Red also sells solar at above-avg sunny hour", red6.strategy == "SELL_SOLAR_PEAK", red6.strategy))
@@ -1118,12 +1122,16 @@ def test_self_consumption_schedule():
     )
     sched = {t.start.hour: t for t in cp.schedule}
 
-    # Request 3: expensive sunny morning sells the surplus + trickle-charges.
-    checks.append(("morning 8-10 above-avg sunny -> EXPORT (sell+trickle)", all(sched[h].action == "EXPORT" for h in (8, 9, 10)), str([sched[h].action for h in (8, 9, 10)])))
-    # Request 4: never EXPORT at a negative price; charge the battery / curtail instead.
+    # Request 3: expensive sunny morning sells the surplus (sell-safe full rate;
+    # Load first fills the pack alongside the export).
+    checks.append(("morning 8-10 above-avg sunny -> EXPORT (sell-safe)", all(sched[h].action == "EXPORT" for h in (8, 9, 10)), str([sched[h].action for h in (8, 9, 10)])))
+    # Request 4: never EXPORT at a negative price; charge the battery / curtail
+    # instead. With the sell-safe rule the pack already bulk-filled during the
+    # morning sell hours, so the negative midday may legitimately be all
+    # curtail/idle — the invariants are "no loss export" and "no other action".
     midday = [sched[h].action for h in (11, 12, 13, 14, 15)]
     checks.append(("negative-price midday never EXPORTs", "EXPORT" not in midday, str(midday)))
-    checks.append(("negative-price midday charges then curtails (no loss export)", all(a in ("SOLAR_CHARGE", "LIMIT_EXPORT", "IDLE") for a in midday) and "SOLAR_CHARGE" in midday, str(midday)))
+    checks.append(("negative-price midday only charges/curtails/idles (no loss export)", all(a in ("SOLAR_CHARGE", "LIMIT_EXPORT", "IDLE") for a in midday), str(midday)))
     checks.append(("full battery at negative price -> LIMIT_EXPORT (curtail)", "LIMIT_EXPORT" in midday, str(midday)))
     # Request 1: charges all the way to ~100%.
     checks.append(("battery charged to ~100%", max(t.projected_soc_pct for t in cp.schedule) >= 99, str(max(t.projected_soc_pct for t in cp.schedule))))
@@ -1205,13 +1213,14 @@ def test_self_consumption_priority():
                    plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50).strategy))
     # Charge-current intent: charge-priority does NOT cap the charge rate (None ->
     # coordinator fills the full configured current, so the battery absorbs the
-    # surplus instead of curtailing PV); only sell-at-peak trickles.
+    # surplus instead of curtailing PV); sell-at-peak pins the full sell-safe
+    # rate explicitly (trickle+sell stalls the Deye PV path — June-11 quirk).
     chg_pri = plan("blue", at(12), 30, pv=3000, load=500, charge_priority=50)
     sell_pk = plan("blue", at(20), 60, pv=3000, load=500, charge_priority=50)
     checks.append(("charge-priority charges at full rate (no trickle cap)",
                    chg_pri.desired_max_charge_current_a is None, str(chg_pri.desired_max_charge_current_a)))
-    checks.append(("only sell-at-peak trickles the charge current",
-                   sell_pk.desired_max_charge_current_a == planner.TRICKLE_CHARGE_A, str(sell_pk.desired_max_charge_current_a)))
+    checks.append(("sell-at-peak pins the sell-safe charge rate (never trickle with sell on)",
+                   sell_pk.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A, str(sell_pk.desired_max_charge_current_a)))
 
     # --- Refill-based peak-sell: a morning hour SELLS the surplus (even below the
     #     daily average) when there's cheaper sun later today to refill the battery;
@@ -2228,7 +2237,8 @@ def test_day_plan():
                    all(abs(by_hour[h].tou_floor_pct - base_floor) < 0.6 for h in (18, 19, 20)),
                    f"{[by_hour[h].tou_floor_pct for h in (18, 19, 20)]}"))
     sell_slots = [s for s in dp.slots if s.intent == "SELL_SURPLUS"]
-    checks.append(("sell-surplus slots trickle-charge", all(s.charge_current_a == 10 for s in sell_slots), f"{len(sell_slots)} slots"))
+    checks.append(("sell-surplus slots carry the sell-safe charge rate (never trickle with sell on)",
+                   all(s.charge_current_a == planner.SELL_SAFE_CHARGE_A for s in sell_slots), f"{len(sell_slots)} slots"))
     checks.append(("slot_for finds the running slot mid-hour", dp.slot_for(at(13, 30)).start.hour == 13, str(dp.slot_for(at(13, 30)))))
     return checks
 
@@ -2271,11 +2281,14 @@ def test_plan_execution():
     p, _ = run(sc_nosell, state(12, soc=60, pv=2000.0, load=600.0))
     checks.append(("SELF_CONSUME no-sell slot -> Zero export", p.desired_limit_control_mode == "Zero export to CT", p.desired_limit_control_mode))
 
+    # The committed slot deliberately carries a STALE trickle (10 A — plans built
+    # before the sell-safe rule, or a future regression): execute_slot must floor
+    # it to SELL_SAFE_CHARGE_A, because trickle+sell stalls the Deye PV path.
     ss = models.SlotPlan(start=at(7), intent="SELL_SURPLUS", sell=True, grid_charge=False,
                          tou_floor_pct=20.0, charge_current_a=10.0, total_import_price=0.80, export_value=0.5)
     p, _ = run(ss, state(7, soc=50, pv=4000.0, load=600.0))
-    checks.append(("SELL_SURPLUS -> SELL_SOLAR_PEAK, trickle, discharge blocked",
-                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == 10.0 and p.desired_discharge_current_a == 0.0,
+    checks.append(("SELL_SURPLUS (stale trickle in slot) -> SELL_SOLAR_PEAK at sell-safe charge, discharge blocked",
+                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A and p.desired_discharge_current_a == 0.0,
                    f"{p.strategy}/{p.desired_max_charge_current_a}/{p.desired_discharge_current_a}"))
     # Sustained deficit in a sell slot -> flip to Zero export: empirically the Deye
     # does NOT discharge the battery to the house under "Selling first", so covering
@@ -2330,6 +2343,70 @@ def test_plan_execution():
     return checks
 
 
+def test_sell_safe_invariant():
+    """June-11 Deye firmware quirk (verified live in three independent windows):
+    solar_sell=ON paired with a trickle charge-current register stalls the whole
+    PV/sell path — the MPPT parks the strings (~390 V at 0.0 A), PV clamps to
+    the house load and the house can even fall back to grid import. Invariant:
+    no plan may pair sell=ON with an explicit charge current below
+    SELL_SAFE_CHARGE_A. (None is safe: the coordinator fills the configured
+    full rate, and additionally floors any sell-plan as a backstop.)"""
+    checks = []
+    at, slots, solar, load_hourly, state = _plan_engine_day()
+
+    def exec_slot(slot, st, **kw):
+        plan, _ = planner.execute_slot(
+            slot, st, battery_mode="blue", min_soc=20, max_soc=95,
+            allow_grid_charge=True, allow_negative_export=False,
+            export_limit_default_w=6000.0, **kw,
+        )
+        return plan
+
+    def violates(p):
+        return bool(p.desired_solar_sell) and (
+            p.desired_max_charge_current_a is not None
+            and p.desired_max_charge_current_a < planner.SELL_SAFE_CHARGE_A
+        )
+
+    # Sweep intents x SOC x surplus/deficit through execute_slot — every slot
+    # deliberately carries a stale 10 A trickle so the floor must do the work.
+    plans = []
+    for intent, sell in (("SELL_SURPLUS", True), ("SELF_CONSUME", True), ("SELF_CONSUME", False),
+                         ("BLOCK_EXPORT", False), ("GRID_CHARGE", False), ("ABSORB_NEGATIVE", False)):
+        for soc in (25, 60, 99, 100):
+            for pv, load in ((4000.0, 600.0), (500.0, 2200.0)):
+                sl = models.SlotPlan(
+                    start=at(9), intent=intent, sell=sell, grid_charge=(intent == "GRID_CHARGE"),
+                    tou_floor_pct=20.0, charge_current_a=10.0,
+                    total_import_price=-0.2 if intent == "ABSORB_NEGATIVE" else 0.6,
+                    export_value=0.5 if sell else 0.0,
+                )
+                plans.append(exec_slot(sl, state(9, soc=soc, pv=pv, load=load)))
+    bad = [(p.strategy, p.desired_max_charge_current_a) for p in plans if violates(p)]
+    checks.append((f"execute_slot sweep: sell=ON never rides with a sub-sell-safe charge register ({len(plans)} plans)",
+                   not bad, f"violations: {bad[:4]}"))
+
+    # Demoted ABSORB at a full battery (negative import price but POSITIVE export
+    # value -> demoted to selling) must also pin the sell-safe rate.
+    dem = models.SlotPlan(start=at(9), intent="ABSORB_NEGATIVE", sell=False, grid_charge=True,
+                          tou_floor_pct=20.0, charge_current_a=10.0,
+                          total_import_price=-0.2, export_value=0.45)
+    p_dem = exec_slot(dem, state(9, soc=100, pv=4000.0, load=600.0))
+    checks.append(("demoted ABSORB (full battery, export pays) sells at the sell-safe charge rate",
+                   (not p_dem.desired_solar_sell) or not violates(p_dem),
+                   f"{p_dem.strategy}/{p_dem.desired_solar_sell}/{p_dem.desired_max_charge_current_a}"))
+
+    # SELF_CONSUME with sell OFF must NOT force a charge current (None -> the
+    # coordinator default), so night slots keep writing the configured ceiling.
+    quiet = models.SlotPlan(start=at(9), intent="SELF_CONSUME", sell=False, grid_charge=False,
+                            tou_floor_pct=20.0, charge_current_a=None,
+                            total_import_price=0.6, export_value=-0.1)
+    p_quiet = exec_slot(quiet, state(9, soc=60, pv=0.0, load=800.0))
+    checks.append(("SELF_CONSUME without sell leaves the charge register to the coordinator default",
+                   p_quiet.desired_max_charge_current_a is None, str(p_quiet.desired_max_charge_current_a)))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -2372,6 +2449,7 @@ def main():
                          ("FORECAST PEAK-RESERVE (A+B)", test_peak_reserve),
                          ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
+                         ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

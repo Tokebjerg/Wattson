@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta
 import math
 
 from .const import (
+    BATTERY_CHARGE_CURRENT_MAX,
     BATTERY_MODE_BLUE,
     BATTERY_MODE_GREEN,
     BATTERY_MODE_PROTECT,
@@ -92,11 +93,23 @@ NEGATIVE_IMPORT_ABSORB_THRESHOLD = 0.0
 SELL_REFILL_MARGIN = 1.2
 
 # Peak-solar-export (export-friendly profiles): in sunny hours priced above the
-# day's average, sell the surplus and only trickle-charge the battery at this
-# current (~0.5 kWh/h on a ~50V LV battery), saving the bulk charge for the
-# cheap midday sun.
+# day's average, sell the surplus. TRICKLE_CHARGE_A survives only as the
+# "battery effectively closed as a sink" threshold for curtailment detection —
+# it must NEVER be written together with solar_sell=ON:
+#
+# Deye SUN-12K firmware quirk (verified live 2026-06-11 across three
+# independent windows — 16:00 slot, the 13:40 + 15:08 counter-windows, and
+# June 10's 2-minute register flapping): solar_sell=ON paired with a trickle
+# charge-current register stalls the whole PV/sell path. The MPPT parks the
+# strings (~390 V at 0.0 A), PV clamps to the house load or below, nothing
+# exports, and the house can even fall back to GRID import — while the same
+# registers with the charge current at the full rate export normally. So every
+# plan that turns solar_sell ON must also write at least SELL_SAFE_CHARGE_A.
+# "Save battery headroom for cheaper sun later" is expressed by WHEN the plan
+# sells, never by throttling the charge register while selling.
 TRICKLE_CHARGE_A = 10
 TRICKLE_CHARGE_KWH = 0.5
+SELL_SAFE_CHARGE_A = BATTERY_CHARGE_CURRENT_MAX
 
 # Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
 # Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
@@ -455,7 +468,9 @@ def build_day_plan(
         elif task.action == "LIMIT_EXPORT" or (task.action == "EXPORT" and not sell_ok):
             intent, sell, grid_charge, charge_a = "BLOCK_EXPORT", False, False, None
         elif task.action == "EXPORT":
-            intent, sell, grid_charge, charge_a = "SELL_SURPLUS", True, False, float(TRICKLE_CHARGE_A)
+            # sell=True must ride with the full charge rate (SELL_SAFE_CHARGE_A):
+            # trickle+sell stalls the Deye PV/sell path entirely.
+            intent, sell, grid_charge, charge_a = "SELL_SURPLUS", True, False, float(SELL_SAFE_CHARGE_A)
         else:
             # SELF_CONSUME (SOLAR_CHARGE/DISCHARGE/IDLE): one stable mode. Per the
             # user's hard rule the inverter ALWAYS runs "Zero export to CT" + "Load
@@ -588,13 +603,18 @@ def execute_slot(
         return (
             BatteryPlan(
                 strategy="SELL_SOLAR_PEAK",
-                reason=f"[plan] selling the surplus (export {slot.export_value if slot.export_value is not None else 0:.2f}) and trickle-charging — bulk-fill on cheaper sun later",
+                reason=f"[plan] selling the surplus (export {slot.export_value if slot.export_value is not None else 0:.2f}); battery absorbs at full rate (sell-safe)",
                 desired_grid_charge=False,
                 desired_solar_sell=True,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
-                desired_max_charge_current_a=slot.charge_current_a or float(TRICKLE_CHARGE_A),
+                # Never below SELL_SAFE_CHARGE_A while sell is ON (also guards
+                # stale committed plans built before this rule existed):
+                # trickle+sell stalls the Deye PV/sell path.
+                desired_max_charge_current_a=max(
+                    float(slot.charge_current_a or 0.0), float(SELL_SAFE_CHARGE_A)
+                ),
                 # Only the SOLAR surplus is sold — never drain the pack into the grid.
                 desired_discharge_current_a=0.0,
             ),
@@ -622,6 +642,9 @@ def execute_slot(
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            # With sell ON the charge register must be at the full rate, or a
+            # trickle inherited from an earlier slot stalls the Deye sell path.
+            desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A) if sell else None,
         ),
         negative_export_active,
     )
@@ -708,14 +731,20 @@ def _horizon_battery_plan(
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            # Full pack takes no current anyway, but the REGISTER value still
+            # gates the firmware's sell path: a leftover trickle kills it.
+            desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
             desired_discharge_current_a=0.0,
         )
 
     # 1. Sell the solar surplus when it pays AND the battery can be refilled later
     #    today: either the price is above average, OR there's enough forecast LATER
-    #    sun to recharge the pack (so we sell the valuable morning surplus and
-    #    bulk-charge on the cheaper/abundant midday sun). Never sell at a zero/
-    #    negative export price. Trickle-charge only while selling.
+    #    sun to recharge the pack. Never sell at a zero/negative export price.
+    #    The charge register stays at the FULL rate while selling (sell-safe):
+    #    the old trickle-while-selling stalled the Deye sell path outright, so
+    #    "fill later on cheaper sun" is now only about WHEN we sell, and Load
+    #    first order (PV -> load -> battery -> export) fills the pack before
+    #    any export anyway.
     capacity = max(0.1, capacity_kwh)
     headroom_kwh = max(0.0, (max_soc - state.battery_soc_pct) / 100.0 * capacity)
     future_solar_kwh = future_solar_surplus_kwh(
@@ -732,13 +761,13 @@ def _horizon_battery_plan(
         why = "above average" if price >= view.mean_price else f"{future_solar_kwh:.1f} kWh sun still to come to refill"
         return BatteryPlan(
             strategy="SELL_SOLAR_PEAK",
-            reason=f"[{profile.name}] selling the surplus (price {price:.2f}, {why}) and trickle-charging at {TRICKLE_CHARGE_A}A — fill the battery later on the cheap sun",
+            reason=f"[{profile.name}] selling the surplus (price {price:.2f}, {why}) at the full sell-safe charge rate",
             desired_grid_charge=False,
             desired_solar_sell=True,
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
-            desired_max_charge_current_a=TRICKLE_CHARGE_A,
+            desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
             # Only the SOLAR surplus is sold here — never drain the battery into the
             # grid. So block battery discharge.
             desired_discharge_current_a=0.0,
@@ -928,11 +957,12 @@ def _build_schedule(
             and (price_high or can_refill_sched)
             and soc_kwh < max_kwh - 0.05
         ):
-            # Above-average price + sun: SELL the surplus, trickle-charge only, and
-            # save the bulk battery charge for the cheap (below-average) hours.
-            # Charge-priority deliberately does NOT apply here — at an above-average
-            # price we sell now and fill the battery later when power is cheap.
-            soc_kwh = min(max_kwh, soc_kwh + TRICKLE_CHARGE_KWH)
+            # Above-average price + sun: SELL the surplus. The charge register
+            # stays at the full rate while selling (sell-safe — trickle+sell
+            # stalls the Deye PV path), and "Load first" fills the battery
+            # BEFORE anything exports, so project the real intake: the pack
+            # absorbs up to its rate, the remainder is what actually sells.
+            soc_kwh = min(max_kwh, soc_kwh + min(surplus_kwh, rate_kwh))
             action = "EXPORT"
         elif surplus_kwh >= SOLAR_CHARGE_MIN_SURPLUS_KWH and soc_kwh < max_kwh - 0.05:
             # Surplus with room in the battery: charge it (prioritised over export,
@@ -1110,6 +1140,11 @@ def build_battery_plan(
             hplan = replace(
                 hplan,
                 desired_solar_sell=True,
+                # Sell-safe: turning sell ON with a (possibly inherited) trickle
+                # charge register would stall the sell path it's meant to open.
+                desired_max_charge_current_a=max(
+                    float(hplan.desired_max_charge_current_a or 0.0), float(SELL_SAFE_CHARGE_A)
+                ),
                 reason=f"{hplan.reason} | full battery + export {cur.export_value:.2f} — selling the surplus, not curtailing",
             )
         return (hplan, False)

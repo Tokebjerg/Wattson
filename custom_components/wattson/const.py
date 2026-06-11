@@ -180,6 +180,12 @@ SOLAR_BIAS_MIN_FACTOR = 0.7        # clamp: never trust the correction beyond ±
 SOLAR_BIAS_MAX_FACTOR = 1.3
 SOLAR_BIAS_MIN_FORECAST_W = 300.0  # only sample hours with a meaningful forecast
 
+# Outcome-based curtailment detection: with the battery saturated and every
+# export register nominally open, a grid reading that never goes below this
+# many watts of export means the sell path is stalled (June-11 trickle+sell
+# firmware quirk) — count those ticks as possible curtailment.
+EXPORT_STUCK_GRID_W = 150.0
+
 # Derived-load robustness: when the whole-site load is derived from the power
 # balance (pv+grid+battery), fast transients can spike it briefly. Median-filter
 # it over this window and reject physically impossible values so the planner's
