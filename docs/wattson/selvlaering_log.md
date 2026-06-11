@@ -9,6 +9,20 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## EV-svingning — 2026-06-11 ~15:00 — v0.22.1 (bruger-rapporteret: "ladestyrken skifter hele tiden")
+
+Bruger: EV-ladning meget svingende, skifter net↔sol, bilen lader langsomt. Målt: **22 ampere-ændringer på 40 min (6↔16 A)** + konstant awaiting_start↔charging-cykling under dagens negative pristimer (14-15h, total −0,01 til −0,08).
+
+**Rodårsager (begge i coordinatorens EV-lag):**
+1. **Tvangs-planen (v0.14.0) arvede sol-planens fasestrømme/phase_mode** fra samme tick. Skyer flippede sol-planen mellem lade/pause → phase_mode "auto_phase"↔None → det STRUKTURELLE fingerprint (mode, enabled, phase_mode, action) ændrede sig konstant → omgik BÅDE 2A-deadband OG 90s-retune-gaten → skiftevis skrivning af sol-ampere (6-15) og tvangs-16. Fix: tvangs-planen er nu en komplet fuld-effekt-plan (circuit_currents=None, phase_mode=None) → konstant fingerprint hele den negative time.
+2. **Dip-hold'et None'ede felterne for at "undgå skrivninger" — men fingerprint-ændringen FORÅRSAGEDE en skrivning pr. sky** (+ én ved resume). Fix: dip-hold gen-asserterer de SIDST SENDTE ampere/fasestrømme → identisk fingerprint + inden for deadband → nul skrivninger under dips.
+
+**VERIFICERET LIVE (selvsamme negative time + skyer):** efter deploy én skrivning ved opstart, derefter **0 ændringer på 8+ minutter, bilen lader uafbrudt**. NB til bruger: Niro på 91 % taperer selv til ~2,5 kW uanset tilbudt strøm (kemi, ikke styring).
+
+**LÆRING:** Et "strukturelt fingerprint" der inkluderer felter en SENERE plan-transformation arver ukontrolleret (phase_mode), gør gaten porøs — enhver plan-erstattende blok SKAL producere en komplet, selvkonsistent plan, og "skriv intet"-intentioner skal udtrykkes som UÆNDRET plan, ikke som None-felter. sim 288/288. Deployet main 9dbc137.
+
+---
+
 ## Min-SOC + UI-oprydning — 2026-06-11 ~12:45 — v0.22.0 (bruger-bestilt)
 
 1. **`number.bryggers_wattson_ev_minimum_soc`** (default 30 %, 0=fra): under gulvet lader bilen STRAKS på max ampere uanset pris ("aldrig strandet" — ev_smart_chargings Minimum SOC). Tjekkes før al prisoptimering; kræver bil-SOC-sensoren (ellers gracefuld no-op); kun scheduled_cheapest.
