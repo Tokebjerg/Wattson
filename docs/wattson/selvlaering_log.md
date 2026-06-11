@@ -9,6 +9,35 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Curtailment #3 — 2026-06-11 ~16:30 — v0.23.0 SELL-SAFE LADESTRØM (bruger-rapporteret 3/3: "solproduktionen bliver begrænset igen")
+
+Bruger (3. gang — og 3. gang med rette): PV begrænset trods positiv eksportpris. Snapshot 16:13: PV 575 W vs Solcast 5.792 W, batteri 100 %, grid −9 W, salgspris +0,42, sell=on, grænse=6000, Zero export to CT + Load first — **alle registre korrekte, alligevel død eksport**. PV1-streng 390 V / 0,0 A = MPPT parkeret (definitiv strubnings-signatur).
+
+**Rodårsag (Deye SUN-12K firmware-quirk, empirisk bevist i tre uafhængige vinduer):**
+`solar_sell=ON` sammen med trickle-ladestrøm (10 A) i registret **staller hele PV/salgsvejen**. Beviser:
+1. I dag 13:40-13:58: sell+6000+**70 A** → stabil eksport ~6,0 kW (stramt klynget om 6000-loftet).
+2. I dag 15:08 (SOC=100, 70 A): eksport 6,2 kW → fuldt batteri dræber IKKE salgsvejen.
+3. I dag 16:00:05: SELL-slottet skrev 70→**10 A** → eksport død, PV klemt til hus-niveau (16:00-16:14), EV-deadlock ("surplus 38W < 840W" — målt overskud var selvforstærkende ~0 fordi PV var klemt).
+4. 10. juni (naturligt eksperiment, 8+ cyklusser): sell flappede hvert ~2. min — **hvert eneste sell-ON+10A-vindue importerede 300-1054 W** (PV kollapset, hus på net), hvert sell-OFF+70A-vindue balancerede ~0. Inverteret mønster = quirken rammer også ved IKKE-fuldt batteri.
+
+**Konsekvens:** v0.19-strategien "sælg overskuddet, trickle-lad, fyld på billigere sol senere" har været aktivt skadelig — hvert SELL-slot strubede PV og importerede husforbruget. Brugerens to konstant-indstillinger (Zero export to CT + Load first) er IKKE problemet og er bevaret uændret.
+
+**Fix (v0.23.0):**
+- Ny invariant: **sell=ON må aldrig ledsages af ladestrøm < SELL_SAFE_CHARGE_A (70 A)**. Alle sell-sites rettet (SELL_SURPLUS-slots, SELF_CONSUME m. sell, legacy fuld-batteri-salg, legacy sell-at-peak, anti-curtailment-safety-net, EV_SOLAR_PRIORITY) + coordinator-backstop der floorer enhver sell-plan lige før skrivelaget.
+- "Fyld senere på billig sol" udtrykkes nu KUN via HVORNÅR planen sælger (Load first fylder alligevel batteriet før eksport — projektionen opdateret tilsvarende).
+- **Bonus-fix (bruger-bestilt):** curtailment-sensoren fik outcome-gate: registre nominelt åbne + batteri mættet + grid-eksport < 150 W → tæl (forecast−faktisk). Den var blind for præcis denne klasse (viste 0,03 kWh under aktiv strubning).
+- Sim: 291/291 (ny SELL-SAFE INVARIANT-suite: 48-plan sweep + demoted-ABSORB + no-sell→None; 3 projektions-checks opdateret til korrigeret fysik). Backtest: ingen regression (+2,43 kr/4 sæsoner vs reaktiv).
+
+**Korrektioner til Deye-modellen (vigtige!):**
+- `max_solar_sell_power = 0` betyder **UBEGRÆNSET** på denne firmware, ikke lukket (observeret 6,4 kW eksport kl. 11:40 i dag med registret på 0). "Eksport styres af solar_sell + grænsen" står, men 0-værdien lukker ikke.
+- Trickle-ladestrøm er nu KUN en detektions-tærskel (curtailment-gate), aldrig en skrevet værdi sammen med sell.
+
+**Sidefund (åbne):**
+- 10/6: 458 solar_sell-flips på én dag — EV_SOLAR_PRIORITY (dwell-exempt) vekslede med SELL-slottet i takt med bilens pause/resume. Efter v0.23.0 er register-deltaet mellem de to mindre, men overvej dwell på batteri-overriden.
+- 10/6: eksport-grænsen stod på 0 hele dagen (=ubegrænset, så uskadeligt i sig selv — men afslører at grænse-skrivninger udeblev en hel dag).
+- SELL-slots sætter discharge=0 → ved sky-dip i salgstime importerer huset i stedet for at bruge fuldt batteri (set 16:25: 343 W import ved SOC 100). Lille omkostning; evt. tillad hus-afladning ved SOC≥99 i salgstimer.
+- MCP-bug bekræftet bredere: ALLE ha_call_service-kald med data-dict fejler (400) — kun data-frie services virker. Diagnose-skrivning til registre umulig via MCP; deploy-then-verify brugt i stedet.
+
 ## EV-svingning — 2026-06-11 ~15:00 — v0.22.1 (bruger-rapporteret: "ladestyrken skifter hele tiden")
 
 Bruger: EV-ladning meget svingende, skifter net↔sol, bilen lader langsomt. Målt: **22 ampere-ændringer på 40 min (6↔16 A)** + konstant awaiting_start↔charging-cykling under dagens negative pristimer (14-15h, total −0,01 til −0,08).
