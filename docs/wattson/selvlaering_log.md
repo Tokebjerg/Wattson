@@ -9,6 +9,19 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## EV-mode-gennemgang — 2026-06-11 ~11:45 — v0.20.0 (bruger-bestilt, eksplicit EV-ændring autoriseret)
+
+Bruger bad om kritisk gennemgang af de 4 EV-modes + implementering. Fund og fixes:
+
+1. **"Kun sol" havde ingen fallback** — på solløse dage (vinter!) blev bilen ALDRIG ladet; ubrugelig som helårs-mode. **Fix:** med en "Bil klar senest"-frist sat grid-kompletterer den nu i de billigste `ev_required_hours` timer FØR fristen når solen svigter ("sol når der er sol, billigste net når der ikke er"). Uden frist: præcis som før (aldrig net). Husbatteri-gaten blokerer bevidst IKKE net-backuppen (net stjæler ingen sol). NB: net-natladning i sol-mode aktiverer EV_SOLAR_PRIORITY → batteri-afladning 0 i de timer → korrekt (hjemmebatteriet drænes aldrig i bilen; huset importerer i de billige timer).
+2. **"Billigste timer" ignorerede gratis sol** — pausede udenfor de valgte net-timer selv med fler-kW overskud (som ellers sælges til lavere eksportpris end nogen import-time koster). **Fix:** sol-opportunisme mellem de billigste timer, med samme overskuds-tærskel/hysterese/husbatteri-gate/fase-logik som sol-mode (delt `_solar_currents`-helper; sol-modes adfærd bit-identisk).
+3. full_speed + scheduled_periods uændrede; midnats-wrap i vinduer VERIFICERET allerede håndteret (`_in_windows` har wrap-gren).
+4. Konfig-observation: planlagt vindue står på 13:00-14:00 (1 time — ligner en rest) og er kun relevant i de to scheduled-modes.
+
+sim **279/279** (+9, inkl. "uændret"-assertions der beviser eksisterende adfærd). Deployet main 6302a53. **For at aktivere vinter-robustheden i sol-mode skal brugeren sætte "Bil klar senest"** (fx 07:00) — ellers er adfærden som hidtil.
+
+---
+
 ## Sæson-robusthed — 2026-06-11 ~11:00-11:30 — v0.19.0 (bruger-bestilt: "komplet plug-and-play på årsbasis")
 
 Bruger bad om simulering af vinter/forår/sommer/efterår + forbedringer implementeret. Kørte 4-sæsons-backtesten mod den aktuelle plan-motor; time-for-time-analysen afslørede 4 strukturelle svagheder, alle fikset:
