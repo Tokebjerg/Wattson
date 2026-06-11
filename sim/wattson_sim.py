@@ -2297,6 +2297,22 @@ def test_plan_execution():
     checks.append(("deficit-flipped sell slot -> self-consume: discharge restored + Zero export (battery covers house)",
                    p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Zero export to CT",
                    f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
+    # v0.23.1: the SAME demotion now fires WITHOUT the coordinator passing
+    # sell_live (it is None in production). A committed sell slot that is live in a
+    # cloud deficit covers the house from a high battery instead of importing
+    # (the June-11 18:07 bug: it stayed SELL_SOLAR_PEAK with discharge=0 and
+    # imported ~900 W under a full battery).
+    p, _ = run(ss, state(7, soc=80, pv=174.0, load=1634.0))
+    checks.append(("sell slot, live cloud deficit (sell_live=None) -> covers house from battery, not import",
+                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None
+                   and p.desired_limit_control_mode == "Zero export to CT" and p.desired_grid_charge is False,
+                   f"{p.strategy}/{p.desired_discharge_current_a}"))
+    # But a sell slot in SURPLUS (the normal case) still sells solar only and never
+    # drains the pack to grid (discharge blocked).
+    p, _ = run(ss, state(7, soc=80, pv=4000.0, load=600.0))
+    checks.append(("sell slot in surplus still blocks battery discharge (sell solar only)",
+                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_discharge_current_a == 0.0,
+                   f"{p.strategy}/{p.desired_discharge_current_a}"))
     # The opposite flip: a no-sell slot with a big surplus the battery can't absorb
     # turns solar_sell on instead of curtailing (mode stays constant).
     sc_promote = models.SlotPlan(start=at(11), intent="SELF_CONSUME", sell=False, grid_charge=False,

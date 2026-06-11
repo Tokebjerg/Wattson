@@ -539,8 +539,22 @@ def execute_slot(
         intent = "BLOCK_EXPORT" if (window and not demoted_sell) else "SELF_CONSUME"
     if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
         intent = "SELF_CONSUME"
-    if intent == "SELL_SURPLUS" and sell_live is False:
-        intent = "SELF_CONSUME"  # sustained deficit -> battery must cover the house
+    if intent == "SELL_SURPLUS":
+        # A committed sell slot that is live in a sustained house DEFICIT (a cloud
+        # dropped PV below the house) has no surplus to sell — cover the house from
+        # a high battery instead of importing. Demote to SELF_CONSUME, which under
+        # Zero export to CT + Load first discharges to the house ONLY (a deficit
+        # means there is nothing to export, so the no-battery-export rule holds).
+        # DISCHARGE_TO_LOAD is dwell-exempt (covers the house at once); reverting to
+        # the sell mode is dwell-rate-limited, so a passing cloud can't flap the
+        # registers. The legacy coordinator sell_live=False path folds in here too.
+        sell_floor = max(min_soc + max(profile.reserve_soc_offset, learned_reserve_pct), slot.tou_floor_pct)
+        live_deficit = (
+            state.battery_soc_pct > sell_floor
+            and (state.load_power_w - state.pv_power_w) > DISCHARGE_DEADBAND_W
+        )
+        if sell_live is False or live_deficit:
+            intent = "SELF_CONSUME"
     # Live negative-export guard beats a stale plan (prices are hourly; cheap check).
     if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE",):
         return (
@@ -615,7 +629,9 @@ def execute_slot(
                 desired_max_charge_current_a=max(
                     float(slot.charge_current_a or 0.0), float(SELL_SAFE_CHARGE_A)
                 ),
-                # Only the SOLAR surplus is sold — never drain the pack into the grid.
+                # Only the SOLAR surplus is sold — never drain the pack into the
+                # grid. A live house DEFICIT is handled earlier by demoting to
+                # SELF_CONSUME (cover the house), so this branch is the surplus case.
                 desired_discharge_current_a=0.0,
             ),
             negative_export_active,

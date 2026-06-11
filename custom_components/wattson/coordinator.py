@@ -399,6 +399,15 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             return False
         if prev.strategy in ("GRID_CHARGE",):  # charging IS a sink
             return False
+        # A live house DEFICIT (load well above PV) means PV is MAXED, not
+        # throttled: there is no surplus to curtail, and the gap to forecast is
+        # cloud cover that the battery/grid covers. Excludes both the importing
+        # case AND the battery-covers-the-house case (the June-11 18:07 false
+        # positive). True curtailment holds PV AT the house load (zero export), so
+        # a genuine throttle shows ~zero deficit, not a large one — this guard
+        # never masks the surplus-throttle the sensor is meant to catch.
+        if state.load_power_w > state.pv_power_w + EXPORT_STUCK_GRID_W:
+            return False
         export_closed = (not bool(prev.desired_solar_sell)) or (
             prev.desired_export_limit_w is not None and prev.desired_export_limit_w <= 0
         )
