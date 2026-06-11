@@ -9,6 +9,21 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+## Mål-SOC for bilen — 2026-06-11 ~12:15 — v0.21.0 (bruger-bestilt; inspireret af jonasbkarlsson/ev_smart_charging)
+
+Bruger: mål-SOC KUN for "Planlagt billigste timer"; de tre andre modes skal forblive bil-agnostiske (enhver bil). Inspirationskilde verificeret via GitHub-README: timer = (mål − nuværende SOC) / ladehastighed (%/t); billigste intervaller før frist; stop ved mål.
+
+**Implementeret (main 2885f9a):**
+- `CONF_EV_SOC_ENTITY` (default denne installations `sensor.niro_ev_battery_level`; options-flow) → `SiteState.ev_soc_pct`. HELT valgfri: fraværende/stale/ugyldig (uden for 0-100) → None → fast `ev_required_hours` (enhver bil virker). Læses med 20× stale-tolerance (cloud-bilsensorer opdaterer langsomt) og kan ALDRIG udløse safe-mode/issues.
+- `number.bryggers_wattson_ev_target_soc` (10-100 %, trin 5, default 80) — justerbar runtime-number, persisteret.
+- `CONF_EV_CHARGE_SPEED_PCT_H` (default 15 %/t; Niro ~10,9 kW på 64 kWh ≈ 17) — ev_smart_charging-parametrisering (ingen bil-kapacitet nødvendig). Konservativ default runder timer OP; live-SOC-stoppet selv-korrigerer overshoot.
+- Planner (kun scheduled_cheapest): SOC ≥ mål → pause ("target reached"); ellers wanted = ceil((mål−soc)/hastighed) clamped 1-24. Spiller sammen med ready-by-deadline + v0.20.0-sol-opportunisme uændret.
+- **Bil-agnostik BEVIST i sim:** solar_only producerer identisk plan med/uden bil-SOC; full_speed/scheduled_periods læser den aldrig.
+
+sim **284/284** (+5). Dataclass-felt-rækkefølge-faldgrube fanget undervejs (default-felter SKAL efter ikke-default — py_compile fanger det IKKE, kun import; sim-importen er den reelle gate).
+
+---
+
 ## EV-mode-gennemgang — 2026-06-11 ~11:45 — v0.20.0 (bruger-bestilt, eksplicit EV-ændring autoriseret)
 
 Bruger bad om kritisk gennemgang af de 4 EV-modes + implementering. Fund og fixes:
