@@ -537,14 +537,14 @@ def execute_slot(
     if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
         intent = "SELF_CONSUME"
     if intent == "SELL_SURPLUS":
-        # A committed sell slot that is live in a sustained house DEFICIT (a cloud
-        # dropped PV below the house) has no surplus to sell — cover the house from
-        # a high battery instead of importing. Demote to SELF_CONSUME, which under
-        # Zero export to CT + Load first discharges to the house ONLY (a deficit
-        # means there is nothing to export, so the no-battery-export rule holds).
-        # DISCHARGE_TO_LOAD is dwell-exempt (covers the house at once); reverting to
-        # the sell mode is dwell-rate-limited, so a passing cloud can't flap the
-        # registers.
+        # A sell slot live in a sustained house DEFICIT (a cloud dropped PV below
+        # the house) demotes to SELF_CONSUME — but since 2026-06-12 that is a pure
+        # LABEL change: both branches write the IDENTICAL register tuple (sell on,
+        # sell-safe charge, discharge open, constant modes), so the inverter glides
+        # between covering the house and selling the surplus by itself and no
+        # register ever flips on the deficit boundary. (The first version of this
+        # demotion flipped the discharge register 0<->70 — a cloudy morning with
+        # the boundary crossing every ~2 min produced 36 writes/hour.)
         sell_floor = max(min_soc + max(profile.reserve_soc_offset, learned_reserve_pct), slot.tou_floor_pct)
         live_deficit = (
             state.battery_soc_pct > sell_floor
@@ -634,10 +634,14 @@ def execute_slot(
                 desired_max_charge_current_a=max(
                     float(slot.charge_current_a or 0.0), float(SELL_SAFE_CHARGE_A)
                 ),
-                # Only the SOLAR surplus is sold — never drain the pack into the
-                # grid. A live house DEFICIT is handled earlier by demoting to
-                # SELF_CONSUME (cover the house), so this branch is the surplus case.
-                desired_discharge_current_a=0.0,
+                # Discharge stays OPEN (None -> the coordinator's configured limit):
+                # under the constant "Zero export to CT" the battery structurally
+                # CANNOT export — the CT clamp limits AC output to the house load
+                # and only PV surplus passes the sell carve-out (deye_contract.py).
+                # The old 0 A belt here made the deficit demotion flip a register
+                # on every cloud; with discharge open the inverter itself balances
+                # cover-the-house <-> sell-the-surplus with zero writes.
+                desired_discharge_current_a=None,
             ),
             negative_export_active,
         )
@@ -756,7 +760,10 @@ def _horizon_battery_plan(
             # Full pack takes no current anyway, but the REGISTER value still
             # gates the firmware's sell path: a leftover trickle kills it.
             desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-            desired_discharge_current_a=0.0,
+            # Discharge open: the CT clamp prevents battery export structurally
+            # (deye_contract.py); a cloud dip must be covered from the pack
+            # instantly, not by flipping a register.
+            desired_discharge_current_a=None,
         )
 
     # 1. Sell the solar surplus when it pays AND the battery can be refilled later
@@ -790,9 +797,10 @@ def _horizon_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-            # Only the SOLAR surplus is sold here — never drain the battery into the
-            # grid. So block battery discharge.
-            desired_discharge_current_a=0.0,
+            # Discharge open: only PV surplus can pass the sell carve-out under
+            # the constant Zero export to CT (deye_contract.py) — the battery
+            # serves the house, never the grid, with no register belt needed.
+            desired_discharge_current_a=None,
         )
 
     # 2. SOC plan / charge-priority: when NOT selling (this is the last/best sun, no
@@ -898,7 +906,10 @@ def _horizon_battery_plan(
         # When selling surplus at a full battery, only the SOLAR surplus is sold —
         # block battery discharge so the pack isn't drained into the grid. Otherwise
         # leave it unset so the battery can still cover a house deficit.
-        desired_discharge_current_a=(0.0 if sell_when_full else None),
+        # Discharge open even while a full pack sells: the CT clamp prevents
+        # battery export structurally (deye_contract.py); a cloud dip is covered
+        # from the pack instantly instead of importing.
+        desired_discharge_current_a=None,
     )
 
 
@@ -1533,7 +1544,10 @@ def build_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=(float(SELL_SAFE_CHARGE_A) if sell_when_full else None),
-            desired_discharge_current_a=(0.0 if sell_when_full else None),
+            # Discharge open even while a full pack sells: the CT clamp prevents
+            # battery export structurally (deye_contract.py); a cloud dip is covered
+            # from the pack instantly instead of importing.
+            desired_discharge_current_a=None,
         ),
         False,
     )

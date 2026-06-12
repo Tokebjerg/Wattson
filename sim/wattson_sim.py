@@ -867,7 +867,14 @@ def test_b_profiles():
     checks.append(("Blue sells solar at above-avg sunny hour", blue6.strategy == "SELL_SOLAR_PEAK", blue6.strategy))
     checks.append(("Blue charges at full sell-safe rate during peak export (trickle+sell stalls the Deye PV path)", blue6.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A, str(blue6.desired_max_charge_current_a)))
     checks.append(("Blue sells the surplus during peak export", blue6.desired_solar_sell is True, str(blue6.desired_solar_sell)))
-    checks.append(("peak export does NOT drain battery (sells solar only, discharge=0)", blue6.desired_discharge_current_a == 0.0 and red6.desired_discharge_current_a == 0.0, f"{blue6.desired_discharge_current_a}/{red6.desired_discharge_current_a}"))
+    # v0.24.2: no-battery-export is guaranteed STRUCTURALLY by the constant
+    # "Zero export to CT" (only PV surplus passes the sell carve-out — see
+    # deye_contract.py); discharge stays OPEN so the pack covers cloud dips
+    # instantly instead of flipping a register (the 2026-06-12 oscillation).
+    checks.append(("peak export: constant Zero-export-CT carries the no-drain rule; discharge open for the house",
+                   blue6.desired_limit_control_mode == "Zero export to CT" and red6.desired_limit_control_mode == "Zero export to CT"
+                   and blue6.desired_discharge_current_a != 0.0 and red6.desired_discharge_current_a != 0.0,
+                   f"{blue6.desired_discharge_current_a}/{red6.desired_discharge_current_a}"))
     checks.append(("Red also sells solar at above-avg sunny hour", red6.strategy == "SELL_SOLAR_PEAK", red6.strategy))
     checks.append(("Green does NOT peak-sell (self-sufficiency)", green6.strategy != "SELL_SOLAR_PEAK", green6.strategy))
 
@@ -887,8 +894,9 @@ def test_b_profiles():
     checks.append(("Blue SELLS surplus at a full battery (solar_sell on; mode stays Zero export to CT)",
                    blue8.strategy == "SELL_SOLAR_PEAK" and blue8.desired_solar_sell is True
                    and blue8.desired_limit_control_mode == "Zero export to CT", f"{blue8.strategy}/{blue8.desired_limit_control_mode}"))
-    checks.append(("full-battery sell does not drain the battery to grid (discharge=0)",
-                   blue8.desired_discharge_current_a == 0.0, str(blue8.desired_discharge_current_a)))
+    checks.append(("full-battery sell: Zero-export-CT prevents drain; discharge open for cloud dips",
+                   blue8.desired_limit_control_mode == "Zero export to CT" and blue8.desired_discharge_current_a != 0.0,
+                   str(blue8.desired_discharge_current_a)))
     # 8b. Full battery but NEGATIVE export -> do NOT sell (curtail/block is correct then).
     st8neg = make_state(at(7), 90, [pslot(h, peak_totals[h], exp=-0.1) for h in range(7, 24)], pv=6000.0, load=1000.0)
     checks.append(("full battery + NEGATIVE export -> not SELL_SOLAR_PEAK", plan("blue", st8neg).strategy != "SELL_SOLAR_PEAK", plan("blue", st8neg).strategy))
@@ -1833,7 +1841,9 @@ def test_mode_coherence():
     # the battery (discharge blocked), and DISCHARGE covers the house with no export.
     idlefull = plan("blue", make_state(at(4), 90, asc))
     checks.append(("IDLE (full) allows sell via solar_sell (mode constant Zero export to CT)", idlefull.strategy == "IDLE" and idlefull.desired_solar_sell is True and idlefull.desired_limit_control_mode == "Zero export to CT", f"{idlefull.strategy}/{idlefull.desired_solar_sell}/{idlefull.desired_limit_control_mode}"))
-    checks.append(("IDLE (full) sells solar only, not the battery (discharge=0)", idlefull.desired_discharge_current_a == 0.0, str(idlefull.desired_discharge_current_a)))
+    checks.append(("IDLE (full) sells under constant Zero-export-CT; discharge open for the house",
+                   idlefull.desired_limit_control_mode == "Zero export to CT" and idlefull.desired_discharge_current_a != 0.0,
+                   str(idlefull.desired_discharge_current_a)))
     # Blue DISCHARGE_TO_LOAD covers the house: zero export + discharge left for the
     # coordinator to set (so the battery covers load but never exports).
     disc = plan("blue", make_state(at(7), 50, asc, pv=0.0, load=2000.0))
@@ -2336,8 +2346,8 @@ def test_plan_execution():
     ss = models.SlotPlan(start=at(7), intent="SELL_SURPLUS", sell=True, grid_charge=False,
                          tou_floor_pct=20.0, charge_current_a=10.0, total_import_price=0.80, export_value=0.5)
     p, _ = run(ss, state(7, soc=50, pv=4000.0, load=600.0))
-    checks.append(("SELL_SURPLUS (stale trickle in slot) -> SELL_SOLAR_PEAK at sell-safe charge, discharge blocked",
-                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A and p.desired_discharge_current_a == 0.0,
+    checks.append(("SELL_SURPLUS (stale trickle in slot) -> SELL_SOLAR_PEAK at sell-safe charge, discharge open",
+                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A and p.desired_discharge_current_a is None,
                    f"{p.strategy}/{p.desired_max_charge_current_a}/{p.desired_discharge_current_a}"))
     # Sustained deficit in a sell slot demotes to self-consume INSIDE execute_slot
     # (the vestigial coordinator sell_live param was removed 2026-06-12): there is
@@ -2353,12 +2363,19 @@ def test_plan_execution():
                    p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None
                    and p.desired_limit_control_mode == "Zero export to CT" and p.desired_grid_charge is False,
                    f"{p.strategy}/{p.desired_discharge_current_a}"))
-    # But a sell slot in SURPLUS (the normal case) still sells solar only and never
-    # drains the pack to grid (discharge blocked).
-    p, _ = run(ss, state(7, soc=80, pv=4000.0, load=600.0))
-    checks.append(("sell slot in surplus still blocks battery discharge (sell solar only)",
-                   p.strategy == "SELL_SOLAR_PEAK" and p.desired_discharge_current_a == 0.0,
-                   f"{p.strategy}/{p.desired_discharge_current_a}"))
+    # THE 2026-06-12 oscillation regression test: the SAME sell slot executed in
+    # SURPLUS and in DEFICIT must write the IDENTICAL register tuple — only the
+    # strategy LABEL may differ. (The first deficit demotion flipped discharge
+    # 0<->70 on every cloud: 36 writes/hour.)
+    p_sur, _ = run(ss, state(7, soc=80, pv=4000.0, load=600.0))
+    p_def, _ = run(ss, state(7, soc=80, pv=174.0, load=1634.0))
+    def regs(p):
+        return (p.desired_solar_sell, p.desired_grid_charge, p.desired_energy_priority,
+                p.desired_limit_control_mode, p.desired_export_limit_w,
+                p.desired_max_charge_current_a, p.desired_discharge_current_a)
+    checks.append(("sell slot: surplus and deficit write the IDENTICAL register tuple (labels may differ)",
+                   regs(p_sur) == regs(p_def) and p_sur.strategy == "SELL_SOLAR_PEAK" and p_def.strategy == "DISCHARGE_TO_LOAD",
+                   f"{regs(p_sur)} vs {regs(p_def)}"))
     # Anti-curtailment at a full battery needs no live flip: day-plan SELF_CONSUME
     # slots already carry sell=True whenever the export value is positive, so the
     # sell switch is on BEFORE the battery fills (the old sell_live=True promotion

@@ -45,10 +45,17 @@ independent windows + June 10's 2-minute register flapping)
 
 BATTERY -> GRID (the no-export rule)
   The battery must NEVER export to the grid. Under the constant modes the CT
-  clamp guarantees it: battery discharge serves the LOAD only, and only the
-  PV surplus passes out through the sell carve-out. Discharge is additionally
-  clamped to 0 A in surplus/sell situations, and discharge in a deficit is
-  provably export-free (there is no surplus to export).
+  clamp guarantees it STRUCTURALLY: battery discharge serves the LOAD only,
+  and only the PV surplus passes out through the sell carve-out. Since
+  2026-06-12 that hardware guarantee is the ONLY mechanism — sell/surplus
+  plans no longer clamp discharge to 0 A as a belt. The belt dated from the
+  "Selling first" era (v0.8.3, when the battery really did drain to grid)
+  and under the constant modes it only caused harm: the sell-slot deficit
+  demotion flipped the discharge register 0<->70 on every cloud (36
+  writes/hour observed 2026-06-12 morning), and a full pack sat idle while
+  the house IMPORTED through cloud dips. Discharge 0 A remains only where it
+  expresses real intent: grid-charge hours, force-charge/hold overrides, and
+  EV-solar priority (don't drain the house battery into the car).
 
 LIVE-CACHE BAN (three strikes: v0.8.2 discharge, v0.12.1 charge, v0.18.2
 export limit)

@@ -119,6 +119,13 @@ def step_with_plan(plan, pv_kwh, load_kwh, soc_kwh, floor_kwh):
             charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, RATE_KWH)
             soc_kwh += charge
             grid_exp = surplus - charge  # sell the rest
+        elif not dis_blocked:
+            # v0.24.2: discharge is open in sell hours (CT clamp prevents battery
+            # export structurally) — a cloud-dip deficit is covered from the pack.
+            deficit = -surplus
+            dis = clamp(min(soc_kwh - floor_kwh, deficit), 0.0, RATE_KWH)
+            soc_kwh -= dis
+            grid_imp = deficit - dis
         else:
             grid_imp = -surplus  # discharge blocked -> grid covers
     else:  # SOLAR_SELF_CONSUMPTION / IDLE / BLOCK_NEGATIVE_EXPORT / HOLD / PROTECT
