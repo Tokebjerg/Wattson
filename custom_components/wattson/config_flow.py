@@ -32,6 +32,10 @@ from .const import (
     CONF_BATTERY_CAPACITY_KWH,
     CONF_PRICE_VAT_MULTIPLIER,
     DEFAULT_PRICE_VAT_MULTIPLIER,
+    CONF_BATTERY_CARE_MAX_SOC,
+    DEFAULT_BATTERY_CARE_MAX_SOC,
+    CONF_RESERVE_HOLD_MARGIN,
+    CONF_EV_RETUNE_SECONDS,
     CONF_SOLAR_CHARGE_PRIORITY_SOC,
     DEFAULT_SOLAR_CHARGE_PRIORITY_SOC,
     CONF_EV_REQUIRED_HOURS,
@@ -261,6 +265,9 @@ def _options_battery_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_BATTERY_CAPACITY_KWH, default=defaults[CONF_BATTERY_CAPACITY_KWH]): _number(1, 100, 0.5),
             vol.Required(CONF_SOLAR_CHARGE_PRIORITY_SOC, default=defaults[CONF_SOLAR_CHARGE_PRIORITY_SOC]): _number(0, 100, 5),
             vol.Required(CONF_PRICE_VAT_MULTIPLIER, default=defaults[CONF_PRICE_VAT_MULTIPLIER]): _number(1.0, 2.0, 0.05),
+            vol.Required(CONF_BATTERY_CARE_MAX_SOC, default=defaults.get(CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC)): _number(80, 100, 1),
+            vol.Required(CONF_RESERVE_HOLD_MARGIN, default=defaults.get(CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN)): _number(0.0, 1.0, 0.05),
+            vol.Required(CONF_EV_RETUNE_SECONDS, default=defaults.get(CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS)): _number(15, 600, 15),
         }
     )
 
@@ -451,6 +458,9 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_BATTERY_CAPACITY_KWH: entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH),
             CONF_SOLAR_CHARGE_PRIORITY_SOC: entry_value(self.config_entry, CONF_SOLAR_CHARGE_PRIORITY_SOC, DEFAULT_SOLAR_CHARGE_PRIORITY_SOC),
             CONF_PRICE_VAT_MULTIPLIER: entry_value(self.config_entry, CONF_PRICE_VAT_MULTIPLIER, DEFAULT_PRICE_VAT_MULTIPLIER),
+            CONF_BATTERY_CARE_MAX_SOC: entry_value(self.config_entry, CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC),
+            CONF_RESERVE_HOLD_MARGIN: entry_value(self.config_entry, CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN),
+            CONF_EV_RETUNE_SECONDS: entry_value(self.config_entry, CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS),
             CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
             CONF_EV_SOC_ENTITY: entry_value(self.config_entry, CONF_EV_SOC_ENTITY, DEFAULT_EV_SOC_ENTITY),
             CONF_EV_CHARGE_SPEED_PCT_H: entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H),

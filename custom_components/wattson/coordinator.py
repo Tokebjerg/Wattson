@@ -18,6 +18,9 @@ from .const import (
     CONF_AUTOMATION_ENABLED,
     CONF_BATTERY_CONTROL_ENABLED,
     CONF_BATTERY_MAX_SOC,
+    CONF_BATTERY_CARE_MAX_SOC,
+    CONF_RESERVE_HOLD_MARGIN,
+    CONF_EV_RETUNE_SECONDS,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_DISCHARGE_CURRENT_A,
     DEFAULT_BATTERY_DISCHARGE_CURRENT_A,
@@ -66,6 +69,7 @@ from .const import (
     DEFAULT_AUTOMATION_ENABLED,
     DEFAULT_BATTERY_CONTROL_ENABLED,
     DEFAULT_BATTERY_MAX_SOC,
+    DEFAULT_BATTERY_CARE_MAX_SOC,
     DEFAULT_BATTERY_CAPACITY_KWH,
     LEARNING_WINDOW_DAYS,
     LEARNING_MIN_DAYS,
@@ -73,6 +77,10 @@ from .const import (
     LEARNING_RESERVE_MAX_PCT,
     LEARNING_REBUILD_SECONDS,
     EXPORT_STUCK_GRID_W,
+    CONF_SOLAR_BIAS_INTRADAY,
+    SOLAR_BIAS_PERSIST_SECONDS,
+    CONF_BATTERY_OVERRIDE_PERSIST,
+    CONF_EV_OVERRIDE_PERSIST,
     VALUE_MAX_TICK_SECONDS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
@@ -119,6 +127,8 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .control import EaseeController, KlatremisController
+from .deye_contract import floor_sell_safe
+from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, ControlPlan, EntityMapping, SiteState
@@ -154,7 +164,7 @@ from .planner import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
+class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=UPDATE_INTERVAL)
         self.config_entry = entry
@@ -164,12 +174,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.capabilities: Capabilities | None = None
         self.last_actions: list[str] = []
         self.pause_until: datetime | None = None
-        # Phase E: timed manual override (in-memory; a restart clears it so a
-        # forced action never silently persists for hours).
+        # Phase E: timed manual override. Persisted WITH its expiry so a restart
+        # mid-window resumes the user's explicit instruction; the expiry stamp
+        # still guarantees it can never silently outlive its window.
         self.battery_override: str = BATTERY_OVERRIDE_AUTO
         self.battery_override_until: datetime | None = None
         self.ev_override: str = EV_OVERRIDE_AUTO
         self.ev_override_until: datetime | None = None
+        self._restore_override_state(entry)
         self.override_minutes = int(entry_value(entry, CONF_OVERRIDE_MINUTES, DEFAULT_OVERRIDE_MINUTES))
         self.shadow_mode = bool(entry_value(entry, CONF_SHADOW_MODE, DEFAULT_SHADOW_MODE))
         self.automation_enabled = bool(entry_value(entry, CONF_AUTOMATION_ENABLED, DEFAULT_AUTOMATION_ENABLED))
@@ -213,10 +225,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
-        self.value_today_kr: float = 0.0
-        self.value_total_kr: float = 0.0
-        self._value_day = None
-        self._value_last_tick: datetime | None = None
+        self._telemetry_init(entry)
         self.ev_window_start = int(entry_value(entry, CONF_EV_WINDOW_START, DEFAULT_EV_WINDOW_START))
         self.ev_window_end = int(entry_value(entry, CONF_EV_WINDOW_END, DEFAULT_EV_WINDOW_END))
         self.ev_ready_hour = int(entry_value(entry, CONF_EV_READY_HOUR, DEFAULT_EV_READY_HOUR))
@@ -224,22 +233,8 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self.ev_min_soc = float(entry_value(entry, CONF_EV_MIN_SOC, DEFAULT_EV_MIN_SOC))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
-        self._solar_accum_day = None
-        self._solar_actual_wh: float = 0.0
-        self._solar_forecast_wh: float = 0.0
-        self._solar_last_tick: datetime | None = None
-        # Curtailment telemetry: estimated PV kWh the inverter throttled today
-        # (forecast minus actual while there was no sink). Restored by its sensor.
-        self.curtailed_today_kwh: float = 0.0
-        self.curtailed_negative_kwh: float = 0.0
-        self._curtail_day = None
-        self._curtail_last_tick: datetime | None = None
         self._load_samples: list[tuple[datetime, float]] = []
         self._repairs_state: dict[str, list] = {}
-        self._solar_bias_factor: float = solar_bias_factor(
-            entry_value(entry, CONF_SOLAR_BIAS_HISTORY, []) or [],
-            min_days=SOLAR_BIAS_MIN_DAYS, lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
-        )
 
     async def async_startup(self) -> None:
         await self._async_update_load_profile()
@@ -260,20 +255,51 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
             end = dt_util.utcnow()
             start = end - timedelta(days=LEARNING_WINDOW_DAYS)
+            # EV exclusion: when the whole-site load includes the EV charger, the
+            # car's 5-11 kW sessions would poison the HOUSE profile (the planner
+            # handles the EV separately). Fetch the charger's hourly statistics
+            # too and subtract them. NOTE the Easee power sensor reports kW
+            # (unit lesson learned 2026-06-09) — statistics keep the entity unit.
+            ev_entity = (
+                mapping.easee_power_entity
+                if (self.site_state is not None and self.site_state.load_includes_ev)
+                else None
+            )
+            wanted = {load_entity} | ({ev_entity} if ev_entity else set())
             stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period, self.hass, start, end, {load_entity}, "hour", None, {"mean"}
+                statistics_during_period, self.hass, start, end, wanted, "hour", None, {"mean"}
             )
             rows = stats.get(load_entity, []) if stats else []
+
+            def _row_ts(row):
+                raw_start = row.get("start")
+                if isinstance(raw_start, (int, float)):
+                    return dt_util.utc_from_timestamp(raw_start)
+                if isinstance(raw_start, datetime):
+                    return raw_start
+                return None
+
+            ev_by_hour: dict[datetime, float] = {}
+            for row in (stats.get(ev_entity, []) if (stats and ev_entity) else []):
+                ts = _row_ts(row)
+                mean = row.get("mean")
+                if ts is None or mean is None:
+                    continue
+                try:
+                    ev_by_hour[ts] = float(mean) * 1000.0  # kW -> W
+                except (TypeError, ValueError):
+                    continue
             samples: list[tuple[datetime, float | None]] = []
             for row in rows:
-                raw_start = row.get("start")
+                ts = _row_ts(row)
                 mean = row.get("mean")
-                if isinstance(raw_start, (int, float)):
-                    ts = dt_util.utc_from_timestamp(raw_start)
-                elif isinstance(raw_start, datetime):
-                    ts = raw_start
-                else:
+                if ts is None:
                     continue
+                if mean is not None and ts in ev_by_hour:
+                    try:
+                        mean = max(0.0, float(mean) - ev_by_hour[ts])
+                    except (TypeError, ValueError):
+                        pass
                 samples.append((dt_util.as_local(ts), mean))
             profile = build_load_profile(samples)
             if profile is not None:
@@ -294,172 +320,36 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         reserve_kwh = predicted_load_kwh(profile, dt_util.now().hour, LEARNING_RESERVE_HOURS)
         return min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
 
-    def _accumulate_value(self) -> None:
-        """Phase F: accumulate today's delivered value (avoided import + export)."""
-        state = self.site_state
-        if state is None:
-            return
+    def _restore_override_state(self, entry) -> None:
+        """Resume persisted manual overrides that have not yet expired."""
         now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._value_day != today:
-            # New local day: reset today's figure. The lifetime total is never reset.
-            self._value_day = today
-            self.value_today_kr = 0.0
-        last = self._value_last_tick
-        self._value_last_tick = now
-        if last is None:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return  # skip restart/sleep gaps
-        slot = current_price_slot(state.price_slots, state.timestamp) if state.price_slots else None
-        import_price = slot.total_import_price if slot else state.current_buy_price
-        export_price = slot.export_value if (slot and slot.export_value is not None) else state.current_sell_price
-        inc = value_increment_kr(
-            state.load_power_w, state.grid_import_power_w, state.grid_export_power_w,
-            import_price, export_price, dt_hours,
-        )
-        self.value_today_kr += inc
-        self.value_total_kr += inc
+        for conf, action_attr, until_attr in (
+            (CONF_BATTERY_OVERRIDE_PERSIST, "battery_override", "battery_override_until"),
+            (CONF_EV_OVERRIDE_PERSIST, "ev_override", "ev_override_until"),
+        ):
+            saved = entry_value(entry, conf, None)
+            if not isinstance(saved, dict) or not saved.get("action"):
+                continue
+            until_raw = saved.get("until")
+            until = dt_util.parse_datetime(until_raw) if isinstance(until_raw, str) else None
+            if until is None or until <= now:
+                continue  # expired (or unbounded-corrupt) — never resume those
+            setattr(self, action_attr, str(saved["action"]))
+            setattr(self, until_attr, until)
 
-    def _current_solar_forecast_w(self) -> float:
-        """Raw (uncorrected) Solcast forecast for the current hour, in average W."""
-        state = self.site_state
-        if state is None or not state.solar_slots:
-            return 0.0
-        hour_start = dt_util.as_local(dt_util.utcnow()).replace(minute=0, second=0, microsecond=0)
-        for slot in state.solar_slots:
-            if dt_util.as_local(slot.start).replace(minute=0, second=0, microsecond=0) == hour_start:
-                return max(0.0, slot.pv_estimate_kwh) * 1000.0
-        return 0.0
-
-    def _accumulate_solar_bias(self) -> None:
-        """Phase D: learn a Solcast correction factor from local production.
-
-        Accumulates actual vs forecast PV energy through each day (meaningful-
-        forecast hours only); on the day rollover it appends the day's
-        actual/forecast ratio to a persisted history and re-derives the clamped
-        median correction factor applied to future forecasts in planning.
-        """
-        state = self.site_state
-        if state is None:
-            return
-        now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._solar_accum_day is None:
-            self._solar_accum_day = today
-        elif self._solar_accum_day != today:
-            if self._solar_forecast_wh >= SOLAR_BIAS_MIN_FORECAST_W and self._solar_actual_wh > 0:
-                ratio = self._solar_actual_wh / self._solar_forecast_wh
-                history = list(entry_value(self.config_entry, CONF_SOLAR_BIAS_HISTORY, []) or [])
-                history.append(round(ratio, 4))
-                history = history[-SOLAR_BIAS_MAX_DAYS:]
-                update_entry_options(self.hass, self.config_entry, **{CONF_SOLAR_BIAS_HISTORY: history})
-                self._solar_bias_factor = solar_bias_factor(
-                    history, min_days=SOLAR_BIAS_MIN_DAYS,
-                    lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
-                )
-            self._solar_accum_day = today
-            self._solar_actual_wh = 0.0
-            self._solar_forecast_wh = 0.0
-            self._solar_last_tick = None
-        forecast_w = self._current_solar_forecast_w()
-        last = self._solar_last_tick
-        self._solar_last_tick = now
-        if last is None or forecast_w < SOLAR_BIAS_MIN_FORECAST_W:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return  # skip restart/sleep gaps
-        # Curtailment exclusion: while the inverter has no sink (battery full +
-        # solar_sell off, e.g. negative-price blocks) the measured PV is THROTTLED,
-        # not what the panels could deliver — learning the ratio from such ticks
-        # would poison the bias factor ("the panels underdeliver 4x"). Skip them.
-        if self._curtailment_possible():
-            return
-        self._solar_actual_wh += max(0.0, state.pv_power_w) * dt_hours
-        self._solar_forecast_wh += forecast_w * dt_hours
-
-    def _curtailment_possible(self) -> bool:
-        """True while the inverter may be throttling PV — i.e. the surplus has no
-        full sink. Two ways there:
-
-        (a) intent: the EXPORT path is closed (solar_sell off OR the export LIMIT
-            is 0 — the sell switch alone is not enough, as the stuck-at-0 limit
-            bug showed) while the BATTERY can't take the full surplus (near-full
-            OR charge-limited to the trickle);
-        (b) outcome: export looks open on every register, yet the grid meter
-            shows no meaningful export while the battery is saturated — the
-            June-11 trickle+sell firmware stall hid behind exactly this gap
-            (sell on + limit 6000 + PV clamped to the house), so the sensor must
-            count by OUTCOME too, not only by intent."""
-        state = self.site_state
-        prev = self.control_plan.battery if self.control_plan else None
-        if state is None or prev is None:
-            return False
-        if prev.strategy in ("GRID_CHARGE",):  # charging IS a sink
-            return False
-        # A live house DEFICIT (load well above PV) means PV is MAXED, not
-        # throttled: there is no surplus to curtail, and the gap to forecast is
-        # cloud cover that the battery/grid covers. Excludes both the importing
-        # case AND the battery-covers-the-house case (the June-11 18:07 false
-        # positive). True curtailment holds PV AT the house load (zero export), so
-        # a genuine throttle shows ~zero deficit, not a large one — this guard
-        # never masks the surplus-throttle the sensor is meant to catch.
-        if state.load_power_w > state.pv_power_w + EXPORT_STUCK_GRID_W:
-            return False
-        export_closed = (not bool(prev.desired_solar_sell)) or (
-            prev.desired_export_limit_w is not None and prev.desired_export_limit_w <= 0
-        )
-        max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-        battery_limited = state.battery_soc_pct >= max_soc - 0.5 or (
-            prev.desired_max_charge_current_a is not None
-            and prev.desired_max_charge_current_a <= float(TRICKLE_CHARGE_A)
-        )
-        if export_closed and battery_limited:
-            return True
-        # (b): grid_power_w is negative when exporting; "no meaningful export"
-        # is anything above -EXPORT_STUCK_GRID_W. Real clouds with the house
-        # eating all PV also land here, but then actual PV tracks the forecast
-        # and the accumulator's (forecast - actual) increment is ~0, so the
-        # false-positive cost is bounded by forecast error (documented above).
-        export_stuck = battery_limited and state.grid_power_w > -EXPORT_STUCK_GRID_W
-        return export_stuck
-
-    def _accumulate_curtailment(self) -> None:
-        """Telemetry: estimated PV energy the inverter throttled today (kWh) =
-        bias-corrected forecast minus actual while there was no sink. At negative
-        prices this is INTENTIONAL (cheaper than paying to export) and tracked in
-        ``curtailed_negative_kwh``; any other contribution is a regression alarm
-        (the June-10 bug class: a sunny day silently yielding a quarter of forecast).
-        An estimate — forecast error and curtailment cannot be fully separated."""
-        state = self.site_state
-        if state is None:
-            return
-        now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._curtail_day != today:
-            self._curtail_day = today
-            self.curtailed_today_kwh = 0.0
-            self.curtailed_negative_kwh = 0.0
-            self._curtail_last_tick = None
-        last = self._curtail_last_tick
-        self._curtail_last_tick = now
-        if last is None:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return
-        if not self._curtailment_possible():
-            return
-        forecast_w = self._current_solar_forecast_w() * self._solar_bias_factor
-        lost_w = max(0.0, forecast_w - max(0.0, state.pv_power_w))
-        if lost_w < 100.0:
-            return  # noise floor
-        inc = lost_w * dt_hours / 1000.0
-        self.curtailed_today_kwh += inc
-        if state.current_sell_price is not None and state.current_sell_price <= 0:
-            self.curtailed_negative_kwh += inc
+    def _persist_override_state(self) -> None:
+        update_entry_options(self.hass, self.config_entry, **{
+            CONF_BATTERY_OVERRIDE_PERSIST: (
+                {"action": self.battery_override, "until": self.battery_override_until.isoformat()}
+                if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until
+                else None
+            ),
+            CONF_EV_OVERRIDE_PERSIST: (
+                {"action": self.ev_override, "until": self.ev_override_until.isoformat()}
+                if self.ev_override != EV_OVERRIDE_AUTO and self.ev_override_until
+                else None
+            ),
+        })
 
     def _despike_derived_load(self) -> None:
         """Median-filter the derived whole-site load so a single bad tick (the
@@ -578,14 +468,19 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
 
     def _expire_overrides(self, now: datetime) -> None:
         """Phase E auto-resume: drop overrides whose window has elapsed."""
+        expired = False
         if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until and now >= self.battery_override_until:
             self.battery_override = BATTERY_OVERRIDE_AUTO
             self.battery_override_until = None
             self._last_ev_fp = None
+            expired = True
         if self.ev_override != EV_OVERRIDE_AUTO and self.ev_override_until and now >= self.ev_override_until:
             self.ev_override = EV_OVERRIDE_AUTO
             self.ev_override_until = None
             self._last_ev_fp = None
+            expired = True
+        if expired:
+            self._persist_override_state()
 
     async def async_set_battery_override(self, action: str) -> None:
         if action not in BATTERY_OVERRIDE_OPTIONS:
@@ -604,6 +499,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self._klatremis.reset_write_history()
             self.battery_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
         self._last_ev_fp = None
+        self._persist_override_state()
         await self.async_request_refresh()
 
     async def async_set_ev_override(self, action: str) -> None:
@@ -616,6 +512,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             self.pause_until = None
             self.ev_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
         self._last_ev_fp = None
+        self._persist_override_state()
         await self.async_request_refresh()
 
     async def async_set_override_minutes(self, minutes: int) -> None:
@@ -631,6 +528,18 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
     @property
     def battery_max_soc(self) -> float:
         return float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+
+    @property
+    def battery_care_soc(self) -> float:
+        return float(entry_value(self.config_entry, CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC))
+
+    @property
+    def reserve_hold_margin(self) -> float:
+        return float(entry_value(self.config_entry, CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN))
+
+    @property
+    def ev_retune_seconds(self) -> float:
+        return float(entry_value(self.config_entry, CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS))
 
     async def async_set_battery_min_soc(self, value: float) -> None:
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MIN_SOC: float(value)})
@@ -775,6 +684,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         self._despike_derived_load()
         self._apply_price_vat()
         self._accumulate_value()
+        self._accumulate_counterfactual()
         # Learn the solar bias from the RAW forecast, then apply the correction
         # so the planner/schedule see bias-corrected production.
         self._accumulate_solar_bias()
@@ -830,6 +740,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 solar_charge_priority_soc=solar_charge_priority,
                 charge_current_a=self.battery_charge_current,
                 discharge_current_a=self.battery_discharge_current,
+                battery_care_soc=self.battery_care_soc,
             )
             self._day_plan_fp = _plan_fp
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -850,13 +761,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 allow_negative_export=_allow_neg_export,
                 export_limit_default_w=self._default_export_limit_w,
                 learned_reserve_pct=learned_reserve_pct,
+                battery_care_soc=self.battery_care_soc,
             )
         else:
             # Legacy reactive fallback (no price horizon): unchanged behaviour.
             peak_reserve = peak_reserve_pct(
                 self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
                 _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
-                margin=RESERVE_HOLD_MARGIN,
+                margin=self.reserve_hold_margin,
                 discharge_rate_kwh=battery_rate_kwh(self.battery_discharge_current),
             )
             battery_plan, negative_price_active = build_battery_plan(
@@ -874,6 +786,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
                 load_hourly_w=_load_hourly,
                 solar_charge_priority_soc=solar_charge_priority,
                 peak_reserve=peak_reserve,
+                battery_care_soc=self.battery_care_soc,
             )
         # Phase C: smooth the solar surplus over a rolling window so the EV
         # regulation reacts to a 2-minute average instead of 10s spikes.
@@ -1053,22 +966,14 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # Set the full/bulk charge-current limit whenever the plan didn't set one,
         # so the battery can absorb the solar surplus (otherwise PV is curtailed
         # when export is blocked). This is the configured ceiling, not a setpoint.
-        # Sell-safe invariant (June-11 firmware quirk): a trickle register must
-        # never accompany solar_sell=ON — sell-plans now set SELL_SAFE_CHARGE_A
-        # explicitly, and the floor below backstops any remaining path.
         if battery_plan.desired_max_charge_current_a is None:
             battery_plan = replace(
                 battery_plan,
                 desired_max_charge_current_a=self.battery_charge_current,
             )
-        elif (
-            battery_plan.desired_solar_sell
-            and battery_plan.desired_max_charge_current_a < float(SELL_SAFE_CHARGE_A)
-        ):
-            battery_plan = replace(
-                battery_plan,
-                desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-            )
+        # Firmware-contract backstop (deye_contract): solar_sell=ON must never
+        # ride with a sub-sell-safe charge register (the trickle+sell stall).
+        battery_plan = floor_sell_safe(battery_plan)
 
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
@@ -1174,6 +1079,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
             solar_charge_priority_soc=solar_charge_priority,
             charge_current_a=self.battery_charge_current,
             discharge_current_a=self.battery_discharge_current,
+            battery_care_soc=self.battery_care_soc,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:
@@ -1259,7 +1165,7 @@ class WattsonCoordinator(DataUpdateCoordinator[ControlPlan]):
         # Rate-limit current changes: a material change is only applied once the
         # re-tune interval has elapsed, so the offered current can't bounce and
         # make the car cycle. Structural changes are always honoured immediately.
-        retune_due = write_allowed(self._last_ev_current_change_at, EV_CURRENT_RETUNE_SECONDS, now)
+        retune_due = write_allowed(self._last_ev_current_change_at, self.ev_retune_seconds, now)
         current_change_wanted = (not within_deadband) and retune_due
         if not structural_changed and not current_change_wanted:
             return []

@@ -41,7 +41,6 @@ START_SOC = 50.0        # % at 00:00 (neutral start; the day is long enough to w
 NOMINAL_V = 51.0        # LV battery pack voltage, for A -> kW
 MAX_CURRENT_A = 70.0    # configured safety ceiling
 RATE_KWH = MAX_CURRENT_A * NOMINAL_V / 1000.0   # ~3.57 kWh per hour charge/discharge
-TRICKLE_KWH = 10.0 * NOMINAL_V / 1000.0          # sell-at-peak trickle (~0.5)
 
 # EDS tariff structure (kr/kWh) — replicates horizon.build_price_slots so the planner
 # sees the same total import price it would live. Hourly grid tariff + flat additions.
@@ -89,7 +88,12 @@ def step_with_plan(plan, pv_kwh, load_kwh, soc_kwh, floor_kwh):
     dis_blocked = (plan.desired_discharge_current_a == 0.0)
 
     if plan.desired_grid_charge:  # GRID_CHARGE or negative-price absorb
-        charge = clamp(max_kwh - soc_kwh, 0.0, RATE_KWH)
+        # Honor the plan's charge TARGET (TOU capacity register): the DP sizes
+        # each charge hour; the inverter stops there instead of filling blind.
+        target_kwh = max_kwh
+        if plan.charge_target_soc_pct is not None:
+            target_kwh = min(max_kwh, plan.charge_target_soc_pct / 100.0 * CAPACITY_KWH)
+        charge = clamp(target_kwh - soc_kwh, 0.0, RATE_KWH)
         soc_kwh += charge
         net = load_kwh + charge - pv_kwh
         if net >= 0:
@@ -108,8 +112,11 @@ def step_with_plan(plan, pv_kwh, load_kwh, soc_kwh, floor_kwh):
             soc_kwh -= dis
             grid_imp = deficit - dis
     elif strat == "SELL_SOLAR_PEAK":
+        # Sell-safe reality (v0.23.0, Deye trickle+sell quirk): selling runs the
+        # FULL charge rate, and "Load first" fills the battery BEFORE export — the
+        # old trickle-while-selling is physically impossible on this firmware.
         if surplus >= 0:
-            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, TRICKLE_KWH)
+            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, RATE_KWH)
             soc_kwh += charge
             grid_exp = surplus - charge  # sell the rest
         else:
@@ -205,16 +212,12 @@ def run_wattson_planned(day, spot, sell, pv, load):
                 capacity_kwh=CAPACITY_KWH, load_hourly_w=load_hourly)
             floor_kwh = MIN_SOC / 100.0 * CAPACITY_KWH
         else:
-            # Hourly approximation of the live one-flip-per-slot sell correction.
-            sell_live = None
-            if slot.sell and (load[h] - pv[h]) > 0.5:
-                sell_live = False
-            elif not slot.sell and (pv[h] - load[h]) > 0.5 and slot.intent == "SELF_CONSUME":
-                sell_live = True
+            # The live deficit demotion (sell slot in a sustained house deficit ->
+            # self-consume) now lives inside execute_slot itself.
             plan, _ = planner.execute_slot(
                 slot, st, battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
                 allow_grid_charge=True, allow_negative_export=False,
-                export_limit_default_w=6000.0, sell_live=sell_live)
+                export_limit_default_w=6000.0)
             floor_kwh = max(MIN_SOC, slot.tou_floor_pct) / 100.0 * CAPACITY_KWH
         soc_kwh, gi, ge, d = step_with_plan(plan, pv[h], load[h], soc_kwh, floor_kwh)
         c = gi * total_import(spot[h], h) - ge * (sell[h] if sell else spot[h])
@@ -254,8 +257,14 @@ def run_dumb_battery(spot, sell, pv, load):
     return cost
 
 
-def run_oracle(spot, sell, pv, load):
-    """Perfect-foresight optimal battery dispatch via DP over discretised SOC."""
+def run_oracle(spot, sell, pv, load, *, no_battery_export: bool = False):
+    """Perfect-foresight optimal battery dispatch via DP over discretised SOC.
+
+    ``no_battery_export=True`` adds Wattson's hard rule (the battery never
+    exports to the grid: discharge is capped at the house deficit) — that
+    variant is the HONEST headroom ceiling for this installation; the
+    unconstrained oracle additionally monetises battery->grid arbitrage the
+    user has explicitly excluded (10 kWh pack)."""
     step = 0.5
     levels = [round(i * step, 3) for i in range(int(CAPACITY_KWH / step) + 1)]
     lo = MIN_SOC / 100.0 * CAPACITY_KWH
@@ -266,6 +275,7 @@ def run_oracle(spot, sell, pv, load):
     dp = {s: 0.0 for s in usable}
     for h in range(23, -1, -1):
         imp_p, exp_p = total_import(spot[h], h), (sell[h] if sell else spot[h])
+        deficit = max(0.0, load[h] - pv[h])
         ndp = {}
         for s in usable:
             best = INF
@@ -273,6 +283,8 @@ def run_oracle(spot, sell, pv, load):
                 d = s2 - s  # battery delta (+charge/-discharge)
                 if d > RATE_KWH + 1e-9 or d < -RATE_KWH - 1e-9:
                     continue
+                if no_battery_export and d < 0 and -d > deficit + 1e-9:
+                    continue  # discharge beyond the house deficit = battery export
                 net = load[h] - pv[h] + d
                 if net >= 0:
                     c = net * imp_p
@@ -302,6 +314,7 @@ def evaluate(path):
     nb = run_no_battery(spot, sell, pv, load)
     dumb = run_dumb_battery(spot, sell, pv, load)
     orac = run_oracle(spot, sell, pv, load)
+    orac_h = run_oracle(spot, sell, pv, load, no_battery_export=True)  # honest ceiling
 
     pv_tot, load_tot = sum(pv), sum(load)
     imp_prices = [total_import(spot[h], h) for h in range(24)]
@@ -330,16 +343,17 @@ def evaluate(path):
     print(f"    WATTSON reaktiv (med reserve)    : {w_cost:+7.2f}")
     print(f"    WATTSON PLAN-MOTOR (Fase A)      : {w_plan:+7.2f}   [vs reaktiv {w_cost - w_plan:+.2f} kr]")
     print(f"    Orakel (perfekt foresight, optimal): {orac:+7.2f}")
+    print(f"    Orakel UDEN batteri-eksport (ærligt loft): {orac_h:+7.2f}")
     nb_save = nb - w_plan
-    orac_save = nb - orac
+    orac_save = nb - orac_h
     eff = (nb_save / orac_save * 100) if abs(orac_save) > 1e-6 else 100.0
     print(f"  PLAN-MOTOR sparer vs intet batteri: {nb_save:+.2f} kr")
     print(f"  Plan-motor vs dumt batteri        : {dumb - w_plan:+.2f} kr")
-    print(f"  Orakel-loft (vs intet batteri)    : {orac_save:+.2f} kr")
-    print(f"  Plan-motor-effektivitet vs orakel : {eff:.0f}%  (headroom {w_plan - orac:+.2f} kr)")
+    print(f"  Ærligt orakel-loft (vs intet batteri): {orac_save:+.2f} kr")
+    print(f"  Plan-motor-effektivitet vs ærligt orakel : {eff:.0f}%  (headroom {w_plan - orac_h:+.2f} kr)")
     return {"season": day["season"], "date": day["date"], "real": day.get("real", False),
-            "nb": nb, "dumb": dumb, "wattson": w_plan, "w_old": w_cost, "oracle": orac,
-            "nb_save": nb_save, "eff": eff, "headroom": w_plan - orac}
+            "nb": nb, "dumb": dumb, "wattson": w_plan, "w_old": w_cost, "oracle": orac_h,
+            "nb_save": nb_save, "eff": eff, "headroom": w_plan - orac_h}
 
 
 def main(paths):

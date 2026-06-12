@@ -15,7 +15,7 @@ rather than raising, so the reactive planner keeps working unchanged.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .models import PriceSlot, SolarSlot
@@ -126,7 +126,43 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
             )
         )
     slots.sort(key=lambda slot: slot.start)
-    return slots
+    return _extend_with_estimated_tomorrow(slots)
+
+
+def _extend_with_estimated_tomorrow(slots: list[PriceSlot]) -> list[PriceSlot]:
+    """Extend a today-only horizon with ESTIMATED tomorrow slots.
+
+    Day-ahead prices publish ~13:00, so until then the horizon ends at
+    midnight — evening/overnight decisions (reserve sizing, refill lookahead,
+    end-of-day battery valuation) were planning against a wall. DK1 day-to-day
+    price SHAPES are similar enough that today's price at the same hour is a
+    far better estimate than nothing, so copy today's shape 24 h forward,
+    flagged ``estimated=True``. Estimated slots are LOOKAHEAD ONLY — the
+    day-plan builder never commits grid-charge/absorb on them, and by the time
+    such an hour would execute, the real day-ahead price has replaced it.
+    """
+    if not slots:
+        return slots
+    by_start = {slot.start for slot in slots}
+    horizon_hours = (slots[-1].start - slots[0].start).total_seconds() / 3600.0
+    if horizon_hours >= 30:  # tomorrow already (mostly) present
+        return slots
+    estimated = []
+    for slot in slots:
+        shifted = slot.start + timedelta(hours=24)
+        if shifted in by_start:
+            continue
+        estimated.append(
+            PriceSlot(
+                start=shifted,
+                spot_price=slot.spot_price,
+                tariff=slot.tariff,
+                total_import_price=slot.total_import_price,
+                export_value=slot.export_value,
+                estimated=True,
+            )
+        )
+    return slots + estimated
 
 
 def _solar_slots_from(hass: Any, entity_id: str | None) -> list[SolarSlot]:

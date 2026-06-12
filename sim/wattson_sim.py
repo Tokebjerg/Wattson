@@ -312,17 +312,28 @@ def chk(fn, label):
 
 SCENARIOS = [
     # ----- Battery (mode=hybrid unless noted) -----
-    ("Cheap night price -> grid charge",
+    # These first scenarios run WITHOUT an hourly price horizon. The old flat-
+    # threshold legacy tree grid-charged / peak-labelled on the single current
+    # price; retired 2026-06-12 — without hourly prices no economic optimization
+    # is possible, so the fallback is safe self-consumption: NO grid charge on
+    # an unrankable price point, battery free to cover the house (registers,
+    # not labels, carry the guarantee).
+    ("Cheap CURRENT price, no horizon -> safe fallback: never grid-charge blind",
      entities(pv1=0, pv2=0, grid=800, soc=45, bat=0, buy=0.40, sell=0.30,
               ev_status="disconnected"),
      Settings(ev_mode=const.EV_MODE_SCHEDULED),
-     chk_battery("GRID_CHARGE")),
+     chk(lambda st, pl: pl.battery.desired_grid_charge is not True
+         and pl.battery.desired_solar_sell is not True,
+         "no-horizon fallback must not grid-charge or sell")),
 
-    ("Expensive peak price -> discharge to load",
+    ("Expensive CURRENT price, no horizon -> battery still free to cover the house",
      entities(pv1=0, pv2=0, grid=1500, soc=70, bat=300, buy=2.50, sell=0.30,
               ev_status="disconnected"),
      Settings(ev_mode=const.EV_MODE_SCHEDULED),
-     chk_battery("DISCHARGE_TO_LOAD")),
+     chk(lambda st, pl: pl.battery.desired_discharge_current_a != 0.0
+         and pl.battery.desired_grid_charge is not True
+         and pl.battery.desired_limit_control_mode == "Zero export to CT",
+         "discharge must not be blocked in the no-horizon fallback")),
 
     ("Cheap price but battery already full -> not grid charge (idle)",
      entities(grid=400, soc=100, buy=0.40, sell=0.30, ev_status="disconnected"),
@@ -342,11 +353,14 @@ SCENARIOS = [
      Settings(ev_mode=const.EV_MODE_SCHEDULED),
      chk_battery("BLOCK_NEGATIVE_EXPORT")),
 
-    ("Self-consumption mode, solar surplus -> self consumption",
+    ("Self-consumption mode, solar surplus, no horizon -> surplus charges the battery",
      entities(pv1=2500, pv2=1500, grid=-1500, soc=60, bat=-500,
               buy=1.00, sell=0.30, ev_status="disconnected"),
      Settings(battery_mode=const.BATTERY_MODE_SELF, ev_mode=const.EV_MODE_SCHEDULED),
-     chk_battery("SOLAR_SELF_CONSUMPTION")),
+     chk(lambda st, pl: pl.battery.desired_grid_charge is not True
+         and pl.battery.desired_solar_sell is not True
+         and pl.battery.desired_energy_priority == "Load first",
+         "fallback: surplus charges the battery (Load first), nothing sold below full")),
 
     ("Protect mode -> protect",
      entities(grid=500, soc=55, buy=1.00, sell=0.30, ev_status="disconnected"),
@@ -550,10 +564,22 @@ def test_horizon():
     dt_hass = FakeHass({"sensor.buy": buy_dt, "sensor.sell": 0.6, "sensor.solar": solar_dt})
     dt_price = horizon.build_price_slots(dt_hass, "sensor.buy", "sensor.sell")
     dt_solar = horizon.build_solar_slots(dt_hass, "sensor.solar")
+    dt_real = [s for s in dt_price if not s.estimated]
+    dt_est = [s for s in dt_price if s.estimated]
     checks.append((
         "datetime-typed hour parses (real-HA shape)",
-        len(dt_price) == 2 and abs(dt_price[0].total_import_price - (0.18 + 0.08 + 0.05)) < 1e-6,
-        f"got {len(dt_price)} slots",
+        len(dt_real) == 2 and abs(dt_real[0].total_import_price - (0.18 + 0.08 + 0.05)) < 1e-6,
+        f"got {len(dt_real)} real slots",
+    ))
+    # Until tomorrow's day-ahead prices publish (~13:00) the horizon is extended
+    # with today's shape, flagged estimated (lookahead only, never committed).
+    checks.append((
+        "thin horizon extends with ESTIMATED tomorrow shape (+24h copies)",
+        len(dt_est) == 2
+        and dt_est[0].start == dt_real[0].start + _td(hours=24)
+        and abs(dt_est[0].total_import_price - dt_real[0].total_import_price) < 1e-9
+        and all(s.estimated for s in dt_est),
+        f"got {len(dt_est)} estimated slots",
     ))
     checks.append(("datetime-typed period_start parses", len(dt_solar) == 1 and dt_solar[0].pv_estimate_kwh == 7.0, f"got {len(dt_solar)}"))
 
@@ -755,7 +781,11 @@ def test_a2_planning():
 
     # Legacy fallback intact when no horizon present.
     bp_legacy = plan_at(at(3), 50, [])
-    checks.append(("no horizon -> legacy flat-threshold still works (GRID_CHARGE)", bp_legacy.strategy == "GRID_CHARGE", bp_legacy.strategy))
+    # The flat-threshold legacy tree was retired 2026-06-12: without hourly prices
+    # the fallback is safe self-consumption — never grid-charge on a lone price.
+    checks.append(("no horizon -> safe fallback (no blind grid charge)",
+                   bp_legacy.strategy == "IDLE" and bp_legacy.desired_grid_charge is not True,
+                   f"{bp_legacy.strategy}/{bp_legacy.desired_grid_charge}"))
 
     return checks
 
@@ -1124,7 +1154,15 @@ def test_self_consumption_schedule():
 
     # Request 3: expensive sunny morning sells the surplus (sell-safe full rate;
     # Load first fills the pack alongside the export).
-    checks.append(("morning 8-10 above-avg sunny -> EXPORT (sell-safe)", all(sched[h].action == "EXPORT" for h in (8, 9, 10)), str([sched[h].action for h in (8, 9, 10)])))
+    # Sell-safe physics (v0.23/v0.24): "Load first" fills the pack BEFORE anything
+    # exports, so early sun hours label SOLAR_CHARGE until the pack saturates and
+    # the remainder sells — the old all-EXPORT expectation was the (impossible)
+    # trickle-while-selling fantasy. The invariant: morning sun is always USED
+    # (charged or sold, never curtailed/idled) and the unstorable part sells.
+    checks.append(("morning 8-10 sun absorbed then sold (pack fills before export)",
+                   all(sched[h].action in ("SOLAR_CHARGE", "EXPORT") for h in (8, 9, 10))
+                   and any(sched[h].action == "EXPORT" for h in (8, 9, 10)),
+                   str([sched[h].action for h in (8, 9, 10)])))
     # Request 4: never EXPORT at a negative price; charge the battery / curtail
     # instead. With the sell-safe rule the pack already bulk-filled during the
     # morning sell hours, so the negative midday may legitimately be all
@@ -1464,6 +1502,13 @@ def test_tou_management():
     checks.append(("TOU: hold/idle -> discharge floor (battery can always cover the house)", ss(idle, soc_pct=53, **kw) == (20.0, False), str(ss(idle, soc_pct=53, **kw))))
     gc = P(strategy="GRID_CHARGE", reason="", desired_grid_charge=True, desired_discharge_current_a=0.0)
     checks.append(("TOU: grid-charge -> max_soc + charge enabled", ss(gc, soc_pct=40, **kw) == (100.0, True), str(ss(gc, soc_pct=40, **kw))))
+    # Battery care: a plan carrying its own charge target (plain cheap-hour grid
+    # charge) caps the TOU capacity there; absorb/force-charge plans leave the
+    # target None and keep the full max (paid import / explicit user action).
+    care = P(strategy="GRID_CHARGE", reason="", desired_grid_charge=True,
+             desired_discharge_current_a=0.0, charge_target_soc_pct=95.0)
+    checks.append(("TOU: battery-care grid-charge targets the care SOC (95), not 100",
+                   ss(care, soc_pct=40, **kw) == (95.0, True), str(ss(care, soc_pct=40, **kw))))
     sell = P(strategy="SELL_SOLAR_PEAK", reason="", desired_discharge_current_a=0.0)
     checks.append(("TOU: sell-solar -> discharge floor (no drain via discharge=0)", ss(sell, soc_pct=90, **kw) == (20.0, False), str(ss(sell, soc_pct=90, **kw))))
     checks.append(("TOU: override charge -> max + enable", ss(P(strategy="OVERRIDE_CHARGE", reason=""), soc_pct=50, **kw) == (100.0, True), "oc"))
@@ -1726,7 +1771,10 @@ def test_mode_dwell():
     # exempt classification: covering the house + EV-solar + safety/override bypass the
     # dwell (never stranded in a sell mode on a sudden deficit); sell/charge/idle dwelled.
     checks.append(("DISCHARGE_TO_LOAD exempt (always cover house now)", planner.mode_dwell_exempt("DISCHARGE_TO_LOAD") is True, "discharge"))
-    checks.append(("EV_SOLAR_PRIORITY exempt (own 150s sticky)", planner.mode_dwell_exempt("EV_SOLAR_PRIORITY") is True, "ev"))
+    # 2026-06-12: EV_SOLAR_PRIORITY lost its dwell exemption — its battery-side
+    # register tuple flapped in step with the car's pause/resume cycle (June 10:
+    # 458 solar_sell flips/day). The 150s EV-side sticky hold remains.
+    checks.append(("EV_SOLAR_PRIORITY is dwell-limited (no register flapping with car cycle)", planner.mode_dwell_exempt("EV_SOLAR_PRIORITY") is False, "ev"))
     checks.append(("HOLD/PROTECT/BLOCK + overrides exempt", all(planner.mode_dwell_exempt(s) for s in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT", "OVERRIDE_CHARGE", "OVERRIDE_DISCHARGE", "OVERRIDE_HOLD")), "safety"))
     checks.append(("SELL_SOLAR_PEAK dwelled (rate-limit entering export)", planner.mode_dwell_exempt("SELL_SOLAR_PEAK") is False, "sell"))
     checks.append(("IDLE / SOLAR_SELF_CONSUMPTION / GRID_CHARGE dwelled", not any(planner.mode_dwell_exempt(s) for s in ("IDLE", "SOLAR_SELF_CONSUMPTION", "GRID_CHARGE")), "charge/idle"))
@@ -1915,7 +1963,8 @@ def test_solar_aware():
         safe_reasons=[], negative_price_active=False, load_hourly_w={h: 1900 for h in range(24)},
     )
     actions = {t.start.hour: t.action for t in cp.schedule}
-    checks.append(("first solar hour -> SOLAR_CHARGE (not grid)", actions.get(10) == "SOLAR_CHARGE", str(actions.get(10))))
+    checks.append(("first solar hour uses the sun (charge or sell), never grid",
+                   actions.get(10) in ("SOLAR_CHARGE", "EXPORT"), str(actions.get(10))))
     checks.append(("solar midday never grid-charges", all(actions.get(h) in ("SOLAR_CHARGE", "EXPORT") for h in range(10, 15)), str({h: actions.get(h) for h in range(10, 15)})))
 
     return checks
@@ -2290,20 +2339,17 @@ def test_plan_execution():
     checks.append(("SELL_SURPLUS (stale trickle in slot) -> SELL_SOLAR_PEAK at sell-safe charge, discharge blocked",
                    p.strategy == "SELL_SOLAR_PEAK" and p.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A and p.desired_discharge_current_a == 0.0,
                    f"{p.strategy}/{p.desired_max_charge_current_a}/{p.desired_discharge_current_a}"))
-    # Sustained deficit in a sell slot -> flip to Zero export: empirically the Deye
-    # does NOT discharge the battery to the house under "Selling first", so covering
-    # the house REQUIRES Zero export (and there is no surplus to curtail in deficit).
-    p, _ = run(ss, state(7, soc=50, pv=500.0, load=2500.0), sell_live=False)
-    checks.append(("deficit-flipped sell slot -> self-consume: discharge restored + Zero export (battery covers house)",
-                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Zero export to CT",
-                   f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
-    # v0.23.1: the SAME demotion now fires WITHOUT the coordinator passing
-    # sell_live (it is None in production). A committed sell slot that is live in a
-    # cloud deficit covers the house from a high battery instead of importing
+    # Sustained deficit in a sell slot demotes to self-consume INSIDE execute_slot
+    # (the vestigial coordinator sell_live param was removed 2026-06-12): there is
+    # no surplus to sell, so the battery covers the house instead of importing
     # (the June-11 18:07 bug: it stayed SELL_SOLAR_PEAK with discharge=0 and
     # imported ~900 W under a full battery).
+    p, _ = run(ss, state(7, soc=50, pv=500.0, load=2500.0))
+    checks.append(("deficit sell slot -> self-consume: discharge restored + Zero export (battery covers house)",
+                   p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None and p.desired_limit_control_mode == "Zero export to CT",
+                   f"{p.strategy}/{p.desired_discharge_current_a}/{p.desired_limit_control_mode}"))
     p, _ = run(ss, state(7, soc=80, pv=174.0, load=1634.0))
-    checks.append(("sell slot, live cloud deficit (sell_live=None) -> covers house from battery, not import",
+    checks.append(("sell slot, live cloud deficit -> covers house from battery, not import",
                    p.strategy == "DISCHARGE_TO_LOAD" and p.desired_discharge_current_a is None
                    and p.desired_limit_control_mode == "Zero export to CT" and p.desired_grid_charge is False,
                    f"{p.strategy}/{p.desired_discharge_current_a}"))
@@ -2313,14 +2359,17 @@ def test_plan_execution():
     checks.append(("sell slot in surplus still blocks battery discharge (sell solar only)",
                    p.strategy == "SELL_SOLAR_PEAK" and p.desired_discharge_current_a == 0.0,
                    f"{p.strategy}/{p.desired_discharge_current_a}"))
-    # The opposite flip: a no-sell slot with a big surplus the battery can't absorb
-    # turns solar_sell on instead of curtailing (mode stays constant).
-    sc_promote = models.SlotPlan(start=at(11), intent="SELF_CONSUME", sell=False, grid_charge=False,
-                                 tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=0.4)
-    p, _ = run(sc_promote, state(11, soc=95, pv=5000.0, load=600.0), sell_live=True)
-    checks.append(("surplus-flipped no-sell slot -> solar_sell on (anti-curtailment promotion)",
-                   p.desired_limit_control_mode == "Zero export to CT" and p.desired_solar_sell is True,
-                   f"{p.strategy}/{p.desired_limit_control_mode}"))
+    # Anti-curtailment at a full battery needs no live flip: day-plan SELF_CONSUME
+    # slots already carry sell=True whenever the export value is positive, so the
+    # sell switch is on BEFORE the battery fills (the old sell_live=True promotion
+    # path was production-dead and removed).
+    sc_full = models.SlotPlan(start=at(11), intent="SELF_CONSUME", sell=True, grid_charge=False,
+                              tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.15, export_value=0.4)
+    p, _ = run(sc_full, state(11, soc=100, pv=5000.0, load=600.0))
+    checks.append(("full battery + surplus in a sell-ok SELF_CONSUME slot -> solar_sell on (no curtailment)",
+                   p.desired_limit_control_mode == "Zero export to CT" and p.desired_solar_sell is True
+                   and p.desired_max_charge_current_a == planner.SELL_SAFE_CHARGE_A,
+                   f"{p.strategy}/{p.desired_solar_sell}/{p.desired_max_charge_current_a}"))
 
     gc = models.SlotPlan(start=at(3), intent="GRID_CHARGE", sell=False, grid_charge=True,
                          tou_floor_pct=20.0, charge_current_a=None, total_import_price=0.30, export_value=0.5)

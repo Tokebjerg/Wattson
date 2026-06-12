@@ -14,34 +14,57 @@ from .models import LoadProfile
 # Full confidence after this many days of observed data (SunMate ramps over ~3-4
 # weeks before it fully trusts its predictions).
 LEARNING_FULL_DAYS = 28
+# Recency half-life (days): yesterday counts twice as much as 10 days ago, so the
+# profile follows seasonal/habit shifts inside the 28-day window instead of
+# dragging a month-old average behind it.
+LEARNING_HALF_LIFE_DAYS = 10.0
 
 
-def build_load_profile(samples: Iterable[tuple[datetime, float | None]], *, full_days: int = LEARNING_FULL_DAYS) -> LoadProfile | None:
-    """Build an hour-of-day mean-load profile from (local_timestamp, mean_W) samples.
+def build_load_profile(
+    samples: Iterable[tuple[datetime, float | None]],
+    *,
+    full_days: int = LEARNING_FULL_DAYS,
+    half_life_days: float = LEARNING_HALF_LIFE_DAYS,
+) -> LoadProfile | None:
+    """Build an hour-of-day load profile from (local_timestamp, mean_W) samples.
 
     Produces a combined hour-of-day profile plus weekday/weekend splits (Sat/Sun
-    are weekend) so planning a given day can use the matching consumption pattern.
+    are weekend) so planning a given day can use the matching consumption
+    pattern. Samples are RECENCY-WEIGHTED with an exponential half-life so the
+    prediction adapts within the window (season transitions, new habits) —
+    ``half_life_days=0`` disables weighting (plain mean).
     """
-    buckets: dict[int, list[float]] = {}
-    weekday_buckets: dict[int, list[float]] = {}
-    weekend_buckets: dict[int, list[float]] = {}
+    buckets: dict[int, list[tuple[float, float]]] = {}
+    weekday_buckets: dict[int, list[tuple[float, float]]] = {}
+    weekend_buckets: dict[int, list[tuple[float, float]]] = {}
     days: set = set()
+    parsed: list[tuple[datetime, float]] = []
     for timestamp, value in samples:
         if value is None:
             continue
         try:
-            watts = float(value)
+            parsed.append((timestamp, float(value)))
         except (TypeError, ValueError):
             continue
-        buckets.setdefault(timestamp.hour, []).append(watts)
-        day_buckets = weekend_buckets if timestamp.weekday() >= 5 else weekday_buckets
-        day_buckets.setdefault(timestamp.hour, []).append(watts)
-        days.add(timestamp.date())
-    if not buckets:
+    if not parsed:
         return None
+    newest = max(ts for ts, _ in parsed)
+    for timestamp, watts in parsed:
+        age_days = max(0.0, (newest - timestamp).total_seconds() / 86400.0)
+        weight = 0.5 ** (age_days / half_life_days) if half_life_days > 0 else 1.0
+        buckets.setdefault(timestamp.hour, []).append((watts, weight))
+        day_buckets = weekend_buckets if timestamp.weekday() >= 5 else weekday_buckets
+        day_buckets.setdefault(timestamp.hour, []).append((watts, weight))
+        days.add(timestamp.date())
 
-    def _mean(b: dict[int, list[float]]) -> dict[int, float]:
-        return {hour: sum(values) / len(values) for hour, values in b.items()}
+    def _mean(b: dict[int, list[tuple[float, float]]]) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for hour, pairs in b.items():
+            total_w = sum(w for _, w in pairs)
+            if total_w <= 0:
+                continue
+            out[hour] = sum(v * w for v, w in pairs) / total_w
+        return out
 
     days_observed = len(days)
     confidence = min(1.0, days_observed / full_days) if full_days > 0 else 0.0

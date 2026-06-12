@@ -138,6 +138,15 @@ DEFAULT_BATTERY_CAPACITY_KWH = 10.0
 # CHARGES the battery before it is sold at a peak or handed to the EV. 0 = off.
 CONF_SOLAR_CHARGE_PRIORITY_SOC = "solar_charge_priority_soc"
 DEFAULT_SOLAR_CHARGE_PRIORITY_SOC = 50.0
+# Battery care: plain cheap-hour GRID charging stops at this SOC (LFP cells age
+# fastest held at 100 %); 100 = off. Paid negative-price absorption and explicit
+# force-charge still fill to max_soc, and SOLAR charging cannot be capped on this
+# firmware (see deye_contract.py).
+CONF_BATTERY_CARE_MAX_SOC = "battery_care_max_soc"
+DEFAULT_BATTERY_CARE_MAX_SOC = 95.0
+# Tunables promoted to options (2026-06-12): change without a deploy.
+CONF_EV_RETUNE_SECONDS = "ev_retune_seconds"          # EV offered-current re-tune cadence
+CONF_RESERVE_HOLD_MARGIN = "reserve_hold_margin"      # peak-reserve hold spread (kr/kWh)
 # Battery charge/discharge-current limits (A). 70 A is a HARD SAFETY CEILING for
 # this battery — the number entities cannot be set above it. Both default to the
 # ceiling. Discharge is a LIMIT (battery delivers only what the house needs, but
@@ -174,6 +183,15 @@ LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
 # Solcast forecast used in planning. Tightly clamped so a bad day can't distort
 # the plan, and neutral (1.0) until enough days are seen.
 CONF_SOLAR_BIAS_HISTORY = "solar_bias_history"      # persisted list of daily ratios
+# Intraday accumulation {date, actual_wh, forecast_wh}, persisted every ~15 min so
+# a restart doesn't throw the running day away (the factor sat at 1.0 for days
+# because near-daily restarts kept wiping the in-memory accumulators).
+CONF_SOLAR_BIAS_INTRADAY = "solar_bias_intraday"
+SOLAR_BIAS_PERSIST_SECONDS = 900
+# Manual overrides persisted {action, until_iso} so a mid-override restart
+# resumes it instead of silently dropping the user's explicit instruction.
+CONF_BATTERY_OVERRIDE_PERSIST = "battery_override_persist"
+CONF_EV_OVERRIDE_PERSIST = "ev_override_persist"
 SOLAR_BIAS_MIN_DAYS = 3            # days of history before the factor leaves 1.0
 SOLAR_BIAS_MAX_DAYS = 14           # rolling window of daily ratios kept
 SOLAR_BIAS_MIN_FACTOR = 0.7        # clamp: never trust the correction beyond ±30%

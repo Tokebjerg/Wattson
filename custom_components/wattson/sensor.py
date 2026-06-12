@@ -204,6 +204,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonSavingsSensor(coordinator, entry))
     entities.append(WattsonSavingsTotalSensor(coordinator, entry))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
+    entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -337,6 +338,64 @@ class WattsonCurtailedSolarSensor(CoordinatorEntity, RestoreSensor):
             "negative_price_kwh": round(neg, 2),
             "unintended_kwh": round(max(0.0, total - neg), 2),
             "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm.",
+        }
+
+
+class WattsonSavingsVsNoBatterySensor(CoordinatorEntity, RestoreSensor):
+    """The honest counterfactual: today's savings vs a NO-BATTERY baseline.
+
+    Unlike "Savings Today" (value delivered vs buying everything from the
+    grid), this isolates what the battery + plan actually EARN: the same house
+    and PV without a battery would import every deficit and export every
+    surplus — the difference to the metered reality is Wattson's contribution.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Savings vs No Battery Today"
+    _attr_icon = "mdi:battery-heart-variant"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_savings_vs_no_battery_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if dt_util.as_local(last_state.last_updated).date() != dt_util.now().date():
+            return
+        try:
+            self.coordinator.savings_vs_no_battery_today_kr = float(last_state.state)
+            self.coordinator.baseline_cost_today_kr = float(
+                last_state.attributes.get("baseline_cost_kr") or 0.0
+            )
+            self.coordinator.actual_cost_today_kr = float(
+                last_state.attributes.get("actual_cost_kr") or 0.0
+            )
+            self.coordinator._cf_day = dt_util.now().date()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.savings_vs_no_battery_today_kr, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "baseline_cost_kr": round(self.coordinator.baseline_cost_today_kr, 2),
+            "actual_cost_kr": round(self.coordinator.actual_cost_today_kr, 2),
+            "note": "Kontrafaktisk: hvad dagen ville have kostet UDEN batteri (underskud købt, overskud solgt) minus de faktiske net-flows. Isolerer batteriets+planens reelle bidrag.",
         }
 
 

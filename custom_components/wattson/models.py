@@ -124,6 +124,13 @@ class PriceSlot:
     tariff: float
     total_import_price: float
     export_value: float | None = None
+    # True for synthesized lookahead slots (tomorrow's day-ahead prices are
+    # published ~13:00; before that the horizon is extended with today's price
+    # SHAPE so evening/overnight planning isn't blind). Estimated slots inform
+    # lookahead (reserve, refill, ranking) but are never COMMITTED to
+    # grid-charge/absorb actions — by the time such an hour executes, the real
+    # day-ahead price has long replaced the estimate.
+    estimated: bool = False
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,13 @@ class BatteryPlan:
     # plus whether to grid-charge in them. None = leave TOU untouched.
     desired_tou_capacity_pct: float | None = None
     desired_tou_charge_enable: bool | None = None
+    # Battery care: an explicit charge TARGET for grid-charging plans (LFP ages
+    # fastest held at 100 %). None = charge to max_soc. Plain cheap-hour grid
+    # charging caps at the care SOC; paid negative-price absorption and explicit
+    # user force-charge keep the full max. (Solar charging cannot be capped on
+    # this firmware — see deye_contract.py: "Load first" fills the pack before
+    # any export, and a low charge register stalls the sell path.)
+    charge_target_soc_pct: float | None = None
 
 
 @dataclass(frozen=True)

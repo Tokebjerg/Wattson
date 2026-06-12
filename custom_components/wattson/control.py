@@ -104,10 +104,21 @@ class KlatremisController:
     def _action(self, entity_id: str, value: Any, degraded: bool) -> str:
         return f"{entity_id}={value}{' (UNVERIFIED)' if degraded else ''}"
 
+    def _blip(self, current) -> bool:
+        """True while the target entity is mid-blip (solarman reconnects drop the
+        Deye entities to unavailable for a few seconds several times a day). A
+        write issued into the blip cannot converge and would both miss the
+        hardware AND count toward the degraded/contention bookkeeping — so the
+        caller skips this tick and retries on the next one, when the entity is
+        back."""
+        return current is not None and str(current.state).lower() in ("unavailable", "unknown")
+
     async def _set_switch(self, entity_id: str | None, enabled: bool) -> list[str]:
         if not entity_id:
             return []
         current = self.hass.states.get(entity_id)
+        if self._blip(current):
+            return []
         target_state = "on" if enabled else "off"
         if current is not None and current.state == target_state:
             self._mark_converged(entity_id)
@@ -121,6 +132,8 @@ class KlatremisController:
         if not entity_id or option is None:
             return []
         current = self.hass.states.get(entity_id)
+        if self._blip(current):
+            return []
         if current is not None and current.state == option:
             self._mark_converged(entity_id)
             return []
@@ -132,6 +145,8 @@ class KlatremisController:
         if not entity_id or value is None:
             return []
         current = self.hass.states.get(entity_id)
+        if self._blip(current):
+            return []
         if current is not None:
             try:
                 if abs(float(current.state) - value) < 0.1:

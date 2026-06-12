@@ -92,24 +92,11 @@ NEGATIVE_IMPORT_ABSORB_THRESHOLD = 0.0
 # margin is the safety buffer against an over-optimistic forecast.
 SELL_REFILL_MARGIN = 1.2
 
-# Peak-solar-export (export-friendly profiles): in sunny hours priced above the
-# day's average, sell the surplus. TRICKLE_CHARGE_A survives only as the
-# "battery effectively closed as a sink" threshold for curtailment detection —
-# it must NEVER be written together with solar_sell=ON:
-#
-# Deye SUN-12K firmware quirk (verified live 2026-06-11 across three
-# independent windows — 16:00 slot, the 13:40 + 15:08 counter-windows, and
-# June 10's 2-minute register flapping): solar_sell=ON paired with a trickle
-# charge-current register stalls the whole PV/sell path. The MPPT parks the
-# strings (~390 V at 0.0 A), PV clamps to the house load or below, nothing
-# exports, and the house can even fall back to GRID import — while the same
-# registers with the charge current at the full rate export normally. So every
-# plan that turns solar_sell ON must also write at least SELL_SAFE_CHARGE_A.
-# "Save battery headroom for cheaper sun later" is expressed by WHEN the plan
-# sells, never by throttling the charge register while selling.
-TRICKLE_CHARGE_A = 10
-TRICKLE_CHARGE_KWH = 0.5
-SELL_SAFE_CHARGE_A = BATTERY_CHARGE_CURRENT_MAX
+# The trickle threshold + sell-safe charge floor live in the firmware contract
+# (deye_contract.py) together with the full empirical Deye model — read THAT
+# file before changing any register recipe. Re-exported here for compatibility
+# (sim + coordinator reference planner.SELL_SAFE_CHARGE_A / TRICKLE_CHARGE_A).
+from .deye_contract import SELL_SAFE_CHARGE_A, TRICKLE_CHARGE_A  # noqa: E402
 
 # Phase B: SunMate-style AI profiles as weight-sets over the shared planner.
 # Rød = ROI-max (aggressive arbitrage + selling, low reserve); Blå = conservative
@@ -309,7 +296,10 @@ def tou_setpoint(
     if plan.strategy in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
         return (None, None)
     if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
-        return (float(max_soc), True)
+        # Battery care: a plan may cap its own grid-charge target below max_soc
+        # (LFP calendar aging at 100 %); absorb/force-charge plans leave it None.
+        target = plan.charge_target_soc_pct if plan.charge_target_soc_pct is not None else max_soc
+        return (float(min(max_soc, target)), True)
     if plan.strategy == "OVERRIDE_DISCHARGE":
         return (float(min_soc), False)
     # Every other state covers the house down to the discharge floor.
@@ -323,11 +313,14 @@ def tou_setpoint(
 #     the battery must ALWAYS be free to cover a sudden deficit (never buy grid while
 #     stranded in a sell/charge mode). It is also the stable mode that naturally
 #     balances surplus<->deficit (Load first + Zero export) without toggling flags,
-#     so holding it is exactly what stops the hunt;
-#   - EV_SOLAR_PRIORITY has its own 150s sticky hold (EV_ACTIVE_HOLD_SECONDS), so the
-#     EV logic already self-damps; leave it untouched.
-# Everything else (SELL_SOLAR_PEAK, IDLE, SOLAR_SELF_CONSUMPTION, GRID_CHARGE) is
-# rate-limited: switching INTO one of these too soon after a change is held.
+#     so holding it is exactly what stops the hunt.
+# Everything else (SELL_SOLAR_PEAK, IDLE, SOLAR_SELF_CONSUMPTION, GRID_CHARGE,
+# EV_SOLAR_PRIORITY) is rate-limited: switching INTO one of these too soon after a
+# change is held. EV_SOLAR_PRIORITY lost its exemption 2026-06-12: its 150 s sticky
+# hold dampens the EV side, but the BATTERY-side register tuple still flapped in
+# step with the car's pause/resume cycle (June 10: 458 solar_sell flips in one
+# day). Diverting PV to the car may now arrive up to one dwell (~120 s) later —
+# an acceptable price for a calm inverter.
 DWELL_EXEMPT_STRATEGIES = frozenset({
     "HOLD",
     "PROTECT",
@@ -336,7 +329,6 @@ DWELL_EXEMPT_STRATEGIES = frozenset({
     "OVERRIDE_DISCHARGE",
     "OVERRIDE_HOLD",
     "DISCHARGE_TO_LOAD",
-    "EV_SOLAR_PRIORITY",
 })
 
 
@@ -408,6 +400,7 @@ def build_day_plan(
     solar_charge_priority_soc: float = 0.0,
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
+    battery_care_soc: float = 100.0,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -431,13 +424,14 @@ def build_day_plan(
         return None
     charge_rate = battery_rate_kwh(charge_current_a)
     discharge_rate = battery_rate_kwh(discharge_current_a)
-    tasks, _, _ = _build_schedule(
+    tasks, _, _ = build_schedule_optimal(
         state, profile, load_hourly_w,
         capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
         learned_reserve_pct=learned_reserve_pct,
         solar_charge_priority_soc=solar_charge_priority_soc,
         charge_rate_kwh=charge_rate,
         discharge_rate_kwh=discharge_rate,
+        battery_care_soc=battery_care_soc,
     )
     if not tasks:
         return None
@@ -461,9 +455,14 @@ def build_day_plan(
                 margin=RESERVE_HOLD_MARGIN, discharge_rate_kwh=discharge_rate,
             )
             floor = max(base_floor, min_soc + reserve)
-        if task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD:
+        # Estimated lookahead slots (today's price shape copied forward until the
+        # real day-ahead prices publish ~13:00) inform ranking/reserve maths but
+        # are never COMMITTED to buying decisions — if EDS stays down so long
+        # that one would execute, self-consume is the only honest action.
+        est = bool(price_slot.estimated) if price_slot else False
+        if task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD and not est:
             intent, sell, grid_charge, charge_a = "ABSORB_NEGATIVE", False, True, None
-        elif task.action == "GRID_CHARGE":
+        elif task.action == "GRID_CHARGE" and not est:
             intent, sell, grid_charge, charge_a = "GRID_CHARGE", False, True, None
         elif task.action == "LIMIT_EXPORT" or (task.action == "EXPORT" and not sell_ok):
             intent, sell, grid_charge, charge_a = "BLOCK_EXPORT", False, False, None
@@ -507,7 +506,7 @@ def execute_slot(
     allow_negative_export: bool,
     export_limit_default_w: float | None,
     learned_reserve_pct: float = 0.0,
-    sell_live: bool | None = None,
+    battery_care_soc: float = 100.0,
 ) -> tuple[BatteryPlan, bool]:
     """Translate the CURRENT plan slot into a BatteryPlan (same contract as
     build_battery_plan, so control/dwell/TOU layers are unchanged).
@@ -515,10 +514,8 @@ def execute_slot(
     The inverter tuple is constant within the slot; only the strategy LABEL follows
     the instantaneous deficit (labels don't write to hardware). Deviations allowed:
     degraded -> HOLD, live negative-export guard, grid-charge no longer possible ->
-    self-consume, and the coordinator's one-flip-per-slot sell correction
-    (``sell_live``): False when a sell slot turned out to be a sustained deficit
-    (the battery must discharge -> Zero export on this Deye), True when a no-sell
-    slot turned out to be a big surplus that would otherwise curtail.
+    self-consume, and a sell slot live in a sustained house deficit demotes to
+    self-consume (the battery must cover the house -> Zero export on this Deye).
     """
     profile = profile_for(battery_mode)
     window, negative_export_active = negative_export_flags(state)
@@ -547,13 +544,13 @@ def execute_slot(
         # means there is nothing to export, so the no-battery-export rule holds).
         # DISCHARGE_TO_LOAD is dwell-exempt (covers the house at once); reverting to
         # the sell mode is dwell-rate-limited, so a passing cloud can't flap the
-        # registers. The legacy coordinator sell_live=False path folds in here too.
+        # registers.
         sell_floor = max(min_soc + max(profile.reserve_soc_offset, learned_reserve_pct), slot.tou_floor_pct)
         live_deficit = (
             state.battery_soc_pct > sell_floor
             and (state.load_power_w - state.pv_power_w) > DISCHARGE_DEADBAND_W
         )
-        if sell_live is False or live_deficit:
+        if live_deficit:
             intent = "SELF_CONSUME"
     # Live negative-export guard beats a stale plan (prices are hourly; cheap check).
     if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE",):
@@ -585,6 +582,13 @@ def execute_slot(
         )
 
     if intent == "GRID_CHARGE":
+        # Charge to the PLAN's target for this hour, not blindly to full: the DP
+        # sizes each charge hour (e.g. +1 kWh at 02:00 to bridge the morning),
+        # and the TOU capacity register stops the inverter exactly there —
+        # overshooting both wastes money (charging dearer than needed) and
+        # displaces tomorrow's free sun. Capped by battery care (LFP at 100 %);
+        # paid negative-price absorption keeps the full max via ABSORB above.
+        plan_target = slot.projected_soc_pct if slot.projected_soc_pct is not None else battery_care_soc
         return (
             BatteryPlan(
                 strategy="GRID_CHARGE",
@@ -595,6 +599,7 @@ def execute_slot(
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
                 desired_discharge_current_a=0.0,
+                charge_target_soc_pct=min(float(battery_care_soc), max(float(plan_target), min_soc)),
             ),
             negative_export_active,
         )
@@ -648,7 +653,7 @@ def execute_slot(
         label, why = "SOLAR_SELF_CONSUMPTION", "charging the battery from the solar surplus"
     else:
         label, why = "IDLE", "no strong battery action required right now"
-    sell = bool(slot.sell if sell_live is None else sell_live) or demoted_sell
+    sell = bool(slot.sell) or demoted_sell
     return (
         BatteryPlan(
             strategy=label,
@@ -705,6 +710,7 @@ def _horizon_battery_plan(
     load_hourly_w: dict[int, float] | None = None,
     solar_charge_priority_soc: float = 0.0,
     peak_reserve: float = 0.0,
+    battery_care_soc: float = 100.0,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -861,6 +867,7 @@ def _horizon_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_discharge_current_a=0.0,
+            charge_target_soc_pct=battery_care_soc,
         )
 
     if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
@@ -1033,6 +1040,343 @@ def _build_schedule(
     return tasks, next_cheap, next_expensive
 
 
+# --------------------------------------------------------------------------- #
+# DP day-optimizer (#1, 2026-06-12): replaces the greedy schedule heuristics
+# with a firmware-true dynamic program over the horizon. The seasonal backtest
+# put the heuristics 9.6-13.9 kr/day from the (no-battery-export) oracle on the
+# real spring/summer days; the DP closes what is actually closable, because it
+# only optimizes what THIS hardware can control:
+#   * the battery ALWAYS absorbs PV surplus up to rate/headroom ("Load first"
+#     fills the pack before any export, and the sell-safe rule forbids
+#     throttling the charge register — see deye_contract.py), so PV-charging
+#     is FORCED, never a decision;
+#   * sellable leftover beyond the forced charge exports at any positive
+#     price (curtailing it is pure waste) — profiles only color the LABEL;
+#   * the real decisions: WHEN/how much to grid-charge (margin-penalized so
+#     arbitrage must beat profile.profit_margin + wear), and how much deficit
+#     to cover from the pack vs import (the reserve emerges from prices
+#     instead of a hand-tuned margin).
+# Discretized SOC (0.25 kWh buckets); leftover horizon value = the cheapest
+# remaining import price (replacement cost). Falls back to the heuristic
+# _build_schedule on any error, and results are memoized per input fingerprint
+# (the coordinator rebuilds the schedule every ~10 s tick).
+# --------------------------------------------------------------------------- #
+_DP_CACHE: dict = {}
+_DP_EPS = 0.05
+# The DP must beat the heuristic by THIS much (judged kr/day) to win the day —
+# judged sub-kr edges are inside plan-vs-execution noise.
+DP_JUDGE_MARGIN_KR = 1.0
+
+
+def dp_schedule(
+    state: SiteState,
+    profile: ProfileWeights,
+    load_hourly_w: dict[int, float] | None = None,
+    *,
+    capacity_kwh: float = 10.0,
+    min_soc: float = 15.0,
+    max_soc: float = 100.0,
+    learned_reserve_pct: float = 0.0,
+    solar_charge_priority_soc: float = 0.0,
+    charge_rate_kwh: float | None = None,
+    discharge_rate_kwh: float | None = None,
+    battery_care_soc: float = 100.0,
+) -> tuple[list[PlanTask], str | None, str | None]:
+    """DP-optimal forward schedule (same contract as ``_build_schedule``)."""
+    view = _horizon_view(state, profile)
+    if view is None:
+        return [], None, None
+    solar_by_start = {slot.start: slot for slot in state.solar_slots}
+    load_hourly_w = load_hourly_w or {}
+
+    capacity_kwh = max(0.1, capacity_kwh)
+    floor_pct = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
+    rate = charge_rate_kwh if charge_rate_kwh is not None else SCHEDULE_CHARGE_RATE_KWH
+    dis_rate = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
+    slots = view.slots[:SCHEDULE_MAX_HOURS]
+    hours = []
+    for slot in slots:
+        pv = solar_by_start.get(slot.start)
+        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
+        load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
+        hours.append((slot, solar_kwh, load_kwh, pv is not None))
+
+    step = capacity_kwh / 40.0
+    max_kwh = max_soc / 100.0 * capacity_kwh
+    floor_kwh = min(max_kwh, floor_pct / 100.0 * capacity_kwh)
+    care_kwh = min(max_kwh, battery_care_soc / 100.0 * capacity_kwh)
+    soc0 = max(0.0, min(max_soc, state.battery_soc_pct)) / 100.0 * capacity_kwh
+
+    fp = (
+        profile.name, round(soc0 / step), round(capacity_kwh, 2), round(max_kwh, 2),
+        round(floor_kwh, 2), round(care_kwh, 2), round(rate, 2), round(dis_rate, 2),
+        tuple(
+            (s.start.isoformat(), round(s.total_import_price, 4),
+             round(s.export_value, 4) if s.export_value is not None else None,
+             s.estimated, round(sk, 2), round(lk, 2))
+            for (s, sk, lk, _hp) in hours
+        ),
+    )
+    cached = _DP_CACHE.get(fp)
+    if cached is not None:
+        return cached
+
+    n_levels = int(round(max_kwh / step)) + 1
+    levels = [i * step for i in range(n_levels)]
+    wear = BATTERY_WEAR_COST
+    margin = profile.profit_margin
+    end_value = max(0.0, min(s.total_import_price for s, _sk, _lk, _hp in hours))
+    # The v0.7.3 free-sun rule, DP edition: don't BUY grid charge that the
+    # forecast sun before the next expensive window would deliver for free —
+    # night-charging into a sunny day displaces free storage 1:1 and forces the
+    # midday surplus out at the (low) export price. Computed per hour: forecast
+    # surplus between this hour and the first expensive slot.
+    sun_before_peak = [0.0] * len(hours)
+    running = 0.0
+    for t in range(len(hours) - 1, -1, -1):
+        slot_t, sk, lk, _hp = hours[t]
+        if slot_t.start in view.expensive_starts:
+            running = 0.0
+        sun_before_peak[t] = running
+        running += max(0.0, sk - lk)
+
+    INF = float("inf")
+    # value[s_idx] = min cost from hour t..end starting at SOC level s
+    value = [-(max(0.0, lv - floor_kwh)) * end_value for lv in levels]
+    choice: list[list[int]] = []
+    for t in range(len(hours) - 1, -1, -1):
+        slot, solar_kwh, load_kwh, _hp = hours[t]
+        imp_p = slot.total_import_price
+        exp_p = max(0.0, slot.export_value or 0.0)
+        sellable = (slot.export_value is None) or (slot.export_value > 0)
+        house_from_pv = min(solar_kwh, load_kwh)
+        deficit = max(0.0, load_kwh - solar_kwh)
+        surplus = max(0.0, solar_kwh - load_kwh)
+        nvalue = [INF] * n_levels
+        nchoice = [0] * n_levels
+        for si, s in enumerate(levels):
+            # FORCED PV charge: Load first absorbs the surplus before anything
+            # exports, capped by rate and headroom — not a decision on this
+            # firmware.
+            pv_charge = min(surplus, rate, max(0.0, max_kwh - s))
+            leftover = surplus - pv_charge
+            export = leftover if (sellable and exp_p >= 0.0) else 0.0
+            base_revenue = export * exp_p
+            best = INF
+            best_j = si
+            if deficit > 0:
+                # Deficit hour: choose discharge in [0 .. min(deficit, rate, s-floor)]
+                # or grid-charge upward. (No surplus -> no PV charge.)
+                max_dis = min(deficit, dis_rate, max(0.0, s - floor_kwh))
+                for j, s2 in enumerate(levels):
+                    d = s2 - s
+                    if d > 0:  # grid charge
+                        if d > rate + 1e-9:
+                            continue
+                        if s2 > care_kwh + 1e-9 and imp_p >= 0:
+                            continue  # battery care: plain grid charge stops at care SOC
+                        if imp_p >= 0 and sun_before_peak[t] >= (max_kwh - s) - 1e-9:
+                            continue  # free sun will fill the pack before the peak
+                        cost = (deficit + d) * imp_p + d * margin
+                    else:
+                        dis = -d
+                        if dis > max_dis + 1e-9:
+                            continue
+                        cost = (deficit - dis) * imp_p + dis * wear
+                    tot = cost + value[j]
+                    if tot < best:
+                        best, best_j = tot, j
+            else:
+                # Surplus/balanced hour: PV charge is forced; EXTRA grid charge on
+                # top ONLY at a negative import price (paid absorption). Never buy
+                # grid while the sun covers the house — a hard product principle
+                # (v0.7.3): grid-charging in sunny hours both confused the user
+                # and competes with free sun.
+                s_after = s + pv_charge
+                for j, s2 in enumerate(levels):
+                    d2 = s2 - s_after
+                    if d2 < -1e-9:
+                        continue  # cannot discharge against a surplus (no battery export)
+                    if d2 > 1e-9 and imp_p >= 0:
+                        continue  # grid top-up in a sun hour only when PAID to import
+                    if pv_charge + d2 > rate + 1e-9:
+                        continue
+                    cost = d2 * imp_p + d2 * margin - base_revenue
+                    tot = cost + value[j]
+                    if tot < best:
+                        best, best_j = tot, j
+            nvalue[si] = best
+            nchoice[si] = best_j
+        value = nvalue
+        choice.append(nchoice)
+    choice.reverse()
+
+    # Walk the optimal path from soc0 and emit PlanTasks.
+    tasks: list[PlanTask] = []
+    next_cheap: str | None = None
+    next_expensive: str | None = None
+    si = min(range(n_levels), key=lambda i: abs(levels[i] - soc0))
+    for t, (slot, solar_kwh, load_kwh, has_pv) in enumerate(hours):
+        s = levels[si]
+        sj = choice[t][si]
+        s2 = levels[sj]
+        deficit = max(0.0, load_kwh - solar_kwh)
+        surplus = max(0.0, solar_kwh - load_kwh)
+        sellable = (slot.export_value is None) or (slot.export_value > 0)
+        pv_charge = min(surplus, rate, max(0.0, max_kwh - s))
+        if deficit > 0:
+            d = s2 - s
+            grid_part = max(0.0, d)
+            dis = max(0.0, -d)
+            leftover = 0.0
+        else:
+            s_after = s + pv_charge
+            grid_part = max(0.0, s2 - s_after)
+            dis = 0.0
+            leftover = surplus - pv_charge
+        export = leftover if sellable else 0.0
+        # Labels keep the profile personality (the registers barely differ):
+        # export-friendly profiles headline the sale; self-sufficiency (green)
+        # headlines the charge and only labels EXPORT once the pack started
+        # the hour full (the unstorable surplus still sells for everyone —
+        # curtailing at a positive price is pure waste).
+        if grid_part > _DP_EPS:
+            action = "GRID_CHARGE"
+        elif dis > _DP_EPS:
+            action = "DISCHARGE"
+        elif export > _DP_EPS and (profile.sell_solar_at_peak or s >= max_kwh - step):
+            action = "EXPORT"
+        elif pv_charge > _DP_EPS:
+            action = "SOLAR_CHARGE"
+        elif leftover > _DP_EPS and not sellable:
+            action = "LIMIT_EXPORT"
+        elif export > _DP_EPS:
+            action = "EXPORT"
+        else:
+            action = "IDLE"
+        tasks.append(
+            PlanTask(
+                start=slot.start,
+                action=action,
+                total_import_price=round(slot.total_import_price, 4),
+                pv_estimate_kwh=round(solar_kwh, 3) if has_pv else None,
+                load_estimate_kwh=round(load_kwh, 3) if load_kwh else None,
+                projected_soc_pct=round(s2 / capacity_kwh * 100.0),
+            )
+        )
+        if action == "GRID_CHARGE" and next_cheap is None:
+            next_cheap = slot.start.isoformat()
+        if action == "DISCHARGE" and next_expensive is None:
+            next_expensive = slot.start.isoformat()
+        si = sj
+
+    result = (tasks, next_cheap, next_expensive)
+    if len(_DP_CACHE) > 8:
+        _DP_CACHE.clear()
+    _DP_CACHE[fp] = result
+    return result
+
+
+def _schedule_expected_cost(
+    tasks: list[PlanTask],
+    state: SiteState,
+    *,
+    capacity_kwh: float,
+    floor_kwh: float,
+    max_kwh: float,
+    rate: float,
+    end_value: float,
+) -> float:
+    """Expected cost (kr) of a schedule under the shared flow model.
+
+    Reconstructs each hour's battery delta from the projected-SOC trajectory
+    and prices it with the SAME rules the DP optimizes under (forced PV
+    absorption, no battery export, sellable-leftover revenue, terminal
+    replacement value) — so two schedules become directly comparable."""
+    solar_by_start = {slot.start: slot for slot in state.solar_slots}
+    price_by_start = {slot.start: slot for slot in state.price_slots}
+    soc = max(0.0, min(100.0, state.battery_soc_pct)) / 100.0 * capacity_kwh
+    cost = 0.0
+    for task in tasks:
+        slot = price_by_start.get(task.start)
+        if slot is None or task.projected_soc_pct is None:
+            continue
+        pv = solar_by_start.get(task.start)
+        solar_kwh = pv.pv_estimate_kwh if pv else 0.0
+        load_kwh = task.load_estimate_kwh or 0.0
+        end = max(0.0, min(100.0, task.projected_soc_pct)) / 100.0 * capacity_kwh
+        d = end - soc
+        deficit = max(0.0, load_kwh - solar_kwh)
+        surplus = max(0.0, solar_kwh - load_kwh)
+        sellable = (slot.export_value is None) or (slot.export_value > 0)
+        exp_p = max(0.0, slot.export_value or 0.0)
+        if surplus > 0:
+            pv_charge = min(surplus, rate, max(0.0, max_kwh - soc))
+            grid_part = max(0.0, d - pv_charge)
+            leftover = max(0.0, surplus - max(0.0, min(d, pv_charge) if d > 0 else pv_charge))
+            cost += grid_part * slot.total_import_price
+            cost -= (leftover if sellable else 0.0) * exp_p
+        else:
+            if d >= 0:
+                cost += (deficit + d) * slot.total_import_price
+            else:
+                dis = min(-d, deficit)
+                cost += (deficit - dis) * slot.total_import_price + dis * BATTERY_WEAR_COST
+        soc = end
+    cost -= max(0.0, soc - floor_kwh) * end_value
+    return cost
+
+
+def build_schedule_optimal(
+    state: SiteState,
+    profile: ProfileWeights,
+    load_hourly_w: dict[int, float] | None = None,
+    **kwargs,
+):
+    """Self-judging schedule choice: build BOTH the DP-optimal and the
+    battle-tested heuristic schedule, price them under the SAME flow model, and
+    run the cheaper one. The DP wins where lookahead pays (it closed 9.6-13.9
+    kr/day of oracle headroom to 0.2-2.6 in the seasonal backtest); the
+    heuristic guards the DP's blind spots (one modelled autumn day priced the
+    DP's night-charge/sun-displacement trade wrong by ~5 kr) — and ANY
+    optimizer exception falls back to the heuristic, so the planner can never
+    be worse than the pre-DP baseline by its own model's judgment."""
+    h_kwargs = dict(kwargs)
+    h_kwargs.pop("battery_care_soc", None)
+    heuristic = _build_schedule(state, profile, load_hourly_w, **h_kwargs)
+    try:
+        dp = dp_schedule(state, profile, load_hourly_w, **kwargs)
+        if not dp[0]:
+            return heuristic
+        if not heuristic[0]:
+            return dp
+        capacity_kwh = max(0.1, kwargs.get("capacity_kwh", 10.0))
+        min_soc = kwargs.get("min_soc", 15.0)
+        max_soc = kwargs.get("max_soc", 100.0)
+        floor_pct = min_soc + max(profile.reserve_soc_offset, kwargs.get("learned_reserve_pct", 0.0))
+        max_kwh = max_soc / 100.0 * capacity_kwh
+        floor_kwh = min(max_kwh, floor_pct / 100.0 * capacity_kwh)
+        rate = kwargs.get("charge_rate_kwh") or SCHEDULE_CHARGE_RATE_KWH
+        prices = [s.total_import_price for s in state.price_slots] or [0.0]
+        end_value = max(0.0, min(prices))
+        cost_dp = _schedule_expected_cost(
+            dp[0], state, capacity_kwh=capacity_kwh, floor_kwh=floor_kwh,
+            max_kwh=max_kwh, rate=rate, end_value=end_value,
+        )
+        cost_h = _schedule_expected_cost(
+            heuristic[0], state, capacity_kwh=capacity_kwh, floor_kwh=floor_kwh,
+            max_kwh=max_kwh, rate=rate, end_value=end_value,
+        )
+        # Conservative bias: the judge prices PLANS, and plans execute with some
+        # drift — a sub-1-kr judged edge is inside that noise (the modelled
+        # autumn day: judged DP edge +0.34, executed −2.7). Only a CLEAR judged
+        # advantage hands the day to the optimizer (winter's was +7.4 and
+        # executed +3.6 better).
+        return dp if (cost_h - cost_dp) > DP_JUDGE_MARGIN_KR else heuristic
+    except Exception:  # noqa: BLE001 — never let the optimizer take the planner down
+        return heuristic
+
+
 def build_battery_plan(
     state: SiteState,
     *,
@@ -1049,6 +1393,7 @@ def build_battery_plan(
     load_hourly_w: dict[int, float] | None = None,
     solar_charge_priority_soc: float = 0.0,
     peak_reserve: float = 0.0,
+    battery_care_soc: float = 100.0,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -1138,6 +1483,7 @@ def build_battery_plan(
             load_hourly_w=load_hourly_w,
             solar_charge_priority_soc=solar_charge_priority_soc,
             peak_reserve=peak_reserve,
+            battery_care_soc=battery_care_soc,
         )
         # Anti-curtailment safety net: at a FULL battery with a positive export price
         # the solar_sell switch must be ON, whatever strategy fired — a full pack
@@ -1165,76 +1511,28 @@ def build_battery_plan(
             )
         return (hplan, False)
 
-    # Legacy fallback (no horizon): flat absolute thresholds, profile-shaped.
-    discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
-
-    if (
-        allow_grid_charge
-        and not profile.self_consumption_first
-        and state.current_buy_price is not None
-        and state.current_buy_price <= cheap_threshold
-        and state.battery_soc_pct < max_soc
-        and state.solar_surplus_w < SOLAR_CHARGE_BLOCK_W
-    ):
-        return (
-            BatteryPlan(
-                strategy="GRID_CHARGE",
-                reason=f"[{profile.name}] import price {state.current_buy_price:.3f} at or below cheap threshold",
-                desired_grid_charge=True,
-                desired_solar_sell=False,
-                desired_energy_priority="Load first",
-                desired_limit_control_mode="Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
-                desired_discharge_current_a=0.0,
-            ),
-            False,
-        )
-
-    if (
-        not profile.self_consumption_first
-        and state.current_buy_price is not None
-        and state.current_buy_price >= expensive_threshold
-        and state.battery_soc_pct > discharge_floor
-    ):
-        sell = profile.sell_at_peak and (state.current_sell_price or 0) > 0
-        return (
-            BatteryPlan(
-                strategy="DISCHARGE_TO_LOAD",
-                reason=f"[{profile.name}] import price {state.current_buy_price:.3f} at or above expensive threshold",
-                desired_grid_charge=False,
-                desired_solar_sell=sell,
-                desired_energy_priority="Load first",
-                desired_limit_control_mode="Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
-            ),
-            False,
-        )
-
-    if profile.self_consumption_first and state.solar_surplus_w > 150 and state.battery_soc_pct < max_soc:
-        return (
-            BatteryPlan(
-                strategy="SOLAR_SELF_CONSUMPTION",
-                reason=f"[{profile.name}] solar surplus available, prioritizing self-consumption",
-                desired_grid_charge=False,
-                desired_solar_sell=False,
-                desired_energy_priority="Load first",
-                desired_limit_control_mode="Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
-            ),
-            False,
-        )
-
+    # No price horizon (EDS down / misconfigured): a deliberately MINIMAL safe
+    # fallback. Without hourly prices no economic optimization is possible, so
+    # run plain self-consumption: PV -> house -> battery (Load first), battery
+    # covers deficits via the coordinator's default discharge limit, NO grid
+    # charging (the price is unknown), and sell only the unstorable surplus at a
+    # full battery (sell-safe charge rate; never at a known-worthless price).
+    # The old flat-threshold tree this replaces (retired 2026-06-12) could
+    # grid-charge or peak-sell on a single possibly-stale price point — in
+    # practice it almost never fired, because a missing horizon usually means
+    # missing prices entirely.
     known_worthless_export = state.current_sell_price is not None and state.current_sell_price <= 0
     sell_when_full = state.battery_soc_pct >= max_soc and not known_worthless_export
     return (
         BatteryPlan(
             strategy="IDLE",
-            reason="No strong battery action required right now",
+            reason="No price horizon — safe self-consumption fallback (no grid charge, no peak logic)",
             desired_grid_charge=False,
             desired_solar_sell=sell_when_full,
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=(float(SELL_SAFE_CHARGE_A) if sell_when_full else None),
             desired_discharge_current_a=(0.0 if sell_when_full else None),
         ),
         False,
@@ -1681,6 +1979,7 @@ def build_control_plan(
     solar_charge_priority_soc: float = 0.0,
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
+    battery_care_soc: float = 100.0,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -1688,12 +1987,13 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
-    schedule, next_cheap_window, next_expensive_window = _build_schedule(
+    schedule, next_cheap_window, next_expensive_window = build_schedule_optimal(
         state, profile_for(battery_mode), load_hourly_w,
         capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
         solar_charge_priority_soc=solar_charge_priority_soc,
         charge_rate_kwh=battery_rate_kwh(charge_current_a),
         discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
+        battery_care_soc=battery_care_soc,
     )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:
