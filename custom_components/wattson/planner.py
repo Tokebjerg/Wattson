@@ -1203,16 +1203,23 @@ def dp_schedule(
                 # grid while the sun covers the house — a hard product principle
                 # (v0.7.3): grid-charging in sunny hours both confused the user
                 # and competes with free sun.
+                # s_after is generally OFF the bucket grid (forced charge is a
+                # float), so transitions within half a bucket of it are pure
+                # DISCRETIZATION (cost 0) — requiring an exact grid match made
+                # every state whose forced charge landed off-grid INFEASIBLE,
+                # which silently forbade arriving at tomorrow's small-surplus
+                # morning below ~95 % (the 2026-06-12 overnight-hoarding bug).
                 s_after = s + pv_charge
                 for j, s2 in enumerate(levels):
                     d2 = s2 - s_after
-                    if d2 < -1e-9:
-                        continue  # cannot discharge against a surplus (no battery export)
-                    if d2 > 1e-9 and imp_p >= 0:
-                        continue  # grid top-up in a sun hour only when PAID to import
-                    if pv_charge + d2 > rate + 1e-9:
-                        continue
-                    cost = d2 * imp_p + d2 * margin - base_revenue
+                    if abs(d2) <= step / 2 + 1e-9:
+                        cost = -base_revenue  # nearest-bucket rounding, no action
+                    elif d2 > 0 and imp_p < 0:
+                        if pv_charge + d2 > rate + 1e-9:
+                            continue
+                        cost = d2 * imp_p + d2 * margin - base_revenue
+                    else:
+                        continue  # no discharge against a surplus; no paid top-up
                     tot = cost + value[j]
                     if tot < best:
                         best, best_j = tot, j
@@ -1243,6 +1250,8 @@ def dp_schedule(
         else:
             s_after = s + pv_charge
             grid_part = max(0.0, s2 - s_after)
+            if grid_part <= step / 2 + 1e-9:
+                grid_part = 0.0  # nearest-bucket rounding, not a real top-up
             dis = 0.0
             leftover = surplus - pv_charge
         export = leftover if sellable else 0.0

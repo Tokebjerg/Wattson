@@ -158,7 +158,14 @@ def _extend_with_estimated_tomorrow(slots: list[PriceSlot]) -> list[PriceSlot]:
                 spot_price=slot.spot_price,
                 tariff=slot.tariff,
                 total_import_price=slot.total_import_price,
-                export_value=slot.export_value,
+                # Export value deliberately UNKNOWN (None): an estimated slot may
+                # still sell (None = sellable, never curtail on missing data) but
+                # must never PROMISE revenue — today's morning export prices are a
+                # poor guess for tomorrow's, and a guessed 0.7 kr/kWh made the DP
+                # hoard the pack overnight "for tomorrow's exports" (2026-06-12).
+                # Import-side estimates stay: over-cautious reserve sizing is
+                # cheap; speculative hold-for-export is not.
+                export_value=None,
                 estimated=True,
             )
         )
