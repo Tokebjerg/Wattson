@@ -184,13 +184,49 @@ class KlatremisController:
         # Deye TOU management: keep all time-points identical to the plan's intent,
         # so the (unknown) active slot always carries Wattson's discharge floor /
         # charge target instead of a stale manual value that silently blocks it.
+        # BEST-EFFORT (2026-06-12): the inverter sometimes reverts TOU capacity
+        # writes outright (observed: every value but the panel-set one bounced
+        # back all night), and these registers are a belt on top of the real
+        # control (grid-charge switch + currents) — so failures here must NEVER
+        # count toward the degraded/contention bookkeeping. Before this, the
+        # nightly revert loop tripped a false "competing controller" back-off of
+        # ALL battery control every ~12 minutes.
         if plan.desired_tou_capacity_pct is not None:
             for entity_id in mapping.tou_capacity_numbers:
-                await do(entity_id, plan.desired_tou_capacity_pct, self._set_number(entity_id, plan.desired_tou_capacity_pct))
+                actions.extend(await self._set_number_best_effort(entity_id, plan.desired_tou_capacity_pct))
         if plan.desired_tou_charge_enable is not None:
             for entity_id in mapping.tou_charge_enable_switches:
-                await do(entity_id, plan.desired_tou_charge_enable, self._set_switch(entity_id, plan.desired_tou_charge_enable))
+                actions.extend(await self._set_switch_best_effort(entity_id, plan.desired_tou_charge_enable))
         return actions
+
+    async def _set_number_best_effort(self, entity_id: str | None, value: float | None) -> list[str]:
+        """Write a number without convergence/contention accounting (belt registers)."""
+        if not entity_id or value is None:
+            return []
+        current = self.hass.states.get(entity_id)
+        if self._blip(current):
+            return []
+        if current is not None:
+            try:
+                if abs(float(current.state) - value) < 0.1:
+                    return []
+            except (TypeError, ValueError):
+                pass
+        await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        return [f"{entity_id}={value} (best-effort)"]
+
+    async def _set_switch_best_effort(self, entity_id: str | None, enabled: bool) -> list[str]:
+        if not entity_id:
+            return []
+        current = self.hass.states.get(entity_id)
+        if self._blip(current):
+            return []
+        target_state = "on" if enabled else "off"
+        if current is not None and current.state == target_state:
+            return []
+        service = "turn_on" if enabled else "turn_off"
+        await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        return [f"{entity_id}={target_state} (best-effort)"]
 
 
 class EaseeController:
