@@ -21,6 +21,8 @@ Baseret på den fulde kode-gennemgang tidligere på dagen. Højdepunkter:
 
 Sim: **295/295** (alle forventninger der kodede pensioneret adfærd omskrevet til flow-garantier — fx "morgen-eksport" tester nu "sol absorberes-så-sælges", scenarier uden horisont tester register-garantier i stedet for labels). main `ebab652`.
 
+**v0.24.1 hotfix (samme formiddag, main `be47b26`):** fejlloggen afslørede at inverteren reverter TOU-capacity-skrivninger (hele natten 03:07–05:49, hvert ~12. min: 3 ukonvergerede skriv → degraded → falsk "competing controller" → batteristyring bakkede af). TOU-målene er rem-og-seler oven på den reelle styring (grid-charge-switch + strømme), så de er nu **best-effort**: skrives stadig, men tæller aldrig mod degraded/contention. Pre-eksisterende (v0.23.1-nat), ikke relateret til v0.24.0. Åbent spørgsmål: HVORFOR reverter inverteren capacity-skriv (38 ser ud til at være panel-sat) — undersøg om klatremis kræver et andet register/mode for TOU-capacity.
+
 ## Curtailment #3 — 2026-06-11 ~16:30 — v0.23.0 SELL-SAFE LADESTRØM (bruger-rapporteret 3/3: "solproduktionen bliver begrænset igen")
 
 Bruger (3. gang — og 3. gang med rette): PV begrænset trods positiv eksportpris. Snapshot 16:13: PV 575 W vs Solcast 5.792 W, batteri 100 %, grid −9 W, salgspris +0,42, sell=on, grænse=6000, Zero export to CT + Load first — **alle registre korrekte, alligevel død eksport**. PV1-streng 390 V / 0,0 A = MPPT parkeret (definitiv strubnings-signatur).
