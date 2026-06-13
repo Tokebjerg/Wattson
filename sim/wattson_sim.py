@@ -1117,8 +1117,17 @@ def test_f_savings():
     checks.append(("avoided import valued at import price", abs(v(2000, 500, 0, 2.0, 0.5, 1.0) - 3.0) < 1e-6, str(v(2000, 500, 0, 2.0, 0.5, 1.0))))
     # Export 800W for 1h @ 0.5 kr = 0.4 kr; no avoided import (import == load).
     checks.append(("export revenue counted", abs(v(1000, 1000, 800, 2.0, 0.5, 1.0) - 0.4) < 1e-6, str(v(1000, 1000, 800, 2.0, 0.5, 1.0))))
-    # Negative import price -> avoided import is not a saving.
-    checks.append(("negative import price -> no saving", v(2000, 0, 0, -0.5, 0.0, 1.0) == 0.0, str(v(2000, 0, 0, -0.5, 0.0, 1.0))))
+    # Negative import price: AVOIDING import is still not a saving (no import to
+    # be paid for, load covered by battery) -> 0.
+    checks.append(("negative price + no import -> no value (avoiding isn't a saving)", v(2000, 0, 0, -0.5, 0.0, 1.0) == 0.0, str(v(2000, 0, 0, -0.5, 0.0, 1.0))))
+    # Negative import price: IMPORTING (force-charge) EARNS money — you are paid
+    # to take it. 5 kW imported at -0.5 kr for 1 h = +2.5 kr (the user's missing
+    # negative-price income that left "Tjent/sparet" flat all morning).
+    checks.append(("negative price + import (force-charge) -> paid-to-import income",
+                   abs(v(800, 5000, 0, -0.5, -0.1, 1.0) - 2.5) < 1e-6, str(v(800, 5000, 0, -0.5, -0.1, 1.0))))
+    # The paid-import and avoided-import terms never double-count: positive price
+    # with import gets only the avoided term (none here, all imported) = 0 saving.
+    checks.append(("positive price + full import -> no paid-import term", v(800, 800, 0, 1.0, 0.5, 1.0) == 0.0, str(v(800, 800, 0, 1.0, 0.5, 1.0))))
     # Zero/!positive dt -> no value.
     checks.append(("zero dt -> no value", v(2000, 0, 0, 2.0, 0.5, 0.0) == 0.0, str(v(2000, 0, 0, 2.0, 0.5, 0.0))))
     # Combined avoided + export.

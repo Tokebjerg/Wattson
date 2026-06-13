@@ -130,18 +130,29 @@ def value_increment_kr(
     export_price: float | None,
     dt_hours: float,
 ) -> float:
-    """Phase F: value (DKK) delivered in one tick.
+    """Phase F: value (DKK) delivered in one tick — money that flowed in your
+    favour vs paying the full import price for all consumption:
 
-    = avoided grid import (house load supplied by solar/battery) valued at the
-    total import price + export revenue. Negative import prices count as zero
-    (self-consuming when grid is free/negative isn't a saving).
+    1. avoided grid import (house load supplied by solar/battery) × import price;
+    2. export revenue (export × export price);
+    3. paid-to-import income: at a NEGATIVE import price every imported kWh EARNS
+       money (you are paid to take it), so force-charging the battery/EV in those
+       hours is a real cash inflow.
+
+    Terms (1) and (3) never overlap: while importing at a negative price (3),
+    avoided import is ~0 and import price is clamped to 0 in (1); while
+    self-consuming at a positive price (1), -import_price is clamped to 0 in (3).
+    Negative-price self-consumption is intentionally NOT a saving (you'd rather
+    import and be paid) — hence the clamp in (1).
     """
     if dt_hours <= 0:
         return 0.0
+    imp = import_price or 0.0
     avoided_w = max(0.0, load_w - grid_import_w)
-    saved = avoided_w / 1000.0 * dt_hours * max(0.0, import_price or 0.0)
+    saved = avoided_w / 1000.0 * dt_hours * max(0.0, imp)
     earned = max(0.0, grid_export_w) / 1000.0 * dt_hours * max(0.0, export_price or 0.0)
-    return saved + earned
+    paid_import = max(0.0, grid_import_w) / 1000.0 * dt_hours * max(0.0, -imp)
+    return saved + earned + paid_import
 
 
 def _resolve_mode(mode: str) -> str:
