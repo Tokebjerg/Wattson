@@ -1872,6 +1872,65 @@ def build_ev_plan(
     )
 
 
+def ev_cheapest_charge_hours(
+    state: SiteState,
+    *,
+    ev_required_hours: int = 4,
+    ev_ready_hour: int = -1,
+    ev_target_soc: float = 0.0,
+    ev_charge_speed_pct_h: float = 15.0,
+) -> dict | None:
+    """Per-hour view of the scheduled-cheapest plan, for the dashboard.
+
+    Returns the SAME hour selection the live ``build_ev_plan`` makes (the N
+    cheapest import hours from now up to the 'ready by' deadline, where N is the
+    fixed required-hours or, with a car-SOC reading + target, the dynamic
+    ceil((target-soc)/speed)). Pure + side-effect-free; the sensor calls it each
+    update so the chart always matches what the car will actually do. None when
+    there is no horizon to plan over."""
+    if not state.price_slots:
+        return None
+    deadline = None
+    if ev_ready_hour is not None and 0 <= int(ev_ready_hour) <= 23:
+        deadline = state.timestamp.replace(hour=int(ev_ready_hour), minute=0, second=0, microsecond=0)
+        if deadline <= state.timestamp:
+            deadline += timedelta(days=1)
+    horizon = [
+        s for s in remaining_price_slots(state.price_slots, state.timestamp)
+        if deadline is None or s.start < deadline
+    ]
+    if not horizon:
+        return None
+    wanted = max(1, int(ev_required_hours))
+    car_soc = state.ev_soc_pct
+    note = f"{wanted} cheapest hours"
+    if car_soc is not None and ev_target_soc > 0:
+        if car_soc >= ev_target_soc:
+            wanted = 0
+            note = f"target {ev_target_soc:.0f}% reached"
+        else:
+            wanted = max(1, min(24, math.ceil(
+                (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+            )))
+            note = f"{wanted}h to reach {ev_target_soc:.0f}% (now {car_soc:.0f}%)"
+    cheapest = sorted(horizon, key=lambda s: s.total_import_price)[:wanted]
+    cheapest_starts = {s.start for s in cheapest}
+    return {
+        "deadline": deadline.isoformat() if deadline else None,
+        "wanted_hours": wanted,
+        "note": note,
+        "hours": [
+            {
+                "hour": s.start.isoformat(),
+                "price": round(s.total_import_price, 3),
+                "charge": s.start in cheapest_starts,
+                "estimated": bool(s.estimated),
+            }
+            for s in horizon
+        ],
+    }
+
+
 def build_override_battery_plan(
     action: str,
     *,

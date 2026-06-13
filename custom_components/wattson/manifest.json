@@ -1,7 +1,7 @@
 {
   "domain": "wattson",
   "name": "Wattson",
-  "version": "0.24.4",
+  "version": "0.24.5",
   "documentation": "https://github.com/emiltokebjerg/wattson",
   "issue_tracker": "https://github.com/emiltokebjerg/wattson/issues",
   "codeowners": ["@emiltokebjerg"],

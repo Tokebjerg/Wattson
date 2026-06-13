@@ -14,9 +14,19 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, NAME
+from .config import entry_value
+from .const import (
+    DOMAIN,
+    NAME,
+    CONF_EV_REQUIRED_HOURS,
+    DEFAULT_EV_REQUIRED_HOURS,
+    CONF_EV_CHARGE_SPEED_PCT_H,
+    DEFAULT_EV_CHARGE_SPEED_PCT_H,
+    EV_MODE_SCHEDULED_CHEAPEST,
+)
 from .learning import predicted_today_kwh
 from .models import ControlPlan, SiteState
+from .planner import ev_cheapest_charge_hours
 
 
 @dataclass(frozen=True)
@@ -205,6 +215,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonSavingsTotalSensor(coordinator, entry))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
+    entities.append(WattsonEvChargePlanSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -396,6 +407,61 @@ class WattsonSavingsVsNoBatterySensor(CoordinatorEntity, RestoreSensor):
             "baseline_cost_kr": round(self.coordinator.baseline_cost_today_kr, 2),
             "actual_cost_kr": round(self.coordinator.actual_cost_today_kr, 2),
             "note": "Kontrafaktisk: hvad dagen ville have kostet UDEN batteri (underskud købt, overskud solgt) minus de faktiske net-flows. Isolerer batteriets+planens reelle bidrag.",
+        }
+
+
+class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
+    """When the car is scheduled to charge in 'Planlagt billigste timer'.
+
+    State = number of charge hours still planned before the 'ready by' deadline;
+    the ``hours`` attribute lists every upcoming hour up to the deadline with its
+    import price and a charge flag, so a chart can show exactly when the car will
+    draw. Only meaningful in scheduled-cheapest mode (else state is 'n/a')."""
+
+    _attr_has_entity_name = True
+    _attr_name = "EV Charge Plan"
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_ev_charge_plan"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    def _plan(self) -> dict | None:
+        coord = self.coordinator
+        if coord.site_state is None or coord.ev_mode != EV_MODE_SCHEDULED_CHEAPEST:
+            return None
+        return ev_cheapest_charge_hours(
+            coord.site_state,
+            ev_required_hours=int(entry_value(self._entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
+            ev_ready_hour=coord.ev_ready_hour,
+            ev_target_soc=coord.ev_target_soc,
+            ev_charge_speed_pct_h=float(entry_value(self._entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
+        )
+
+    @property
+    def native_value(self) -> Any:
+        plan = self._plan()
+        if plan is None:
+            return "n/a"
+        return sum(1 for h in plan["hours"] if h["charge"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        plan = self._plan()
+        if plan is None:
+            return {"hours": [], "note": "Kun aktiv i 'Planlagt billigste timer'"}
+        return {
+            "deadline": plan["deadline"],
+            "wanted_hours": plan["wanted_hours"],
+            "note": plan["note"],
+            "hours": plan["hours"],
         }
 
 

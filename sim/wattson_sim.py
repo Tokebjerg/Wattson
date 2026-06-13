@@ -960,6 +960,24 @@ def test_c_smartcharge():
     )
     checks.append(("scheduled_cheapest falls back to window when no horizon", nohorizon.desired_action == "resume", nohorizon.reason))
 
+    # --- EV charge-plan overview (dashboard sensor) matches the live selection ---
+    overview = planner.ev_cheapest_charge_hours(
+        ev_state(at(0), slots=night), ev_required_hours=2, ev_ready_hour=6)
+    charge_hours = [h for h in overview["hours"] if h["charge"]]
+    # The two cheapest before the 06:00 deadline are 03:00 (0.10) and 02:00 (0.20).
+    charge_set = {h["hour"][11:13] for h in charge_hours}
+    checks.append(("ev_charge_plan: marks exactly the 2 cheapest hours before the deadline",
+                   len(charge_hours) == 2 and charge_set == {"02", "03"}, f"{charge_set}"))
+    checks.append(("ev_charge_plan: every horizon hour carries a price + charge flag",
+                   all("price" in h and "charge" in h for h in overview["hours"]) and overview["wanted_hours"] == 2,
+                   f"{len(overview['hours'])} hours"))
+    # Live plan and overview agree: the cheapest hour resumes AND is flagged charge.
+    checks.append(("ev_charge_plan agrees with build_ev_plan at the cheapest hour",
+                   sched(3).desired_action == "resume"
+                   and any(h["hour"][11:13] == "03" and h["charge"] for h in
+                           planner.ev_cheapest_charge_hours(ev_state(at(3), slots=night), ev_required_hours=2, ev_ready_hour=6)["hours"]),
+                   "agree"))
+
     # --- solar-only house-battery threshold ---
     below = planner.build_ev_plan(
         ev_state(at(12), soc=40, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
