@@ -1031,6 +1031,22 @@ def test_c_smartcharge():
     checks.append(("phase change suppressed within 15 min", any("suppressed" in x for x in a2), str(a2)))
     checks.append(("phase change allowed after 15 min", any("phase_mode" in x and "suppressed" not in x for x in a3), str(a3)))
 
+    # --- #4 phase-mode normalization: the charger reports "auto" but the planner
+    #     emits "auto_phase". They MUST canonicalize to the same value, else a
+    #     spurious phase write fires every cycle (auto != auto_phase). ---
+    nm = control.EaseeController._normalize_phase_mode
+    checks.append(("normalize: 'auto' canonicalizes to 'auto_phase'",
+                   nm("auto") == nm("auto_phase") == "auto_phase", f"{nm('auto')}/{nm('auto_phase')}"))
+    checks.append(("normalize: 1_phase stays distinct from auto",
+                   nm("single") == "1_phase" and nm("1_phase") != nm("auto"), f"{nm('single')}/{nm('auto')}"))
+    # End-to-end: planner wants auto_phase, charger already on "auto" -> NO write
+    # (the 15-min lock is irrelevant here; at(13) is well past the a3 change).
+    nw = asyncio.run(ec.apply_ev_plan(
+        mp, ev_state(at(13), phase="auto"),
+        models.EvPlan(mode="solar_only", reason="", desired_phase_mode="auto_phase")))
+    checks.append(("apply: desired auto_phase vs charger 'auto' issues no phase write",
+                   not any("phase_mode=" in x for x in nw), str(nw)))
+
     # --- custom scheduled window (built from start/end hours, e.g. "01:00-05:00") ---
     def scheduled(now_h, window):
         return planner.build_ev_plan(
@@ -1040,6 +1056,16 @@ def test_c_smartcharge():
 
     checks.append(("custom window 01-05: charges at 02:00", scheduled(2, "01:00-05:00").desired_action == "resume", scheduled(2, "01:00-05:00").reason))
     checks.append(("custom window 01-05: pauses at 06:00", scheduled(6, "01:00-05:00").desired_action == "pause", scheduled(6, "01:00-05:00").reason))
+
+    # --- #2 scheduled_periods: the in-window plan must offer the SAME max on every
+    #     phase (constant circuit currents) + auto_phase. Leaving circuit currents
+    #     unset lets a stale (8,0,0) from a prior solar slot survive, and
+    #     min(charger, circuit) then throttles the offer to 8 A. ---
+    sw = scheduled(2, "01:00-05:00")
+    checks.append(("scheduled_periods in-window sets full circuit currents on all phases",
+                   sw.desired_circuit_currents == (16, 16, 16), str(sw.desired_circuit_currents)))
+    checks.append(("scheduled_periods in-window requests auto_phase",
+                   sw.desired_phase_mode == "auto_phase", str(sw.desired_phase_mode)))
 
     # --- priority gate: threshold 0 (toggle off) charges regardless of house battery ---
     off = planner.build_ev_plan(
@@ -1464,6 +1490,59 @@ def test_phase_gaps():
     checks.append(("car-agnostic: solar_only identical with/without car SOC (never reads it)",
                    (p_s1.desired_action, p_s1.reason) == (p_s2.desired_action, p_s2.reason),
                    f"{p_s1.desired_action} vs {p_s2.desired_action}"))
+
+    # ---- "Lad til fuld" / charge-until-complete (scheduled_cheapest only) ---- #
+    # The escape hatch for the wrong-car-SOC problem: the Niro is the ONLY car
+    # with a SOC sensor, so when a different car is plugged in the sensor reads
+    # the parked Niro (e.g. 100%) and the target-SOC logic would refuse to charge
+    # the empty car. The toggle ignores the SOC and charges EVERY cheap hour up to
+    # the deadline; no-SOC + deadline auto-uses the same car-agnostic path.
+    def sched_full(now_h, soc=None, ready_hour=6, complete=False, target=80.0, hours=2):
+        st = ev_state(at(now_h))
+        if soc is not None:
+            st = replace_state(st, ev_soc_pct=soc)
+        return planner.build_ev_plan(
+            st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
+            ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=hours,
+            ev_ready_hour=ready_hour, solar_surplus_override=0.0,
+            ev_target_soc=target, ev_charge_speed_pct_h=15.0,
+            ev_charge_until_complete=complete)
+
+    # Toggle ON ignores a SATISFIED target (wrong-car escape hatch): car reads 82%
+    # >= target 80%, which would normally pause — but the toggle charges anyway.
+    p_esc_on = sched_full(0, soc=82.0, complete=True)
+    p_esc_off = sched_full(0, soc=82.0, complete=False)
+    checks.append(("charge-until-full: toggle ON ignores a satisfied car SOC and charges",
+                   p_esc_on.desired_action == "resume" and "charging until full" in p_esc_on.reason,
+                   f"{p_esc_on.desired_action}/{p_esc_on.reason[:55]}"))
+    checks.append(("charge-until-full: toggle OFF still honours target-reached (pause)",
+                   p_esc_off.desired_action == "pause" and "target 80% reached" in p_esc_off.reason,
+                   f"{p_esc_off.desired_action}/{p_esc_off.reason[:50]}"))
+    # Toggle charges an EXPENSIVE pre-deadline hour (0.50) that the fixed 2-cheapest
+    # plan would skip -> proves it allocates every horizon hour, not just N.
+    checks.append(("charge-until-full: toggle charges a costly hour the fixed plan skips",
+                   sched_full(0, soc=82.0, complete=True).desired_action == "resume"
+                   and sched_full(0, soc=None, complete=False, target=0.0).desired_action == "pause",
+                   "toggle resume / fixed pause"))
+    # No car SOC + deadline + target -> auto charge-until-full WITHOUT the toggle.
+    p_nosoc_full = sched_full(0, soc=None, complete=False, target=80.0)
+    checks.append(("charge-until-full: no car SOC + deadline auto-charges until full",
+                   p_nosoc_full.desired_action == "resume" and "no car SOC" in p_nosoc_full.reason,
+                   f"{p_nosoc_full.desired_action}/{p_nosoc_full.reason[:55]}"))
+    # Contrast: no SOC + NO target -> the fixed required-hours fallback (hour 0 pauses).
+    p_nosoc_fixed = sched_full(0, soc=None, complete=False, target=0.0)
+    checks.append(("charge-until-full: no SOC + no target -> fixed required-hours (costly hour pauses)",
+                   p_nosoc_fixed.desired_action == "pause", f"{p_nosoc_fixed.desired_action}/{p_nosoc_fixed.reason[:50]}"))
+    # Toggle works WITHOUT a deadline too: spans the whole remaining horizon.
+    p_full_nodl = sched_full(7, soc=None, complete=True, ready_hour=-1)
+    checks.append(("charge-until-full: toggle without deadline spans the full horizon",
+                   p_full_nodl.desired_action == "resume", f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:50]}"))
+    # The dashboard overview MUST mirror the live selection: every pre-deadline hour charges.
+    ov_full = planner.ev_cheapest_charge_hours(
+        ev_state(at(0)), ev_required_hours=2, ev_ready_hour=6, ev_target_soc=80.0, ev_charge_until_complete=True)
+    checks.append(("ev_charge_plan overview: charge-until-full marks EVERY pre-deadline hour",
+                   all(h["charge"] for h in ov_full["hours"]) and ov_full["wanted_hours"] == len(ov_full["hours"]),
+                   f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
     def sched_min(now_h, soc, min_soc=35.0, windows=""):

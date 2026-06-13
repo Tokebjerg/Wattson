@@ -22,6 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             WattsonBatteryControlSwitch(coordinator, entry),
             WattsonEVControlSwitch(coordinator, entry),
             WattsonEVSolarBatteryPrioritySwitch(coordinator, entry),
+            WattsonEvChargeUntilCompleteSwitch(coordinator, entry),
             WattsonMasterLockSwitch(coordinator, entry),
         ]
     )
@@ -128,6 +129,28 @@ class WattsonEVSolarBatteryPrioritySwitch(_BaseSwitch):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._coordinator.async_set_ev_solar_battery_priority(False)
+        self.async_write_ha_state()
+
+
+class WattsonEvChargeUntilCompleteSwitch(_BaseSwitch):
+    """Scheduled-cheapest escape hatch: ignore the (Niro-only) car SOC and charge
+    every cheap hour up to 'ready by' until the car itself stops. Use this when a
+    car without a SOC sensor is plugged in, or when the Niro SOC is stale because
+    a different car is on the charger."""
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "EV Charge Until Full", "ev_charge_until_complete", "mdi:battery-charging-100")
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coordinator.ev_charge_until_complete)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_ev_charge_until_complete(True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_ev_charge_until_complete(False)
         self.async_write_ha_state()
 
 

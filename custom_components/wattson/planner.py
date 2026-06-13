@@ -1607,6 +1607,7 @@ def build_ev_plan(
     ev_target_soc: float = 0.0,
     ev_charge_speed_pct_h: float = 15.0,
     ev_min_soc: float = 0.0,
+    ev_charge_until_complete: bool = False,
 ) -> EvPlan:
     if state.easee_status is None:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
@@ -1757,8 +1758,10 @@ def build_ev_plan(
         # Target-SOC charging (ev_smart_charging-inspired; THIS mode only — the
         # other modes are deliberately car-agnostic): with a car-SOC reading and a
         # target, the number of cheapest hours is DYNAMIC: ceil((target - soc) /
-        # charge speed %/h). At/above target -> stop. No SOC reading (any other
-        # car / sensor unavailable) -> the fixed ev_required_hours, as always.
+        # charge speed %/h). At/above target -> stop. No SOC reading -> "charge
+        # until full" up to the deadline (the car stops itself); see the wanted-
+        # hours block below. The explicit toggle forces "charge until full" even
+        # when a SOC reading exists (when it is for a different, non-connected car).
         car_soc = state.ev_soc_pct
         # Minimum-SOC floor: below it, charge NOW at max amps regardless of price
         # ("never stranded"). Checked before any price optimization.
@@ -1770,28 +1773,11 @@ def build_ev_plan(
                 desired_amps=int(ev_max_amps),
                 desired_action="resume",
             )
-        wanted_hours = max(1, int(ev_required_hours))
-        target_note = ""
-        if car_soc is not None and ev_target_soc > 0:
-            if car_soc >= ev_target_soc:
-                return EvPlan(
-                    mode=ev_mode,
-                    reason=f"Car at {car_soc:.0f}% — target {ev_target_soc:.0f}% reached",
-                    desired_enabled=False,
-                    desired_action="pause",
-                )
-            wanted_hours = max(1, min(24, math.ceil(
-                (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
-            )))
-            target_note = f" (car {car_soc:.0f}% -> {ev_target_soc:.0f}%)"
         # The scheduled start/end WINDOW deliberately does not apply here (it
         # belongs to scheduled_periods): cheapest-mode is governed by the optional
-        # "ready by" deadline alone — the optimizer picks the cheapest hours of
-        # the whole remaining horizon (or up to the deadline).
-        # "Klar-til-tid": when a ready-hour deadline is set, the car must be done
-        # by then, so pick the cheapest hours from now UP TO the deadline (the next
-        # occurrence of that hour) rather than across the whole window. Slots after
-        # the deadline are not eligible. With no deadline, keep the window behaviour.
+        # "ready by" deadline alone. Compute the deadline + horizon FIRST — both the
+        # cheapest-N selection and the car-agnostic "charge until full" allocation
+        # need them. Slots after the deadline are not eligible.
         deadline = None
         if ev_ready_hour is not None and 0 <= int(ev_ready_hour) <= 23:
             deadline = state.timestamp.replace(
@@ -1805,6 +1791,41 @@ def build_ev_plan(
             for slot in remaining_price_slots(state.price_slots, state.timestamp)
             if deadline is None or slot.start < deadline
         ]
+
+        # How many of the cheapest hours to charge:
+        #  - "Charge until full" (the toggle, OR no usable car SOC while a deadline
+        #    is set): allocate EVERY hour up to the deadline and let the CAR stop
+        #    itself when full. Car-AGNOSTIC — works for any EV and guarantees the
+        #    car is ready by the deadline. This is the right mode when the SOC
+        #    sensor is for a DIFFERENT car than the one plugged in.
+        #  - Car SOC + target available (and toggle off): the DYNAMIC cheapest
+        #    count ceil((target-soc)/speed) — cost-optimal, only as many cheap
+        #    hours as needed; at/above target -> stop.
+        #  - Otherwise (no SOC, no deadline): the fixed ev_required_hours.
+        wanted_hours = max(1, int(ev_required_hours))
+        target_note = ""
+        if ev_charge_until_complete and horizon_slots:
+            wanted_hours = len(horizon_slots)
+            target_note = " — charging until full"
+        elif car_soc is not None and ev_target_soc > 0:
+            if car_soc >= ev_target_soc:
+                return EvPlan(
+                    mode=ev_mode,
+                    reason=f"Car at {car_soc:.0f}% — target {ev_target_soc:.0f}% reached",
+                    desired_enabled=False,
+                    desired_action="pause",
+                )
+            wanted_hours = max(1, min(24, math.ceil(
+                (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+            )))
+            target_note = f" (car {car_soc:.0f}% -> {ev_target_soc:.0f}%)"
+        elif car_soc is None and ev_target_soc > 0 and deadline is not None and horizon_slots:
+            # A target was set but no car SOC is readable (non-Niro car / stale
+            # sensor): can't compute hours-to-target, so charge until full by the
+            # deadline rather than silently doing the fixed default.
+            wanted_hours = len(horizon_slots)
+            target_note = " — charging until full (no car SOC)"
+
         if horizon_slots:
             wanted = wanted_hours
             cheapest = sorted(horizon_slots, key=lambda s: s.total_import_price)[:wanted]
@@ -1857,6 +1878,8 @@ def build_ev_plan(
                 reason="No price horizon for cheapest-hour selection — charging (degraded mode)",
                 desired_enabled=True,
                 desired_amps=int(ev_max_amps),
+                desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+                desired_phase_mode="auto_phase",
                 desired_action="resume",
             )
         return EvPlan(
@@ -1868,11 +1891,17 @@ def build_ev_plan(
 
     windows = _parse_windows(ev_windows)
     if _in_windows(state.timestamp, windows):
+        # Charge at max on EVERY phase. Set the circuit currents to a constant max
+        # tuple (like full_speed) — leaving them unset keeps whatever a previous
+        # solar slot wrote (e.g. (8,0,0)), and min(charger, circuit) then throttles
+        # the offer to 8 A. Constant -> can't flap the apply gate.
         return EvPlan(
             mode=ev_mode,
             reason="Within scheduled EV charging window",
             desired_enabled=True,
             desired_amps=int(ev_max_amps),
+            desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+            desired_phase_mode="auto_phase",
             desired_action="resume",
         )
     return EvPlan(
@@ -1890,15 +1919,16 @@ def ev_cheapest_charge_hours(
     ev_ready_hour: int = -1,
     ev_target_soc: float = 0.0,
     ev_charge_speed_pct_h: float = 15.0,
+    ev_charge_until_complete: bool = False,
 ) -> dict | None:
     """Per-hour view of the scheduled-cheapest plan, for the dashboard.
 
-    Returns the SAME hour selection the live ``build_ev_plan`` makes (the N
-    cheapest import hours from now up to the 'ready by' deadline, where N is the
-    fixed required-hours or, with a car-SOC reading + target, the dynamic
-    ceil((target-soc)/speed)). Pure + side-effect-free; the sensor calls it each
-    update so the chart always matches what the car will actually do. None when
-    there is no horizon to plan over."""
+    Mirrors the SAME hour selection the live ``build_ev_plan`` makes: the toggle
+    or no-SOC "charge until full" path (every hour up to the deadline), the
+    dynamic ceil((target-soc)/speed) when a trustworthy car SOC is present, or
+    the fixed required-hours fallback. Pure + side-effect-free; the sensor calls
+    it each update so the chart always matches what the car will actually do.
+    None when there is no horizon to plan over."""
     if not state.price_slots:
         return None
     deadline = None
@@ -1912,10 +1942,13 @@ def ev_cheapest_charge_hours(
     ]
     if not horizon:
         return None
-    wanted = max(1, int(ev_required_hours))
     car_soc = state.ev_soc_pct
+    wanted = max(1, int(ev_required_hours))
     note = f"{wanted} cheapest hours"
-    if car_soc is not None and ev_target_soc > 0:
+    if ev_charge_until_complete:
+        wanted = len(horizon)
+        note = "charging until the car is full" + (f" before {int(ev_ready_hour):02d}:00" if deadline is not None else "")
+    elif car_soc is not None and ev_target_soc > 0:
         if car_soc >= ev_target_soc:
             wanted = 0
             note = f"target {ev_target_soc:.0f}% reached"
@@ -1924,6 +1957,9 @@ def ev_cheapest_charge_hours(
                 (ev_target_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
             )))
             note = f"{wanted}h to reach {ev_target_soc:.0f}% (now {car_soc:.0f}%)"
+    elif car_soc is None and ev_target_soc > 0 and deadline is not None:
+        wanted = len(horizon)
+        note = f"no car SOC — charging until full before {int(ev_ready_hour):02d}:00"
     cheapest = sorted(horizon, key=lambda s: s.total_import_price)[:wanted]
     cheapest_starts = {s.start for s in cheapest}
     return {

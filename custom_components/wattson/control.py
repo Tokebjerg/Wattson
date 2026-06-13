@@ -243,6 +243,12 @@ class EaseeController:
             return "1_phase"
         if lowered in {"3_phase", "three_phase", "three"}:
             return "3_phase"
+        # The planner emits "auto_phase" for "let Easee pick the phase count".
+        # Older call sites / the charger select use "auto". Treat them as the
+        # same canonical value so a desired "auto_phase" never looks different
+        # from a current "auto" and triggers a needless phase-mode write.
+        if lowered in {"auto_phase", "auto", "auto_mode"}:
+            return "auto_phase"
         return lowered
 
     async def _set_switch(self, entity_id: str | None, enabled: bool) -> list[str]:

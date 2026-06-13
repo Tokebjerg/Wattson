@@ -118,6 +118,17 @@ DEFAULT_EV_SOLAR_BATTERY_THRESHOLD = 50
 DEFAULT_EV_SOLAR_BATTERY_PRIORITY = False
 # Number of cheapest in-window hours to charge in scheduled_cheapest mode.
 DEFAULT_EV_REQUIRED_HOURS = 4
+# scheduled_cheapest "charge until the car is full": ignore the car-SOC target and
+# charge in the cheapest hours up to the 'ready by' deadline until the car itself
+# stops drawing (status -> completed). Car-AGNOSTIC — the right choice when the
+# plugged-in car has no SOC sensor, OR when the configured SOC sensor reflects a
+# DIFFERENT car than the one connected (e.g. the Niro is parked at 100% but an
+# empty car is plugged in). Off by default (the SOC-target path is cost-optimal
+# when the SOC is trustworthy). NOTE: a no-SOC car with a deadline set already
+# uses this behaviour automatically; the toggle additionally forces it even when
+# a SOC reading exists.
+CONF_EV_CHARGE_UNTIL_COMPLETE = "ev_charge_until_complete"
+DEFAULT_EV_CHARGE_UNTIL_COMPLETE = False
 # Scheduled charging window (whole hours, local time). 00:00-06:00 by default.
 DEFAULT_EV_WINDOW_START = 0
 DEFAULT_EV_WINDOW_END = 6

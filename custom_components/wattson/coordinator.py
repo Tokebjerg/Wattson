@@ -36,6 +36,8 @@ from .const import (
     CONF_EV_SOLAR_BATTERY_THRESHOLD,
     CONF_EV_SOLAR_BATTERY_PRIORITY,
     CONF_EV_REQUIRED_HOURS,
+    CONF_EV_CHARGE_UNTIL_COMPLETE,
+    DEFAULT_EV_CHARGE_UNTIL_COMPLETE,
     CONF_EV_READY_HOUR,
     DEFAULT_EV_READY_HOUR,
     CONF_EV_TARGET_SOC,
@@ -233,6 +235,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.ev_ready_hour = int(entry_value(entry, CONF_EV_READY_HOUR, DEFAULT_EV_READY_HOUR))
         self.ev_target_soc = float(entry_value(entry, CONF_EV_TARGET_SOC, DEFAULT_EV_TARGET_SOC))
         self.ev_min_soc = float(entry_value(entry, CONF_EV_MIN_SOC, DEFAULT_EV_MIN_SOC))
+        self.ev_charge_until_complete = bool(entry_value(entry, CONF_EV_CHARGE_UNTIL_COMPLETE, DEFAULT_EV_CHARGE_UNTIL_COMPLETE))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
         self._load_samples: list[tuple[datetime, float]] = []
@@ -614,6 +617,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_MIN_SOC: float(percent)})
         await self.async_request_refresh()
 
+    async def async_set_ev_charge_until_complete(self, enabled: bool) -> None:
+        self.ev_charge_until_complete = bool(enabled)
+        self._last_ev_fp = None
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_CHARGE_UNTIL_COMPLETE: bool(enabled)})
+        await self.async_request_refresh()
+
     async def async_set_ev_target_soc(self, percent: float) -> None:
         self.ev_target_soc = float(percent)
         self._last_ev_fp = None
@@ -830,6 +839,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_target_soc=self.ev_target_soc,
             ev_charge_speed_pct_h=float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
             ev_min_soc=self.ev_min_soc,
+            ev_charge_until_complete=self.ev_charge_until_complete,
         )
 
         # Phase E: a manual EV override is an explicit user action and wins over
