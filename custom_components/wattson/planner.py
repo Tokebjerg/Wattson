@@ -1654,11 +1654,19 @@ def build_ev_plan(
         return per_phase_amps, (per_phase_amps, 0, 0)
 
     if ev_mode == EV_MODE_FULL_SPEED:
+        # Full speed = max on every phase. Set the per-phase circuit currents to
+        # max EXPLICITLY (not None): leaving them unset keeps whatever a previous
+        # solar slot wrote (e.g. (8,0,0)), and the effective offer is the MIN of
+        # the charger limit and the circuit limit — so a stale 8 A circuit cap
+        # silently throttled "full speed" to 8 A. A constant max tuple clears it
+        # and is stable (it never varies, so it can't flap the apply gate).
         return EvPlan(
             mode=ev_mode,
             reason="Full speed mode is active",
             desired_enabled=True,
             desired_amps=int(ev_max_amps),
+            desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+            desired_phase_mode="auto_phase",
             desired_action="resume",
         )
 

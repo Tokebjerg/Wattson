@@ -429,12 +429,13 @@ SCENARIOS = [
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk_battery("EV_SOLAR_PRIORITY")),
 
-    ("EV full speed -> resume at max amps",
+    ("EV full speed -> resume at max amps on every phase (clears stale circuit cap)",
      entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,
               buy=1.0, sell=0.4, ev_status="charging", ev_power=3000, ev_phase="3_phase"),
      Settings(ev_mode=const.EV_MODE_FULL_SPEED),
-     chk(lambda st, pl: pl.ev.desired_action == "resume" and pl.ev.desired_amps == const.DEFAULT_EV_MAX_AMPS,
-         f"expect resume at {const.DEFAULT_EV_MAX_AMPS}A")),
+     chk(lambda st, pl: pl.ev.desired_action == "resume" and pl.ev.desired_amps == const.DEFAULT_EV_MAX_AMPS
+         and pl.ev.desired_circuit_currents == (const.DEFAULT_EV_MAX_AMPS,)*3,
+         f"expect resume at {const.DEFAULT_EV_MAX_AMPS}A on all 3 phases")),
 
     ("EV status unavailable -> no EV control",
      entities(pv1=3000, pv2=2000, grid=-3000, soc=80, ev_phase="3_phase", omit=("ev_status",)),

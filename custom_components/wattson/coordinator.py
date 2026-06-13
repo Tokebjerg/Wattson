@@ -118,6 +118,7 @@ from .const import (
     BATTERY_MODE_DWELL_SECONDS,
     DEFAULT_EXPORT_LIMIT_W,
     EV_WRITE_COOLDOWN_SECONDS,
+    EV_RESUME_RETRY_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
     EV_CURRENT_RETUNE_SECONDS,
@@ -201,6 +202,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_amps: int | None = None
         self._last_ev_currents: tuple[int, int, int] | None = None
         self._last_ev_current_change_at: datetime | None = None
+        self._last_ev_resume_retry_at: datetime | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -937,19 +939,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and (self.site_state.easee_status or "").lower()
             not in ("disconnected", "", "unknown", "unavailable")
         ):
-            # A COMPLETE full-power plan: clear the solar plan's per-phase
-            # currents/phase-mode rather than inheriting them — otherwise the
-            # cloud-varying solar values keep flipping the structural fingerprint
-            # (phase_mode "auto_phase" <-> None) which bypasses the deadband AND
-            # the 90s retune gate, making the offered current bounce 6<->16 A and
-            # the car renegotiate constantly (observed: 22 changes in 40 min).
+            # A COMPLETE full-power plan with CONSTANT max values on every axis:
+            # max charger amps AND max per-phase circuit currents (clearing any
+            # stale solar circuit cap that would otherwise throttle the forced
+            # charge to e.g. 8 A) AND a fixed phase mode. Constants don't vary, so
+            # unlike the cloud-varying solar values they inherit, they can't flap
+            # the apply gate (the v0.22.1 bounce: 22 changes in 40 min).
             ev_plan = replace(
                 ev_plan,
                 reason=f"paid to import (total {_neg_slot.total_import_price:.2f} kr/kWh < 0) — force-charging the EV to absorb it",
                 desired_enabled=True,
                 desired_amps=ev_max_amps,
-                desired_circuit_currents=None,
-                desired_phase_mode=None,
+                desired_circuit_currents=(ev_max_amps, ev_max_amps, ev_max_amps),
+                desired_phase_mode="auto_phase",
                 desired_action="resume",
             )
 
@@ -1167,7 +1169,23 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # make the car cycle. Structural changes are always honoured immediately.
         retune_due = write_allowed(self._last_ev_current_change_at, self.ev_retune_seconds, now)
         current_change_wanted = (not within_deadband) and retune_due
-        if not structural_changed and not current_change_wanted:
+        # Stuck-car nudge: the plan WANTS the car charging but the charger is still
+        # awaiting_start / ready_to_charge / paused — the single resume that the
+        # structural change sent didn't wake it. The deadband/retune gates only
+        # fire on CHANGES, so without this the car would sit at 0 kW forever.
+        # Re-assert the whole plan (resume + enable + currents) on a slow cadence
+        # until it actually draws; the moment status is "charging" this stops, so
+        # it never competes with the in-session anti-oscillation gating.
+        wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
+        not_yet_charging = (self.site_state.easee_status or "").lower() in (
+            "awaiting_start", "ready_to_charge", "paused",
+        )
+        nudge_stuck = (
+            wants_charging
+            and not_yet_charging
+            and write_allowed(self._last_ev_resume_retry_at, EV_RESUME_RETRY_SECONDS, now)
+        )
+        if not structural_changed and not current_change_wanted and not nudge_stuck:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
             # Cooldown active: leave state unchanged so we retry next tick.
@@ -1175,6 +1193,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev)
         if acts:
             self._last_ev_write_at = now
+        if nudge_stuck:
+            self._last_ev_resume_retry_at = now
         self._last_ev_fp = structural
         if not within_deadband:
             self._last_ev_amps = ev.desired_amps

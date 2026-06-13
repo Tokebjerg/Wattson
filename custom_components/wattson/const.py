@@ -254,6 +254,14 @@ EV_CURRENT_DEADBAND_A = 2
 # current bounce 16A<->6A every ~15s and the car cycle. Rate-limiting current
 # changes gives the car a steady offer long enough to settle.
 EV_CURRENT_RETUNE_SECONDS = 90
+# When the plan WANTS the car charging but the charger is still awaiting_start /
+# ready_to_charge / paused (the car never actually started — a single resume
+# didn't wake it, or it was offered current capped by a stale circuit limit),
+# re-assert the full plan this often until it is genuinely drawing power. The
+# deadband/retune gating only fires on changes, so without this nudge a stuck
+# car sits in awaiting_start forever (observed 2026-06-13: ~50 min at 0 kW on a
+# negative-price morning after a mode switch). Stops the instant the car charges.
+EV_RESUME_RETRY_SECONDS = 60
 
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan
