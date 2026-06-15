@@ -229,7 +229,16 @@ def run_wattson_planned(day, spot, sell, pv, load):
         soc_kwh, gi, ge, d = step_with_plan(plan, pv[h], load[h], soc_kwh, floor_kwh)
         c = gi * total_import(spot[h], h) - ge * (sell[h] if sell else spot[h])
         cost += c
-        rows.append({"h": h, "strat": plan.strategy, "soc": round(soc_kwh / CAPACITY_KWH * 100), "gi": gi, "ge": ge, "d": d, "cost": c})
+        # The inverter REGISTER tuple actually written this hour — distinct from
+        # the human-facing strategy label (DISCHARGE_TO_LOAD / IDLE /
+        # SOLAR_SELF_CONSUMPTION all write the SAME tuple within a SELF_CONSUME
+        # slot), so the analyzer can count real register writes, not label flips.
+        reg = (plan.desired_grid_charge, plan.desired_solar_sell,
+               plan.desired_limit_control_mode, plan.desired_energy_priority,
+               plan.desired_export_limit_w, plan.desired_max_charge_current_a,
+               plan.desired_discharge_current_a, plan.charge_target_soc_pct)
+        rows.append({"h": h, "strat": plan.strategy, "soc": round(soc_kwh / CAPACITY_KWH * 100),
+                     "gi": gi, "ge": ge, "d": d, "cost": c, "reg": reg})
     return rows, cost
 
 
@@ -271,9 +280,16 @@ def run_oracle(spot, sell, pv, load, *, no_battery_export: bool = False):
     exports to the grid: discharge is capped at the house deficit) — that
     variant is the HONEST headroom ceiling for this installation; the
     unconstrained oracle additionally monetises battery->grid arbitrage the
-    user has explicitly excluded (10 kWh pack)."""
-    step = 0.5
-    levels = [round(i * step, 3) for i in range(int(CAPACITY_KWH / step) + 1)]
+    user has explicitly excluded (10 kWh pack).
+
+    The SOC grid is FINE (0.02 kWh): the plan's SOC evolves continuously in
+    step_with_plan, so a coarse oracle grid (the old 0.5 kWh) made this DP
+    SUBOPTIMAL and the plan spuriously 'beat' the ceiling on ~10/24 days
+    (efficiency >100%, which is impossible for a true upper bound). 0.02 kWh is
+    converged (0.02->0.01 gap <=0.03 kr) and also stops the 0.5-grid snapping the
+    3.57 kWh/h rate down to 3.5."""
+    step = 0.02
+    levels = [round(i * step, 3) for i in range(int(round(CAPACITY_KWH / step)) + 1)]
     lo = MIN_SOC / 100.0 * CAPACITY_KWH
     hi = MAX_SOC / 100.0 * CAPACITY_KWH
     usable = [s for s in levels if lo - 1e-9 <= s <= hi + 1e-9]
@@ -354,6 +370,12 @@ def evaluate(path):
     nb_save = nb - w_plan
     orac_save = nb - orac_h
     eff = (nb_save / orac_save * 100) if abs(orac_save) > 1e-6 else 100.0
+    # Study-validity guard: the honest oracle is a TRUE upper bound, so the plan
+    # can never cost less than it (eff can never exceed 100%). A violation means
+    # the oracle DP is mis-discretized again, not that the plan is superhuman.
+    assert (w_plan - orac_h) >= -0.05, (
+        f"{day['date']}: plan {w_plan:.2f} beats honest oracle {orac_h:.2f} "
+        f"(eff {eff:.0f}%) — oracle ceiling is broken, fix run_oracle discretization")
     print(f"  PLAN-MOTOR sparer vs intet batteri: {nb_save:+.2f} kr")
     print(f"  Plan-motor vs dumt batteri        : {dumb - w_plan:+.2f} kr")
     print(f"  Ærligt orakel-loft (vs intet batteri): {orac_save:+.2f} kr")

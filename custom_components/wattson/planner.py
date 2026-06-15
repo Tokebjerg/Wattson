@@ -277,7 +277,30 @@ def peak_reserve_pct(
                         for s in later if s.start < first_peak)
     net = max(0.0, reserve_kwh - refill_before)
     usable_pct = max(0.0, max_soc - min_soc)
-    return min(net / max(0.1, capacity_kwh) * 100.0, usable_pct)
+    base_reserve_pct = min(net / max(0.1, capacity_kwh) * 100.0, usable_pct)
+    # Cheap-refill awareness: hours before the first peak that the plan will
+    # GRID-CHARGE for free (negative import price -> ABSORB_NEGATIVE, same
+    # NEGATIVE_IMPORT_ABSORB_THRESHOLD gate build_day_plan uses) can refill the pack
+    # cheaply, so we need to hold back LESS now — discharge the morning and re-buy
+    # it free at midday instead of importing it at the grid price. Each such hour
+    # can charge ~70 A; convert that to a SOC% credit and subtract it from the
+    # reserve. Restricting to ABSORB hours (not merely "cheaper") keeps this SAFE:
+    # the refill is GUARANTEED by the plan's own negative-price rule, so the pack is
+    # never stranded before a peak; a modestly-positive cheap midday (e.g. the
+    # 2026-08-01 spike day, or EV-heavy 2026-04-22) does NOT qualify and those days
+    # keep their full reserve. ESTIMATED lookahead slots are excluded — releasing
+    # the reserve on a GUESSED cheap tomorrow could strand the pack at a real peak.
+    # Days with no free pre-peak hour are unchanged (credit = 0). This freed the
+    # frozen-at-95% morning on low-solar winter days (2026-02-10, the single
+    # biggest backtest headroom ~5 kr) while regressing none.
+    free_refill_hours = sum(
+        1 for s in later
+        if s.start < first_peak
+        and not bool(getattr(s, "estimated", False))
+        and s.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD
+    )
+    refill_credit_pct = free_refill_hours * rate_cap / max(0.1, capacity_kwh) * 100.0
+    return max(0.0, base_reserve_pct - refill_credit_pct)
 
 
 def tou_setpoint(

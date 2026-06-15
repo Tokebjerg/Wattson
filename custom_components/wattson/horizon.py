@@ -15,6 +15,7 @@ rather than raising, so the reactive planner keeps working unchanged.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -115,14 +116,25 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
             spot = float(item["price"])
         except (TypeError, ValueError, KeyError):
             continue
+        # float("nan")/float("inf") do NOT raise, so a price entity publishing a
+        # non-finite value leaks straight into total_import_price and silently
+        # poisons every downstream comparison (mean_price -> NaN, peak_reserve_pct
+        # collapses to 0%) with no error and no log. Drop the slot like an
+        # unavailable one. Use isfinite, never "spot < 0" — that would wrongly
+        # discard legitimate negative (ABSORB) prices.
+        if not math.isfinite(spot):
+            continue
         tariff = _hourly_tariff(tariffs_attr, start.hour) + flat_total
+        export_value = export_index.get(start)
+        if export_value is not None and not math.isfinite(export_value):
+            export_value = None
         slots.append(
             PriceSlot(
                 start=start,
                 spot_price=spot,
                 tariff=tariff,
                 total_import_price=spot + tariff,
-                export_value=export_index.get(start),
+                export_value=export_value,
             )
         )
     slots.sort(key=lambda slot: slot.start)

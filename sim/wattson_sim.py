@@ -592,6 +592,35 @@ def test_horizon():
         and horizon.build_solar_slots(empty_hass, "sensor.solar") == [],
         "graceful",
     ))
+
+    # B2: a non-finite price (NaN/inf) does NOT raise in float(), so without an
+    # isfinite guard it would leak into total_import_price and silently poison
+    # mean_price / peak_reserve_pct. The bad hour must be DROPPED like an
+    # unavailable one, while finite negatives (legit ABSORB prices) are kept.
+    nan_buy = {
+        "state": 0.2,
+        "attributes": {
+            "raw_today": [
+                {"hour": "2026-06-07T00:00:00+02:00", "price": 0.18},
+                {"hour": "2026-06-07T10:00:00+02:00", "price": float("nan")},
+                {"hour": "2026-06-07T11:00:00+02:00", "price": float("inf")},
+                {"hour": "2026-06-07T12:00:00+02:00", "price": "NaN"},
+                {"hour": "2026-06-07T17:00:00+02:00", "price": -0.45},
+            ],
+            "tariffs": {"additional_tariffs": {"a": 0.05}, "tariffs": {"0": 0.08}},
+        },
+    }
+    nan_hass = FakeHass({"sensor.buy": nan_buy, "sensor.sell": 0.6, "sensor.solar": 46.0})
+    nan_slots = horizon.build_price_slots(nan_hass, "sensor.buy", "sensor.sell")
+    nan_real = [s for s in nan_slots if not s.estimated]
+    import math as _math
+    checks.append((
+        "B2: non-finite prices (nan/inf/'NaN') dropped, finite negative kept",
+        len(nan_real) == 2
+        and all(_math.isfinite(s.total_import_price) for s in nan_slots)
+        and any(abs(s.spot_price - (-0.45)) < 1e-9 for s in nan_real),
+        f"got {len(nan_real)} finite real slots",
+    ))
     return checks
 
 
@@ -2321,6 +2350,38 @@ def test_peak_reserve():
     checks.append(("hold margin is well below the arbitrage spread",
                    planner.RESERVE_HOLD_MARGIN < planner.required_spread(planner.profile_for("blue")) / 2,
                    f"{planner.RESERVE_HOLD_MARGIN}"))
+
+    # --- A1: cheap-refill awareness. A CONFIRMED negative-price window before the
+    #     peak (the plan ABSORB-grid-charges it for free) releases the morning
+    #     reserve so the pack can discharge now and refill free at midday. A merely
+    #     cheaper-but-POSITIVE midday does NOT release it (the refill is not
+    #     guaranteed -> never strand the pack before a peak, e.g. a spike day). An
+    #     ESTIMATED (guessed) negative slot is also excluded.
+    def a1_slots(midday_price, est=False):
+        pr = {h: 0.60 for h in range(24)}
+        for h in (10, 11, 12, 13):
+            pr[h] = midday_price
+        for h in (18, 19, 20):
+            pr[h] = 1.50
+        return [models.PriceSlot(start=at(h), spot_price=pr[h], tariff=0.0,
+                                 total_import_price=pr[h], export_value=0.5,
+                                 estimated=(est and h in (10, 11, 12, 13)))
+                for h in range(24)]
+
+    def a1_reserve(midday, est=False):
+        return planner.peak_reserve_pct(
+            a1_slots(midday, est), at(3), [], load_hourly, capacity_kwh=10, min_soc=20,
+            max_soc=95, margin=planner.RESERVE_HOLD_MARGIN, discharge_rate_kwh=rate)
+
+    r_neg = a1_reserve(-0.20)   # confirmed negative midday -> guaranteed ABSORB refill
+    r_pos = a1_reserve(0.20)    # cheaper-but-positive midday -> refill not guaranteed
+    r_est = a1_reserve(-0.20, est=True)  # estimated negative -> excluded
+    checks.append((f"A1: confirmed negative refill window RELEASES the morning reserve (neg {r_neg:.0f} < pos {r_pos:.0f})",
+                   r_neg < r_pos - 5, f"neg={r_neg:.1f} pos={r_pos:.1f}"))
+    checks.append((f"A1: a cheaper-but-POSITIVE midday keeps the reserve (no guaranteed refill, got {r_pos:.0f}%)",
+                   r_pos > 0.0, f"{r_pos:.1f}"))
+    checks.append((f"A1: ESTIMATED negative slots do NOT release the reserve (est {r_est:.0f} == pos {r_pos:.0f})",
+                   abs(r_est - r_pos) < 1.0, f"est={r_est:.1f} pos={r_pos:.1f}"))
     # B: the SOC projection charges at the REAL configured rate, not the old flat
     # 5 kWh/h — one charge hour at 70 A on a 10 kWh pack lifts ~36%, not 50%.
     checks.append((f"battery_rate_kwh(70) ~= 3.57 kWh/h (got {rate:.2f})", abs(rate - 3.57) < 0.05, f"{rate}"))
