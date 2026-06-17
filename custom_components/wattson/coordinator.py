@@ -899,45 +899,44 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 battery_control_enabled=self.battery_control_enabled,
                 ev_recently_active=ev_recently_active,
             ):
-                # The car is actively charging on solar: prioritize PV for the car.
-                # Coherent inverter mode (like IDLE): the house battery absorbs the
-                # surplus the car isn't using (zero export) instead of dumping it at
-                # low prices; only a FULL battery exports the genuine surplus.
-                battery_full = self.site_state.battery_soc_pct >= float(
-                    entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)
-                )
-                # Only sell when the battery is full AND export actually pays; at a
-                # zero/negative price keep zero-export so the car absorbs the surplus
-                # (no curtailment) instead of exporting at a loss.
-                sell_surplus = battery_full and (self.site_state.current_sell_price or 0) > 0
+                # The car is actively charging on solar ("Ren sol"): PV goes to the
+                # car, and the house battery is NEITHER drained into the car NOR
+                # sold-from. This is "pure solar" the way it ran well last week — the
+                # history (2026-06-17) showed the discharge register lay rock-stable
+                # before the broken-cloud days exposed the stall below.
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
-                        f"{battery_plan.reason} | EV solar-only actively charging; PV to car, "
-                        "surplus charges the house battery"
+                        f"{battery_plan.reason} | EV solar-only: PV to the car, "
+                        "house battery neither drained nor sold-from (pure solar)"
                     ),
                     desired_grid_charge=False,
-                    desired_solar_sell=sell_surplus,
+                    # solar_sell OFF, ALWAYS, while the car charges on solar. This is
+                    # the linchpin. The PV/MPPT stall on this Deye firmware is the
+                    # REGISTER PAIR solar_sell=ON + discharge=0 (the v0.23.0 quirk
+                    # family, on the discharge side; live-proven 2026-06-17: discharge
+                    # 0 A -> PV 276 W, 70 A -> PV 3218 W same instant — but ONLY while
+                    # sell was on). Forcing sell OFF lets us ALSO keep discharge=0
+                    # (below) WITHOUT stalling — so the battery is never drained into
+                    # the car ("no drain") AND the PV runs at full output ("no
+                    # curtailment"). The only cost: surplus beyond what the car+battery
+                    # absorb is clipped rather than exported, usually at the low/neg
+                    # midday export prices where selling barely pays anyway.
+                    desired_solar_sell=False,
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Zero export to CT",
-                    # Full-rate charge register, always: the battery is the
-                    # absorber for what the car doesn't take, and a trickle
-                    # inherited from an earlier SELL slot would both starve the
-                    # absorber AND (with sell_surplus on) stall the Deye sell path.
+                    # Full-rate charge register: the battery absorbs whatever surplus
+                    # the car doesn't take (until full), never a trickle inherited
+                    # from an earlier SELL slot.
                     desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-                    # Keep the DISCHARGE register OPEN, NOT 0 A. On this Deye
-                    # firmware, discharge=0 while the car DRAWS power (with solar_sell
-                    # on / battery full) stalls the whole PV/MPPT path — PV collapses
-                    # to a few hundred W and the site imports from grid, even in full
-                    # sun. Confirmed live by an A/B test (2026-06-17): discharge 0 A ->
-                    # PV 276 W; 70 A -> PV 3218 W, same instant. It is the same
-                    # quirk-family as the v0.23.0 trickle-CHARGE+sell stall, on the
-                    # discharge side. The CT clamp under "Zero export to CT" still
-                    # prevents battery->grid export (v0.24.2), so an open discharge
-                    # only lets the pack cover the house+EV deficit during cloud dips
-                    # (self-consumption) — it never exports.
-                    desired_discharge_current_a=self.battery_discharge_current,
+                    # Discharge CLOSED (0 A): the house battery must not discharge into
+                    # the car. Safe here precisely BECAUSE sell is OFF above — the
+                    # stall needs the sell+discharge=0 pair, not discharge=0 alone. The
+                    # cost is that during a cloud dip (PV < house+car) the deficit is
+                    # covered by the grid, not the battery; on a stable-sun day the car
+                    # just tracks the surplus and neither grid nor battery is touched.
+                    desired_discharge_current_a=0.0,
                 )
 
         # Negative TOTAL import price (spot + tariff): you are PAID to import, so

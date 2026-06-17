@@ -234,13 +234,14 @@ def simulate_tick(entities, s: Settings):
                 strategy="EV_SOLAR_PRIORITY",
                 reason=f"{battery_plan.reason} | EV solar-only active",
                 desired_grid_charge=False,
-                desired_solar_sell=True,
+                # Option A (pure solar): sell OFF + discharge 0. Sell OFF is the
+                # linchpin — the PV stall is the sell=ON+discharge=0 PAIR, so with
+                # sell off the battery can stay closed (no drain into the car) without
+                # stalling the MPPT.
+                desired_solar_sell=False,
                 desired_energy_priority="Load first",
-                desired_limit_control_mode="Selling first",
-                # Discharge stays OPEN (0 A stalls PV on this firmware while the car
-                # draws). Coordinator fills None -> battery_discharge_current; the
-                # mock uses the configured default directly.
-                desired_discharge_current_a=70.0,
+                desired_limit_control_mode="Zero export to CT",
+                desired_discharge_current_a=0.0,
             )
 
     safe_reasons = []
@@ -426,13 +427,14 @@ SCENARIOS = [
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk_ev_action("pause")),
 
-    ("EV solar active -> battery becomes EV_SOLAR_PRIORITY (discharge OPEN, not 0 -> 0 stalls PV)",
+    ("EV solar active -> EV_SOLAR_PRIORITY pure solar (sell OFF + discharge 0: no drain, no stall)",
      entities(pv1=3000, pv2=2500, grid=-4000, soc=80, bat=-300,
               buy=1.0, sell=0.4, ev_status="charging", ev_power=2500, ev_phase="3_phase"),
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
-         and pl.battery.desired_discharge_current_a != 0.0,
-         "EV_SOLAR_PRIORITY must keep the discharge register OPEN (0 A stalls PV on this firmware)")),
+         and pl.battery.desired_solar_sell is not True
+         and pl.battery.desired_discharge_current_a == 0.0,
+         "EV_SOLAR_PRIORITY must be sell OFF + discharge 0 (the sell+discharge=0 PAIR is what stalls PV)")),
 
     ("EV full speed -> resume at max amps on every phase (clears stale circuit cap)",
      entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,
