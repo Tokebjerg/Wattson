@@ -97,9 +97,6 @@ from .const import (
     DEFAULT_EV_WINDOW_START,
     DEFAULT_EV_WINDOW_END,
     EV_SURPLUS_AVERAGE_SECONDS,
-    EV_SURPLUS_FAST_SECONDS,
-    EV_SOLAR_IMPORT_RELEASE_SECONDS,
-    EV_SOLAR_IMPORT_RELEASE_W,
     DEFAULT_EV_WINDOWS,
     DEFAULT_EXPENSIVE_PRICE_THRESHOLD,
     DEFAULT_INVERT_BATTERY_POWER_SIGN,
@@ -159,7 +156,6 @@ from .planner import (
     build_override_battery_plan,
     build_override_ev_plan,
     effective_solar_surplus_w,
-    robust_surplus_signal,
     ev_current_within_deadband,
     ev_drawing_real_power,
     profile_for,
@@ -227,17 +223,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.master_lock_enabled = bool(entry_value(entry, CONF_MASTER_LOCK_ENABLED, DEFAULT_MASTER_LOCK_ENABLED))
         self._default_export_limit_w: float | None = None
         self._ev_solar_hold_until: datetime | None = None
-        # P1: when a solar-dip-hold is asserting "solar" but the meter shows the
-        # site importing, this marks WHEN that import started, so a SUSTAINED
-        # collapse (vs a brief dip) releases the hold instead of coasting on grid.
-        self._ev_solar_import_since: datetime | None = None
-        # P4: grid-backed EV energy delivered during solar_only sessions (kWh, today)
-        # + the last sample time for trapezoidal accumulation. Diagnostic only —
-        # makes the otherwise-invisible "Ren sol" grid leak measurable.
-        self.ev_solar_grid_kwh_today: float = 0.0
-        self.ev_solar_total_kwh_today: float = 0.0
-        self._ev_solar_accum_at: datetime | None = None
-        self._ev_solar_accum_day: int | None = None
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -815,19 +800,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 battery_care_soc=self.battery_care_soc,
             )
         # Phase C: smooth the solar surplus over a rolling window so the EV
-        # regulation reacts to an average instead of 10s spikes. P2: the signal is
-        # ASYMMETRIC (fast-down, slow-up) — min(120s mean, 45s median) — so the
-        # offered current rises only on the slow mean (anti-flap) but FALLS within
-        # ~one fast-window of a real PV collapse, instead of the car coasting on
-        # grid while the slow mean still carries the just-collapsed spike.
+        # regulation reacts to a 2-minute average instead of 10s spikes.
         sample_now = dt_util.utcnow()
         self._surplus_samples.append((sample_now, effective_solar_surplus_w(self.site_state, self.battery_control_enabled)))
         cutoff = sample_now - timedelta(seconds=EV_SURPLUS_AVERAGE_SECONDS)
         self._surplus_samples = [(t, v) for (t, v) in self._surplus_samples if t >= cutoff]
-        averaged_surplus = robust_surplus_signal(
-            self._surplus_samples, sample_now,
-            avg_seconds=EV_SURPLUS_AVERAGE_SECONDS, fast_seconds=EV_SURPLUS_FAST_SECONDS,
-        )
+        averaged_surplus = sum(v for _, v in self._surplus_samples) / len(self._surplus_samples)
 
         # Phase C UI: scheduled window is built from the start/end hour numbers;
         # the house-battery threshold only applies when the priority toggle is on.
@@ -879,74 +857,35 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 (self.site_state.easee_power_w or 0.0) >= 200.0
                 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
             )
-            # P4 (diagnostic): accumulate how much of this "Ren sol" session's EV
-            # energy is actually GRID-backed = min(EV draw, grid import). This is
-            # invisible to the curtailment sensor (it is import, not PV spill), so
-            # it makes the otherwise-hidden grid leak measurable. Resets daily.
-            _ev_w = max(0.0, self.site_state.easee_power_w or 0.0)
-            _grid_to_ev_w = min(_ev_w, max(0.0, self.site_state.grid_power_w or 0.0))
-            _ord = now.date().toordinal()
-            if self._ev_solar_accum_day != _ord:
-                self._ev_solar_accum_day = _ord
-                self.ev_solar_grid_kwh_today = 0.0
-                self.ev_solar_total_kwh_today = 0.0
-                self._ev_solar_accum_at = None
-            if self._ev_solar_accum_at is not None:
-                _dt_h = min((now - self._ev_solar_accum_at).total_seconds(), 180.0) / 3600.0
-                self.ev_solar_grid_kwh_today += _grid_to_ev_w / 1000.0 * _dt_h
-                self.ev_solar_total_kwh_today += _ev_w / 1000.0 * _dt_h
-            self._ev_solar_accum_at = now
             if ev_plan.desired_action == "resume" and ev_plan.desired_enabled is True:
-                # Genuine solar resume: (re)arm the brief-dip hold and clear the
-                # sustained-import timer — the session is actually being solar-fed.
+                # Hold a solar-driven EV session through short PV dips to avoid rapid pause/resume flapping.
                 self._ev_solar_hold_until = now + timedelta(minutes=3)
-                self._ev_solar_import_since = None
             elif (
                 ev_plan.desired_action == "pause"
                 and ev_session_active
                 and self._ev_solar_hold_until is not None
                 and now < self._ev_solar_hold_until
             ):
-                # The planner wants to pause but we're inside the brief-dip hold.
-                # P1: ride through a BRIEF dip only. If the METER shows the site
-                # IMPORTING (> EV_SOLAR_IMPORT_RELEASE_W) while the hold asserts
-                # "solar" for longer than EV_SOLAR_IMPORT_RELEASE_SECONDS, this is a
-                # SUSTAINED collapse and the car would coast on grid — so release
-                # the hold and let the pause stand. Outcome-based: trust the meter,
-                # not the derived surplus (which lags the collapse).
-                importing = max(0.0, self.site_state.grid_power_w or 0.0) > EV_SOLAR_IMPORT_RELEASE_W
-                if importing:
-                    if self._ev_solar_import_since is None:
-                        self._ev_solar_import_since = now
-                    held_import_s = (now - self._ev_solar_import_since).total_seconds()
-                else:
-                    self._ev_solar_import_since = None
-                    held_import_s = 0.0
-                if importing and held_import_s >= EV_SOLAR_IMPORT_RELEASE_SECONDS:
-                    # Sustained grid import under the solar label -> stop coasting.
-                    self._ev_solar_hold_until = None
-                    self._ev_solar_import_since = None
-                else:
-                    # Genuine brief dip: re-assert the LAST-SENT values. The
-                    # structural fingerprint and currents stay identical, so the
-                    # apply layer writes NOTHING during the dip (the old None-fields
-                    # approach changed the fingerprint and wrote on every cloud).
-                    ev_plan = replace(
-                        ev_plan,
-                        reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
-                        desired_enabled=True,
-                        desired_amps=self._last_ev_amps,
-                        desired_circuit_currents=self._last_ev_currents,
-                        desired_phase_mode="auto_phase",
-                        desired_action="resume",
-                    ) if self._last_ev_amps is not None else replace(
-                        ev_plan,
-                        reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
-                        desired_enabled=None,
-                        desired_amps=None,
-                        desired_phase_mode=None,
-                        desired_action=None,
-                    )
+                # Re-assert the LAST-SENT values: the structural fingerprint and
+                # the currents stay identical, so the apply layer writes NOTHING
+                # during the dip (the old None-fields approach changed the
+                # fingerprint and triggered a write on every passing cloud).
+                ev_plan = replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
+                    desired_enabled=True,
+                    desired_amps=self._last_ev_amps,
+                    desired_circuit_currents=self._last_ev_currents,
+                    desired_phase_mode="auto_phase",
+                    desired_action="resume",
+                ) if self._last_ev_amps is not None else replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
+                    desired_enabled=None,
+                    desired_amps=None,
+                    desired_phase_mode=None,
+                    desired_action=None,
+                )
 
             # Sticky: keep EV-solar priority through brief charger dips so the
             # battery strategy doesn't flip every few seconds and churn the
@@ -1239,16 +1178,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # re-tune interval has elapsed, so the offered current can't bounce and
         # make the car cycle. Structural changes are always honoured immediately.
         retune_due = write_allowed(self._last_ev_current_change_at, self.ev_retune_seconds, now)
-        # P2 (asymmetric): a material DOWNWARD current change applies immediately,
-        # bypassing the retune timer — when solar collapses the offer must drop NOW
-        # so the car stops coasting on grid. UP-moves still wait for the retune
-        # window (anti-flap). The deadband still filters tiny wiggles either way.
-        is_down_move = (
-            ev.desired_amps is not None
-            and self._last_ev_amps is not None
-            and ev.desired_amps < self._last_ev_amps
-        )
-        current_change_wanted = (not within_deadband) and (retune_due or is_down_move)
+        current_change_wanted = (not within_deadband) and retune_due
         # Stuck-car nudge: the plan WANTS the car charging but the charger is still
         # awaiting_start / ready_to_charge / paused — the single resume that the
         # structural change sent didn't wake it. The deadband/retune gates only
