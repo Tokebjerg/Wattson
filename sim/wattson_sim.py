@@ -237,7 +237,10 @@ def simulate_tick(entities, s: Settings):
                 desired_solar_sell=True,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Selling first",
-                desired_discharge_current_a=0.0,
+                # Discharge stays OPEN (0 A stalls PV on this firmware while the car
+                # draws). Coordinator fills None -> battery_discharge_current; the
+                # mock uses the configured default directly.
+                desired_discharge_current_a=70.0,
             )
 
     safe_reasons = []
@@ -423,11 +426,13 @@ SCENARIOS = [
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk_ev_action("pause")),
 
-    ("EV solar active -> battery becomes EV_SOLAR_PRIORITY",
+    ("EV solar active -> battery becomes EV_SOLAR_PRIORITY (discharge OPEN, not 0 -> 0 stalls PV)",
      entities(pv1=3000, pv2=2500, grid=-4000, soc=80, bat=-300,
               buy=1.0, sell=0.4, ev_status="charging", ev_power=2500, ev_phase="3_phase"),
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
-     chk_battery("EV_SOLAR_PRIORITY")),
+     chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
+         and pl.battery.desired_discharge_current_a != 0.0,
+         "EV_SOLAR_PRIORITY must keep the discharge register OPEN (0 A stalls PV on this firmware)")),
 
     ("EV full speed -> resume at max amps on every phase (clears stale circuit cap)",
      entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,

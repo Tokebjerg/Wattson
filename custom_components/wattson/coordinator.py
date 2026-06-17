@@ -926,7 +926,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # inherited from an earlier SELL slot would both starve the
                     # absorber AND (with sell_surplus on) stall the Deye sell path.
                     desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-                    desired_discharge_current_a=0.0,
+                    # Keep the DISCHARGE register OPEN, NOT 0 A. On this Deye
+                    # firmware, discharge=0 while the car DRAWS power (with solar_sell
+                    # on / battery full) stalls the whole PV/MPPT path — PV collapses
+                    # to a few hundred W and the site imports from grid, even in full
+                    # sun. Confirmed live by an A/B test (2026-06-17): discharge 0 A ->
+                    # PV 276 W; 70 A -> PV 3218 W, same instant. It is the same
+                    # quirk-family as the v0.23.0 trickle-CHARGE+sell stall, on the
+                    # discharge side. The CT clamp under "Zero export to CT" still
+                    # prevents battery->grid export (v0.24.2), so an open discharge
+                    # only lets the pack cover the house+EV deficit during cloud dips
+                    # (self-consumption) — it never exports.
+                    desired_discharge_current_a=self.battery_discharge_current,
                 )
 
         # Negative TOTAL import price (spot + tariff): you are PAID to import, so
@@ -967,9 +978,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
         # Set a healthy discharge-current limit whenever the plan didn't explicitly
         # set one, so "Aflad til hus" actually discharges the battery to cover the
-        # house instead of importing from the grid. (EV-solar priority, force-charge
-        # and hold set it to 0 explicitly and are preserved.) The configured value
-        # is a LIMIT, not a setpoint — the battery only delivers what the house needs.
+        # house instead of importing from the grid. (Force-charge and hold set it to
+        # 0 explicitly and are preserved; EV-solar priority keeps it OPEN — a 0 here
+        # stalls PV on this firmware while the car draws.) The configured value is a
+        # LIMIT, not a setpoint — the battery only delivers what the house needs.
         if battery_plan.desired_discharge_current_a is None:
             battery_plan = replace(
                 battery_plan,
