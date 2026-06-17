@@ -98,6 +98,7 @@ def _load_wattson():
 _install_ha_stubs()
 const, models, horizon, learning, mapping, planner, control = _load_wattson()
 safety = importlib.import_module("wattson.safety")
+deye_contract = importlib.import_module("wattson.deye_contract")
 State = sys.modules["homeassistant.core"].State
 
 
@@ -2664,6 +2665,48 @@ def test_sell_safe_invariant():
     return checks
 
 
+def test_morning_sell_throttle():
+    """v0.24.13 EXPERIMENT — morning sell-throttle. In the 07-11 window a SELLING
+    plan gets its charge register dropped to MORNING_SELL_THROTTLE_A (10 A) so the
+    surplus EXPORTS instead of bulk-charging the pack, deferring the fill to the
+    cheaper midday. Runs AFTER floor_sell_safe and intentionally overrides it for
+    the window only; a no-op when not selling, outside the window, or at a full
+    battery — so 10 A can ONLY ever ride WITH an active sell (the config under
+    test), never on its own."""
+    checks = []
+    A = deye_contract.MORNING_SELL_THROTTLE_A
+    SAFE = deye_contract.SELL_SAFE_CHARGE_A
+
+    def sell_plan(charge=SAFE):
+        return models.BatteryPlan(strategy="SELL_SOLAR_PEAK", reason="sell",
+                                  desired_solar_sell=True, desired_max_charge_current_a=charge)
+
+    def thr(plan, hour, soc=50.0, mx=95.0):
+        return deye_contract.apply_morning_sell_throttle(plan, hour=hour, soc_pct=soc, max_soc_pct=mx)
+
+    p = thr(sell_plan(), 8)
+    checks.append(("in-window (08) sell -> charge throttled to 10 A", p.desired_max_charge_current_a == A, str(p.desired_max_charge_current_a)))
+    checks.append(("throttle annotates the decision reason", "sell-throttle" in p.reason, p.reason[-40:]))
+
+    checks.append(("after window (13) sell -> full rate kept", thr(sell_plan(), 13).desired_max_charge_current_a == SAFE, "13"))
+    checks.append(("before window (06) sell -> full rate kept", thr(sell_plan(), 6).desired_max_charge_current_a == SAFE, "06"))
+    checks.append(("end hour (11) is exclusive -> full rate resumes", thr(sell_plan(), 11).desired_max_charge_current_a == SAFE, "11"))
+
+    nosell = models.BatteryPlan(strategy="IDLE", reason="idle", desired_solar_sell=False, desired_max_charge_current_a=SAFE)
+    checks.append(("in-window but NOT selling -> untouched (10A only rides with a sell)", thr(nosell, 8).desired_max_charge_current_a == SAFE, "nosell"))
+
+    checks.append(("in-window sell at FULL battery -> untouched", thr(sell_plan(), 8, soc=95.0, mx=95.0).desired_max_charge_current_a == SAFE, "full"))
+
+    # End-to-end like the coordinator: floor_sell_safe THEN throttle. A sell plan
+    # carrying a stale 10 A is floored to 70 by the backstop, then the window
+    # throttle deliberately re-drops it to 10 — the ONLY place sell+10A is allowed.
+    staged = deye_contract.floor_sell_safe(sell_plan(charge=10.0))
+    checks.append(("floor_sell_safe floors a stale trickle first (->70)", staged.desired_max_charge_current_a == SAFE, str(staged.desired_max_charge_current_a)))
+    checks.append(("then morning throttle re-applies 10 A in-window", thr(staged, 9).desired_max_charge_current_a == A, "staged"))
+    checks.append(("floored 70 survives OUTSIDE the window (no stray trickle)", thr(staged, 15).desired_max_charge_current_a == SAFE, "15"))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -2707,6 +2750,7 @@ def main():
                          ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
+                         ("MORNING SELL-THROTTLE (v0.24.13 experiment)", test_morning_sell_throttle),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

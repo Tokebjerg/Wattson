@@ -130,7 +130,7 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .control import EaseeController, KlatremisController
-from .deye_contract import floor_sell_safe
+from .deye_contract import apply_morning_sell_throttle, floor_sell_safe
 from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
@@ -997,6 +997,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Firmware-contract backstop (deye_contract): solar_sell=ON must never
         # ride with a sub-sell-safe charge register (the trickle+sell stall).
         battery_plan = floor_sell_safe(battery_plan)
+
+        # EXPERIMENT (v0.24.13, user-directed): morning sell-throttle. In the
+        # 07-11 window, when selling surplus, drop the charge register to 10 A so
+        # the pack fills slowly and the surplus EXPORTS — deferring the bulk fill
+        # to the cheaper/negative midday. Runs AFTER floor_sell_safe and overrides
+        # it for this window only; a STABLE setpoint (no flapping) to test whether
+        # the v0.23.0 trickle+sell stall was a flapping artifact. Self-heals to the
+        # full rate at 11:00. See deye_contract.apply_morning_sell_throttle.
+        battery_plan = apply_morning_sell_throttle(
+            battery_plan,
+            hour=dt_util.now().hour,
+            soc_pct=self.site_state.battery_soc_pct,
+            max_soc_pct=float(
+                entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)
+            ),
+        )
 
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
