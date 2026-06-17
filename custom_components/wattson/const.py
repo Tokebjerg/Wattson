@@ -245,7 +245,29 @@ EV_MODES = [
 
 # Phase C anti-flap parameters.
 EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
-EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
+EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus (UP-ramps)
+# Asymmetric surplus signal (fast-down, slow-up): the offered current must DROP
+# promptly when broken-cloud PV collapses, or the car coasts on grid for up to a
+# minute while the 120 s mean still carries the just-collapsed spike. The signal is
+# min(mean over EV_SURPLUS_AVERAGE_SECONDS, MEDIAN over EV_SURPLUS_FAST_SECONDS):
+# the median falls within ~30-45 s of a real collapse but is robust to the car's
+# own 0<->peak power cycling embedded in the surplus estimate (a plain MIN would
+# collapse to 0 on a single sample and starve the car on a clear day).
+EV_SURPLUS_FAST_SECONDS = 45
+# Solar-dip-hold release: the 3-minute hold that carries a session through a BRIEF
+# cloud must NOT keep the car drawing from the grid through a sustained collapse.
+# If the site has been IMPORTING more than EV_SOLAR_IMPORT_RELEASE_W while the hold
+# asserts "solar" for longer than this, force the pause through (outcome-based —
+# trusts the meter, not the derived surplus).
+EV_SOLAR_IMPORT_RELEASE_SECONDS = 60
+EV_SOLAR_IMPORT_RELEASE_W = 300.0
+# Once a solar session is ACTIVE, keep charging only while the surplus can sustain
+# the real minimum hardware draw (6 A 1-phase ~= 6*235 = 1410 W) minus a tolerance.
+# The old continue-threshold (840 W) sat far below that floor, so any surplus in
+# [840, 1410) W kept the car pulling 1410 W while <=840 W was solar -> >=570 W from
+# grid under the "solar" label. Start (ev_solar_min_surplus_w) stays > stop for
+# hysteresis so the offer doesn't chatter at the edge.
+EV_SOLAR_SESSION_STOP_W = 1260.0
 
 # Only hand PV to the car (stop charging the house battery + allow export) when
 # the charger actually draws at least this much. A charger that is merely enabled

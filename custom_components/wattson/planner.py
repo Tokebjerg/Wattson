@@ -15,6 +15,7 @@ from .const import (
     BATTERY_OVERRIDE_DISCHARGE,
     BATTERY_OVERRIDE_HOLD,
     BATTERY_WEAR_COST,
+    EV_SOLAR_SESSION_STOP_W,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
     EV_MODE_SCHEDULED_CHEAPEST,
@@ -1596,6 +1597,48 @@ def build_battery_plan(
     )
 
 
+def _median(values: list[float]) -> float:
+    """Median of a list (robust to single-sample spikes/dips). Empty -> 0.0."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def robust_surplus_signal(
+    samples: list[tuple[datetime, float]],
+    now: datetime,
+    *,
+    avg_seconds: float,
+    fast_seconds: float,
+) -> float:
+    """Asymmetric (fast-DOWN, slow-UP) solar-surplus signal for the EV regulation.
+
+    ``samples`` are (timestamp, surplus_w). Returns ``min(mean over avg_seconds,
+    median over fast_seconds)``:
+      - the long MEAN damps up-ramps so the offered current can't flap upward on a
+        passing bright edge (anti-hunt);
+      - the short MEDIAN falls within ~one fast-window of a genuine PV collapse, so
+        the offer drops promptly instead of the car coasting on grid while the slow
+        mean still carries the just-collapsed spike;
+      - taking the MIN makes it fast-down / slow-up. The median (not a plain MIN)
+        is robust to the car's own 0<->peak power cycling, which is embedded in the
+        surplus estimate — a MIN would snap to 0 on a single sample and starve the
+        car on a clear day.
+    """
+    if not samples:
+        return 0.0
+    avg_cut = now - timedelta(seconds=avg_seconds)
+    fast_cut = now - timedelta(seconds=fast_seconds)
+    avg_vals = [v for (t, v) in samples if t >= avg_cut]
+    fast_vals = [v for (t, v) in samples if t >= fast_cut]
+    mean = sum(avg_vals) / len(avg_vals) if avg_vals else 0.0
+    med = _median(fast_vals) if fast_vals else mean
+    return min(mean, med)
+
+
 def effective_solar_surplus_w(state: SiteState, can_reclaim_battery_charge: bool) -> float:
     """PV power available for the car right now (W).
 
@@ -1717,7 +1760,13 @@ def build_ev_plan(
             if solar_surplus_override is not None
             else effective_solar_surplus_w(state, can_reclaim_battery_charge)
         )
-        stop_surplus_threshold_w = max(500.0, ev_solar_min_surplus_w * 0.6)
+        # Once a session is active, CONTINUE only while the surplus can sustain the
+        # real minimum hardware draw (6 A 1-phase ~= 1410 W) minus a tolerance —
+        # NOT the old 840 W, which sat far below the 6 A floor and guaranteed
+        # >=570 W of grid import in the [840, 1410) W band under the "solar" label.
+        # Keep start (ev_solar_min_surplus_w) > stop for hysteresis (>=10% gap) so
+        # the offer doesn't chatter at the threshold edge.
+        stop_surplus_threshold_w = min(ev_solar_min_surplus_w * 0.9, EV_SOLAR_SESSION_STOP_W)
         required_surplus_w = stop_surplus_threshold_w if ev_session_active else ev_solar_min_surplus_w
         # Phase C: hold solar for the house battery until it reaches the configured
         # threshold, so the car does not compete with filling the home battery.

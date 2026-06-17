@@ -216,6 +216,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
+    entities.append(WattsonEvSolarGridSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -349,6 +350,68 @@ class WattsonCurtailedSolarSensor(CoordinatorEntity, RestoreSensor):
             "negative_price_kwh": round(neg, 2),
             "unintended_kwh": round(max(0.0, total - neg), 2),
             "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm.",
+        }
+
+
+class WattsonEvSolarGridSensor(CoordinatorEntity, RestoreSensor):
+    """Diagnostic (P4): grid-backed EV energy delivered during 'Ren sol' sessions
+    today (kWh) = integral of min(EV draw, grid import). This is INVISIBLE to the
+    curtailment sensor (it is grid IMPORT, not PV spill), yet it is the real waste
+    when solar_only keeps the car drawing through a cloud collapse. The attribute
+    'grid_fraction_pct' shows how much of today's solar-mode EV energy came from
+    the grid rather than the sun — the honest 'how solar is Ren sol' number."""
+
+    _attr_has_entity_name = True
+    _attr_name = "EV Grid-Backed (Solar Mode) Today"
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_ev_solar_grid_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        try:
+            value = float(last_state.state)
+        except (TypeError, ValueError):
+            return
+        if dt_util.as_local(last_state.last_updated).date() == dt_util.now().date():
+            self.coordinator.ev_solar_grid_kwh_today = value
+            # Mark today's accumulation day so the coordinator's daily-reset guard
+            # doesn't wipe the just-restored value on the first solar_only tick.
+            self.coordinator._ev_solar_accum_day = dt_util.utcnow().date().toordinal()
+            tot = last_state.attributes.get("total_ev_kwh")
+            try:
+                self.coordinator.ev_solar_total_kwh_today = float(tot)
+            except (TypeError, ValueError):
+                pass
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.ev_solar_grid_kwh_today, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        grid = self.coordinator.ev_solar_grid_kwh_today
+        total = self.coordinator.ev_solar_total_kwh_today
+        frac = (grid / total * 100.0) if total > 0.01 else 0.0
+        return {
+            "total_ev_kwh": round(total, 2),
+            "solar_ev_kwh": round(max(0.0, total - grid), 2),
+            "grid_fraction_pct": round(frac, 0),
+            "note": "Net-andel af 'Ren sol'-opladning i dag = ∫min(EV-træk, net-import). Usynlig for curtailment-sensoren (det er import, ikke tabt sol). Lav grid_fraction = sund sol-opladning.",
         }
 
 
