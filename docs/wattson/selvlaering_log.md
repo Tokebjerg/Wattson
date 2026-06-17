@@ -9,6 +9,8 @@ Program: 21 dage, start 2026-06-08. Sikkerhedsgulv + kill-switch
 
 ---
 
+**v0.24.10 — 2026-06-17 — TILBAGERULNING af v0.24.9 (bruger-rapporteret regression: "kører ikke godt efter nyeste version, kørte perfekt da Fable lavede det"):** v0.24.9's "Ren sol"-ændringer (P1 dip-hold-release, P2 asymmetrisk hurtig-ned + median-signal, P3 hævet stop-gulv) FORVÆRREDE den live ladning trods 328/328 grøn sim. Live-data 8 min efter deploy: tilbudt strøm flappede 6→16→9→8→15→7 A, EV-effekt sprang vildt og faldt to gange til 0, og **bilen CYKLEDE** charging→awaiting_start→ready_to_charge→charging gentagne gange. Roden i FEJLEN: min broken-cloud-sim modellerede EV-trækket som øjeblikkeligt-følgende og straffede IKKE pause→genstart-cyklus-omkostningen (Easee går awaiting_start og er ~10-30s om at vågne). Fable-versionens 3-min dip-hold red bevidst GLAT gennem dips netop for at undgå denne cykling; mit P1 (pause ved import) + P2 (hurtig-ned) pausede bilen på hvert dip → cykling, mindre ladning, værre end før. `git revert 4bd327e` → fuld gendannelse til v0.24.8-adfærd (planner/coordinator/const/sensor/sim). Sim 316/316. **Lære:** EV-sol-loopet er coordinator-timing der IKKE er sim-dækket; en offline-model uden pause/genstart-hysterese-omkostning er upålidelig til at validere den slags ændring — kræver enten en model med cyklus-straf eller live-shadow-test før deploy. P4-diagnostik-sensoren ryger med i tilbagerulningen (kan re-tilføjes isoleret senere).
+
 ## Stor-release — 2026-06-12 — v0.24.0 ALLE 15 REVIEW-FORBEDRINGER (bruger: "Implementer alle 15, simuler og deploy automatisk")
 
 Baseret på den fulde kode-gennemgang tidligere på dagen. Højdepunkter:
