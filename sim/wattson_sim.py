@@ -17,7 +17,7 @@ import importlib
 import sys
 import types
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = "/Users/emiltokebjerg/Documents/Playground"
 WATTSON_DIR = f"{REPO_ROOT}/custom_components/wattson"
@@ -2707,6 +2707,46 @@ def test_morning_sell_throttle():
     return checks
 
 
+def test_solar_aware_reserve():
+    """v0.24.14: release the LEARNED self-use reserve when forecast solar over the
+    next 24h can refill the whole usable band x SOLAR_RESERVE_RELEASE_MARGIN — so the
+    pack runs down to the hard min on cheap overnight/evening hours and refills free
+    from tomorrow's sun. Conservative: a marginal/low-solar day keeps the reserve,
+    and only solar inside the horizon (not past, not far-future) counts."""
+    checks = []
+    SS = models.SolarSlot
+    base = datetime(2026, 6, 18, 16, 0, tzinfo=timezone.utc)  # evening 'now'
+    def at(h):
+        return base + timedelta(hours=h)
+    load = {h: 600.0 for h in range(24)}  # ~0.6 kWh/h
+    # usable band 85% x 10 kWh = 8.5 kWh; margin 1.5 -> release needs >= 12.75 kWh.
+
+    sunny = [SS(start=at(h), pv_estimate_kwh=2.5) for h in range(16, 25)]  # ~9h x 1.9 = 17 kWh
+    rel = planner.solar_aware_reserve_pct(15.0, solar_slots=sunny, load_hourly_w=load,
+                                          now=base, usable_pct=85.0, capacity_kwh=10.0)
+    checks.append(("sunny tomorrow (~17 kWh > 8.5x1.5) -> learned reserve released to 0", rel == 0.0, str(rel)))
+
+    cloudy = [SS(start=at(h), pv_estimate_kwh=1.1) for h in range(16, 25)]  # ~9h x 0.5 = 4.5 kWh
+    keep = planner.solar_aware_reserve_pct(15.0, solar_slots=cloudy, load_hourly_w=load,
+                                           now=base, usable_pct=85.0, capacity_kwh=10.0)
+    checks.append(("low-solar tomorrow (~4.5 kWh < threshold) -> reserve kept (no stranding)", keep == 15.0, str(keep)))
+
+    checks.append(("no learned reserve to begin with -> unchanged",
+                   planner.solar_aware_reserve_pct(0.0, solar_slots=sunny, load_hourly_w=load,
+                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 0.0, "0"))
+
+    far = [SS(start=at(h), pv_estimate_kwh=2.5) for h in range(30, 39)]  # beyond the 24h horizon
+    checks.append(("solar beyond the 24h horizon ignored -> reserve kept",
+                   planner.solar_aware_reserve_pct(15.0, solar_slots=far, load_hourly_w=load,
+                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 15.0, "far"))
+
+    past = [SS(start=at(-h), pv_estimate_kwh=5.0) for h in range(1, 10)]  # already happened
+    checks.append(("past solar (before now) ignored -> reserve kept",
+                   planner.solar_aware_reserve_pct(15.0, solar_slots=past, load_hourly_w=load,
+                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 15.0, "past"))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -2751,6 +2791,7 @@ def main():
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
                          ("MORNING SELL-THROTTLE (v0.24.13 experiment)", test_morning_sell_throttle),
+                         ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

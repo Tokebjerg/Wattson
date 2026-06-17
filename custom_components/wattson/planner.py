@@ -92,6 +92,16 @@ NEGATIVE_IMPORT_ABSORB_THRESHOLD = 0.0
 # margin is the safety buffer against an over-optimistic forecast.
 SELL_REFILL_MARGIN = 1.2
 
+# Solar-aware reserve release (v0.24.14): drop the LEARNED self-use reserve when the
+# forecast solar surplus over the next SOLAR_RESERVE_HORIZON_H hours can refill the
+# whole usable SOC band at least this many times over — high-confidence enough that
+# the pack refills from the sun regardless, so holding the reserve overnight/evening
+# is dead weight. Conservative margin + bias-corrected forecast; mirrors the
+# peak_reserve cheap-refill credit (A1). Lets the pack discharge the cheap
+# overnight/evening hours down to the hard min and refill free from tomorrow's sun.
+SOLAR_RESERVE_RELEASE_MARGIN = 1.5
+SOLAR_RESERVE_HORIZON_H = 24
+
 # The trickle threshold + sell-safe charge floor live in the firmware contract
 # (deye_contract.py) together with the full empirical Deye model — read THAT
 # file before changing any register recipe. Re-exported here for compatibility
@@ -220,6 +230,47 @@ def future_solar_surplus_kwh(slots, solar_by_start, load_hourly_w, after_start, 
         load_kwh = (load_hourly_w.get(slot.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
         total += max(0.0, solar_kwh - load_kwh)
     return total
+
+
+def solar_aware_reserve_pct(
+    learned_reserve_pct,
+    *,
+    solar_slots,
+    load_hourly_w,
+    now,
+    usable_pct,
+    capacity_kwh,
+    horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
+    margin: float = SOLAR_RESERVE_RELEASE_MARGIN,
+) -> float:
+    """Release (-> 0) the LEARNED self-use reserve when the forecast solar surplus
+    over the next ``horizon_hours`` can refill the whole usable SOC band at least
+    ``margin``x over — so the pack may run down to the hard min on the cheap
+    overnight/evening hours and refill for free from the coming sun, instead of
+    carrying the reserve dead to a near-certain solar refill.
+
+    Conservative by construction: it needs the (already bias-corrected) forecast
+    surplus to clear the FULL usable band x margin, so a clearly-sunny tomorrow
+    releases while a marginal/low-solar day keeps the reserve and never strands the
+    pack. Only the LEARNED reserve is released here — a profile self-sufficiency
+    reserve (Grøn's reserve_soc_offset) is the caller's max() and stays untouched.
+    Mirrors peak_reserve_pct's cheap-refill credit (A1, v0.24.8)."""
+    if learned_reserve_pct <= 0.0:
+        return learned_reserve_pct
+    band_kwh = max(0.0, usable_pct) / 100.0 * max(0.0, capacity_kwh)
+    if band_kwh <= 0.0:
+        return learned_reserve_pct
+    horizon_end = now + timedelta(hours=horizon_hours)
+    avg_load_w = (sum(load_hourly_w.values()) / len(load_hourly_w)) if load_hourly_w else 0.0
+    surplus_kwh = 0.0
+    for s in solar_slots:
+        if s.start <= now or s.start > horizon_end:
+            continue
+        load_kwh = (load_hourly_w.get(s.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
+        surplus_kwh += max(0.0, s.pv_estimate_kwh - load_kwh)
+    if surplus_kwh >= band_kwh * margin:
+        return 0.0
+    return learned_reserve_pct
 
 
 def peak_reserve_pct(

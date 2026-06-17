@@ -149,6 +149,7 @@ from .planner import (
     execute_slot,
     mode_dwell_exempt,
     peak_reserve_pct,
+    solar_aware_reserve_pct,
     required_spread,
     build_battery_plan,
     build_control_plan,
@@ -716,6 +717,23 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         _allow_grid_charge = bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE))
         _allow_neg_export = bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT))
         _load_hourly = self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None
+
+        # Solar-aware reserve release (v0.24.14): when enough high-confidence
+        # forecast solar is coming to refill the whole usable band, drop the learned
+        # self-use reserve so the pack can run down to the hard min on the cheap
+        # overnight/evening hours and refill for free from the sun — instead of
+        # carrying the reserve dead to a near-certain refill. solar_slots are already
+        # bias-corrected here (_apply_solar_bias above). Only the LEARNED reserve is
+        # released; a Grøn profile self-sufficiency offset stays (it's the planner's
+        # max()). Mirrors the peak_reserve cheap-refill credit (A1).
+        learned_reserve_pct = solar_aware_reserve_pct(
+            learned_reserve_pct,
+            solar_slots=self.site_state.solar_slots,
+            load_hourly_w=_load_hourly,
+            now=self.site_state.timestamp,
+            usable_pct=max(0.0, _max_soc - _min_soc),
+            capacity_kwh=_capacity,
+        )
 
         # ---- Fase A plan engine: the day plan is the boss. Rebuild only when ----
         # missing/expired, the horizon grew (tomorrow's prices arrived), the SOC has
