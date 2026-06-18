@@ -130,7 +130,7 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .control import EaseeController, KlatremisController
-from .deye_contract import apply_morning_sell_throttle, floor_sell_safe
+from .deye_contract import floor_sell_safe
 from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
@@ -148,6 +148,7 @@ from .planner import (
     build_day_plan,
     execute_slot,
     mode_dwell_exempt,
+    apply_sell_throttle,
     peak_reserve_pct,
     solar_aware_reserve_pct,
     required_spread,
@@ -1016,20 +1017,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # ride with a sub-sell-safe charge register (the trickle+sell stall).
         battery_plan = floor_sell_safe(battery_plan)
 
-        # EXPERIMENT (v0.24.13, user-directed): morning sell-throttle. In the
-        # 07-11 window, when selling surplus, drop the charge register to 10 A so
-        # the pack fills slowly and the surplus EXPORTS — deferring the bulk fill
-        # to the cheaper/negative midday. Runs AFTER floor_sell_safe and overrides
-        # it for this window only; a STABLE setpoint (no flapping) to test whether
-        # the v0.23.0 trickle+sell stall was a flapping artifact. Self-heals to the
-        # full rate at 11:00. See deye_contract.apply_morning_sell_throttle.
-        battery_plan = apply_morning_sell_throttle(
+        # Sell-throttle (v0.24.15): while SELLING surplus with a cheaper same-day
+        # refill window ahead, drop the charge register to 10 A so the surplus EXPORTS
+        # now (high price) and the pack refills later from the cheaper/negative-priced
+        # sun. Price-based (any "high now, cheaper sun later" shape), self-releasing at
+        # the day's cheapest hours. Runs AFTER floor_sell_safe and intentionally
+        # overrides it; a STABLE setpoint (the v0.23.0 stall was a flapping artifact).
+        battery_plan = apply_sell_throttle(
             battery_plan,
-            hour=dt_util.now().hour,
+            price_slots=self.site_state.price_slots,
+            solar_slots=self.site_state.solar_slots,
+            load_hourly_w=_load_hourly,
+            now=self.site_state.timestamp,
             soc_pct=self.site_state.battery_soc_pct,
-            max_soc_pct=float(
-                entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)
-            ),
+            max_soc_pct=_max_soc,
+            capacity_kwh=_capacity,
         )
 
         # Phase E: a manual battery override is an explicit user action and wins

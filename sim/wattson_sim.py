@@ -2665,45 +2665,55 @@ def test_sell_safe_invariant():
     return checks
 
 
-def test_morning_sell_throttle():
-    """v0.24.13 EXPERIMENT — morning sell-throttle. In the 07-11 window a SELLING
-    plan gets its charge register dropped to MORNING_SELL_THROTTLE_A (10 A) so the
-    surplus EXPORTS instead of bulk-charging the pack, deferring the fill to the
-    cheaper midday. Runs AFTER floor_sell_safe and intentionally overrides it for
-    the window only; a no-op when not selling, outside the window, or at a full
-    battery — so 10 A can ONLY ever ride WITH an active sell (the config under
-    test), never on its own."""
+def test_sell_throttle():
+    """v0.24.15 — price-based sell-throttle. While SELLING surplus with a CHEAPER
+    same-day refill window ahead (the can_refill_later test: future solar priced below
+    now >= headroom x SELL_REFILL_MARGIN), the charge register drops to 10 A so the
+    surplus EXPORTS now (high price) and the pack refills later from the cheaper/
+    negative sun. Self-releases at the day's cheapest hours (no cheaper refill ahead
+    -> charge). No-op when not selling or at a full battery — 10 A only ever rides with
+    an active sell that has a guaranteed cheaper refill."""
     checks = []
-    A = deye_contract.MORNING_SELL_THROTTLE_A
-    SAFE = deye_contract.SELL_SAFE_CHARGE_A
+    A = planner.SELL_THROTTLE_CHARGE_A
+    SAFE = planner.SELL_SAFE_CHARGE_A
+    base = datetime(2026, 6, 18, 0, 0, tzinfo=timezone.utc)
+    def at(h):
+        return base + timedelta(hours=h)
+    # High morning -> negative midday -> small recovery (import price; export proxy).
+    prices = {8: 0.57, 9: 0.42, 10: 0.18, 11: -0.08, 12: -0.27, 13: -0.33, 14: -0.30, 15: -0.09, 16: 0.21}
+    price_slots = [models.PriceSlot(start=at(h), spot_price=p, tariff=0.0,
+                                    total_import_price=p, export_value=max(0.0, p)) for h, p in prices.items()]
+    solar_slots = [models.SolarSlot(start=at(h), pv_estimate_kwh=3.0) for h in range(8, 17)]
+    load = {h: 1000.0 for h in range(24)}  # 1 kWh/h -> ~2 kWh surplus/h
 
     def sell_plan(charge=SAFE):
         return models.BatteryPlan(strategy="SELL_SOLAR_PEAK", reason="sell",
                                   desired_solar_sell=True, desired_max_charge_current_a=charge)
 
-    def thr(plan, hour, soc=50.0, mx=95.0):
-        return deye_contract.apply_morning_sell_throttle(plan, hour=hour, soc_pct=soc, max_soc_pct=mx)
+    def thr(plan, now, soc=30.0, mx=100.0):
+        return planner.apply_sell_throttle(plan, price_slots=price_slots, solar_slots=solar_slots,
+                                           load_hourly_w=load, now=now, soc_pct=soc, max_soc_pct=mx, capacity_kwh=10.0)
 
-    p = thr(sell_plan(), 8)
-    checks.append(("in-window (08) sell -> charge throttled to 10 A", p.desired_max_charge_current_a == A, str(p.desired_max_charge_current_a)))
-    checks.append(("throttle annotates the decision reason", "sell-throttle" in p.reason, p.reason[-40:]))
+    p = thr(sell_plan(), at(8))
+    checks.append(("high-price hour (0.57) + cheaper sun ahead -> throttled to 10 A", p.desired_max_charge_current_a == A, str(p.desired_max_charge_current_a)))
+    checks.append(("throttle annotates the decision reason", "sell-throttle" in p.reason, p.reason[-48:]))
 
-    checks.append(("after window (13) sell -> full rate kept", thr(sell_plan(), 13).desired_max_charge_current_a == SAFE, "13"))
-    checks.append(("before window (06) sell -> full rate kept", thr(sell_plan(), 6).desired_max_charge_current_a == SAFE, "06"))
-    checks.append(("end hour (11) is exclusive -> full rate resumes", thr(sell_plan(), 11).desired_max_charge_current_a == SAFE, "11"))
+    checks.append(("cheapest hour (-0.33, nothing cheaper ahead) -> full rate (charge)",
+                   thr(sell_plan(), at(13)).desired_max_charge_current_a == SAFE, "13"))
+    checks.append(("mid-curve hour (0.42) + cheaper sun ahead -> throttled",
+                   thr(sell_plan(), at(9)).desired_max_charge_current_a == A, "09"))
 
     nosell = models.BatteryPlan(strategy="IDLE", reason="idle", desired_solar_sell=False, desired_max_charge_current_a=SAFE)
-    checks.append(("in-window but NOT selling -> untouched (10A only rides with a sell)", thr(nosell, 8).desired_max_charge_current_a == SAFE, "nosell"))
+    checks.append(("not selling -> untouched (10A only rides with a sell)", thr(nosell, at(8)).desired_max_charge_current_a == SAFE, "nosell"))
 
-    checks.append(("in-window sell at FULL battery -> untouched", thr(sell_plan(), 8, soc=95.0, mx=95.0).desired_max_charge_current_a == SAFE, "full"))
+    checks.append(("full battery -> untouched", thr(sell_plan(), at(8), soc=100.0, mx=100.0).desired_max_charge_current_a == SAFE, "full"))
 
-    # End-to-end like the coordinator: floor_sell_safe THEN throttle. A sell plan
-    # carrying a stale 10 A is floored to 70 by the backstop, then the window
-    # throttle deliberately re-drops it to 10 — the ONLY place sell+10A is allowed.
+    # End-to-end like the coordinator: floor_sell_safe floors a stale trickle to 70,
+    # then the throttle re-drops to 10 at a high-price hour with cheaper sun ahead.
     staged = deye_contract.floor_sell_safe(sell_plan(charge=10.0))
     checks.append(("floor_sell_safe floors a stale trickle first (->70)", staged.desired_max_charge_current_a == SAFE, str(staged.desired_max_charge_current_a)))
-    checks.append(("then morning throttle re-applies 10 A in-window", thr(staged, 9).desired_max_charge_current_a == A, "staged"))
-    checks.append(("floored 70 survives OUTSIDE the window (no stray trickle)", thr(staged, 15).desired_max_charge_current_a == SAFE, "15"))
+    checks.append(("then sell-throttle re-applies 10 A at a high-price hour", thr(staged, at(9)).desired_max_charge_current_a == A, "staged"))
+    checks.append(("floored 70 survives at the cheapest hour", thr(staged, at(13)).desired_max_charge_current_a == SAFE, "13b"))
     return checks
 
 
@@ -2790,7 +2800,7 @@ def main():
                          ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
-                         ("MORNING SELL-THROTTLE (v0.24.13 experiment)", test_morning_sell_throttle),
+                         ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),

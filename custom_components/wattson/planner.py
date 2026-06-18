@@ -102,6 +102,19 @@ SELL_REFILL_MARGIN = 1.2
 SOLAR_RESERVE_RELEASE_MARGIN = 1.5
 SOLAR_RESERVE_HORIZON_H = 24
 
+# Sell-throttle charge current (v0.24.15): while SELLING surplus with a CHEAPER
+# same-day refill window ahead, the charge register is dropped to this so the pack
+# fills slowly and the surplus EXPORTS now (at the higher price) — deferring the bulk
+# fill to the cheaper/negative-priced sun later in the day. Price-based generalisation
+# of the old fixed 07-11 morning window: it fires on any "high price now, cheaper sun
+# later" shape (the same can_refill_later test SELL_SOLAR_PEAK uses) and self-releases
+# at the day's cheapest hours (no cheaper refill ahead -> the pack just charges).
+# CAUTION: charge<=10A + solar_sell=ON is the v0.23.0 trickle+sell stall pair on this
+# klatremis/Deye — applied ONLY as a STABLE setpoint (every v0.23.0 stall was during
+# rapid flapping; the community runs stable low setpoints cleanly: kellerza-sunsynk,
+# solarenergyconcepts). It overrides floor_sell_safe; see apply_sell_throttle.
+SELL_THROTTLE_CHARGE_A = 10.0
+
 # The trickle threshold + sell-safe charge floor live in the firmware contract
 # (deye_contract.py) together with the full empirical Deye model — read THAT
 # file before changing any register recipe. Re-exported here for compatibility
@@ -271,6 +284,60 @@ def solar_aware_reserve_pct(
     if surplus_kwh >= band_kwh * margin:
         return 0.0
     return learned_reserve_pct
+
+
+def apply_sell_throttle(
+    plan,
+    *,
+    price_slots,
+    solar_slots,
+    load_hourly_w,
+    now,
+    soc_pct,
+    max_soc_pct,
+    capacity_kwh,
+    throttle_a: float = SELL_THROTTLE_CHARGE_A,
+    refill_margin: float = SELL_REFILL_MARGIN,
+):
+    """Throttle the charge register to ``throttle_a`` while the plan is SELLING
+    surplus AND there is a cheaper same-day refill window ahead with enough forecast
+    solar to refill the pack — the SAME can_refill_later test SELL_SOLAR_PEAK uses
+    (future solar surplus priced below the current hour >= headroom x refill_margin).
+    The surplus then EXPORTS now at the higher price and the pack refills later from
+    the cheaper/negative-priced sun, instead of bulk-charging now.
+
+    Price-based generalisation of the old fixed 07-11 morning window: fires on any
+    "high price now, cheaper sun later" shape and self-releases at the day's cheapest
+    hours (no cheaper refill ahead -> the pack just charges). Runs AFTER floor_sell_safe
+    and intentionally overrides it. No-op when not selling, at a full battery, or with
+    no cheaper refill window — so the low charge can ONLY ride with an active sell that
+    has a guaranteed cheaper refill, never on its own. CAUTION: the 10A+sell pair is the
+    v0.23.0 stall family — see SELL_THROTTLE_CHARGE_A; applied as a stable setpoint."""
+    if not getattr(plan, "desired_solar_sell", False) or soc_pct >= max_soc_pct:
+        return plan
+    current = current_price_slot(price_slots, now)
+    if current is None:
+        return plan
+    headroom_kwh = max(0.0, (max_soc_pct - soc_pct) / 100.0 * max(0.0, capacity_kwh))
+    if headroom_kwh <= 0.0:
+        return plan
+    refill_kwh = future_solar_surplus_kwh(
+        price_slots,
+        {s.start: s for s in solar_slots},
+        load_hourly_w,
+        current.start,
+        current.total_import_price,
+    )
+    if refill_kwh >= headroom_kwh * refill_margin:
+        return replace(
+            plan,
+            desired_max_charge_current_a=float(throttle_a),
+            reason=(
+                f"{plan.reason} | sell-throttle {throttle_a:.0f} A "
+                f"({refill_kwh:.1f} kWh cheaper sun ahead — selling now, refill later)"
+            ),
+        )
+    return plan
 
 
 def peak_reserve_pct(
