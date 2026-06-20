@@ -145,6 +145,15 @@ DEFAULT_PRICE_VAT_MULTIPLIER = 1.0
 DEFAULT_BATTERY_MIN_SOC = 15       # use the battery down to 15%
 DEFAULT_BATTERY_MAX_SOC = 100      # charge all the way to 100%
 DEFAULT_BATTERY_CAPACITY_KWH = 10.0
+
+# How many SOC% below max_soc still counts as "full" for the EV-solar discharge
+# buffer. A full pack can't absorb the PV surplus; with discharge=0 + sell off +
+# export blocked it becomes a fully CLOSED buffer and the Deye MPPT parks/cycles in
+# full sun (documented full-battery curtailment). At/above (max_soc - this), Ren sol
+# opens the discharge so the full pack covers the house+EV and BUFFERS the MPPT. The
+# margin keeps it stably open through normal near-full micro-cycling (no register
+# flap) while only touching the very top of the pack (no reserve drained into the car).
+BATTERY_NEAR_FULL_MARGIN_PCT = 2.0
 # Home-battery SOC plan has first priority: while SOC is below this, solar surplus
 # CHARGES the battery before it is sold at a peak or handed to the EV. 0 = off.
 CONF_SOLAR_CHARGE_PRIORITY_SOC = "solar_charge_priority_soc"

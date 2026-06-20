@@ -230,19 +230,23 @@ def simulate_tick(entities, s: Settings):
             and ev_plan.desired_enabled is True
             and ev_plan.desired_action == "resume"
         ):
+            _pack_full = state.battery_soc_pct >= (
+                float(s.max_soc) - const.BATTERY_NEAR_FULL_MARGIN_PCT
+            )
             battery_plan = replace(
                 battery_plan,
                 strategy="EV_SOLAR_PRIORITY",
                 reason=f"{battery_plan.reason} | EV solar-only active",
                 desired_grid_charge=False,
-                # Option A (pure solar): sell OFF + discharge 0. Sell OFF is the
-                # linchpin — the PV stall is the sell=ON+discharge=0 PAIR, so with
-                # sell off the battery can stay closed (no drain into the car) without
-                # stalling the MPPT.
+                # Option A (pure solar): sell OFF (the linchpin — the stall is the
+                # sell=ON+discharge=0 PAIR). discharge=0 BELOW near-full (no reserve
+                # drained into the car); OPEN at near-full so the full pack BUFFERS the
+                # MPPT instead of the site importing while a full pack sits locked (the
+                # documented full-battery curtailment). Stall-safe because sell is OFF.
                 desired_solar_sell=False,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
-                desired_discharge_current_a=0.0,
+                desired_discharge_current_a=(70.0 if _pack_full else 0.0),
             )
 
     safe_reasons = []
@@ -428,14 +432,23 @@ SCENARIOS = [
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk_ev_action("pause")),
 
-    ("EV solar active -> EV_SOLAR_PRIORITY pure solar (sell OFF + discharge 0: no drain, no stall)",
+    ("EV solar, battery NOT full -> EV_SOLAR_PRIORITY sell OFF + discharge 0 (no reserve drained into car)",
      entities(pv1=3000, pv2=2500, grid=-4000, soc=80, bat=-300,
               buy=1.0, sell=0.4, ev_status="charging", ev_power=2500, ev_phase="3_phase"),
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
          and pl.battery.desired_solar_sell is not True
          and pl.battery.desired_discharge_current_a == 0.0,
-         "EV_SOLAR_PRIORITY must be sell OFF + discharge 0 (the sell+discharge=0 PAIR is what stalls PV)")),
+         "EV_SOLAR_PRIORITY below full: sell OFF + discharge 0 (pure solar, no drain)")),
+
+    ("EV solar, battery FULL -> EV_SOLAR_PRIORITY opens discharge to buffer the MPPT (no full-battery curtailment)",
+     entities(pv1=3000, pv2=2500, grid=200, soc=100, bat=0,
+              buy=0.35, sell=-0.05, ev_status="charging", ev_power=2750, ev_phase="3_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
+         and pl.battery.desired_solar_sell is not True
+         and pl.battery.desired_discharge_current_a not in (0.0, None),
+         "EV_SOLAR_PRIORITY at a FULL battery must OPEN the discharge (full pack buffers the MPPT; sell OFF = stall-safe)")),
 
     ("EV full speed -> resume at max amps on every phase (clears stale circuit cap)",
      entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,

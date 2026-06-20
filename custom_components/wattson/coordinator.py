@@ -70,6 +70,7 @@ from .const import (
     DEFAULT_ALLOW_NEGATIVE_EXPORT,
     DEFAULT_AUTOMATION_ENABLED,
     DEFAULT_BATTERY_CONTROL_ENABLED,
+    BATTERY_NEAR_FULL_MARGIN_PCT,
     DEFAULT_BATTERY_MAX_SOC,
     DEFAULT_BATTERY_CARE_MAX_SOC,
     DEFAULT_BATTERY_CAPACITY_KWH,
@@ -923,6 +924,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 # sold-from. This is "pure solar" the way it ran well last week — the
                 # history (2026-06-17) showed the discharge register lay rock-stable
                 # before the broken-cloud days exposed the stall below.
+                # A FULL pack can't absorb the PV surplus, so with discharge=0 it is a
+                # completely closed buffer (can't charge, can't discharge, sell off) —
+                # the Deye MPPT then can't hold a stable point against the bare house+EV
+                # load and parks/cycles, importing from grid in full sun (the documented
+                # full-battery curtailment; live-proven 2026-06-20: manual discharge
+                # 0->70 recovered PV instantly). Only OPEN the discharge when near-full.
+                _ev_pack_full = self.site_state.battery_soc_pct >= (
+                    float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+                    - BATTERY_NEAR_FULL_MARGIN_PCT
+                )
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
@@ -949,13 +960,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # the car doesn't take (until full), never a trickle inherited
                     # from an earlier SELL slot.
                     desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-                    # Discharge CLOSED (0 A): the house battery must not discharge into
-                    # the car. Safe here precisely BECAUSE sell is OFF above — the
-                    # stall needs the sell+discharge=0 pair, not discharge=0 alone. The
-                    # cost is that during a cloud dip (PV < house+car) the deficit is
-                    # covered by the grid, not the battery; on a stable-sun day the car
-                    # just tracks the surplus and neither grid nor battery is touched.
-                    desired_discharge_current_a=0.0,
+                    # Discharge: CLOSED (0 A) below near-full so the reserve is never
+                    # drained into the car ("pure solar"); OPEN (full rate) when the
+                    # pack is near-full so it BUFFERS the MPPT and covers the house+EV
+                    # instead of the site importing while a full pack sits locked. Both
+                    # are stall-safe because sell is OFF above (the stall needs the
+                    # sell+discharge=0 pair). The CT clamp still blocks battery->grid
+                    # export (v0.24.2), so an open discharge only ever covers the load.
+                    # Mirrors the v0.24.2 sell-slot fix, which had left this path at 0.
+                    desired_discharge_current_a=(
+                        self.battery_discharge_current if _ev_pack_full else 0.0
+                    ),
                 )
 
         # Negative TOTAL import price (spot + tariff): you are PAID to import, so
