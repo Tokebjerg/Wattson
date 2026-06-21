@@ -2678,6 +2678,47 @@ def test_sell_safe_invariant():
     return checks
 
 
+def test_full_battery_hold():
+    """S1: a FULL pack in a charge slot (ABSORB_NEGATIVE / GRID_CHARGE) with a house
+    deficit demotes to a STABLE IDLE hold (grid_charge off, discharge 0, sell off),
+    NOT SELF_CONSUME's open discharge that drains the pack and flaps the registers on
+    the ceiling (the overnight 99<->100 limit cycle). NOT-full and surplus are
+    unchanged. max_soc=95 here, so soc>=95 == full."""
+    checks = []
+    at, _slots, _solar, _load_hourly, state = _plan_engine_day()
+
+    def ex(slot, st):
+        plan, _ = planner.execute_slot(
+            slot, st, battery_mode="blue", min_soc=20, max_soc=95,
+            allow_grid_charge=True, allow_negative_export=False, export_limit_default_w=6000.0,
+        )
+        return plan
+
+    def slot(intent, price, exp):
+        return models.SlotPlan(start=at(2), intent=intent, sell=False, grid_charge=(intent == "GRID_CHARGE"),
+                               tou_floor_pct=20.0, charge_current_a=None, total_import_price=price, export_value=exp)
+
+    p = ex(slot("ABSORB_NEGATIVE", -0.2, -0.05), state(2, soc=100, pv=0, load=2000))
+    checks.append(("full+deficit ABSORB_NEGATIVE -> IDLE hold (grid_charge off, discharge 0, sell off)",
+                   p.strategy == "IDLE" and p.desired_grid_charge is False
+                   and p.desired_discharge_current_a == 0.0 and p.desired_solar_sell is not True,
+                   f"{p.strategy}/{p.desired_grid_charge}/{p.desired_discharge_current_a}/{p.desired_solar_sell}"))
+
+    p = ex(slot("GRID_CHARGE", 0.30, 0.20), state(2, soc=100, pv=0, load=2000))
+    checks.append(("full+deficit GRID_CHARGE -> IDLE hold (discharge 0, no register flap)",
+                   p.strategy == "IDLE" and p.desired_discharge_current_a == 0.0 and p.desired_grid_charge is False,
+                   f"{p.strategy}/{p.desired_discharge_current_a}"))
+
+    p = ex(slot("GRID_CHARGE", 0.30, 0.20), state(2, soc=50, pv=0, load=2000))
+    checks.append(("not-full GRID_CHARGE -> still GRID_CHARGE (charges normally)",
+                   p.strategy == "GRID_CHARGE" and p.desired_grid_charge is True, f"{p.strategy}/{p.desired_grid_charge}"))
+
+    p = ex(slot("ABSORB_NEGATIVE", -0.2, 0.10), state(2, soc=100, pv=5000, load=600))
+    checks.append(("full+surplus ABSORB -> NOT the discharge-0 hold (daytime sell path intact)",
+                   p.desired_discharge_current_a != 0.0, f"{p.strategy}/{p.desired_discharge_current_a}"))
+    return checks
+
+
 def test_sell_throttle():
     """v0.24.15 — price-based sell-throttle. While SELLING surplus with a CHEAPER
     same-day refill window ahead (the can_refill_later test: future solar priced below
@@ -2813,6 +2854,7 @@ def main():
                          ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
+                         ("FULL-BATTERY HOLD (S1: kill the overnight ceiling flap)", test_full_battery_hold),
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

@@ -677,17 +677,31 @@ def execute_slot(
 
     intent = slot.intent
     demoted_sell = False
+    # S1 (2026-06-21): a FULL pack in a charge slot must HOLD, not cover the house
+    # from the battery. SELF_CONSUME leaves the discharge open, so the pack covers a
+    # hair of the house load, SOC drops below max_soc, the charge slot re-promotes,
+    # and the grid_charge/discharge registers flap on the ceiling all night (~120 s
+    # limit cycle; O1's strategy-flip counter measures it). In a cheap/paid charge
+    # window importing the house load is correct anyway, so at a full battery WITH a
+    # house deficit (i.e. it WOULD discharge) we pin a stable IDLE hold (grid_charge
+    # off, discharge 0, sell off) — SOC holds, the flap is gone. Only the config
+    # "grid charge disabled" demotion (not full) still covers the house from the pack.
+    _at_ceiling = state.battery_soc_pct >= max_soc
+    _house_deficit = (state.load_power_w - state.pv_power_w) > DISCHARGE_DEADBAND_W
     # Live demotions (one-way within the slot, or forced by live conditions):
-    if intent == "ABSORB_NEGATIVE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
+    if intent == "ABSORB_NEGATIVE" and (not allow_grid_charge or _at_ceiling):
         # The pack can't absorb the paid import (full / charging disallowed). The
         # IMPORT total being negative does not mean exporting is worthless — import
         # and export carry different tariffs, so the EXPORT value is often still
         # positive in these hours. If it pays, SELL the surplus instead of
         # curtailing; only a genuinely negative export price blocks.
         demoted_sell = (slot.export_value or 0) > 0
-        intent = "BLOCK_EXPORT" if (window and not demoted_sell) else "SELF_CONSUME"
-    if intent == "GRID_CHARGE" and (not allow_grid_charge or state.battery_soc_pct >= max_soc):
-        intent = "SELF_CONSUME"
+        if _at_ceiling and _house_deficit:
+            intent = "HOLD_FULL"
+        else:
+            intent = "BLOCK_EXPORT" if (window and not demoted_sell) else "SELF_CONSUME"
+    if intent == "GRID_CHARGE" and (not allow_grid_charge or _at_ceiling):
+        intent = "HOLD_FULL" if (_at_ceiling and _house_deficit) else "SELF_CONSUME"
     if intent == "SELL_SURPLUS":
         # A sell slot live in a sustained house DEFICIT (a cloud dropped PV below
         # the house) demotes to SELF_CONSUME — but since 2026-06-12 that is a pure
@@ -705,7 +719,10 @@ def execute_slot(
         if live_deficit:
             intent = "SELF_CONSUME"
     # Live negative-export guard beats a stale plan (prices are hourly; cheap check).
-    if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE",):
+    # HOLD_FULL already blocks export (sell off, discharge 0, grid_charge off) AND
+    # holds the pack; letting BLOCK_NEGATIVE_EXPORT (open discharge) override it would
+    # re-open the overnight ceiling flap on negative-price nights. So exclude it too.
+    if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE", "HOLD_FULL"):
         return (
             BatteryPlan(
                 strategy="BLOCK_NEGATIVE_EXPORT",
@@ -766,6 +783,26 @@ def execute_slot(
                 desired_limit_control_mode="Zero export to CT",
                 desired_energy_priority="Load first",
                 desired_export_limit_w=0.0,
+            ),
+            negative_export_active,
+        )
+
+    if intent == "HOLD_FULL":
+        # Stable IDLE at a full battery in a cheap/paid charge hour: hold the pack
+        # (keep it for the peak), cover the house from the grid (cheap/paid), and
+        # write a single non-flapping tuple — grid_charge OFF, discharge 0, sell OFF.
+        # discharge=0 is stall-safe here because sell is OFF (the stall needs the
+        # sell+discharge=0 PAIR) and there is no PV at these hours anyway.
+        return (
+            BatteryPlan(
+                strategy="IDLE",
+                reason=f"[plan] battery full at a cheap/paid hour ({slot.total_import_price:.2f}) — holding the pack for the peak, house on grid",
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
+                desired_discharge_current_a=0.0,
             ),
             negative_export_active,
         )
