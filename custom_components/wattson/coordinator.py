@@ -326,7 +326,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if capacity_kwh <= 0:
             return 0.0
         reserve_kwh = predicted_load_kwh(profile, dt_util.now().hour, LEARNING_RESERVE_HOURS)
-        return min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
+        base = min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
+        # Apply the learning confidence ramp (0->1 over the learning window) the
+        # models docstring promises, instead of jumping to full strength at the
+        # day-7 cliff. Floored at 0.4 so morning-shoulder protection still
+        # contributes early; only ever LOWERS the reserve (safe direction).
+        return base * max(0.4, getattr(profile, "confidence", 1.0))
 
     def _restore_override_state(self, entry) -> None:
         """Resume persisted manual overrides that have not yet expired."""
@@ -1178,6 +1183,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             return
 
         self.last_actions = actions
+        self._accumulate_churn(actions, plan)
 
     async def _async_apply_battery(self, plan: ControlPlan, now: datetime) -> list[str]:
         """Continuously re-assert the battery plan (idempotent writes), bounded by

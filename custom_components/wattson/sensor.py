@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from homeassistant.components.sensor import RestoreSensor, SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower, UnitOfEnergy
+from homeassistant.const import EntityCategory, UnitOfPower, UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -216,6 +216,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
+    entities.append(WattsonChurnSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -393,6 +394,9 @@ class WattsonSavingsVsNoBatterySensor(CoordinatorEntity, RestoreSensor):
             self.coordinator.actual_cost_today_kr = float(
                 last_state.attributes.get("actual_cost_kr") or 0.0
             )
+            self.coordinator.wear_cost_today_kr = float(
+                last_state.attributes.get("wear_cost_kr") or 0.0
+            )
             self.coordinator._cf_day = dt_util.now().date()
         except (TypeError, ValueError):
             return
@@ -406,8 +410,55 @@ class WattsonSavingsVsNoBatterySensor(CoordinatorEntity, RestoreSensor):
         return {
             "baseline_cost_kr": round(self.coordinator.baseline_cost_today_kr, 2),
             "actual_cost_kr": round(self.coordinator.actual_cost_today_kr, 2),
-            "note": "Kontrafaktisk: hvad dagen ville have kostet UDEN batteri (underskud købt, overskud solgt) minus de faktiske net-flows. Isolerer batteriets+planens reelle bidrag.",
+            "wear_cost_kr": round(self.coordinator.wear_cost_today_kr, 2),
+            "note": "Kontrafaktisk: hvad dagen ville have kostet UDEN batteri (underskud købt, overskud solgt) minus de faktiske net-flows MINUS batteri-slid. Isolerer batteriets+planens reelle nettobidrag.",
         }
+
+
+class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
+    """O1: daily count of real register writes (+ battery-strategy flips as an
+    attribute). A spike is the flapping failure class showing up live — the
+    tripwire that confirms a stability fix landed, before churn trips the
+    master-controller lock."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Register Writes Today"
+    _attr_icon = "mdi:counter"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_register_writes_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if dt_util.as_local(last_state.last_updated).date() != dt_util.now().date():
+            return
+        try:
+            self.coordinator.register_writes_today = int(float(last_state.state))
+            self.coordinator.battery_strategy_changes_today = int(
+                float(last_state.attributes.get("battery_strategy_changes") or 0)
+            )
+            self.coordinator._churn_day = dt_util.now().date()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> int:
+        return self.coordinator.register_writes_today
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"battery_strategy_changes": self.coordinator.battery_strategy_changes_today}
 
 
 class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):

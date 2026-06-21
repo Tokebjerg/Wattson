@@ -25,23 +25,28 @@ EXPORT SEMANTICS (verified 2026-06-09 .. 2026-06-11)
                                      the sell switch.
   * "Zero export to CT" alone does NOT block the solar-sell carve-out.
 
-THE TRICKLE+SELL STALL (curtailment #3, verified 2026-06-11 in three
-independent windows + June 10's 2-minute register flapping)
-  solar_sell=ON together with a TRICKLE charge-current register stalls the
-  whole PV/sell pipeline: the MPPT parks the strings (~390 V at 0.0 A), PV
-  clamps to the house load, nothing exports, and the house can fall back to
-  GRID IMPORT — while the identical registers with the charge current at the
-  full rate export normally. Hence:
+THE TRICKLE+SELL STALL — it is the FLAPPING, not a stable low charge
+(curtailment #3 first blamed the level; 2026-06-18 live-proved it is the churn)
+  The ORIGINAL observations (2026-06-11 three windows + June 10's 2-minute
+  register flapping) were ALL during rapid sell/charge toggling, and the MPPT
+  parked (strings ~390 V at 0.0 A), PV clamped to the house load, nothing
+  exported, the house fell to GRID IMPORT. We first read this as "a low charge
+  register stalls the sell path." It does NOT: a STABLE low charge setpoint runs
+  clean. Live 2026-06-18: SELL_THROTTLE_CHARGE_A=10 held steady for minutes with
+  solar_sell=ON, PV rose, grid exported, no stall (commits e6840f9/66f1df0). The
+  stall is the REGISTER CHURN, not the level. So:
 
-      solar_sell=ON  =>  max_battery_charge_current >= SELL_SAFE_CHARGE_A
+      a STABLE charge setpoint is safe with solar_sell=ON, even at 10 A;
+      RAPID flapping of the charge/discharge/sell registers is what stalls.
 
-  enforced at every plan site and floored once more just before the write
-  layer (``floor_sell_safe``). "Save battery headroom for cheaper sun later"
-  must be expressed by WHEN the plan sells, never by throttling the charge
-  register while selling. Corollary: the battery cannot be held below 100 %
-  while selling either — "Load first" fills the pack BEFORE anything exports,
-  so a 95 % battery-care cap is only enforceable for GRID charging (TOU
-  capacity targets), not for solar charging.
+  ``floor_sell_safe`` (>= SELL_SAFE_CHARGE_A while selling) is still load-bearing
+  as a backstop for NON-throttle sell paths and transient flaps — a leftover
+  trickle inherited from another slot, or a plan path that did not intend a low
+  charge. The deliberate sell-throttle (planner.SELL_THROTTLE_CHARGE_A) overrides
+  it ON PURPOSE, AFTER the floor, as a stable setpoint. Do NOT "restore the >=70 A
+  invariant" everywhere — that would silently kill the sell-throttle savings.
+  Corollary unchanged: under "Load first" the pack fills BEFORE anything exports,
+  so a battery-care % cap is only enforceable for GRID charging, not solar.
 
 BATTERY -> GRID (the no-export rule)
   The battery must NEVER export to the grid. Under the constant modes the CT

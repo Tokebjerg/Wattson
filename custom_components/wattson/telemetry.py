@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from .config import entry_value, update_entry_options
 from .const import (
+    BATTERY_WEAR_COST,
     CONF_BATTERY_MAX_SOC,
     CONF_SOLAR_BIAS_HISTORY,
     CONF_SOLAR_BIAS_INTRADAY,
@@ -51,9 +52,15 @@ class TelemetryMixin:
         # (deficit imports, surplus exports) vs what it actually costs.
         self.baseline_cost_today_kr: float = 0.0
         self.actual_cost_today_kr: float = 0.0
+        self.wear_cost_today_kr: float = 0.0
         self.savings_vs_no_battery_today_kr: float = 0.0
         self._cf_day = None
         self._cf_last_tick: datetime | None = None
+        # O1: register-write / strategy-flap churn visibility (the flapping class).
+        self.register_writes_today: int = 0
+        self.battery_strategy_changes_today: int = 0
+        self._churn_day = None
+        self._last_churn_strategy: str | None = None
         # Solar-bias learning.
         self._solar_accum_day = None
         self._solar_actual_wh: float = 0.0
@@ -154,6 +161,7 @@ class TelemetryMixin:
             self._cf_day = today
             self.baseline_cost_today_kr = 0.0
             self.actual_cost_today_kr = 0.0
+            self.wear_cost_today_kr = 0.0
             self.savings_vs_no_battery_today_kr = 0.0
         last = self._cf_last_tick
         self._cf_last_tick = now
@@ -175,9 +183,40 @@ class TelemetryMixin:
             max(0.0, state.grid_import_power_w) / 1000.0 * dt_hours * import_price
             - max(0.0, state.grid_export_power_w) / 1000.0 * dt_hours * exp
         )
+        # Debit battery wear (H1): the planner optimises against BATTERY_WEAR_COST
+        # (kr/kWh discharged), so the honest counterfactual must subtract it too or
+        # it overstates the net gain. Sign convention (see planner.py reclaim:
+        # battery_power_w < 0 == charging): DISCHARGE is battery_power_w > 0. Book
+        # wear on the discharge leg only — charging is the other half of the same
+        # round trip the discharge already pays for.
+        wear = max(0.0, state.battery_power_w) / 1000.0 * dt_hours * BATTERY_WEAR_COST
         self.baseline_cost_today_kr += baseline
         self.actual_cost_today_kr += actual
-        self.savings_vs_no_battery_today_kr = self.baseline_cost_today_kr - self.actual_cost_today_kr
+        self.wear_cost_today_kr += wear
+        self.savings_vs_no_battery_today_kr = (
+            self.baseline_cost_today_kr - self.actual_cost_today_kr - self.wear_cost_today_kr
+        )
+
+    # ------------------------------------------------------------------ #
+    # O1: register-write / strategy-flap churn counter
+    # ------------------------------------------------------------------ #
+    def _accumulate_churn(self, actions, plan) -> None:
+        """Count real register writes + battery-strategy flips per day, so the
+        flapping failure class (overnight GRID_CHARGE<->DISCHARGE etc.) is VISIBLE
+        live instead of only surfacing when it trips the master-controller lock.
+        ``actions`` is already a REAL-write count (the write layer returns [] when a
+        value already matches), so a daily spike == churn."""
+        today = dt_util.now().date()
+        if self._churn_day != today:
+            self._churn_day = today
+            self.register_writes_today = 0
+            self.battery_strategy_changes_today = 0
+        self.register_writes_today += len(actions or [])
+        strat = plan.battery.strategy if (plan is not None and plan.battery is not None) else None
+        if strat is not None:
+            if self._last_churn_strategy is not None and strat != self._last_churn_strategy:
+                self.battery_strategy_changes_today += 1
+            self._last_churn_strategy = strat
 
     # ------------------------------------------------------------------ #
     # Phase D: Solcast bias learning

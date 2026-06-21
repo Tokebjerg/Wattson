@@ -214,8 +214,9 @@ CONF_BATTERY_OVERRIDE_PERSIST = "battery_override_persist"
 CONF_EV_OVERRIDE_PERSIST = "ev_override_persist"
 SOLAR_BIAS_MIN_DAYS = 3            # days of history before the factor leaves 1.0
 SOLAR_BIAS_MAX_DAYS = 14           # rolling window of daily ratios kept
-SOLAR_BIAS_MIN_FACTOR = 0.7        # clamp: never trust the correction beyond ±30%
-SOLAR_BIAS_MAX_FACTOR = 1.3
+SOLAR_BIAS_MIN_FACTOR = 0.55       # clamp floor (asymmetric): over-prediction is the
+SOLAR_BIAS_MAX_FACTOR = 1.3        # documented harmful tail, so allow a deeper down-
+                                   # correction (winter/soiling/degradation) than up.
 SOLAR_BIAS_MIN_FORECAST_W = 300.0  # only sample hours with a meaningful forecast
 
 # Outcome-based curtailment detection: with the battery saturated and every
