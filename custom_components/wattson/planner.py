@@ -286,6 +286,32 @@ def solar_aware_reserve_pct(
     return learned_reserve_pct
 
 
+def near_full_buffer_active(
+    active_prev: bool,
+    soc_pct: float,
+    max_soc_pct: float,
+    *,
+    engage_margin: float,
+    release_margin: float,
+) -> bool:
+    """Sticky near-full state with hysteresis for the EV-solar full-pack buffer.
+
+    Opening the discharge register at a full pack (so it BUFFERS the MPPT and the
+    surplus can sell) lets the pack cover house/EV dips, so SOC drains a few %
+    below the engage point. A single stateless threshold then flips discharge
+    70->0 and sell ON->off the instant SOC dips past it, refills, and flips back
+    — a register flap that both wastes solar and risks the firmware churn-stall
+    (live 2026-06-22: SOC 100->97% crossed the 98% line and discharge dropped to
+    0). So the state is sticky: ENGAGE once SOC reaches (max - engage_margin), and
+    RELEASE only once SOC falls below the deeper (max - release_margin) band.
+    ``release_margin`` MUST be > ``engage_margin`` to form the deadband; with
+    equal margins this degenerates to the old stateless threshold.
+    """
+    if active_prev:
+        return soc_pct >= (max_soc_pct - release_margin)
+    return soc_pct >= (max_soc_pct - engage_margin)
+
+
 def apply_sell_throttle(
     plan,
     *,

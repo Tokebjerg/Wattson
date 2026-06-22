@@ -235,8 +235,13 @@ def simulate_tick(entities, s: Settings):
             and ev_plan.desired_enabled is True
             and ev_plan.desired_action == "resume"
         ):
-            _pack_full = state.battery_soc_pct >= (
-                float(s.max_soc) - const.BATTERY_NEAR_FULL_MARGIN_PCT
+            # Single-tick scenarios start from the released state (active_prev=False),
+            # so this is the ENGAGE threshold (max - NEAR_FULL); the sticky RELEASE band
+            # is exercised by test_near_full_buffer_hysteresis over a SOC trajectory.
+            _pack_full = planner.near_full_buffer_active(
+                False, state.battery_soc_pct, float(s.max_soc),
+                engage_margin=const.BATTERY_NEAR_FULL_MARGIN_PCT,
+                release_margin=const.BATTERY_FULL_RELEASE_MARGIN_PCT,
             )
             # At a FULL pack the car can't soak the whole PV surplus; with sell OFF the
             # leftover is CURTAILED. Sell it ONLY when export actually pays (>0); at
@@ -2760,6 +2765,57 @@ def test_full_battery_hold():
                    p.strategy == "IDLE" and p.desired_grid_charge is False
                    and p.desired_discharge_current_a == 0.0 and p.desired_solar_sell is not True,
                    f"{p.strategy}/{p.desired_grid_charge}/{p.desired_discharge_current_a}/{p.desired_solar_sell}"))
+    return checks
+
+
+def test_near_full_buffer_hysteresis():
+    """v0.24.21: the EV-solar near-full buffer is STICKY. Opening the discharge at a
+    full pack lets it cover house/EV dips, so SOC drains a few % below the engage
+    point; a stateless threshold then flips discharge 70->0 + sell ON->off and back
+    every time SOC crosses it (live 2026-06-22: 100->97% flapped discharge to 0). The
+    sticky state engages at (max - NEAR_FULL) and releases only below (max - RELEASE),
+    so normal near-full dips ride through. Mirrors coordinator.py's
+    self._ev_full_buffer_active loop via the shared planner.near_full_buffer_active."""
+    checks = []
+    EM = const.BATTERY_NEAR_FULL_MARGIN_PCT   # engage margin (2 -> 98%)
+    RM = const.BATTERY_FULL_RELEASE_MARGIN_PCT # release margin (6 -> 94%)
+    MX = 100.0
+
+    def step(active, soc):
+        return planner.near_full_buffer_active(active, soc, MX, engage_margin=EM, release_margin=RM)
+
+    checks.append(("release margin deeper than engage margin (a real deadband exists)", RM > EM, f"{EM}<{RM}"))
+
+    # The live bug trajectory: engaged at full, then a normal dip to 97% must NOT flap.
+    a = step(False, 100.0)            # cold start at full -> engage
+    checks.append(("cold start at 100% engages", a is True, str(a)))
+    flapped = False
+    for soc in (100.0, 99.0, 98.0, 97.0, 96.0, 95.0):   # the exact live drain band
+        a = step(a, soc)
+        flapped |= (a is not True)
+    checks.append(("sticky through the 100->95% drain (no discharge/sell flap)", a is True and not flapped, str(a)))
+
+    # Falls past the release band -> releases; then the deadband blocks premature re-engage.
+    a = step(a, 94.0)
+    checks.append(("at exactly the release line (94%) still engaged (>=)", a is True, str(a)))
+    a = step(a, 93.0)
+    checks.append(("below the release band (93%) releases", a is False, str(a)))
+    a = step(a, 95.0)
+    checks.append(("released + back inside the deadband (95%) does NOT re-engage", a is False, str(a)))
+    a = step(a, 97.0)
+    checks.append(("released + 97% (still below engage) stays released", a is False, str(a)))
+    a = step(a, 98.0)
+    checks.append(("reaching the engage line (98%) re-engages", a is True, str(a)))
+
+    # Never-full pack: a car charging at low SOC must never engage (no spurious open discharge).
+    a = False
+    for soc in (40.0, 55.0, 70.0, 85.0):
+        a = step(a, soc)
+    checks.append(("low-SOC pack never engages the full buffer", a is False, str(a)))
+
+    # A stale True (left from a prior full session) self-corrects on the first low-SOC tick.
+    checks.append(("stale-active + low SOC self-corrects to released", step(True, 60.0) is False, "stale"))
+    return checks
 
     p = ex(slot("GRID_CHARGE", 0.30, 0.20), state(2, soc=100, pv=0, load=2000))
     checks.append(("full+deficit GRID_CHARGE -> IDLE hold (discharge 0, no register flap)",
@@ -2943,6 +2999,7 @@ def main():
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
                          ("FULL-BATTERY HOLD (S1: kill the overnight ceiling flap)", test_full_battery_hold),
+                         ("NEAR-FULL BUFFER HYSTERESIS (v0.24.21: kill the 98% discharge flap)", test_near_full_buffer_hysteresis),
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

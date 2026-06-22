@@ -154,6 +154,16 @@ DEFAULT_BATTERY_CAPACITY_KWH = 10.0
 # margin keeps it stably open through normal near-full micro-cycling (no register
 # flap) while only touching the very top of the pack (no reserve drained into the car).
 BATTERY_NEAR_FULL_MARGIN_PCT = 2.0
+# Hysteresis RELEASE band for the near-full buffer (v0.24.21). Engaging the full-
+# pack buffer (discharge open + sell the surplus) at (max_soc - NEAR_FULL) opens the
+# discharge, which lets the pack cover house/EV dips — so it drains a few % BELOW the
+# engage point. With a single stateless threshold that immediately flips discharge
+# 70->0 and sell ON->off (live 2026-06-22: SOC 100->97 in 4 min crossed the 98% line
+# and the registers flapped). The buffer is therefore STICKY: once engaged it stays
+# engaged until SOC falls below (max_soc - this), a deeper band than NEAR_FULL, so a
+# normal near-full micro-dip never flaps the registers. Must be > NEAR_FULL to form a
+# deadband; 6% (release ~94% at max_soc=100) absorbs the observed dips with margin.
+BATTERY_FULL_RELEASE_MARGIN_PCT = 6.0
 # Home-battery SOC plan has first priority: while SOC is below this, solar surplus
 # CHARGES the battery before it is sold at a peak or handed to the EV. 0 = off.
 CONF_SOLAR_CHARGE_PRIORITY_SOC = "solar_charge_priority_soc"

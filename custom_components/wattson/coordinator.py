@@ -71,6 +71,7 @@ from .const import (
     DEFAULT_AUTOMATION_ENABLED,
     DEFAULT_BATTERY_CONTROL_ENABLED,
     BATTERY_NEAR_FULL_MARGIN_PCT,
+    BATTERY_FULL_RELEASE_MARGIN_PCT,
     DEFAULT_BATTERY_MAX_SOC,
     DEFAULT_BATTERY_CARE_MAX_SOC,
     DEFAULT_BATTERY_CAPACITY_KWH,
@@ -150,6 +151,7 @@ from .planner import (
     execute_slot,
     mode_dwell_exempt,
     apply_sell_throttle,
+    near_full_buffer_active,
     peak_reserve_pct,
     solar_aware_reserve_pct,
     required_spread,
@@ -229,6 +231,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
+        # Sticky hysteresis for the EV-solar near-full buffer: once the pack is
+        # near-full we OPEN discharge + sell the surplus, which lets it drain a few %
+        # below the engage point — so we hold that state until SOC falls past the
+        # (deeper) release band, instead of flapping the registers at the boundary.
+        self._ev_full_buffer_active: bool = False
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
@@ -953,10 +960,24 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 # load and parks/cycles, importing from grid in full sun (the documented
                 # full-battery curtailment; live-proven 2026-06-20: manual discharge
                 # 0->70 recovered PV instantly). Only OPEN the discharge when near-full.
-                _ev_pack_full = self.site_state.battery_soc_pct >= (
-                    float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-                    - BATTERY_NEAR_FULL_MARGIN_PCT
+                #
+                # HYSTERESIS (v0.24.21): opening the discharge lets the full pack cover
+                # house/EV dips, so it drains a few % BELOW the engage point. A stateless
+                # threshold then flips discharge 70->0 and sell ON->off the instant SOC
+                # dips past it, refills, and flips back — a register flap (live 2026-06-22:
+                # SOC 100->97% in 4 min crossed the 98% line and discharge dropped to 0).
+                # So the near-full state is STICKY: engage at (max_soc - NEAR_FULL), and
+                # only release once SOC falls past the deeper (max_soc - RELEASE) band, so
+                # a normal near-full micro-dip rides through without flapping.
+                _max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+                self._ev_full_buffer_active = near_full_buffer_active(
+                    self._ev_full_buffer_active,
+                    self.site_state.battery_soc_pct,
+                    _max_soc,
+                    engage_margin=BATTERY_NEAR_FULL_MARGIN_PCT,
+                    release_margin=BATTERY_FULL_RELEASE_MARGIN_PCT,
                 )
+                _ev_pack_full = self._ev_full_buffer_active
                 # A FULL pack can't soak the whole PV surplus, and with sell OFF the
                 # leftover is CURTAILED, not exported (live-proven 2026-06-22: pack hit
                 # 100% at 13:51 -> PV1 string current collapsed 21 A -> 4 A while the
