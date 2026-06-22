@@ -305,7 +305,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     continue
                 if mean is not None and ts in ev_by_hour:
                     try:
-                        mean = max(0.0, float(mean) - ev_by_hour[ts])
+                        raw = float(mean)
+                        mean = max(0.0, raw - ev_by_hour[ts])
+                        # F5: a partial-hour EV session (or an over-counted Easee row)
+                        # can subtract MORE than the hour's metered load, clamping the
+                        # house bucket to 0 and dropping a real load sample. The F3
+                        # median shrugs off one such sample, but log it so a recurring
+                        # gap is visible.
+                        if mean == 0.0 and raw > 300.0:
+                            _LOGGER.debug(
+                                "Wattson load-learn: EV subtraction zeroed hour %s (house %.0fW - EV %.0fW)",
+                                ts, raw, ev_by_hour[ts],
+                            )
                     except (TypeError, ValueError):
                         pass
                 samples.append((dt_util.as_local(ts), mean))
@@ -325,7 +336,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         capacity_kwh = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
         if capacity_kwh <= 0:
             return 0.0
-        reserve_kwh = predicted_load_kwh(profile, dt_util.now().hour, LEARNING_RESERVE_HOURS)
+        # F2: size the reserve from the SAME weekday/weekend hourly profile the
+        # planner uses (hourly_for(today)), not the all-days mean — the two halves
+        # otherwise disagree about the very same day's load.
+        reserve_kwh = predicted_load_kwh(
+            profile, dt_util.now().hour, LEARNING_RESERVE_HOURS,
+            hourly=profile.hourly_for(dt_util.now().date()),
+        )
         base = min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
         # Apply the learning confidence ramp (0->1 over the learning window) the
         # models docstring promises, instead of jumping to full strength at the
@@ -704,6 +721,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._apply_price_vat()
         self._accumulate_value()
         self._accumulate_counterfactual()
+        self._accumulate_battery_health()
         # Learn the solar bias from the RAW forecast, then apply the correction
         # so the planner/schedule see bias-corrected production.
         self._accumulate_solar_bias()

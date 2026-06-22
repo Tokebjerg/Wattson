@@ -21,7 +21,9 @@ from homeassistant.util import dt as dt_util
 from .config import entry_value, update_entry_options
 from .const import (
     BATTERY_WEAR_COST,
+    CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_MAX_SOC,
+    DEFAULT_BATTERY_CAPACITY_KWH,
     CONF_SOLAR_BIAS_HISTORY,
     CONF_SOLAR_BIAS_INTRADAY,
     DEFAULT_BATTERY_MAX_SOC,
@@ -61,6 +63,12 @@ class TelemetryMixin:
         self.battery_strategy_changes_today: int = 0
         self._churn_day = None
         self._last_churn_strategy: str | None = None
+        # O3: battery-health telemetry — equivalent full cycles + time at SOC extremes.
+        self.battery_cycles_today: float = 0.0
+        self.battery_minutes_above_95_today: float = 0.0
+        self.battery_minutes_below_20_today: float = 0.0
+        self._bh_day = None
+        self._bh_last_tick: datetime | None = None
         # Solar-bias learning.
         self._solar_accum_day = None
         self._solar_actual_wh: float = 0.0
@@ -217,6 +225,41 @@ class TelemetryMixin:
             if self._last_churn_strategy is not None and strat != self._last_churn_strategy:
                 self.battery_strategy_changes_today += 1
             self._last_churn_strategy = strat
+
+    # ------------------------------------------------------------------ #
+    # O3: battery-health telemetry
+    # ------------------------------------------------------------------ #
+    def _accumulate_battery_health(self) -> None:
+        """Equivalent full cycles (discharge throughput / capacity) + minutes at the
+        SOC extremes per day. Makes the deep-cycling-vs-wear trade MEASURED (it is
+        only assumed today) and de-risks a future confident-solar soft-cap. Gap-capped
+        and only counts the discharge leg (battery_power_w > 0), so a sensor dropout
+        can't corrupt it."""
+        state = self.site_state
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._bh_day != today:
+            self._bh_day = today
+            self.battery_cycles_today = 0.0
+            self.battery_minutes_above_95_today = 0.0
+            self.battery_minutes_below_20_today = 0.0
+        last = self._bh_last_tick
+        self._bh_last_tick = now
+        if state is None or last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        capacity_kwh = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        if capacity_kwh > 0:
+            discharge_kwh = max(0.0, state.battery_power_w) / 1000.0 * dt_hours
+            self.battery_cycles_today += discharge_kwh / capacity_kwh
+        soc = state.battery_soc_pct
+        minutes = dt_hours * 60.0
+        if soc >= 95.0:
+            self.battery_minutes_above_95_today += minutes
+        elif soc <= 20.0:
+            self.battery_minutes_below_20_today += minutes
 
     # ------------------------------------------------------------------ #
     # Phase D: Solcast bias learning

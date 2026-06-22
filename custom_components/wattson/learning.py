@@ -57,21 +57,34 @@ def build_load_profile(
         day_buckets.setdefault(timestamp.hour, []).append((watts, weight))
         days.add(timestamp.date())
 
-    def _mean(b: dict[int, list[tuple[float, float]]]) -> dict[int, float]:
+    def _typical(b: dict[int, list[tuple[float, float]]]) -> dict[int, float]:
+        # F3: weighted MEDIAN per hour, not mean. A single contaminated sample
+        # (an Easee-statistics gap leaks the full ~12 kW EV draw into the house
+        # bucket; a one-off spike) drags a recency-weighted mean up ~70% for that
+        # hour and persists ~10 days — the median ignores it. Recency weighting is
+        # preserved (the weights pick the median position), matching the clamped
+        # median the solar-bias path already uses.
         out: dict[int, float] = {}
         for hour, pairs in b.items():
             total_w = sum(w for _, w in pairs)
             if total_w <= 0:
                 continue
-            out[hour] = sum(v * w for v, w in pairs) / total_w
+            ordered = sorted(pairs, key=lambda p: p[0])
+            half, cum, med = total_w / 2.0, 0.0, ordered[-1][0]
+            for value, weight in ordered:
+                cum += weight
+                if cum >= half:
+                    med = value
+                    break
+            out[hour] = med
         return out
 
     days_observed = len(days)
     confidence = min(1.0, days_observed / full_days) if full_days > 0 else 0.0
     return LoadProfile(
-        hourly_w=_mean(buckets),
-        weekday_hourly_w=_mean(weekday_buckets),
-        weekend_hourly_w=_mean(weekend_buckets),
+        hourly_w=_typical(buckets),
+        weekday_hourly_w=_typical(weekday_buckets),
+        weekend_hourly_w=_typical(weekend_buckets),
         days_observed=days_observed,
         confidence=round(confidence, 3),
     )
@@ -98,13 +111,18 @@ def solar_bias_factor(
     return max(lo, min(hi, median))
 
 
-def predicted_load_kwh(profile: LoadProfile | None, start_hour: int, hours: int) -> float:
-    """Predicted house consumption (kWh) over the next ``hours`` hours from ``start_hour``."""
+def predicted_load_kwh(
+    profile: LoadProfile | None, start_hour: int, hours: int, hourly: dict[int, float] | None = None
+) -> float:
+    """Predicted house consumption (kWh) over the next ``hours`` hours from
+    ``start_hour``. F2: pass ``hourly`` (e.g. profile.hourly_for(today)) to use the
+    weekday/weekend split the planner uses; defaults to the all-days profile."""
     if profile is None or hours <= 0:
         return 0.0
+    table = hourly if hourly is not None else profile.hourly_w
     total_wh = 0.0
     for offset in range(hours):
-        total_wh += profile.hourly_w.get((start_hour + offset) % 24, 0.0)  # mean W over 1 h = Wh
+        total_wh += table.get((start_hour + offset) % 24, 0.0)  # typical W over 1 h = Wh
     return total_wh / 1000.0
 
 

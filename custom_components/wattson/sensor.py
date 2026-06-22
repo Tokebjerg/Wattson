@@ -217,6 +217,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
     entities.append(WattsonChurnSensor(coordinator, entry))
+    entities.append(WattsonBatteryHealthSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -459,6 +460,55 @@ class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"battery_strategy_changes": self.coordinator.battery_strategy_changes_today}
+
+
+class WattsonBatteryHealthSensor(CoordinatorEntity, RestoreSensor):
+    """O3: daily equivalent full battery cycles (discharge throughput / capacity),
+    with minutes spent >95% and <20% SOC as attributes. Makes the deep-cycling-vs-
+    wear trade MEASURED (it is only assumed today) and de-risks a future confident-
+    solar soft-cap."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery Cycles Today"
+    _attr_icon = "mdi:battery-sync-outline"
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_battery_cycles_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if dt_util.as_local(last_state.last_updated).date() != dt_util.now().date():
+            return
+        try:
+            self.coordinator.battery_cycles_today = float(last_state.state)
+            self.coordinator.battery_minutes_above_95_today = float(last_state.attributes.get("minutes_above_95") or 0.0)
+            self.coordinator.battery_minutes_below_20_today = float(last_state.attributes.get("minutes_below_20") or 0.0)
+            self.coordinator._bh_day = dt_util.now().date()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.battery_cycles_today, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "minutes_above_95": round(self.coordinator.battery_minutes_above_95_today),
+            "minutes_below_20": round(self.coordinator.battery_minutes_below_20_today),
+        }
 
 
 class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):

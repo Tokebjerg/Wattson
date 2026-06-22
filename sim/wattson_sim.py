@@ -1636,7 +1636,9 @@ def test_phase_gaps():
     prof = learning.build_load_profile(samples)
     checks.append(("weekday bucket learned (2000W @18)", abs(prof.weekday_hourly_w[18] - 2000) < 1e-6, str(prof.weekday_hourly_w.get(18))))
     checks.append(("weekend bucket learned (500W @18)", abs(prof.weekend_hourly_w[18] - 500) < 1e-6, str(prof.weekend_hourly_w.get(18))))
-    checks.append(("combined mean is between the two", 500 < prof.hourly_w[18] < 2000, str(round(prof.hourly_w[18]))))
+    checks.append(("combined per-hour is a robust MEDIAN (a real day-type value, not a blended mean)",
+                   abs(prof.hourly_w[18] - 500) < 1e-6 or abs(prof.hourly_w[18] - 2000) < 1e-6,
+                   str(round(prof.hourly_w[18]))))
     for d in (date(2026, 6, 8), date(2026, 6, 13)):
         expected = prof.weekend_hourly_w if d.weekday() >= 5 else prof.weekday_hourly_w
         checks.append((f"hourly_for({d}) uses its day-type bucket", prof.hourly_for(d).get(18) == expected.get(18), str(prof.hourly_for(d).get(18))))
