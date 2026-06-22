@@ -957,26 +957,54 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
                     - BATTERY_NEAR_FULL_MARGIN_PCT
                 )
+                # A FULL pack can't soak the whole PV surplus, and with sell OFF the
+                # leftover is CURTAILED, not exported (live-proven 2026-06-22: pack hit
+                # 100% at 13:51 -> PV1 string current collapsed 21 A -> 4 A while the
+                # voltage rose 300 -> 360 V toward Voc, ~4 kWh clipped that afternoon
+                # at a +0.30 kr/kWh export price). With "Load first" the car is still
+                # served BEFORE any export, so selling that leftover doesn't touch the
+                # car's "Ren sol" — it just monetises what would be thrown away. Only
+                # when export actually pays (>0); at zero/negative prices curtailing is
+                # correct. None export_value (no price data) -> don't sell blind.
+                _cur_slot = (
+                    current_price_slot(self.site_state.price_slots, self.site_state.timestamp)
+                    if self.site_state.price_slots
+                    else None
+                )
+                _export_pays = (
+                    _cur_slot is not None
+                    and _cur_slot.export_value is not None
+                    and _cur_slot.export_value > 0.0
+                )
+                _sell_full_surplus = _ev_pack_full and _export_pays
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
                         f"{battery_plan.reason} | EV solar-only: PV to the car, "
                         "house battery neither drained nor sold-from (pure solar)"
+                        + (
+                            f"; pack full + export pays {_cur_slot.export_value:.2f} kr "
+                            "-> selling the surplus the car can't absorb (else curtailed)"
+                            if _sell_full_surplus
+                            else ""
+                        )
                     ),
                     desired_grid_charge=False,
-                    # solar_sell OFF, ALWAYS, while the car charges on solar. This is
-                    # the linchpin. The PV/MPPT stall on this Deye firmware is the
-                    # REGISTER PAIR solar_sell=ON + discharge=0 (the v0.23.0 quirk
-                    # family, on the discharge side; live-proven 2026-06-17: discharge
-                    # 0 A -> PV 276 W, 70 A -> PV 3218 W same instant — but ONLY while
-                    # sell was on). Forcing sell OFF lets us ALSO keep discharge=0
-                    # (below) WITHOUT stalling — so the battery is never drained into
-                    # the car ("no drain") AND the PV runs at full output ("no
-                    # curtailment"). The only cost: surplus beyond what the car+battery
-                    # absorb is clipped rather than exported, usually at the low/neg
-                    # midday export prices where selling barely pays anyway.
-                    desired_solar_sell=False,
+                    # solar_sell: OFF while the car charges on solar, EXCEPT when the
+                    # pack is FULL and export pays (_sell_full_surplus) — then we sell
+                    # the leftover the car can't absorb instead of curtailing it. The
+                    # PV/MPPT stall on this Deye firmware is the REGISTER PAIR
+                    # solar_sell=ON + discharge=0 (the v0.23.0 quirk family; live-proven
+                    # 2026-06-17: discharge 0 A -> PV 276 W, 70 A -> PV 3218 W same
+                    # instant — but ONLY while sell was on). BELOW near-full we keep
+                    # BOTH sell=OFF and discharge=0 — stall-safe and "pure solar" (no
+                    # drain, no sale). AT full we OPEN discharge (below), so sell=ON
+                    # rides with discharge>0 — also stall-safe (the stall needs sell +
+                    # discharge=0, never sell + discharge=70). "Load first" + the CT
+                    # clamp (v0.24.2) mean car/house are served first and the battery is
+                    # never sold to grid; only true PV surplus is exported.
+                    desired_solar_sell=_sell_full_surplus,
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Zero export to CT",
                     # Full-rate charge register: the battery absorbs whatever surplus
@@ -987,10 +1015,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # drained into the car ("pure solar"); OPEN (full rate) when the
                     # pack is near-full so it BUFFERS the MPPT and covers the house+EV
                     # instead of the site importing while a full pack sits locked. Both
-                    # are stall-safe because sell is OFF above (the stall needs the
-                    # sell+discharge=0 pair). The CT clamp still blocks battery->grid
-                    # export (v0.24.2), so an open discharge only ever covers the load.
-                    # Mirrors the v0.24.2 sell-slot fix, which had left this path at 0.
+                    # are stall-safe: below near-full sell is OFF (so sell+discharge=0
+                    # never co-occurs), and at full discharge is OPEN (so the sell that
+                    # _sell_full_surplus may switch on rides with discharge=70, not 0).
+                    # The CT clamp still blocks battery->grid export (v0.24.2), so an
+                    # open discharge only ever covers the load; only PV surplus is sold.
                     desired_discharge_current_a=(
                         self.battery_discharge_current if _ev_pack_full else 0.0
                     ),

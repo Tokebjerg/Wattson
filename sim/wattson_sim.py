@@ -177,6 +177,7 @@ class Settings:
     export_limit_default_w = 6000.0
     discharge_current_default_a = 50.0
     config_over = None  # optional {CONF_*: entity_id} overrides for the mapping
+    price_slots = None  # optional [PriceSlot] attached to state (for export-value gates)
 
     def __init__(self, **over):
         for k, v in over.items():
@@ -202,6 +203,10 @@ def simulate_tick(entities, s: Settings):
         invert_grid_power_sign=invert_grid,
         invert_battery_power_sign=s.invert_battery_sign,
     )
+    # Attach price slots when a scenario needs export-value-aware decisions
+    # (e.g. EV_SOLAR_PRIORITY selling the full-battery surplus only when export pays).
+    if s.price_slots is not None:
+        state = replace(state, price_slots=s.price_slots)
 
     battery_plan, negative_price_active = planner.build_battery_plan(
         state,
@@ -233,17 +238,28 @@ def simulate_tick(entities, s: Settings):
             _pack_full = state.battery_soc_pct >= (
                 float(s.max_soc) - const.BATTERY_NEAR_FULL_MARGIN_PCT
             )
+            # At a FULL pack the car can't soak the whole PV surplus; with sell OFF the
+            # leftover is CURTAILED. Sell it ONLY when export actually pays (>0); at
+            # zero/neg prices, or when no price data, curtailing is correct.
+            _cur_slot = horizon.current_price_slot(state.price_slots, state.timestamp)
+            _export_pays = (
+                _cur_slot is not None
+                and _cur_slot.export_value is not None
+                and _cur_slot.export_value > 0.0
+            )
+            _sell_full_surplus = _pack_full and _export_pays
             battery_plan = replace(
                 battery_plan,
                 strategy="EV_SOLAR_PRIORITY",
                 reason=f"{battery_plan.reason} | EV solar-only active",
                 desired_grid_charge=False,
-                # Option A (pure solar): sell OFF (the linchpin — the stall is the
-                # sell=ON+discharge=0 PAIR). discharge=0 BELOW near-full (no reserve
-                # drained into the car); OPEN at near-full so the full pack BUFFERS the
-                # MPPT instead of the site importing while a full pack sits locked (the
-                # documented full-battery curtailment). Stall-safe because sell is OFF.
-                desired_solar_sell=False,
+                # Option A (pure solar): sell OFF BELOW near-full (the linchpin — the
+                # stall is the sell=ON+discharge=0 PAIR). discharge=0 BELOW near-full (no
+                # reserve drained into the car); OPEN at near-full so the full pack
+                # BUFFERS the MPPT. AT full, sell the leftover the car can't absorb when
+                # export pays (sell=ON rides with discharge=70 -> stall-safe; "Load
+                # first" + CT clamp keep the car's solar and block battery->grid export).
+                desired_solar_sell=_sell_full_surplus,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_discharge_current_a=(70.0 if _pack_full else 0.0),
@@ -317,6 +333,27 @@ def chk(fn, label):
         ok = fn(st, pl)
         return ok, label
     return wrapped
+
+
+def _export_slots(export_value):
+    """Hourly price slots spanning a window around wall-clock now with a uniform
+    export_value, so EV_SOLAR_PRIORITY's "export pays" gate has price data.
+    current_price_slot() returns the latest slot <= now, so a uniform value over the
+    window is robust to the exact minute the test runs."""
+    base = (
+        datetime.now(timezone.utc).astimezone().replace(minute=0, second=0, microsecond=0)
+        - timedelta(hours=6)
+    )
+    return [
+        models.PriceSlot(
+            start=base + timedelta(hours=h),
+            spot_price=0.0,
+            tariff=0.0,
+            total_import_price=0.5,
+            export_value=export_value,
+        )
+        for h in range(30)
+    ]
 
 
 SCENARIOS = [
@@ -441,14 +478,32 @@ SCENARIOS = [
          and pl.battery.desired_discharge_current_a == 0.0,
          "EV_SOLAR_PRIORITY below full: sell OFF + discharge 0 (pure solar, no drain)")),
 
-    ("EV solar, battery FULL -> EV_SOLAR_PRIORITY opens discharge to buffer the MPPT (no full-battery curtailment)",
+    ("EV solar, battery FULL + export does NOT pay -> open discharge, keep sell OFF (curtail correct)",
      entities(pv1=3000, pv2=2500, grid=200, soc=100, bat=0,
               buy=0.35, sell=-0.05, ev_status="charging", ev_power=2750, ev_phase="3_phase"),
-     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY, price_slots=_export_slots(-0.10)),
      chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
          and pl.battery.desired_solar_sell is not True
          and pl.battery.desired_discharge_current_a not in (0.0, None),
-         "EV_SOLAR_PRIORITY at a FULL battery must OPEN the discharge (full pack buffers the MPPT; sell OFF = stall-safe)")),
+         "FULL + negative export: OPEN discharge (buffer MPPT) but sell OFF (don't pay to export)")),
+
+    ("EV solar, battery FULL + export PAYS -> sell the surplus the car can't absorb (else curtailed)",
+     entities(pv1=3200, pv2=2600, grid=200, soc=100, bat=0,
+              buy=0.94, sell=0.30, ev_status="charging", ev_power=3000, ev_phase="1_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY, price_slots=_export_slots(0.30)),
+     chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
+         and pl.battery.desired_solar_sell is True
+         and pl.battery.desired_discharge_current_a not in (0.0, None),
+         "FULL + export pays -> solar_sell ON (export leftover) with discharge OPEN (stall-safe; recovers the 2026-06-22 curtailment)")),
+
+    ("EV solar, battery FULL + export pays but NO price data -> sell OFF (don't sell blind)",
+     entities(pv1=3200, pv2=2600, grid=200, soc=100, bat=0,
+              buy=0.94, sell=0.30, ev_status="charging", ev_power=3000, ev_phase="1_phase"),
+     Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),  # no price_slots attached
+     chk(lambda st, pl: pl.battery.strategy == "EV_SOLAR_PRIORITY"
+         and pl.battery.desired_solar_sell is not True
+         and pl.battery.desired_discharge_current_a not in (0.0, None),
+         "FULL but no horizon -> keep sell OFF (None export_value must not enable sell)")),
 
     ("EV full speed -> resume at max amps on every phase (clears stale circuit cap)",
      entities(pv1=0, pv2=0, grid=2000, soc=50, bat=200,
@@ -2770,6 +2825,37 @@ def test_sell_throttle():
     checks.append(("floor_sell_safe floors a stale trickle first (->70)", staged.desired_max_charge_current_a == SAFE, str(staged.desired_max_charge_current_a)))
     checks.append(("then sell-throttle re-applies 10 A at a high-price hour", thr(staged, at(9)).desired_max_charge_current_a == A, "staged"))
     checks.append(("floored 70 survives at the cheapest hour", thr(staged, at(13)).desired_max_charge_current_a == SAFE, "13b"))
+
+    # DISCHARGE side of the sell-safe invariant (2026-06-22). sell=ON must never
+    # ride with a closed discharge buffer: the stall pair is solar_sell=ON +
+    # discharge=0. A misconfigured discharge-current number (native_min=0) or a
+    # stale 0 inherited from an EV-solar/grid-charge slot would otherwise form it.
+    DSAFE = deye_contract.SELL_SAFE_DISCHARGE_A
+    sell_dis0 = models.BatteryPlan(
+        strategy="EV_SOLAR_PRIORITY", reason="ev", desired_solar_sell=True,
+        desired_max_charge_current_a=SAFE, desired_discharge_current_a=0.0)
+    checks.append(("floor_sell_safe OPENS a closed discharge while selling (sell+discharge=0 stall)",
+                   deye_contract.floor_sell_safe(sell_dis0).desired_discharge_current_a == DSAFE,
+                   str(deye_contract.floor_sell_safe(sell_dis0).desired_discharge_current_a)))
+    # sell OFF + discharge 0 is legitimate intent (EV-solar below full = no drain
+    # into car, grid-charge, hold) -> must stay 0.
+    nosell_dis0 = models.BatteryPlan(
+        strategy="EV_SOLAR_PRIORITY", reason="ev", desired_solar_sell=False,
+        desired_discharge_current_a=0.0)
+    checks.append(("sell OFF + discharge 0 stays 0 (legit no-drain/grid-charge intent)",
+                   deye_contract.floor_sell_safe(nosell_dis0).desired_discharge_current_a == 0.0, "nosell-dis0"))
+    # discharge None while selling -> untouched (coordinator fills the configured ceiling).
+    sell_disN = models.BatteryPlan(
+        strategy="SELL_SOLAR_PEAK", reason="sell", desired_solar_sell=True,
+        desired_max_charge_current_a=SAFE, desired_discharge_current_a=None)
+    checks.append(("discharge None while selling -> left to coordinator default",
+                   deye_contract.floor_sell_safe(sell_disN).desired_discharge_current_a is None, "disN"))
+    # already-open discharge while selling -> unchanged (no needless rewrite).
+    sell_disOpen = models.BatteryPlan(
+        strategy="SELL_SOLAR_PEAK", reason="sell", desired_solar_sell=True,
+        desired_max_charge_current_a=SAFE, desired_discharge_current_a=DSAFE)
+    checks.append(("already-open discharge while selling -> unchanged",
+                   deye_contract.floor_sell_safe(sell_disOpen).desired_discharge_current_a == DSAFE, "disOpen"))
     return checks
 
 

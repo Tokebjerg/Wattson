@@ -72,11 +72,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from .const import BATTERY_CHARGE_CURRENT_MAX
+from .const import BATTERY_CHARGE_CURRENT_MAX, BATTERY_DISCHARGE_CURRENT_MAX
 
 # The minimum charge-current register value that keeps the firmware's
 # solar-sell pipeline alive while solar_sell is ON (the trickle+sell stall).
 SELL_SAFE_CHARGE_A: float = BATTERY_CHARGE_CURRENT_MAX
+
+# The minimum DISCHARGE-current register that keeps the buffer open on the
+# discharge side while solar_sell is ON. The stall pair is solar_sell=ON +
+# discharge=0 (the MPPT can't hold a point against a closed-on-both-sides pack
+# and parks): sell needs an OPEN buffer on BOTH sides, not just charge. Live-
+# proven 2026-06-20 (manual discharge 0->70 recovered PV instantly) and again
+# 2026-06-22 (full pack + sell would have stalled at discharge 0). This floor is
+# the discharge twin of SELL_SAFE_CHARGE_A; it has no deliberate-throttle
+# exception (unlike charge, discharge is never intentionally lowered while
+# selling), so it is always safe to raise.
+SELL_SAFE_DISCHARGE_A: float = BATTERY_DISCHARGE_CURRENT_MAX
 
 # Charge currents at or below this are "trickle" — used as a DETECTION
 # threshold (curtailment gate: the battery is effectively closed as a sink),
@@ -85,18 +96,31 @@ TRICKLE_CHARGE_A: float = 10.0
 
 
 def floor_sell_safe(plan):
-    """Return ``plan`` with the sell-safe invariant enforced.
+    """Return ``plan`` with the sell-safe invariant enforced on BOTH register sides.
 
-    Any battery plan that turns solar_sell ON with an explicit charge current
-    below SELL_SAFE_CHARGE_A gets floored — the final backstop right before
-    the write layer, protecting against future plan paths reintroducing the
-    trickle+sell stall. Plans with charge=None are untouched (the coordinator
-    fills the configured full-rate ceiling for those).
+    solar_sell=ON requires the battery to be an OPEN buffer on both sides:
+      * CHARGE  >= SELL_SAFE_CHARGE_A    (the trickle+sell stall, charge side)
+      * DISCHARGE >= SELL_SAFE_DISCHARGE_A (the sell+discharge=0 stall, discharge side)
+    Any plan that turns solar_sell ON with an explicit charge/discharge current
+    below the respective floor gets raised — the final backstop right before the
+    write layer, protecting against future plan paths (or a misconfigured
+    discharge-current number, native_min=0) reintroducing the stall pair. Fields
+    left at None are untouched (the coordinator fills the configured ceiling for
+    those before this runs). The deliberate sell-throttle lowers CHARGE to 10 A
+    AFTER this floor on purpose (a stable low setpoint is safe); it never touches
+    discharge, so the discharge floor below has no such exception.
     """
+    if not plan.desired_solar_sell:
+        return plan
+    updates = {}
     if (
-        plan.desired_solar_sell
-        and plan.desired_max_charge_current_a is not None
+        plan.desired_max_charge_current_a is not None
         and plan.desired_max_charge_current_a < float(SELL_SAFE_CHARGE_A)
     ):
-        return replace(plan, desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A))
-    return plan
+        updates["desired_max_charge_current_a"] = float(SELL_SAFE_CHARGE_A)
+    if (
+        plan.desired_discharge_current_a is not None
+        and plan.desired_discharge_current_a < float(SELL_SAFE_DISCHARGE_A)
+    ):
+        updates["desired_discharge_current_a"] = float(SELL_SAFE_DISCHARGE_A)
+    return replace(plan, **updates) if updates else plan
