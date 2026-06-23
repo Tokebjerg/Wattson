@@ -236,6 +236,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # below the engage point — so we hold that state until SOC falls past the
         # (deeper) release band, instead of flapping the registers at the boundary.
         self._ev_full_buffer_active: bool = False
+        # S2: sticky sell-ceiling for the reactive path — latch the full-battery sell
+        # flag on at >=max_soc, release only below max_soc-NEAR_FULL, so the overnight
+        # 99<->100 SOC tick doesn't flap the solar_sell switch.
+        self._sell_ceiling_active: bool = False
         self._surplus_samples: list[tuple[datetime, float]] = []
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
@@ -832,11 +836,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 margin=self.reserve_hold_margin,
                 discharge_rate_kwh=battery_rate_kwh(self.battery_discharge_current),
             )
+            # S2: latch the sell-ceiling with hysteresis (engage at max_soc, release
+            # only below max_soc-NEAR_FULL) so the reactive sell flag doesn't flap on
+            # the 99<->100 overnight SOC tick.
+            self._sell_ceiling_active = near_full_buffer_active(
+                self._sell_ceiling_active,
+                self.site_state.battery_soc_pct,
+                _max_soc,
+                engage_margin=0.0,
+                release_margin=BATTERY_NEAR_FULL_MARGIN_PCT,
+            )
             battery_plan, negative_price_active = build_battery_plan(
                 self.site_state,
                 battery_mode=self.battery_mode,
                 min_soc=_min_soc,
                 max_soc=_max_soc,
+                sell_full_sticky=self._sell_ceiling_active,
                 cheap_threshold=float(entry_value(self.config_entry, CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD)),
                 expensive_threshold=float(entry_value(self.config_entry, CONF_EXPENSIVE_PRICE_THRESHOLD, DEFAULT_EXPENSIVE_PRICE_THRESHOLD)),
                 allow_grid_charge=_allow_grid_charge,
@@ -1252,6 +1267,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
         self.last_actions = actions
         self._accumulate_churn(actions, plan)
+        self._accumulate_grid_charge(plan)
 
     async def _async_apply_battery(self, plan: ControlPlan, now: datetime) -> list[str]:
         """Continuously re-assert the battery plan (idempotent writes), bounded by

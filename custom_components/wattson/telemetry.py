@@ -58,6 +58,30 @@ class TelemetryMixin:
         self.savings_vs_no_battery_today_kr: float = 0.0
         self._cf_day = None
         self._cf_last_tick: datetime | None = None
+        # H2: the honest counterfactual over the long horizons. The existing
+        # weekly/monthly/yearly Savings meters track value_total (vs buying
+        # EVERYTHING from grid — credits the bare PV array, 4-8x overstated), so
+        # they cannot answer "did the battery+plan earn their keep?". These mirror
+        # savings_vs_no_battery into week/month/year/lifetime buckets so the
+        # long-horizon headline is the honest number too. value_total is kept as a
+        # separate PV+battery KPI; existing meters are NOT re-pointed (history).
+        self.savings_vs_no_battery_total_kr: float = 0.0
+        self.savings_vs_no_battery_week_kr: float = 0.0
+        self.savings_vs_no_battery_month_kr: float = 0.0
+        self.savings_vs_no_battery_year_kr: float = 0.0
+        self._cf_week = None
+        self._cf_month = None
+        self._cf_year = None
+        # O2: grid-charge kWh + cost visibility. Grid-charging is the highest-
+        # downside strategy (stuck trickle, misfired force-charge) and the savings
+        # sensors net it away invisibly. Gated on the PLAN's desired_grid_charge so
+        # it also catches OVERRIDE_CHARGE / ABSORB_NEGATIVE paid absorption, not just
+        # strategy=='GRID_CHARGE'. paid_kwh = the share imported at a negative price.
+        self.grid_charge_kwh_today: float = 0.0
+        self.grid_charge_cost_today_kr: float = 0.0
+        self.grid_charge_paid_kwh_today: float = 0.0
+        self._gc_day = None
+        self._gc_last_tick: datetime | None = None
         # O1: register-write / strategy-flap churn visibility (the flapping class).
         self.register_writes_today: int = 0
         self.battery_strategy_changes_today: int = 0
@@ -204,6 +228,73 @@ class TelemetryMixin:
         self.savings_vs_no_battery_today_kr = (
             self.baseline_cost_today_kr - self.actual_cost_today_kr - self.wear_cost_today_kr
         )
+        # H2: book the same per-tick increment into the long-horizon honest buckets
+        # (each with its own boundary reset; lifetime never resets). Same number as
+        # today's, just not zeroed at midnight — so the weekly/monthly/yearly headline
+        # reflects the battery's REAL net contribution, not value-vs-no-PV.
+        savings_inc = baseline - actual - wear
+        self.savings_vs_no_battery_total_kr += savings_inc
+        iso_week = today.isocalendar()[:2]
+        if self._cf_week != iso_week:
+            self._cf_week = iso_week
+            self.savings_vs_no_battery_week_kr = 0.0
+        if self._cf_month != (today.year, today.month):
+            self._cf_month = (today.year, today.month)
+            self.savings_vs_no_battery_month_kr = 0.0
+        if self._cf_year != today.year:
+            self._cf_year = today.year
+            self.savings_vs_no_battery_year_kr = 0.0
+        self.savings_vs_no_battery_week_kr += savings_inc
+        self.savings_vs_no_battery_month_kr += savings_inc
+        self.savings_vs_no_battery_year_kr += savings_inc
+
+    # ------------------------------------------------------------------ #
+    # O2: grid-charge kWh + cost counter
+    # ------------------------------------------------------------------ #
+    def _accumulate_grid_charge(self, plan) -> None:
+        """Energy (and its cost) taken FROM the grid to charge the battery, per day.
+
+        Gated on the PLAN's ``desired_grid_charge`` so it also catches OVERRIDE_CHARGE
+        force-charge and ABSORB_NEGATIVE paid absorption, not only
+        strategy=='GRID_CHARGE'. The charged energy is the battery charge power
+        (``battery_power_w < 0`` == charging) while grid-charge is commanded — at the
+        night cheap-hours PV≈0 so that power is grid-sourced. Cost is priced at the
+        slot import price; the negative-price (paid-to-import) share is split out.
+        Gap-capped like every other accumulator so a restart never inflates a day."""
+        state = self.site_state
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._gc_day != today:
+            self._gc_day = today
+            self.grid_charge_kwh_today = 0.0
+            self.grid_charge_cost_today_kr = 0.0
+            self.grid_charge_paid_kwh_today = 0.0
+        last = self._gc_last_tick
+        self._gc_last_tick = now
+        grid_charging = bool(
+            plan is not None and plan.battery is not None
+            and getattr(plan.battery, "desired_grid_charge", False)
+        )
+        if state is None or last is None or not grid_charging:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        # Only the share actually drawn FROM the grid counts. ABSORB_NEGATIVE also
+        # sets desired_grid_charge on negative-price MIDDAY slots where the pack
+        # charges from PV (grid import ~0 / exporting) — capping the charge power at
+        # the concurrent grid import isolates the true grid-bought share so PV
+        # self-charge isn't mis-booked (and mis-priced at the negative slot).
+        charge_kw = min(max(0.0, -state.battery_power_w), max(0.0, state.grid_import_power_w)) / 1000.0
+        if charge_kw <= 0.0:
+            return
+        kwh = charge_kw * dt_hours
+        import_price, _ = self._tick_prices()
+        self.grid_charge_kwh_today += kwh
+        if import_price is not None:
+            self.grid_charge_cost_today_kr += kwh * import_price
+            if import_price < 0:
+                self.grid_charge_paid_kwh_today += kwh
 
     # ------------------------------------------------------------------ #
     # O1: register-write / strategy-flap churn counter

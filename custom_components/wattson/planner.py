@@ -47,6 +47,13 @@ SOLAR_CHARGE_MIN_SURPLUS_KWH = 0.5
 # Assumed battery charge rate (kWh per hour) used only for the forward SOC
 # projection in the schedule, so it knows roughly how fast grid-charging fills.
 SCHEDULE_CHARGE_RATE_KWH = 5.0  # legacy fallback; callers now derive the real rate
+# E1: grid charging is FIRMWARE-throttled far below the PV charge rate — measured
+# ~1.14 kWh/h across three clean night windows (Jun13/14/15) vs the 70 A PV rate
+# (~3.57 kWh/h). The forward projection must size cheap GRID hours at THIS rate, or
+# it thinks one night hour fills the pack, schedules too few cheap hours, and arrives
+# short at the evening peak on low-solar/winter days. PV-charge projection keeps the
+# 70 A rate. Projection-only — never written to the inverter (LIVE-CACHE BAN).
+SCHEDULE_GRID_CHARGE_RATE_KWH = 1.15
 
 # Nominal LV battery pack voltage used to convert configured current limits (A)
 # into energy rates (kWh/h). 70 A x 51 V ~= 3.57 kWh/h. Deriving rates from the
@@ -930,6 +937,7 @@ def _horizon_battery_plan(
     solar_charge_priority_soc: float = 0.0,
     peak_reserve: float = 0.0,
     battery_care_soc: float = 100.0,
+    sell_full_sticky: bool | None = None,
 ) -> BatteryPlan:
     """Plan-driven battery decision using the ranked horizon, shaped by the profile.
 
@@ -1109,7 +1117,12 @@ def _horizon_battery_plan(
     # zero-export so the surplus charges the battery / covers the house rather than
     # being dumped at a loss or making the inverter hunt.
     known_worthless_export = current.export_value is not None and current.export_value <= 0
-    sell_when_full = state.battery_soc_pct >= max_soc and not known_worthless_export
+    # S2: sticky sell-ceiling. Without hysteresis the sell flag flips ON at >=max_soc
+    # and OFF the instant SOC ticks 1% below — the overnight 99<->100 sell flap. When
+    # the coordinator supplies a sticky decision (latched on at max_soc, off only below
+    # max_soc-NEAR_FULL), use it; else fall back to the bare boundary.
+    _at_ceiling = sell_full_sticky if sell_full_sticky is not None else (state.battery_soc_pct >= max_soc)
+    sell_when_full = _at_ceiling and not known_worthless_export
     return BatteryPlan(
         strategy="IDLE",
         reason="No strong battery action required right now",
@@ -1140,6 +1153,7 @@ def _build_schedule(
     solar_charge_priority_soc: float = 0.0,
     charge_rate_kwh: float | None = None,
     discharge_rate_kwh: float | None = None,
+    grid_charge_rate_kwh: float | None = None,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan with a battery-SOC projection.
 
@@ -1166,6 +1180,9 @@ def _build_schedule(
     # leaving the battery short at the evening peak on low-solar (winter) days.
     rate_kwh = charge_rate_kwh if charge_rate_kwh is not None else SCHEDULE_CHARGE_RATE_KWH
     dis_rate_kwh = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
+    # E1: grid charging fills the pack far slower than PV (firmware-throttled ~1.14
+    # kWh/h), so project GRID_CHARGE intake at the grid rate — PV charge keeps rate_kwh.
+    grid_rate_kwh = grid_charge_rate_kwh if grid_charge_rate_kwh is not None else SCHEDULE_GRID_CHARGE_RATE_KWH
 
     slots = view.slots[:SCHEDULE_MAX_HOURS]
     # Per-hour solar / load / surplus, precomputed so grid-charge can look ahead.
@@ -1242,7 +1259,7 @@ def _build_schedule(
             if future_solar >= (max_kwh - soc_kwh):
                 action = "IDLE"
             else:
-                soc_kwh = min(max_kwh, soc_kwh + rate_kwh)
+                soc_kwh = min(max_kwh, soc_kwh + grid_rate_kwh)
                 action = "GRID_CHARGE"
         elif slot.export_value is not None and slot.export_value < 0:
             action = "LIMIT_EXPORT"
@@ -1306,6 +1323,7 @@ def dp_schedule(
     solar_charge_priority_soc: float = 0.0,
     charge_rate_kwh: float | None = None,
     discharge_rate_kwh: float | None = None,
+    grid_charge_rate_kwh: float | None = None,
     battery_care_soc: float = 100.0,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """DP-optimal forward schedule (same contract as ``_build_schedule``)."""
@@ -1319,6 +1337,11 @@ def dp_schedule(
     floor_pct = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
     rate = charge_rate_kwh if charge_rate_kwh is not None else SCHEDULE_CHARGE_RATE_KWH
     dis_rate = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
+    # E1: GRID charge is firmware-throttled (~1.14 kWh/h) far below the PV rate, so
+    # the DP can lift the SOC by at most this per cheap GRID hour — keeps it from
+    # assuming one night hour fills the pack and under-scheduling cheap hours. PV
+    # charge (pv_charge below) still uses the full ``rate``.
+    grid_rate = grid_charge_rate_kwh if grid_charge_rate_kwh is not None else SCHEDULE_GRID_CHARGE_RATE_KWH
     slots = view.slots[:SCHEDULE_MAX_HOURS]
     hours = []
     for slot in slots:
@@ -1335,7 +1358,7 @@ def dp_schedule(
 
     fp = (
         profile.name, round(soc0 / step), round(capacity_kwh, 2), round(max_kwh, 2),
-        round(floor_kwh, 2), round(care_kwh, 2), round(rate, 2), round(dis_rate, 2),
+        round(floor_kwh, 2), round(care_kwh, 2), round(rate, 2), round(dis_rate, 2), round(grid_rate, 2),
         tuple(
             (s.start.isoformat(), round(s.total_import_price, 4),
              round(s.export_value, 4) if s.export_value is not None else None,
@@ -1397,7 +1420,7 @@ def dp_schedule(
                 for j, s2 in enumerate(levels):
                     d = s2 - s
                     if d > 0:  # grid charge
-                        if d > rate + 1e-9:
+                        if d > grid_rate + 1e-9:
                             continue
                         if s2 > care_kwh + 1e-9 and imp_p >= 0:
                             continue  # battery care: plain grid charge stops at care SOC
@@ -1430,7 +1453,10 @@ def dp_schedule(
                     if abs(d2) <= step / 2 + 1e-9:
                         cost = -base_revenue  # nearest-bucket rounding, no action
                     elif d2 > 0 and imp_p < 0:
-                        if pv_charge + d2 > rate + 1e-9:
+                        # Paid (negative-price) grid top-up ON TOP of forced PV charge:
+                        # the grid part is throttled to grid_rate, and total intake
+                        # (PV + grid) still can't exceed the pack's full rate.
+                        if d2 > grid_rate + 1e-9 or pv_charge + d2 > rate + 1e-9:
                             continue
                         cost = d2 * imp_p + d2 * margin - base_revenue
                     else:
@@ -1629,6 +1655,7 @@ def build_battery_plan(
     solar_charge_priority_soc: float = 0.0,
     peak_reserve: float = 0.0,
     battery_care_soc: float = 100.0,
+    sell_full_sticky: bool | None = None,
 ) -> tuple[BatteryPlan, bool]:
     negative_price_window = bool(
         (state.current_sell_price is not None and state.current_sell_price < 0)
@@ -1719,6 +1746,7 @@ def build_battery_plan(
             solar_charge_priority_soc=solar_charge_priority_soc,
             peak_reserve=peak_reserve,
             battery_care_soc=battery_care_soc,
+            sell_full_sticky=sell_full_sticky,
         )
         # Anti-curtailment safety net: at a FULL battery with a positive export price
         # the solar_sell switch must be ON, whatever strategy fired — a full pack
@@ -1757,7 +1785,9 @@ def build_battery_plan(
     # practice it almost never fired, because a missing horizon usually means
     # missing prices entirely.
     known_worthless_export = state.current_sell_price is not None and state.current_sell_price <= 0
-    sell_when_full = state.battery_soc_pct >= max_soc and not known_worthless_export
+    # S2: sticky sell-ceiling (see _horizon_battery_plan) — latched by the coordinator.
+    _at_ceiling = sell_full_sticky if sell_full_sticky is not None else (state.battery_soc_pct >= max_soc)
+    sell_when_full = _at_ceiling and not known_worthless_export
     return (
         BatteryPlan(
             strategy="IDLE",

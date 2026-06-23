@@ -2915,6 +2915,87 @@ def test_sell_throttle():
     return checks
 
 
+def test_grid_charge_rate_projection():
+    """E1: GRID_CHARGE hours are projected at the firmware-throttled ~1.15 kWh/h, not
+    the 70A PV rate (~3.57). A deep-deficit winter night must therefore schedule at
+    least as many cheap grid hours with the slow rate — it can no longer pretend one
+    hour fills the pack and arrive short at the evening peak. PV charge keeps 70A."""
+    checks = []
+    base = datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc)  # winter
+    def at(h):
+        return base + timedelta(hours=h)
+    price = {h: 0.20 for h in range(24)}          # cheap night baseline
+    for h in (17, 18, 19, 20):
+        price[h] = 2.00                            # expensive evening peak
+    day = [models.PriceSlot(start=at(h), spot_price=price[h], tariff=0.0,
+                            total_import_price=price[h], export_value=max(0.0, price[h])) for h in range(24)]
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=(0.3 if 10 <= h <= 13 else 0.0)) for h in range(24)]
+    load = {h: 1500.0 for h in range(24)}          # 1.5 kWh/h, deep winter deficit
+    st = models.SiteState(
+        timestamp=at(0), pv_power_w=0.0, load_power_w=1500.0, load_includes_ev=False,
+        grid_power_w=1500.0, grid_import_power_w=1500.0, grid_export_power_w=0.0,
+        battery_soc_pct=20.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.20, current_sell_price=0.20, forecast_today_kwh=2.0,
+        price_slots=day, solar_slots=solar,
+    )
+    prof = planner.profile_for("blue")
+    def grid_hours(grate):
+        tasks, _, _ = planner.dp_schedule(
+            st, prof, load, capacity_kwh=10.0, min_soc=15, max_soc=100,
+            charge_rate_kwh=planner.battery_rate_kwh(70.0),
+            discharge_rate_kwh=planner.battery_rate_kwh(70.0),
+            grid_charge_rate_kwh=grate)
+        return sum(1 for t in tasks if t.action == "GRID_CHARGE")
+    slow = grid_hours(planner.SCHEDULE_GRID_CHARGE_RATE_KWH)   # ~1.15
+    fast = grid_hours(planner.battery_rate_kwh(70.0))          # ~3.57 (old behaviour)
+    checks.append((f"slow grid rate schedules >= as many cheap GRID hours as the fast rate (slow={slow} fast={fast})",
+                   slow >= fast, f"{slow} vs {fast}"))
+    checks.append((f"deep-deficit winter night actually grid-charges (slow={slow}>0)", slow > 0, str(slow)))
+    checks.append(("default grid rate is the measured ~1.1-1.2 kWh/h, well under the 70A PV rate",
+                   1.0 <= planner.SCHEDULE_GRID_CHARGE_RATE_KWH <= 1.3 and planner.SCHEDULE_GRID_CHARGE_RATE_KWH < planner.battery_rate_kwh(70.0),
+                   str(planner.SCHEDULE_GRID_CHARGE_RATE_KWH)))
+    return checks
+
+
+def test_sell_ceiling_hysteresis():
+    """S2: the reactive full-battery sell flag is STICKY via the coordinator's latch.
+    build_battery_plan honours sell_full_sticky (engage at max_soc, release only below
+    max_soc-NEAR_FULL) instead of the bare >=max_soc boundary that flapped the solar_sell
+    switch on the overnight 99<->100 SOC tick. The worthless-export gate is preserved."""
+    checks = []
+    base = datetime(2026, 6, 18, 0, 0, tzinfo=timezone.utc)
+    def at(h):
+        return base + timedelta(hours=h)
+    day = [models.PriceSlot(start=at(h), spot_price=0.5, tariff=0.0, total_import_price=0.5, export_value=0.4) for h in range(24)]
+    def st(soc, export=0.4, sell_price=0.4):
+        d = [models.PriceSlot(start=at(h), spot_price=0.5, tariff=0.0, total_import_price=0.5, export_value=export) for h in range(24)]
+        return models.SiteState(
+            timestamp=at(12), pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.5, current_sell_price=sell_price, forecast_today_kwh=10.0,
+            price_slots=d, solar_slots=[],
+        )
+    def sell(soc, sticky, export=0.4, sell_price=0.4):
+        bp, _ = planner.build_battery_plan(
+            st(soc, export, sell_price), battery_mode="blue", min_soc=15, max_soc=100,
+            cheap_threshold=0.2, expensive_threshold=2.0, allow_grid_charge=False,
+            allow_negative_export=False, export_limit_default_w=6000.0, sell_full_sticky=sticky)
+        return bp.desired_solar_sell
+    # The flap is the 98-99% band: at exactly 100% the anti-curtailment net forces
+    # sell ON regardless (never curtail a full pack with positive export). The sticky
+    # latch governs the band BELOW max where the bare boundary used to flip OFF.
+    checks.append(("sticky engaged at 98% (recently full) keeps selling -> kills the 99<->100 flap", sell(98.0, True) is True, "98/sticky"))
+    checks.append(("sticky released at 98% does NOT sell (drained well below the ceiling)", sell(98.0, False) is False, "98/released"))
+    checks.append(("no sticky supplied -> bare boundary does NOT sell at 98%", sell(98.0, None) is False, "98/none"))
+    checks.append(("at exactly 100% the anti-curtailment net sells regardless of the latch", sell(100.0, False) is True, "100/net"))
+    checks.append(("worthless-export gate preserved: sticky-engaged but export<=0 -> no sell",
+                   sell(98.0, True, export=-0.1, sell_price=-0.1) is not True, "worthless"))
+    return checks
+
+
 def test_solar_aware_reserve():
     """v0.24.14: release the LEARNED self-use reserve when forecast solar over the
     next 24h can refill the whole usable band x SOLAR_RESERVE_RELEASE_MARGIN — so the
@@ -3000,6 +3081,8 @@ def main():
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),
                          ("FULL-BATTERY HOLD (S1: kill the overnight ceiling flap)", test_full_battery_hold),
                          ("NEAR-FULL BUFFER HYSTERESIS (v0.24.21: kill the 98% discharge flap)", test_near_full_buffer_hysteresis),
+                         ("GRID-CHARGE RATE PROJECTION (E1: ~1.15 kWh/h, not 70A)", test_grid_charge_rate_projection),
+                         ("SELL-CEILING HYSTERESIS (S2: sticky reactive sell flag)", test_sell_ceiling_hysteresis),
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),

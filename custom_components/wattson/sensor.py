@@ -218,6 +218,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
     entities.append(WattsonChurnSensor(coordinator, entry))
     entities.append(WattsonBatteryHealthSensor(coordinator, entry))
+    entities.append(WattsonGridChargeSensor(coordinator, entry))
+    entities.append(WattsonHonestSavingsTotalSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -508,6 +510,127 @@ class WattsonBatteryHealthSensor(CoordinatorEntity, RestoreSensor):
         return {
             "minutes_above_95": round(self.coordinator.battery_minutes_above_95_today),
             "minutes_below_20": round(self.coordinator.battery_minutes_below_20_today),
+        }
+
+
+class WattsonGridChargeSensor(CoordinatorEntity, RestoreSensor):
+    """O2: energy taken FROM the grid to charge the battery today, with its cost.
+
+    Grid-charging is the highest-downside strategy (stuck trickle, misfired
+    force-charge) and the savings sensors net it away invisibly. State = kWh
+    grid-charged today; attributes carry the cost, the average price paid, and the
+    share imported at a NEGATIVE price (paid to absorb). Closes the self-learning
+    loop's grid-charge cost feedback."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Grid Charge Today"
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_grid_charge_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if dt_util.as_local(last_state.last_updated).date() != dt_util.now().date():
+            return
+        try:
+            self.coordinator.grid_charge_kwh_today = float(last_state.state)
+            self.coordinator.grid_charge_cost_today_kr = float(last_state.attributes.get("cost_kr") or 0.0)
+            self.coordinator.grid_charge_paid_kwh_today = float(last_state.attributes.get("paid_kwh") or 0.0)
+            self.coordinator._gc_day = dt_util.now().date()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.grid_charge_kwh_today, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        kwh = self.coordinator.grid_charge_kwh_today
+        cost = self.coordinator.grid_charge_cost_today_kr
+        return {
+            "cost_kr": round(cost, 2),
+            "avg_price_paid_kr_kwh": round(cost / kwh, 3) if kwh > 0.01 else 0.0,
+            "paid_kwh": round(self.coordinator.grid_charge_paid_kwh_today, 2),
+            "note": "Energi TAGET fra nettet til at lade batteriet i dag (gated på desired_grid_charge). paid_kwh = andelen importeret til NEGATIV pris (betalt for at lade).",
+        }
+
+
+class WattsonHonestSavingsTotalSensor(CoordinatorEntity, RestoreSensor):
+    """H2: lifetime honest savings vs a NO-BATTERY baseline, with week/month/year/today
+    as attributes. The existing Savings Weekly/Monthly/Yearly meters track value_total
+    (value vs buying EVERYTHING from grid — credits the bare PV array, ~4-8x overstated);
+    this is the number that answers 'did the battery+plan earn their keep?' over the long
+    horizons. value_total is kept as a separate PV+battery KPI; existing meters untouched."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Savings vs No Battery Total"
+    _attr_icon = "mdi:battery-heart-variant"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_savings_vs_no_battery_total"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        try:
+            c = self.coordinator
+            c.savings_vs_no_battery_total_kr = float(last_state.state)  # lifetime: always
+            attrs = last_state.attributes
+            lu = dt_util.as_local(last_state.last_updated)
+            now_local = dt_util.now()
+            if lu.isocalendar()[:2] == now_local.date().isocalendar()[:2]:
+                c.savings_vs_no_battery_week_kr = float(attrs.get("week_kr") or 0.0)
+                c._cf_week = now_local.date().isocalendar()[:2]
+            if (lu.year, lu.month) == (now_local.year, now_local.month):
+                c.savings_vs_no_battery_month_kr = float(attrs.get("month_kr") or 0.0)
+                c._cf_month = (now_local.year, now_local.month)
+            if lu.year == now_local.year:
+                c.savings_vs_no_battery_year_kr = float(attrs.get("year_kr") or 0.0)
+                c._cf_year = now_local.year
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.savings_vs_no_battery_total_kr, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        c = self.coordinator
+        return {
+            "today_kr": round(c.savings_vs_no_battery_today_kr, 2),
+            "week_kr": round(c.savings_vs_no_battery_week_kr, 2),
+            "month_kr": round(c.savings_vs_no_battery_month_kr, 2),
+            "year_kr": round(c.savings_vs_no_battery_year_kr, 2),
+            "note": "Ærlig kontrafaktisk besparelse vs INTET batteri (underskud købt, overskud solgt, minus slid), over lange horisonter. De eksisterende Savings-målere måler vs at købe ALT fra nettet (krediterer det bare solpanel) — denne isolerer batteriets+planens reelle bidrag.",
         }
 
 
