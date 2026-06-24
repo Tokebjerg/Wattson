@@ -2291,6 +2291,7 @@ def build_override_battery_plan(
     export_limit_default_w: float | None,
     default_charge_current_a: float | None = None,
     default_discharge_current_a: float | None = None,
+    export_pays: bool = False,
 ) -> BatteryPlan | None:
     """Phase E: a manually forced battery action (or None to follow the AI plan).
 
@@ -2298,16 +2299,25 @@ def build_override_battery_plan(
     explicit user intent that wins over the planner for the override window.
     """
     if action == BATTERY_OVERRIDE_CHARGE:
+        # When export pays, also SELL the PV surplus the charge can't absorb instead of
+        # CURTAILING it: on a sunny midday the force-charge fills the pack at ~3.5 kW, the
+        # house takes ~1 kW, and the rest of the PV (potentially several kW) has no sink
+        # with sell OFF — so the MPPT clamps PV to house+charge (the user-observed "it
+        # limits the panels"). sell=ON exports that surplus; it rides with the discharge
+        # OPEN so it is NOT the sell+discharge=0 stall pair (floor_sell_safe also backstops
+        # this). "Load first" + the CT clamp keep the charge first and block battery->grid
+        # — only the true PV surplus exports. At a zero/negative export price, curtail.
+        _sell = bool(export_pays)
         return BatteryPlan(
             strategy="OVERRIDE_CHARGE",
-            reason="Manual override: forced grid charge",
+            reason="Manual override: forced charge" + (" + selling the PV surplus" if _sell else " (grid)"),
             desired_grid_charge=True,
-            desired_solar_sell=False,
+            desired_solar_sell=_sell,
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=default_charge_current_a,
-            desired_discharge_current_a=0.0,
+            desired_discharge_current_a=(default_discharge_current_a if _sell else 0.0),
         )
     if action == BATTERY_OVERRIDE_DISCHARGE:
         return BatteryPlan(

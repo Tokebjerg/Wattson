@@ -1152,14 +1152,25 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
         if self.battery_override != BATTERY_OVERRIDE_AUTO:
+            _ov_slot = (
+                current_price_slot(self.site_state.price_slots, self.site_state.timestamp)
+                if self.site_state.price_slots else None
+            )
+            _ov_export_pays = (
+                _ov_slot is not None and _ov_slot.export_value is not None and _ov_slot.export_value > 0.0
+            )
             forced_battery = build_override_battery_plan(
                 self.battery_override,
                 export_limit_default_w=self._default_export_limit_w,
                 default_charge_current_a=self.battery_charge_current,
                 default_discharge_current_a=self.battery_discharge_current,
+                export_pays=_ov_export_pays,
             )
             if forced_battery is not None:
-                battery_plan = forced_battery
+                # The override bypassed the floor_sell_safe above (that ran on the AI plan),
+                # so re-run it: a selling override (OVERRIDE_CHARGE surplus-sell) must keep
+                # BOTH register sides open — never the sell + discharge=0 stall pair.
+                battery_plan = floor_sell_safe(forced_battery)
 
         # Anti-hunt mode dwell: a plan that flips strategy every tick (IDLE<->DISCHARGE
         # at a full battery) would toggle the inverter mode fast enough to make the Deye

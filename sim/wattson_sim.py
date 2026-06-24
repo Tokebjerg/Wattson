@@ -1813,6 +1813,17 @@ def test_e_override():
     checks.append(("force_charge uses default charge current", chg.desired_max_charge_current_a == 40.0, str(chg.desired_max_charge_current_a)))
     checks.append(("force_charge blocks discharge (0A)", chg.desired_discharge_current_a == 0.0, str(chg.desired_discharge_current_a)))
 
+    # When export pays, force_charge ALSO sells the PV surplus the charge can't absorb
+    # (instead of curtailing it) — with the discharge OPEN so sell never rides with
+    # discharge=0 (the firmware stall pair). Still grid-charges.
+    chg_sell = planner.build_override_battery_plan(
+        const.BATTERY_OVERRIDE_CHARGE, export_limit_default_w=6000.0,
+        default_charge_current_a=40.0, default_discharge_current_a=50.0, export_pays=True,
+    )
+    checks.append(("force_charge + export pays -> SELLS the surplus (not curtail)", chg_sell.desired_solar_sell is True, str(chg_sell.desired_solar_sell)))
+    checks.append(("force_charge + sell opens the discharge (stall-safe, not 0A)", chg_sell.desired_discharge_current_a == 50.0, str(chg_sell.desired_discharge_current_a)))
+    checks.append(("force_charge + sell still grid-charges", chg_sell.desired_grid_charge is True, str(chg_sell.desired_grid_charge)))
+
     dis = planner.build_override_battery_plan(
         const.BATTERY_OVERRIDE_DISCHARGE, export_limit_default_w=6000.0,
         default_charge_current_a=40.0, default_discharge_current_a=50.0,
