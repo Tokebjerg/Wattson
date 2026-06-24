@@ -1029,8 +1029,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
-                        f"{battery_plan.reason} | EV solar-only: PV to the car, "
-                        "house battery neither drained nor sold-from (pure solar)"
+                        f"{battery_plan.reason} | EV solar-only: PV to the car first; the "
+                        "house battery covers cloud dips (from battery, not grid)"
                         + (
                             f"; pack full + export pays {_cur_slot.export_value:.2f} kr "
                             "-> selling the surplus the car can't absorb (else curtailed)"
@@ -1045,13 +1045,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # PV/MPPT stall on this Deye firmware is the REGISTER PAIR
                     # solar_sell=ON + discharge=0 (the v0.23.0 quirk family; live-proven
                     # 2026-06-17: discharge 0 A -> PV 276 W, 70 A -> PV 3218 W same
-                    # instant — but ONLY while sell was on). BELOW near-full we keep
-                    # BOTH sell=OFF and discharge=0 — stall-safe and "pure solar" (no
-                    # drain, no sale). AT full we OPEN discharge (below), so sell=ON
-                    # rides with discharge>0 — also stall-safe (the stall needs sell +
-                    # discharge=0, never sell + discharge=70). "Load first" + the CT
-                    # clamp (v0.24.2) mean car/house are served first and the battery is
-                    # never sold to grid; only true PV surplus is exported.
+                    # instant — but ONLY while sell was on). solar_sell stays OFF below
+                    # near-full and only switches ON at a full pack with a positive export
+                    # (sell the surplus the car can't absorb). The discharge is OPEN both
+                    # below and at full (see below), so sell=ON never rides with
+                    # discharge=0. "Load first" + the CT clamp (v0.24.2) serve car/house
+                    # first and block battery->grid; only true PV surplus is exported.
                     desired_solar_sell=_sell_full_surplus,
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Zero export to CT",
@@ -1059,18 +1058,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # the car doesn't take (until full), never a trickle inherited
                     # from an earlier SELL slot.
                     desired_max_charge_current_a=float(SELL_SAFE_CHARGE_A),
-                    # Discharge: CLOSED (0 A) below near-full so the reserve is never
-                    # drained into the car ("pure solar"); OPEN (full rate) when the
-                    # pack is near-full so it BUFFERS the MPPT and covers the house+EV
-                    # instead of the site importing while a full pack sits locked. Both
-                    # are stall-safe: below near-full sell is OFF (so sell+discharge=0
-                    # never co-occurs), and at full discharge is OPEN (so the sell that
-                    # _sell_full_surplus may switch on rides with discharge=70, not 0).
-                    # The CT clamp still blocks battery->grid export (v0.24.2), so an
-                    # open discharge only ever covers the load; only PV surplus is sold.
-                    desired_discharge_current_a=(
-                        self.battery_discharge_current if _ev_pack_full else 0.0
-                    ),
+                    # Discharge: OPEN (full rate) ALWAYS in EV-solar (user pref 2026-06-24:
+                    # "Ren sol shouldn't buy grid — cover the dips from the battery"). On a
+                    # cloud dip the car draws more than the (reduced) PV; with the discharge
+                    # OPEN the deficit is covered from the BATTERY (down to its TOU floor),
+                    # not the GRID. On a sunny day the car ~= the surplus so the pack net-
+                    # charges; only dips drain it. Stall-safe: the stall is sell=ON +
+                    # discharge=0 — here discharge is always OPEN (sell rides with it at a
+                    # full pack), and the CT clamp still blocks battery->grid (an open
+                    # discharge only covers the load). Also removes the old 98% discharge
+                    # flap entirely (the register is now a constant 70A, never toggled).
+                    desired_discharge_current_a=self.battery_discharge_current,
                 )
 
         # Negative TOTAL import price (spot + tariff): you are PAID to import, so
