@@ -400,6 +400,45 @@ def sell_throttle_active(
     return (refill_kwh >= headroom_kwh * refill_margin), refill_kwh
 
 
+def reproject_tasks_with_throttle(tasks, state, *, capacity_kwh, max_soc, charge_rate, load_hourly_w):
+    """Re-project each task's projected_soc through the coordinator's sell-throttle, so the
+    committed plan AND the dashboard schedule show the morning-sell (charge held to ~10 A in
+    high-price surplus hours with cheaper sun ahead, refilled at midday) instead of the DP's
+    optimistic full-rate "100% by 11:00". Deficit model: the held-back charge accrues vs the
+    DP path during throttled selling and drains on later surplus, so a NO-THROTTLE day stays
+    byte-identical to the DP projection. The throttle decides on the START-of-slot SOC (as the
+    live executor does, on the current SOC), not the DP end-of-slot target. A GRID_CHARGE /
+    negative-price ABSORB slot physically BUYS up to the DP target — its projected_soc is the
+    live TOU charge-capacity ceiling, so the deficit is CLEARED there (never lower the grid
+    target). Shared by build_day_plan (committed SlotPlans) and build_control_plan (dashboard)."""
+    if not tasks:
+        return tasks
+    throttle_rate = battery_rate_kwh(SELL_THROTTLE_CHARGE_A)
+    deficit = 0.0
+    prev = max(0.0, state.battery_soc_pct / 100.0 * capacity_kwh)
+    out = []
+    for task in tasks:
+        orig = ((task.projected_soc_pct if task.projected_soc_pct is not None
+                 else round(prev / capacity_kwh * 100.0)) / 100.0 * capacity_kwh)
+        surplus = max(0.0, (task.pv_estimate_kwh or 0.0) - (task.load_estimate_kwh or 0.0))
+        intended = max(0.0, orig - prev)
+        if task.action == "GRID_CHARGE" or task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD:
+            deficit = 0.0
+        elif surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE"):
+            re_soc_pct = max(0.0, prev - deficit) / capacity_kwh * 100.0
+            throttled = task.action == "EXPORT" and sell_throttle_active(
+                price_slots=state.price_slots, solar_slots=state.solar_slots,
+                load_hourly_w=load_hourly_w, now=task.start, soc_pct=re_soc_pct,
+                max_soc_pct=max_soc, capacity_kwh=capacity_kwh)[0]
+            if throttled:
+                deficit += max(0.0, intended - throttle_rate)
+            else:
+                deficit = max(0.0, deficit - max(0.0, min(surplus, charge_rate) - intended))
+        prev = orig
+        out.append(replace(task, projected_soc_pct=round(max(0.0, orig - deficit) / capacity_kwh * 100.0)))
+    return out
+
+
 def peak_reserve_pct(
     price_slots,
     now: datetime,
@@ -647,20 +686,16 @@ def build_day_plan(
     )
     if not tasks:
         return None
+    # Re-project the projected_soc curve through the sell-throttle BEFORE building the slots,
+    # so the committed plan + the SOC-deviation replan trigger reflect the morning-sell. The
+    # dashboard schedule gets the SAME treatment via the shared helper in build_control_plan.
+    tasks = reproject_tasks_with_throttle(
+        tasks, state, capacity_kwh=capacity_kwh, max_soc=max_soc,
+        charge_rate=charge_rate, load_hourly_w=load_hourly_w,
+    )
     base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
     slots_by_start = {s.start: s for s in view.slots}
     plan_slots: list[SlotPlan] = []
-    # Throttle-aware SOC re-projection: the displayed/committed projected_soc must
-    # reflect the coordinator's sell-throttle — in high-price surplus hours with a
-    # guaranteed cheaper refill ahead the charge is held to ~10 A and the surplus
-    # EXPORTS, so the pack stays LOW in the morning and catches up at the cheaper midday
-    # hours, instead of the optimistic full-rate "100% by 11:00" the DP projects. Tracked
-    # as a DEFICIT vs the DP path that builds during throttled selling and drains on
-    # later surplus — so a no-throttle day stays byte-identical to the DP projection.
-    # Display + the SOC-deviation replan trigger only; the schedule's ACTIONS are unchanged.
-    _proj_deficit_kwh = 0.0
-    _proj_prev_kwh = max(0.0, state.battery_soc_pct / 100.0 * capacity_kwh)
-    _throttle_rate = battery_rate_kwh(SELL_THROTTLE_CHARGE_A)
     for task in tasks:
         price_slot = slots_by_start.get(task.start)
         export_value = price_slot.export_value if price_slot else None
@@ -703,38 +738,6 @@ def build_day_plan(
             # up to the export limit), OFF at non-positive prices. Harmless during
             # deficits (there is no surplus to sell).
             intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
-        # Re-project this slot's SOC through the sell-throttle (deficit model above).
-        _orig_kwh = (
-            (task.projected_soc_pct if task.projected_soc_pct is not None
-             else round(_proj_prev_kwh / capacity_kwh * 100.0)) / 100.0 * capacity_kwh
-        )
-        _surplus = max(0.0, (task.pv_estimate_kwh or 0.0) - (task.load_estimate_kwh or 0.0))
-        _intended_charge = max(0.0, _orig_kwh - _proj_prev_kwh)
-        if grid_charge:
-            # A GRID_CHARGE / ABSORB_NEGATIVE slot physically BUYS up to the DP's target
-            # (execute_slot writes projected_soc as the TOU charge-capacity ceiling), so
-            # it ERASES the throttle deficit — projected_soc here MUST stay the unmodified
-            # DP target, or the live grid-charge ceiling is silently lowered and the pack
-            # under-buys cheap energy. (The deficit was a morning sell-throttle artifact;
-            # a grid charge refills past it.)
-            _proj_deficit_kwh = 0.0
-        elif _surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE"):
-            # Throttle decides on the SOC at the START of the slot (the battery's actual
-            # level, the way the live coordinator calls it), NOT the DP's end-of-slot
-            # target — else a slot the DP already projects at 100% looks "full" and never
-            # throttles (the displayed plan then keeps the false full-rate curve).
-            _re_soc_pct = max(0.0, _proj_prev_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0
-            _throttled = task.action == "EXPORT" and sell_throttle_active(
-                price_slots=state.price_slots, solar_slots=state.solar_slots,
-                load_hourly_w=load_hourly_w, now=task.start, soc_pct=_re_soc_pct,
-                max_soc_pct=max_soc, capacity_kwh=capacity_kwh,
-            )[0]
-            if _throttled:
-                _proj_deficit_kwh += max(0.0, _intended_charge - _throttle_rate)
-            else:  # full-rate surplus hour catches up the held-back charge
-                _proj_deficit_kwh = max(0.0, _proj_deficit_kwh - max(0.0, min(_surplus, charge_rate) - _intended_charge))
-        _proj_prev_kwh = _orig_kwh
-        _projected_soc = round(max(0.0, _orig_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0)
         plan_slots.append(SlotPlan(
             start=task.start,
             intent=intent,
@@ -744,7 +747,7 @@ def build_day_plan(
             charge_current_a=charge_a,
             total_import_price=task.total_import_price,
             export_value=export_value,
-            projected_soc_pct=_projected_soc,
+            projected_soc_pct=task.projected_soc_pct,
             reason=task.action,
         ))
     return DayPlan(built_at=state.timestamp, day=plan_slots[0].start.date(), slots=tuple(plan_slots))
@@ -2435,6 +2438,12 @@ def build_control_plan(
         charge_rate_kwh=battery_rate_kwh(charge_current_a),
         discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
         battery_care_soc=battery_care_soc,
+    )
+    # Same throttle re-projection the committed day plan uses, so the dashboard
+    # "Automatiseringsopgaver" SOC curve reflects the morning-sell (not a false 100%).
+    schedule = reproject_tasks_with_throttle(
+        schedule, state, capacity_kwh=capacity_kwh, max_soc=max_soc,
+        charge_rate=battery_rate_kwh(charge_current_a), load_hourly_w=load_hourly_w,
     )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:

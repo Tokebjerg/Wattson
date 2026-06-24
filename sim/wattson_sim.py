@@ -882,11 +882,17 @@ def test_a2_planning():
     blue_sched = pe_schedule(const.BATTERY_MODE_BLUE)
     green_sched = pe_schedule(const.BATTERY_MODE_GREEN)
     checks.append(("schedule: expensive sunny morning -> EXPORT (sell surplus)", blue_sched[7].action == "EXPORT", blue_sched[7].action))
-    # Sell-safe reality (June-11 Deye quirk): trickle+sell stalls the PV path, so
-    # sell hours run the full charge rate and "Load first" fills the pack BEFORE
-    # anything exports — the projection must show the fast SOC rise, not the old
-    # (unrealizable) trickle hold-back.
-    checks.append(("schedule: morning export also bulk-fills the pack (Load first before export)", blue_sched[7].projected_soc_pct >= blue_sched[6].projected_soc_pct + 15, f"{blue_sched[6].projected_soc_pct}->{blue_sched[7].projected_soc_pct}"))
+    # Sell-throttle (v0.24.24 projection): this scenario is the throttle's reason for
+    # being — an expensive morning (1.20) with cheaper sun ahead (0.20 midday). The charge
+    # is held to ~10 A so the surplus SELLS now and the pack BULK-charges later at the cheap
+    # midday sun. The projection now reflects that: the morning SOC is held back (it used to
+    # falsely show a full-rate fill the throttle never actually performs).
+    checks.append(("schedule: throttled morning export holds the SOC back (sell now, refill at cheap midday)",
+                   blue_sched[7].projected_soc_pct - blue_sched[6].projected_soc_pct < 15,
+                   f"{blue_sched[6].projected_soc_pct}->{blue_sched[7].projected_soc_pct}"))
+    checks.append(("schedule: the cheap midday sun bulk-charges the pack to ~full",
+                   max(blue_sched[h].projected_soc_pct for h in (13, 14, 15)) >= 85,
+                   f"midday {[blue_sched[h].projected_soc_pct for h in (11, 12, 13, 14, 15)]}"))
     checks.append(("schedule: cheap midday sun keeps a sink (charge or sell, never curtail at positive price)", blue_sched[11].action in ("SOLAR_CHARGE", "EXPORT"), blue_sched[11].action))
     checks.append(("schedule: Green keeps charging at sunny morning (no peak-sell)", green_sched[7].action == "SOLAR_CHARGE", green_sched[7].action))
 
