@@ -719,7 +719,11 @@ def build_day_plan(
             # a grid charge refills past it.)
             _proj_deficit_kwh = 0.0
         elif _surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE"):
-            _re_soc_pct = max(0.0, _orig_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0
+            # Throttle decides on the SOC at the START of the slot (the battery's actual
+            # level, the way the live coordinator calls it), NOT the DP's end-of-slot
+            # target — else a slot the DP already projects at 100% looks "full" and never
+            # throttles (the displayed plan then keeps the false full-rate curve).
+            _re_soc_pct = max(0.0, _proj_prev_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0
             _throttled = task.action == "EXPORT" and sell_throttle_active(
                 price_slots=state.price_slots, solar_slots=state.solar_slots,
                 load_hourly_w=load_hourly_w, now=task.start, soc_pct=_re_soc_pct,

@@ -3042,6 +3042,22 @@ def test_plan_projection_throttle_aware():
         now=at(2), soc_pct=55.0, max_soc_pct=100.0, capacity_kwh=10.0)
     checks.append(("sell_throttle_active fires on the premium morning (shared with the live executor)", active is True, "morning"))
 
+    # Regression: when the battery starts high the DP projects 100% at the FIRST slot —
+    # the throttle must decide on the START-of-slot SOC (the real level), not the DP's
+    # end-of-slot 100% (which would look 'full' and skip, leaving the live plan at a
+    # false 100% — the v0.24.25 fix).
+    st_hi = models.SiteState(
+        timestamp=at(0), pv_power_w=4000.0, load_power_w=500.0, load_includes_ev=False,
+        grid_power_w=-2000.0, grid_import_power_w=0.0, grid_export_power_w=2000.0, battery_soc_pct=72.0,
+        battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+        easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=1.55, current_sell_price=1.0, forecast_today_kwh=60.0, price_slots=day, solar_slots=solar)
+    plan_hi = planner.build_day_plan(st_hi, battery_mode="blue", min_soc=15, max_soc=100, capacity_kwh=10.0,
+        load_hourly_w=load, learned_reserve_pct=0.0, charge_current_a=70, discharge_current_a=70)
+    first2 = [s.projected_soc_pct for s in plan_hi.slots[:2]]
+    checks.append((f"throttle fires even when the DP projects full at the first slot ({first2})",
+                   bool(first2) and min(first2) <= 90, str(first2)))
+
     # BLOCKER REGRESSION GUARD (adversarial review): projected_soc is NOT display-only —
     # execute_slot writes a GRID_CHARGE slot's projected_soc as the live TOU charge-capacity
     # ceiling. The throttle deficit must be CLEARED at grid-charge slots, or the inverter
