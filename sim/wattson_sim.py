@@ -2975,6 +2975,44 @@ def test_grid_charge_rate_projection():
     return checks
 
 
+def test_h4_grid_rate_threads_through_day_plan():
+    """H4: the grid-charge rate is a config option threaded through build_day_plan, not
+    just the bare dp_schedule. A slower rate must schedule >= as many cheap GRID hours
+    via build_day_plan, proving the knob reaches the committed plan end-to-end (the
+    coordinator passes entry_value(CONF_GRID_CHARGE_RATE_KWH) here)."""
+    checks = []
+    base = datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc)  # winter deep deficit
+    def at(h):
+        return base + timedelta(hours=h)
+    price = {h: 0.20 for h in range(24)}
+    for h in (17, 18, 19, 20):
+        price[h] = 2.00
+    day = [models.PriceSlot(start=at(h), spot_price=price[h], tariff=0.0,
+                            total_import_price=price[h], export_value=max(0.0, price[h])) for h in range(24)]
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=(0.3 if 10 <= h <= 13 else 0.0)) for h in range(24)]
+    load = {h: 1500.0 for h in range(24)}
+    st = models.SiteState(
+        timestamp=at(0), pv_power_w=0.0, load_power_w=1500.0, load_includes_ev=False,
+        grid_power_w=1500.0, grid_import_power_w=1500.0, grid_export_power_w=0.0,
+        battery_soc_pct=20.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.20, current_sell_price=0.20, forecast_today_kwh=2.0,
+        price_slots=day, solar_slots=solar,
+    )
+    def gc(grate):
+        dp = planner.build_day_plan(st, battery_mode="blue", min_soc=15, max_soc=100,
+                                    capacity_kwh=10.0, load_hourly_w=load, grid_charge_rate_kwh=grate)
+        return sum(1 for s in dp.slots if s.intent == "GRID_CHARGE") if dp else -1
+    slow = gc(planner.SCHEDULE_GRID_CHARGE_RATE_KWH)   # ~1.15 (config default)
+    fast = gc(planner.battery_rate_kwh(70.0))          # ~3.57 (a fast override)
+    checks.append((f"build_day_plan honours grid_charge_rate_kwh: slow={slow} >= fast={fast} > 0",
+                   slow >= fast and slow > 0, f"{slow} vs {fast}"))
+    slower = gc(0.6)                                   # a still-slower config value
+    checks.append((f"slower config rate (0.6) schedules >= the default (slower={slower} >= slow={slow})",
+                   slower >= slow, f"{slower} vs {slow}"))
+    return checks
+
+
 def test_sell_ceiling_hysteresis():
     """S2: the reactive full-battery sell flag is STICKY via the coordinator's latch.
     build_battery_plan honours sell_full_sticky (engage at max_soc, release only below
@@ -3253,6 +3291,7 @@ def main():
                          ("FULL-BATTERY HOLD (S1: kill the overnight ceiling flap)", test_full_battery_hold),
                          ("NEAR-FULL BUFFER HYSTERESIS (v0.24.21: kill the 98% discharge flap)", test_near_full_buffer_hysteresis),
                          ("GRID-CHARGE RATE PROJECTION (E1: ~1.15 kWh/h, not 70A)", test_grid_charge_rate_projection),
+                         ("GRID-RATE THREADS THROUGH DAY PLAN (H4: config knob end-to-end)", test_h4_grid_rate_threads_through_day_plan),
                          ("SELL-CEILING HYSTERESIS (S2: sticky reactive sell flag)", test_sell_ceiling_hysteresis),
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),

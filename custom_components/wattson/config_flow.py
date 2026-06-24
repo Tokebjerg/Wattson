@@ -36,6 +36,10 @@ from .const import (
     DEFAULT_BATTERY_CARE_MAX_SOC,
     CONF_RESERVE_HOLD_MARGIN,
     CONF_EV_RETUNE_SECONDS,
+    CONF_EV_FULL_RELEASE_MARGIN_PCT,
+    CONF_GRID_CHARGE_RATE_KWH,
+    EV_CURRENT_RETUNE_SECONDS,
+    BATTERY_FULL_RELEASE_MARGIN_PCT,
     CONF_SOLAR_CHARGE_PRIORITY_SOC,
     DEFAULT_SOLAR_CHARGE_PRIORITY_SOC,
     CONF_EV_REQUIRED_HOURS,
@@ -105,6 +109,7 @@ from .const import (
     EV_MODES,
 )
 from .mapping import suggested_mapping
+from .planner import RESERVE_HOLD_MARGIN, SCHEDULE_GRID_CHARGE_RATE_KWH
 
 CONF_CONFIRM_SINGLE_CONTROLLER = "confirm_single_controller"
 
@@ -268,6 +273,8 @@ def _options_battery_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_BATTERY_CARE_MAX_SOC, default=defaults.get(CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC)): _number(80, 100, 1),
             vol.Required(CONF_RESERVE_HOLD_MARGIN, default=defaults.get(CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN)): _number(0.0, 1.0, 0.05),
             vol.Required(CONF_EV_RETUNE_SECONDS, default=defaults.get(CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS)): _number(15, 600, 15),
+            vol.Required(CONF_EV_FULL_RELEASE_MARGIN_PCT, default=defaults.get(CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)): _number(2, 20, 1),
+            vol.Required(CONF_GRID_CHARGE_RATE_KWH, default=defaults.get(CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH)): _number(0.5, 5.0, 0.05),
         }
     )
 
@@ -461,6 +468,8 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_BATTERY_CARE_MAX_SOC: entry_value(self.config_entry, CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC),
             CONF_RESERVE_HOLD_MARGIN: entry_value(self.config_entry, CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN),
             CONF_EV_RETUNE_SECONDS: entry_value(self.config_entry, CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS),
+            CONF_EV_FULL_RELEASE_MARGIN_PCT: entry_value(self.config_entry, CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT),
+            CONF_GRID_CHARGE_RATE_KWH: entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH),
             CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
             CONF_EV_SOC_ENTITY: entry_value(self.config_entry, CONF_EV_SOC_ENTITY, DEFAULT_EV_SOC_ENTITY),
             CONF_EV_CHARGE_SPEED_PCT_H: entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H),

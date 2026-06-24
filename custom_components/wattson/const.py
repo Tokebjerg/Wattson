@@ -174,9 +174,11 @@ DEFAULT_SOLAR_CHARGE_PRIORITY_SOC = 50.0
 # firmware (see deye_contract.py).
 CONF_BATTERY_CARE_MAX_SOC = "battery_care_max_soc"
 DEFAULT_BATTERY_CARE_MAX_SOC = 95.0
-# Tunables promoted to options (2026-06-12): change without a deploy.
+# Tunables promoted to options (2026-06-12, extended 2026-06-24): change without a deploy.
 CONF_EV_RETUNE_SECONDS = "ev_retune_seconds"          # EV offered-current re-tune cadence
 CONF_RESERVE_HOLD_MARGIN = "reserve_hold_margin"      # peak-reserve hold spread (kr/kWh)
+CONF_EV_FULL_RELEASE_MARGIN_PCT = "ev_full_release_margin_pct"  # Ren sol: SOC band below max where the pack still covers the car (H4)
+CONF_GRID_CHARGE_RATE_KWH = "grid_charge_rate_kwh"    # measured grid-charge rate (kWh/h) for the cheap-hour projection (H4/E1)
 # Battery charge/discharge-current limits (A). 70 A is a HARD SAFETY CEILING for
 # this battery — the number entities cannot be set above it. Both default to the
 # ceiling. Discharge is a LIMIT (battery delivers only what the house needs, but

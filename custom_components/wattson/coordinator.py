@@ -20,6 +20,8 @@ from .const import (
     CONF_BATTERY_MAX_SOC,
     CONF_BATTERY_CARE_MAX_SOC,
     CONF_RESERVE_HOLD_MARGIN,
+    CONF_EV_FULL_RELEASE_MARGIN_PCT,
+    CONF_GRID_CHARGE_RATE_KWH,
     CONF_EV_RETUNE_SECONDS,
     CONF_BATTERY_CAPACITY_KWH,
     CONF_BATTERY_DISCHARGE_CURRENT_A,
@@ -152,6 +154,7 @@ from .planner import (
     mode_dwell_exempt,
     apply_sell_throttle,
     near_full_buffer_active,
+    SCHEDULE_GRID_CHARGE_RATE_KWH,
     peak_reserve_pct,
     solar_aware_reserve_pct,
     required_spread,
@@ -464,7 +467,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         severities = {
             "missing_entities": ir.IssueSeverity.ERROR,
             "controller_contention": ir.IssueSeverity.WARNING,
-            "degraded_writes": ir.IssueSeverity.WARNING,
+            # O6: a stuck write path can cement a bad register (e.g. discharge=0 at a
+            # full pack → stall/curtail), so it is CRITICAL, not a quiet WARNING.
+            "degraded_writes": ir.IssueSeverity.CRITICAL,
         }
         for key, entities in conditions.items():
             issue_id = f"{key}_{self.config_entry.entry_id}"
@@ -475,9 +480,36 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     translation_placeholders={"entities": ", ".join(entities)},
                 )
                 self._repairs_state[key] = entities
+                if key == "degraded_writes":
+                    self._notify_degraded_writes(entities)
             elif not entities and key in self._repairs_state:
                 ir.async_delete_issue(self.hass, DOMAIN, issue_id)
                 self._repairs_state.pop(key, None)
+                if key == "degraded_writes":
+                    self._notify_degraded_writes(None)
+
+    def _notify_degraded_writes(self, entities: list[str] | None) -> None:
+        """O6: a persistent notification (the bell, not just the Repairs page) when an
+        inverter control register won't accept writes — the same write reissues forever,
+        so a stuck discharge=0 / sell-pair could quietly cement a stall. ``entities=None``
+        dismisses it once the write path recovers. Best-effort; never breaks the update."""
+        try:
+            from homeassistant.components import persistent_notification
+        except Exception:  # noqa: BLE001
+            return
+        nid = f"wattson_degraded_writes_{self.config_entry.entry_id}"
+        if not entities:
+            persistent_notification.async_dismiss(self.hass, nid)
+            return
+        persistent_notification.async_create(
+            self.hass,
+            "Wattson kan ikke skrive til inverter-registre, der bliver ved at afvise "
+            f"værdien: {', '.join(entities)}. Et fastlåst register kan låse batteriet i "
+            "en dårlig tilstand (fx udladning=0 ved fuldt batteri → stall/spildt sol). "
+            "Tjek klatremis/Modbus-forbindelsen.",
+            title="Wattson: skrivefejl på inverter",
+            notification_id=nid,
+        )
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
@@ -784,9 +816,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # free from tomorrow's sun (live 2026-06-23/24: ~50% held, ~2.5 kWh bought at
         # ~1.8 kr/night). Rebuilding when the reserve changes lets the released floor
         # reach the overnight slots. Plan rebuilds write no registers, so this is cheap.
+        # Read the grid-charge-rate option here so a change to it (H4: no reload listener,
+        # options apply live) is part of the cache fingerprint and rebuilds the committed
+        # day plan — same lesson as the reserve in v0.24.23.
+        _grid_charge_rate = float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH))
         _plan_fp = (
             self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge,
-            round(learned_reserve_pct / 5.0),
+            round(learned_reserve_pct / 5.0), _grid_charge_rate,
         )
         _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
         _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -818,6 +854,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 charge_current_a=self.battery_charge_current,
                 discharge_current_a=self.battery_discharge_current,
                 battery_care_soc=self.battery_care_soc,
+                grid_charge_rate_kwh=_grid_charge_rate,
             )
             self._day_plan_fp = _plan_fp
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -1002,7 +1039,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     self.site_state.battery_soc_pct,
                     _max_soc,
                     engage_margin=BATTERY_NEAR_FULL_MARGIN_PCT,
-                    release_margin=BATTERY_FULL_RELEASE_MARGIN_PCT,
+                    release_margin=float(entry_value(self.config_entry, CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)),
                 )
                 _ev_pack_full = self._ev_full_buffer_active
                 # A FULL pack can't soak the whole PV surplus, and with sell OFF the
@@ -1263,6 +1300,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             charge_current_a=self.battery_charge_current,
             discharge_current_a=self.battery_discharge_current,
             battery_care_soc=self.battery_care_soc,
+            grid_charge_rate_kwh=float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH)),
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:

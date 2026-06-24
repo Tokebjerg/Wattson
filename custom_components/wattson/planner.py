@@ -652,6 +652,7 @@ def build_day_plan(
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
     battery_care_soc: float = 100.0,
+    grid_charge_rate_kwh: float | None = None,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -682,6 +683,7 @@ def build_day_plan(
         solar_charge_priority_soc=solar_charge_priority_soc,
         charge_rate_kwh=charge_rate,
         discharge_rate_kwh=discharge_rate,
+        grid_charge_rate_kwh=grid_charge_rate_kwh,
         battery_care_soc=battery_care_soc,
     )
     if not tasks:
@@ -2434,6 +2436,7 @@ def build_control_plan(
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
     battery_care_soc: float = 100.0,
+    grid_charge_rate_kwh: float | None = None,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -2447,6 +2450,7 @@ def build_control_plan(
         solar_charge_priority_soc=solar_charge_priority_soc,
         charge_rate_kwh=battery_rate_kwh(charge_current_a),
         discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
+        grid_charge_rate_kwh=grid_charge_rate_kwh,
         battery_care_soc=battery_care_soc,
     )
     # Same throttle re-projection the committed day plan uses, so the dashboard
