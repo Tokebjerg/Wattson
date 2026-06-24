@@ -468,23 +468,30 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "missing_entities": ir.IssueSeverity.ERROR,
             "controller_contention": ir.IssueSeverity.WARNING,
             # O6: a stuck write path can cement a bad register (e.g. discharge=0 at a
-            # full pack → stall/curtail), so it is CRITICAL, not a quiet WARNING.
-            "degraded_writes": ir.IssueSeverity.CRITICAL,
+            # full pack → stall/curtail), so it is ERROR (a prominent Repair + the push
+            # notification below), not a quiet WARNING. NOT CRITICAL — that severity is
+            # reserved for HA core and renders as un-ignorable.
+            "degraded_writes": ir.IssueSeverity.ERROR,
         }
         for key, entities in conditions.items():
             issue_id = f"{key}_{self.config_entry.entry_id}"
-            if entities and self._repairs_state.get(key) != entities:
-                ir.async_create_issue(
-                    self.hass, DOMAIN, issue_id,
-                    is_fixable=False, severity=severities[key], translation_key=key,
-                    translation_placeholders={"entities": ", ".join(entities)},
-                )
-                self._repairs_state[key] = entities
-                if key == "degraded_writes":
-                    self._notify_degraded_writes(entities)
-            elif not entities and key in self._repairs_state:
-                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            if entities:
+                if self._repairs_state.get(key) != entities:
+                    ir.async_create_issue(
+                        self.hass, DOMAIN, issue_id,
+                        is_fixable=False, severity=severities[key], translation_key=key,
+                        translation_placeholders={"entities": ", ".join(entities)},
+                    )
+                    self._repairs_state[key] = entities
+                    if key == "degraded_writes":
+                        self._notify_degraded_writes(entities)
+            else:
+                # Clear UNCONDITIONALLY (delete/dismiss are cheap no-ops when absent).
+                # The issue registry persists across a restart but self._repairs_state
+                # does not, so a guard on "key in self._repairs_state" would strand a
+                # pre-restart Repair/notification forever once the condition resolves.
                 self._repairs_state.pop(key, None)
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
                 if key == "degraded_writes":
                     self._notify_degraded_writes(None)
 
@@ -1039,7 +1046,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     self.site_state.battery_soc_pct,
                     _max_soc,
                     engage_margin=BATTERY_NEAR_FULL_MARGIN_PCT,
-                    release_margin=float(entry_value(self.config_entry, CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)),
+                    # Clamp so the option can never collapse the hysteresis deadband:
+                    # release must stay clear of the engage margin, else
+                    # near_full_buffer_active degenerates to a stateless threshold and the
+                    # v0.24.21 full-pack discharge/sell flap returns. Floor = engage + 2%.
+                    release_margin=max(
+                        BATTERY_NEAR_FULL_MARGIN_PCT + 2.0,
+                        float(entry_value(self.config_entry, CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)),
+                    ),
                 )
                 _ev_pack_full = self._ev_full_buffer_active
                 # A FULL pack can't soak the whole PV surplus, and with sell OFF the

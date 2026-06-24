@@ -273,7 +273,7 @@ def _options_battery_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_BATTERY_CARE_MAX_SOC, default=defaults.get(CONF_BATTERY_CARE_MAX_SOC, DEFAULT_BATTERY_CARE_MAX_SOC)): _number(80, 100, 1),
             vol.Required(CONF_RESERVE_HOLD_MARGIN, default=defaults.get(CONF_RESERVE_HOLD_MARGIN, RESERVE_HOLD_MARGIN)): _number(0.0, 1.0, 0.05),
             vol.Required(CONF_EV_RETUNE_SECONDS, default=defaults.get(CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS)): _number(15, 600, 15),
-            vol.Required(CONF_EV_FULL_RELEASE_MARGIN_PCT, default=defaults.get(CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)): _number(2, 20, 1),
+            vol.Required(CONF_EV_FULL_RELEASE_MARGIN_PCT, default=defaults.get(CONF_EV_FULL_RELEASE_MARGIN_PCT, BATTERY_FULL_RELEASE_MARGIN_PCT)): _number(4, 20, 1),
             vol.Required(CONF_GRID_CHARGE_RATE_KWH, default=defaults.get(CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH)): _number(0.5, 5.0, 0.05),
         }
     )
