@@ -2996,6 +2996,55 @@ def test_sell_ceiling_hysteresis():
     return checks
 
 
+def test_reserve_release_overnight_floor():
+    """v0.24.23: once solar_aware releases the learned reserve to 0, the day plan must
+    discharge the pack overnight to COVER THE HOUSE (reaching the hard min) instead of
+    holding a high floor and importing at the night price. This is the engine half of
+    the fix — the coordinator now rebuilds the plan when the released reserve changes
+    (it was excluded from the rebuild fingerprint, so a plan baked with a high reserve
+    held a ~50% overnight floor all night and bought grid; live 2026-06-23/24)."""
+    checks = []
+    base = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+    def at(h):
+        return base + timedelta(hours=h)
+    price = {h: 1.3 for h in range(36)}
+    for h in range(11, 18):
+        price[h] = 1.8            # overnight June 23->24 (the cheap-ish night that was imported)
+    for h in (29, 30, 31):
+        price[h] = 6.0            # next evening's extreme peak
+    day = [models.PriceSlot(start=at(h), spot_price=price[h], tariff=0.0,
+                            total_import_price=price[h], export_value=max(0.0, price[h] - 0.5)) for h in range(36)]
+    pv = {h: 0.0 for h in range(36)}
+    for h in range(19, 30):
+        pv[h] = 6.0               # next-day sunny refill
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=pv[h]) for h in range(36)]
+    load = {h: 500.0 for h in range(24)}
+    st = models.SiteState(
+        timestamp=at(0), pv_power_w=4000.0, load_power_w=500.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=80.0,
+        battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+        easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=1.3, current_sell_price=0.8, forecast_today_kwh=60.0, price_slots=day, solar_slots=solar)
+
+    def overnight_floor_and_soc(reserve):
+        plan = planner.build_day_plan(st, battery_mode="blue", min_soc=15, max_soc=100, capacity_kwh=10.0,
+            load_hourly_w=load, learned_reserve_pct=reserve, charge_current_a=70, discharge_current_a=70)
+        ov = [s for s in plan.slots if 11 <= int((s.start - base).total_seconds() // 3600) <= 18]
+        floors = {round(s.tou_floor_pct) for s in ov}
+        min_soc = min(round(s.projected_soc_pct) for s in ov)
+        return floors, min_soc
+
+    held_floors, held_min = overnight_floor_and_soc(35.0)
+    rel_floors, rel_min = overnight_floor_and_soc(0.0)
+    checks.append((f"held reserve (35%) bakes a high overnight floor (>=45%) -> pack holds ({held_floors})",
+                   all(f >= 45 for f in held_floors), str(held_floors)))
+    checks.append((f"released reserve (0%) lets the overnight floor drop to the hard min (15%) ({rel_floors})",
+                   rel_floors == {15}, str(rel_floors)))
+    checks.append((f"released reserve discharges overnight to COVER THE HOUSE (min SOC {rel_min}% << held {held_min}%)",
+                   rel_min < held_min - 20, f"{rel_min} vs {held_min}"))
+    return checks
+
+
 def test_solar_aware_reserve():
     """v0.24.14: release the LEARNED self-use reserve when forecast solar over the
     next 24h can refill the whole usable band x SOLAR_RESERVE_RELEASE_MARGIN — so the
@@ -3085,6 +3134,7 @@ def main():
                          ("SELL-CEILING HYSTERESIS (S2: sticky reactive sell flag)", test_sell_ceiling_hysteresis),
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
+                         ("RESERVE-RELEASE OVERNIGHT FLOOR (v0.24.23: rebuild on reserve change)", test_reserve_release_overnight_floor),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

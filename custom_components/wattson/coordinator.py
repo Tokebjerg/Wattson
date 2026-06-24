@@ -775,7 +775,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # missing/expired, the horizon grew (tomorrow's prices arrived), the SOC has
         # deviated far from the plan's projection, or the battery config changed.
         _now_local = self.site_state.timestamp
-        _plan_fp = (self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge)
+        # Include the (solar-aware-RELEASED) learned reserve in the rebuild fingerprint,
+        # quantized to 5% buckets. Without it, a plan built while the reserve was high
+        # (e.g. just after a restart with empty solar_slots, or a momentarily low
+        # forecast) BAKES a high overnight discharge floor and is never rebuilt when
+        # solar_aware later drops the reserve to 0 — so the pack holds ~50% overnight
+        # and IMPORTS the house at the night price instead of discharging and refilling
+        # free from tomorrow's sun (live 2026-06-23/24: ~50% held, ~2.5 kWh bought at
+        # ~1.8 kr/night). Rebuilding when the reserve changes lets the released floor
+        # reach the overnight slots. Plan rebuilds write no registers, so this is cheap.
+        _plan_fp = (
+            self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge,
+            round(learned_reserve_pct / 5.0),
+        )
         _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
         _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
         _soc_far_off = (
