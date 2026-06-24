@@ -2996,6 +2996,95 @@ def test_sell_ceiling_hysteresis():
     return checks
 
 
+def test_plan_projection_throttle_aware():
+    """v0.24.24: the plan's projected_soc must REFLECT the coordinator's sell-throttle.
+    In high-price morning surplus hours with cheaper sun ahead the charge is held to ~10A
+    and the surplus EXPORTS, so the displayed SOC stays LOW in the morning and catches up
+    at the cheaper midday hours — not the old optimistic '100% by 11:00'. Uses the SAME
+    sell_throttle_active the live executor uses (no plan-vs-reality divergence)."""
+    checks = []
+    base = datetime(2026, 6, 24, 4, 0, tzinfo=timezone.utc)  # 06:00 local
+    def at(h):
+        return base + timedelta(hours=h)
+    # Expensive morning (06-11 local), cheaper sunny midday (12-16) = "sell now, refill later".
+    price = {h: 1.2 for h in range(24)}
+    for h in range(2, 8):
+        price[h] = 1.55           # morning premium
+    for h in range(8, 13):
+        price[h] = 1.00           # cheaper midday
+    day = [models.PriceSlot(start=at(h), spot_price=price[h], tariff=0.0,
+                            total_import_price=price[h], export_value=max(0.0, price[h] - 0.4)) for h in range(24)]
+    pv = {h: 0.0 for h in range(24)}
+    for h in range(2, 16):
+        pv[h] = 6.0               # strong sun from early morning
+    solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=pv[h]) for h in range(24)]
+    load = {h: 500.0 for h in range(24)}
+    st = models.SiteState(
+        timestamp=at(0), pv_power_w=4000.0, load_power_w=500.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=50.0,
+        battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+        easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=1.55, current_sell_price=1.0, forecast_today_kwh=60.0, price_slots=day, solar_slots=solar)
+    plan = planner.build_day_plan(st, battery_mode="blue", min_soc=15, max_soc=100, capacity_kwh=10.0,
+        load_hourly_w=load, learned_reserve_pct=0.0, charge_current_a=70, discharge_current_a=70)
+
+    by_hour = {int((s.start - base).total_seconds() // 3600): s for s in plan.slots}
+    # Premium-morning EXPORT slots (h2-h4, ~08-10 local) must NOT already show ~full —
+    # the throttle holds the charge back to sell.
+    morning = [by_hour[h].projected_soc_pct for h in (2, 3, 4) if h in by_hour]
+    afternoon = [by_hour[h].projected_soc_pct for h in (13, 14, 15) if h in by_hour]
+    checks.append((f"throttle holds the premium-morning projected SOC below full ({morning})",
+                   bool(morning) and max(morning) <= 90, str(morning)))
+    checks.append((f"projected SOC catches up to ~full by afternoon ({afternoon})",
+                   bool(afternoon) and max(afternoon) >= 95, str(afternoon)))
+    # The plan's projection uses the SAME decision the live throttle does.
+    active, _ = planner.sell_throttle_active(price_slots=day, solar_slots=solar, load_hourly_w=load,
+        now=at(2), soc_pct=55.0, max_soc_pct=100.0, capacity_kwh=10.0)
+    checks.append(("sell_throttle_active fires on the premium morning (shared with the live executor)", active is True, "morning"))
+
+    # BLOCKER REGRESSION GUARD (adversarial review): projected_soc is NOT display-only —
+    # execute_slot writes a GRID_CHARGE slot's projected_soc as the live TOU charge-capacity
+    # ceiling. The throttle deficit must be CLEARED at grid-charge slots, or the inverter
+    # under-buys cheap energy. Build a throttled-morning + cheap-night-grid-charge horizon and
+    # assert every GRID_CHARGE slot's projected_soc is byte-identical to the raw DP projection.
+    base2 = datetime(2026, 6, 24, 4, 0, tzinfo=timezone.utc)  # 06:00 local
+    def at2(h):
+        return base2 + timedelta(hours=h)
+    # Premium-sun morning (throttled sell builds the deficit) then NEGATIVE-price sun
+    # hours (ABSORB_NEGATIVE = grid_charge) while the deficit is still large.
+    p2 = {h: 1.2 for h in range(24)}
+    for h in range(2, 6):
+        p2[h] = 1.60                      # premium morning + sun -> throttled sell
+    for h in range(6, 10):
+        p2[h] = -0.30                     # paid-to-import sunny midday -> ABSORB_NEGATIVE (grid_charge)
+    d2 = [models.PriceSlot(start=at2(h), spot_price=p2[h], tariff=0.0, total_import_price=p2[h],
+                           export_value=max(0.0, p2[h] - 0.4)) for h in range(24)]
+    pv2 = {h: 0.0 for h in range(24)}
+    for h in range(2, 16):
+        pv2[h] = 6.0                      # strong sun spanning morning + midday
+    s2 = [models.SolarSlot(start=at2(h), pv_estimate_kwh=pv2[h]) for h in range(24)]
+    l2 = {h: 500.0 for h in range(24)}
+    st2 = models.SiteState(
+        timestamp=at2(0), pv_power_w=4000.0, load_power_w=500.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0, battery_soc_pct=55.0,
+        battery_power_w=0.0, inverter_online=True, inverter_status="normal", easee_online=True,
+        easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=1.60, current_sell_price=1.2, forecast_today_kwh=50.0, price_slots=d2, solar_slots=s2)
+    prof = planner.profile_for("blue")
+    raw_tasks, _, _ = planner.build_schedule_optimal(st2, prof, l2, capacity_kwh=10.0, min_soc=15, max_soc=100,
+        learned_reserve_pct=0.0, charge_rate_kwh=planner.battery_rate_kwh(70.0),
+        discharge_rate_kwh=planner.battery_rate_kwh(70.0))
+    raw_soc = {t.start: t.projected_soc_pct for t in raw_tasks}
+    plan2 = planner.build_day_plan(st2, battery_mode="blue", min_soc=15, max_soc=100, capacity_kwh=10.0,
+        load_hourly_w=l2, learned_reserve_pct=0.0, charge_current_a=70, discharge_current_a=70)
+    gc_slots = [s for s in plan2.slots if s.grid_charge]
+    gc_mismatch = [(s.start.hour, s.projected_soc_pct, raw_soc.get(s.start)) for s in gc_slots
+                   if raw_soc.get(s.start) is not None and s.projected_soc_pct != raw_soc.get(s.start)]
+    checks.append((f"GRID_CHARGE slots keep the raw DP charge target (deficit cleared) — {len(gc_slots)} grid-charge slots, {len(gc_mismatch)} altered",
+                   not gc_mismatch, f"mismatches: {gc_mismatch[:4]}"))
+    return checks
+
+
 def test_reserve_release_overnight_floor():
     """v0.24.23: once solar_aware releases the learned reserve to 0, the day plan must
     discharge the pack overnight to COVER THE HOUSE (reaching the hard min) instead of
@@ -3135,6 +3224,7 @@ def main():
                          ("PRICE-BASED SELL-THROTTLE (v0.24.15)", test_sell_throttle),
                          ("SOLAR-AWARE RESERVE RELEASE (v0.24.14)", test_solar_aware_reserve),
                          ("RESERVE-RELEASE OVERNIGHT FLOOR (v0.24.23: rebuild on reserve change)", test_reserve_release_overnight_floor),
+                         ("PLAN PROJECTION THROTTLE-AWARE (v0.24.24: SOC curve reflects morning-sell)", test_plan_projection_throttle_aware),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

@@ -346,14 +346,50 @@ def apply_sell_throttle(
     no cheaper refill window — so the low charge can ONLY ride with an active sell that
     has a guaranteed cheaper refill, never on its own. CAUTION: the 10A+sell pair is the
     v0.23.0 stall family — see SELL_THROTTLE_CHARGE_A; applied as a stable setpoint."""
-    if not getattr(plan, "desired_solar_sell", False) or soc_pct >= max_soc_pct:
+    if not getattr(plan, "desired_solar_sell", False):
         return plan
+    active, refill_kwh = sell_throttle_active(
+        price_slots=price_slots, solar_slots=solar_slots, load_hourly_w=load_hourly_w,
+        now=now, soc_pct=soc_pct, max_soc_pct=max_soc_pct, capacity_kwh=capacity_kwh,
+        refill_margin=refill_margin,
+    )
+    if not active:
+        return plan
+    return replace(
+        plan,
+        desired_max_charge_current_a=float(throttle_a),
+        reason=(
+            f"{plan.reason} | sell-throttle {throttle_a:.0f} A "
+            f"({refill_kwh:.1f} kWh cheaper sun ahead — selling now, refill later)"
+        ),
+    )
+
+
+def sell_throttle_active(
+    *,
+    price_slots,
+    solar_slots,
+    load_hourly_w,
+    now,
+    soc_pct,
+    max_soc_pct,
+    capacity_kwh,
+    refill_margin: float = SELL_REFILL_MARGIN,
+) -> tuple[bool, float]:
+    """``(active, refill_kwh)`` — the throttle DECISION shared by the live coordinator
+    (apply_sell_throttle) and the day-plan's SOC projection, so the plan reflects the
+    same "sell now, refill from cheaper sun later" the executor actually does. Active
+    when below full AND the future same-day solar surplus priced BELOW the current hour
+    is enough to refill the headroom x refill_margin. SOC-dependent: more headroom at a
+    low SOC needs more refill to justify holding the charge back."""
+    if soc_pct >= max_soc_pct:
+        return False, 0.0
     current = current_price_slot(price_slots, now)
     if current is None:
-        return plan
+        return False, 0.0
     headroom_kwh = max(0.0, (max_soc_pct - soc_pct) / 100.0 * max(0.0, capacity_kwh))
     if headroom_kwh <= 0.0:
-        return plan
+        return False, 0.0
     refill_kwh = future_solar_surplus_kwh(
         price_slots,
         {s.start: s for s in solar_slots},
@@ -361,16 +397,7 @@ def apply_sell_throttle(
         current.start,
         current.total_import_price,
     )
-    if refill_kwh >= headroom_kwh * refill_margin:
-        return replace(
-            plan,
-            desired_max_charge_current_a=float(throttle_a),
-            reason=(
-                f"{plan.reason} | sell-throttle {throttle_a:.0f} A "
-                f"({refill_kwh:.1f} kWh cheaper sun ahead — selling now, refill later)"
-            ),
-        )
-    return plan
+    return (refill_kwh >= headroom_kwh * refill_margin), refill_kwh
 
 
 def peak_reserve_pct(
@@ -623,6 +650,17 @@ def build_day_plan(
     base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
     slots_by_start = {s.start: s for s in view.slots}
     plan_slots: list[SlotPlan] = []
+    # Throttle-aware SOC re-projection: the displayed/committed projected_soc must
+    # reflect the coordinator's sell-throttle — in high-price surplus hours with a
+    # guaranteed cheaper refill ahead the charge is held to ~10 A and the surplus
+    # EXPORTS, so the pack stays LOW in the morning and catches up at the cheaper midday
+    # hours, instead of the optimistic full-rate "100% by 11:00" the DP projects. Tracked
+    # as a DEFICIT vs the DP path that builds during throttled selling and drains on
+    # later surplus — so a no-throttle day stays byte-identical to the DP projection.
+    # Display + the SOC-deviation replan trigger only; the schedule's ACTIONS are unchanged.
+    _proj_deficit_kwh = 0.0
+    _proj_prev_kwh = max(0.0, state.battery_soc_pct / 100.0 * capacity_kwh)
+    _throttle_rate = battery_rate_kwh(SELL_THROTTLE_CHARGE_A)
     for task in tasks:
         price_slot = slots_by_start.get(task.start)
         export_value = price_slot.export_value if price_slot else None
@@ -665,6 +703,34 @@ def build_day_plan(
             # up to the export limit), OFF at non-positive prices. Harmless during
             # deficits (there is no surplus to sell).
             intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
+        # Re-project this slot's SOC through the sell-throttle (deficit model above).
+        _orig_kwh = (
+            (task.projected_soc_pct if task.projected_soc_pct is not None
+             else round(_proj_prev_kwh / capacity_kwh * 100.0)) / 100.0 * capacity_kwh
+        )
+        _surplus = max(0.0, (task.pv_estimate_kwh or 0.0) - (task.load_estimate_kwh or 0.0))
+        _intended_charge = max(0.0, _orig_kwh - _proj_prev_kwh)
+        if grid_charge:
+            # A GRID_CHARGE / ABSORB_NEGATIVE slot physically BUYS up to the DP's target
+            # (execute_slot writes projected_soc as the TOU charge-capacity ceiling), so
+            # it ERASES the throttle deficit — projected_soc here MUST stay the unmodified
+            # DP target, or the live grid-charge ceiling is silently lowered and the pack
+            # under-buys cheap energy. (The deficit was a morning sell-throttle artifact;
+            # a grid charge refills past it.)
+            _proj_deficit_kwh = 0.0
+        elif _surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE"):
+            _re_soc_pct = max(0.0, _orig_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0
+            _throttled = task.action == "EXPORT" and sell_throttle_active(
+                price_slots=state.price_slots, solar_slots=state.solar_slots,
+                load_hourly_w=load_hourly_w, now=task.start, soc_pct=_re_soc_pct,
+                max_soc_pct=max_soc, capacity_kwh=capacity_kwh,
+            )[0]
+            if _throttled:
+                _proj_deficit_kwh += max(0.0, _intended_charge - _throttle_rate)
+            else:  # full-rate surplus hour catches up the held-back charge
+                _proj_deficit_kwh = max(0.0, _proj_deficit_kwh - max(0.0, min(_surplus, charge_rate) - _intended_charge))
+        _proj_prev_kwh = _orig_kwh
+        _projected_soc = round(max(0.0, _orig_kwh - _proj_deficit_kwh) / capacity_kwh * 100.0)
         plan_slots.append(SlotPlan(
             start=task.start,
             intent=intent,
@@ -674,7 +740,7 @@ def build_day_plan(
             charge_current_a=charge_a,
             total_import_price=task.total_import_price,
             export_value=export_value,
-            projected_soc_pct=task.projected_soc_pct,
+            projected_soc_pct=_projected_soc,
             reason=task.action,
         ))
     return DayPlan(built_at=state.timestamp, day=plan_slots[0].start.date(), slots=tuple(plan_slots))
