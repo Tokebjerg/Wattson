@@ -331,6 +331,7 @@ def apply_sell_throttle(
     capacity_kwh,
     throttle_a: float = SELL_THROTTLE_CHARGE_A,
     refill_margin: float = SELL_REFILL_MARGIN,
+    pv_power_w: float | None = None,
 ):
     """Throttle the charge register to ``throttle_a`` while the plan is SELLING
     surplus AND there is a cheaper same-day refill window ahead with enough forecast
@@ -351,7 +352,7 @@ def apply_sell_throttle(
     active, refill_kwh = sell_throttle_active(
         price_slots=price_slots, solar_slots=solar_slots, load_hourly_w=load_hourly_w,
         now=now, soc_pct=soc_pct, max_soc_pct=max_soc_pct, capacity_kwh=capacity_kwh,
-        refill_margin=refill_margin,
+        refill_margin=refill_margin, pv_power_w=pv_power_w,
     )
     if not active:
         return plan
@@ -375,6 +376,7 @@ def sell_throttle_active(
     max_soc_pct,
     capacity_kwh,
     refill_margin: float = SELL_REFILL_MARGIN,
+    pv_power_w: float | None = None,
 ) -> tuple[bool, float]:
     """``(active, refill_kwh)`` — the throttle DECISION shared by the live coordinator
     (apply_sell_throttle) and the day-plan's SOC projection, so the plan reflects the
@@ -383,6 +385,17 @@ def sell_throttle_active(
     is enough to refill the headroom x refill_margin. SOC-dependent: more headroom at a
     low SOC needs more refill to justify holding the charge back."""
     if soc_pct >= max_soc_pct:
+        return False, 0.0
+    # The 10A+sell throttle only rides safely while LIVE PV keeps the sell/discharge
+    # pipeline alive. At night (PV≈0) "cheaper sun ahead today" is still true (the coming
+    # sunrise), so the throttle fires and pins charge=10A — but with no PV that is the
+    # solar_sell=ON + charge=10A stall pair (v0.23.0 family) that parks the Deye's
+    # battery→house discharge and dumps the house load onto the grid (confirmed live
+    # 2026-06-25 03:32: charge pinned 10A, PV=0, battery_output 555→7W / grid 7→536W in
+    # one second, no Wattson write). Require real PV before throttling. None = the caller
+    # has no live PV (the forecast reprojection, which already gates on slot PV-surplus>0
+    # and action==EXPORT) → skip this guard so the plan/dashboard projection is unchanged.
+    if pv_power_w is not None and pv_power_w <= SOLAR_CHARGE_BLOCK_W:
         return False, 0.0
     current = current_price_slot(price_slots, now)
     if current is None:

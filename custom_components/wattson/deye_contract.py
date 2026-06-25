@@ -31,19 +31,28 @@ THE TRICKLE+SELL STALL — it is the FLAPPING, not a stable low charge
   register flapping) were ALL during rapid sell/charge toggling, and the MPPT
   parked (strings ~390 V at 0.0 A), PV clamped to the house load, nothing
   exported, the house fell to GRID IMPORT. We first read this as "a low charge
-  register stalls the sell path." It does NOT: a STABLE low charge setpoint runs
-  clean. Live 2026-06-18: SELL_THROTTLE_CHARGE_A=10 held steady for minutes with
-  solar_sell=ON, PV rose, grid exported, no stall (commits e6840f9/66f1df0). The
-  stall is the REGISTER CHURN, not the level. So:
+  register stalls the sell path." A stable low charge setpoint runs clean WHILE
+  THERE IS LIVE PV: 2026-06-18 SELL_THROTTLE_CHARGE_A=10 held steady for minutes
+  with solar_sell=ON, PV rose, grid exported, no stall (commits e6840f9/66f1df0).
+  So flapping stalls — AND a stable 10A+sell stalls too WHEN PV≈0:
 
-      a STABLE charge setpoint is safe with solar_sell=ON, even at 10 A;
-      RAPID flapping of the charge/discharge/sell registers is what stalls.
+      a STABLE charge setpoint is safe with solar_sell=ON, even at 10 A, ONLY
+      while PV is actually flowing; with NO PV the stable 10A+sell pair ALSO
+      stalls (the sell pipeline has nothing to keep alive, so the firmware parks
+      the battery→house discharge); RAPID flapping stalls regardless of PV.
 
-  ``floor_sell_safe`` (>= SELL_SAFE_CHARGE_A while selling) is still load-bearing
-  as a backstop for NON-throttle sell paths and transient flaps — a leftover
-  trickle inherited from another slot, or a plan path that did not intend a low
-  charge. The deliberate sell-throttle (planner.SELL_THROTTLE_CHARGE_A) overrides
-  it ON PURPOSE, AFTER the floor, as a stable setpoint. Do NOT "restore the >=70 A
+  Live 2026-06-25 03:32 (the no-PV counter-example): the sell-throttle fired
+  overnight (it counts the coming day's sunrise as "cheaper sun ahead today"),
+  pinned charge=10A with solar_sell=ON and PV=0, and the Deye spontaneously moved
+  the ~460 W house load from the battery to the grid (battery_output 555→7 W /
+  out_of_grid 7→536 W in one second, NO Wattson write) — a stable-setpoint stall.
+  FIX: sell_throttle_active is now gated on live ``pv_power_w`` so the throttle
+  never fires without PV (planner.py). ``floor_sell_safe`` (>= SELL_SAFE_CHARGE_A
+  while selling) is still load-bearing as a backstop for NON-throttle sell paths
+  and transient flaps — a leftover trickle inherited from another slot, or a plan
+  path that did not intend a low charge. The deliberate sell-throttle
+  (planner.SELL_THROTTLE_CHARGE_A) overrides it ON PURPOSE, AFTER the floor, as a
+  stable setpoint, but only when there is live PV. Do NOT "restore the >=70 A
   invariant" everywhere — that would silently kill the sell-throttle savings.
   Corollary unchanged: under "Load first" the pack fills BEFORE anything exports,
   so a battery-care % cap is only enforceable for GRID charging, not solar.

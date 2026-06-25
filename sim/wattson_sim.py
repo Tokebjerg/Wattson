@@ -2887,6 +2887,23 @@ def test_sell_throttle():
     checks.append(("mid-curve hour (0.42) + cheaper sun ahead -> throttled",
                    thr(sell_plan(), at(9)).desired_max_charge_current_a == A, "09"))
 
+    # PV GATE (2026-06-25): the 10A+sell throttle only rides safely with LIVE PV. At night
+    # (pv≈0) "cheaper sun ahead today" is still true (the coming sunrise), so the throttle
+    # WOULD fire and pin charge=10A with no PV — the v0.23.0 stall pair that parked the Deye
+    # battery→house discharge and dumped the house load onto the grid (confirmed live 03:32).
+    # With pv_power_w supplied it must NOT throttle at/below SOLAR_CHARGE_BLOCK_W; omitted
+    # (None, the forecast reprojection which gates on slot surplus>0) leaves it unchanged.
+    def thr_pv(now, pv):
+        return planner.apply_sell_throttle(sell_plan(), price_slots=price_slots, solar_slots=solar_slots,
+                                           load_hourly_w=load, now=now, soc_pct=30.0, max_soc_pct=100.0,
+                                           capacity_kwh=10.0, pv_power_w=pv)
+    checks.append(("no live PV (night) -> NOT throttled even with cheaper sun ahead (kills the stall pair)",
+                   thr_pv(at(8), 0.0).desired_max_charge_current_a == SAFE, str(thr_pv(at(8), 0.0).desired_max_charge_current_a)))
+    checks.append(("live PV present (daytime) -> throttled as before (morning-sell preserved)",
+                   thr_pv(at(8), 4000.0).desired_max_charge_current_a == A, str(thr_pv(at(8), 4000.0).desired_max_charge_current_a)))
+    checks.append(("pv_power_w omitted (reprojection path) -> gate skipped, throttles (plan projection unchanged)",
+                   thr(sell_plan(), at(8)).desired_max_charge_current_a == A, "none"))
+
     nosell = models.BatteryPlan(strategy="IDLE", reason="idle", desired_solar_sell=False, desired_max_charge_current_a=SAFE)
     checks.append(("not selling -> untouched (10A only rides with a sell)", thr(nosell, at(8)).desired_max_charge_current_a == SAFE, "nosell"))
 

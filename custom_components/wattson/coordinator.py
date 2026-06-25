@@ -1186,7 +1186,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # now (high price) and the pack refills later from the cheaper/negative-priced
         # sun. Price-based (any "high now, cheaper sun later" shape), self-releasing at
         # the day's cheapest hours. Runs AFTER floor_sell_safe and intentionally
-        # overrides it; a STABLE setpoint (the v0.23.0 stall was a flapping artifact).
+        # overrides it. GATED ON LIVE PV (pv_power_w): a stable 10A+sell setpoint is NOT
+        # universally safe — at night (PV≈0) it forms the v0.23.0 stall pair and parks the
+        # battery→house discharge onto the grid (confirmed live 2026-06-25). With no PV
+        # there is nothing to "sell now" anyway, so the throttle simply does not fire and
+        # the charge register stays at the full sell-safe rate (open buffer).
         battery_plan = apply_sell_throttle(
             battery_plan,
             price_slots=self.site_state.price_slots,
@@ -1196,6 +1200,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             soc_pct=self.site_state.battery_soc_pct,
             max_soc_pct=_max_soc,
             capacity_kwh=_capacity,
+            pv_power_w=self.site_state.pv_power_w,
         )
 
         # Phase E: a manual battery override is an explicit user action and wins
