@@ -1201,6 +1201,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             max_soc_pct=_max_soc,
             capacity_kwh=_capacity,
             pv_power_w=self.site_state.pv_power_w,
+            load_power_w=self.site_state.load_power_w,
         )
 
         # Phase E: a manual battery override is an explicit user action and wins

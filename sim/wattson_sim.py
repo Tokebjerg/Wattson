@@ -2893,14 +2893,20 @@ def test_sell_throttle():
     # battery→house discharge and dumped the house load onto the grid (confirmed live 03:32).
     # With pv_power_w supplied it must NOT throttle at/below SOLAR_CHARGE_BLOCK_W; omitted
     # (None, the forecast reprojection which gates on slot surplus>0) leaves it unchanged.
-    def thr_pv(now, pv):
+    def thr_pv(now, pv, load_w=0.0):
         return planner.apply_sell_throttle(sell_plan(), price_slots=price_slots, solar_slots=solar_slots,
                                            load_hourly_w=load, now=now, soc_pct=30.0, max_soc_pct=100.0,
-                                           capacity_kwh=10.0, pv_power_w=pv)
+                                           capacity_kwh=10.0, pv_power_w=pv, load_power_w=load_w)
     checks.append(("no live PV (night) -> NOT throttled even with cheaper sun ahead (kills the stall pair)",
                    thr_pv(at(8), 0.0).desired_max_charge_current_a == SAFE, str(thr_pv(at(8), 0.0).desired_max_charge_current_a)))
-    checks.append(("live PV present (daytime) -> throttled as before (morning-sell preserved)",
+    checks.append(("live PV present, no load -> throttled as before (morning-sell preserved)",
                    thr_pv(at(8), 4000.0).desired_max_charge_current_a == A, str(thr_pv(at(8), 4000.0).desired_max_charge_current_a)))
+    # NET-SURPLUS gate (2026-06-26): PV above the 500W floor but BELOW the live house load is
+    # a net DEFICIT — the marginal-dawn stall variant (PV ~558W, house ~1.5kW). Must NOT throttle.
+    checks.append(("marginal PV (600W) but house in net deficit (1500W) -> NOT throttled (kills the marginal stall)",
+                   thr_pv(at(8), 600.0, 1500.0).desired_max_charge_current_a == SAFE, str(thr_pv(at(8), 600.0, 1500.0).desired_max_charge_current_a)))
+    checks.append(("genuine net surplus (pv 4000, load 800) -> still throttled (real morning-sell preserved)",
+                   thr_pv(at(8), 4000.0, 800.0).desired_max_charge_current_a == A, str(thr_pv(at(8), 4000.0, 800.0).desired_max_charge_current_a)))
     checks.append(("pv_power_w omitted (reprojection path) -> gate skipped, throttles (plan projection unchanged)",
                    thr(sell_plan(), at(8)).desired_max_charge_current_a == A, "none"))
 
