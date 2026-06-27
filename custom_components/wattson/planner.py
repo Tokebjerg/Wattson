@@ -449,7 +449,15 @@ def reproject_tasks_with_throttle(tasks, state, *, capacity_kwh, max_soc, charge
         intended = max(0.0, orig - prev)
         if task.action == "GRID_CHARGE" or task.total_import_price < NEGATIVE_IMPORT_ABSORB_THRESHOLD:
             deficit = 0.0
-        elif surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE"):
+        elif surplus > 1e-6 and task.action in ("EXPORT", "SOLAR_CHARGE", "LIMIT_EXPORT"):
+            # LIMIT_EXPORT is a CURTAIL hour (export <= 0), never a throttled sell:
+            # the pack still force-charges the surplus (firmware "Load first" fills
+            # it before curtailing), so the throttle deficit DRAINS here exactly as
+            # at SOLAR_CHARGE. Omitting it froze the deficit across the midday
+            # negative-export glut, projecting the pack HELD below full (e.g. 70 %)
+            # through 12-15 while it was physically at 100 % — the user-visible
+            # "stores nothing then charges at the 1.10-kr hour" artifact (the live
+            # SOC and the 16:00+ sale were already correct; only the curve lied).
             re_soc_pct = max(0.0, prev - deficit) / capacity_kwh * 100.0
             throttled = task.action == "EXPORT" and sell_throttle_active(
                 price_slots=state.price_slots, solar_slots=state.solar_slots,

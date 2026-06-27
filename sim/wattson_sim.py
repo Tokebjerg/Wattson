@@ -896,6 +896,58 @@ def test_a2_planning():
     checks.append(("schedule: cheap midday sun keeps a sink (charge or sell, never curtail at positive price)", blue_sched[11].action in ("SOLAR_CHARGE", "EXPORT"), blue_sched[11].action))
     checks.append(("schedule: Green keeps charging at sunny morning (no peak-sell)", green_sched[7].action == "SOLAR_CHARGE", green_sched[7].action))
 
+    # Negative-export midday glut (2026-06-27 regression): a deep solar surplus over a
+    # negative-export window (LIMIT_EXPORT, export <= 0) sandwiched between a positive-
+    # export morning and a positive-export afternoon peak. The pack force-charges the
+    # surplus to FULL during the glut (firmware "Load first"), so the throttle
+    # reprojection must DRAIN its deficit through the LIMIT_EXPORT hours and project the
+    # SOC rising to ~full — NOT hold it back below max across 12-15 (the user saw a
+    # frozen 70 % that then "charged" at the 1.10-kr positive-export hour, a pure
+    # projection artifact: live the pack was already at 100 % and sold the afternoon
+    # surplus). And LIMIT_EXPORT must never fire where the export price is positive.
+    ng_totals = {h: 0.55 for h in range(11)}
+    ng_totals.update({11: 0.71, 12: 0.66, 13: 0.66, 14: 0.66, 15: 0.74,
+                      16: 1.10, 17: 1.96, 18: 2.21})
+    ng_totals.update({h: 1.50 for h in range(19, 24)})
+    ng_exp = {h: 0.40 for h in range(11)}
+    ng_exp.update({11: 0.20, 12: -0.05, 13: -0.05, 14: -0.05, 15: -0.02,
+                   16: 1.10, 17: 1.96, 18: 2.21})
+    ng_exp.update({h: 1.50 for h in range(19, 24)})
+    ng_pv = {h: 0.0 for h in range(6)}
+    ng_pv.update({6: 1.0, 7: 2.5, 8: 4.0, 9: 5.0, 10: 5.7, 11: 6.1, 12: 6.6,
+                  13: 6.77, 14: 6.57, 15: 5.61, 16: 4.49, 17: 3.45, 18: 2.22})
+    ng_pv.update({h: 0.0 for h in range(19, 24)})
+    ng_load = {h: 0.6 for h in range(24)}
+    ng_day = [pslot(h, ng_totals.get(h, 0.55), exp=ng_exp.get(h, 0.40)) for h in range(24)]
+    ng_solar = [models.SolarSlot(start=at(h), pv_estimate_kwh=ng_pv[h]) for h in range(24) if ng_pv[h] > 0]
+    ng_state = models.SiteState(
+        timestamp=at(11), pv_power_w=ng_pv[11] * 1000.0, load_power_w=ng_load[11] * 1000.0,
+        load_includes_ev=False, grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=34.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+        easee_phase_mode="auto", current_buy_price=0.71, current_sell_price=0.20, forecast_today_kwh=40.0,
+        price_slots=ng_day, solar_slots=ng_solar,
+    )
+    ng_dp = planner.build_day_plan(
+        ng_state, battery_mode=const.BATTERY_MODE_BLUE, min_soc=15, max_soc=100,
+        capacity_kwh=10.0, load_hourly_w={h: ng_load[h] * 1000.0 for h in range(24)},
+    )
+    ng_slots = {s.start.hour: s for s in ng_dp.slots}
+    checks.append(("neg-glut: 12-15 are LIMIT_EXPORT/BLOCK (export <= 0, curtail)",
+                   all(ng_slots[h].intent == "BLOCK_EXPORT" for h in (13, 14, 15)),
+                   {h: ng_slots[h].intent for h in (12, 13, 14, 15)}))
+    checks.append(("neg-glut: pack PROJECTED full through the glut (not held back below max)",
+                   min(ng_slots[h].projected_soc_pct for h in (13, 14, 15)) >= 98,
+                   {h: ng_slots[h].projected_soc_pct for h in (12, 13, 14, 15)}))
+    checks.append(("neg-glut: positive-export afternoon SELLS the surplus (never curtails)",
+                   all(ng_slots[h].intent == "SELL_SURPLUS" for h in (16, 17, 18)),
+                   {h: ng_slots[h].intent for h in (16, 17, 18)}))
+    checks.append(("neg-glut: no curtail at any positive export price",
+                   all(ng_slots[h].intent != "BLOCK_EXPORT" for h in range(11, 24)
+                       if (ng_slots[h].export_value or 0) > 0),
+                   [h for h in range(11, 24) if (ng_slots[h].export_value or 0) > 0
+                    and ng_slots[h].intent == "BLOCK_EXPORT"]))
+
     # Legacy fallback intact when no horizon present.
     bp_legacy = plan_at(at(3), 50, [])
     # The flat-threshold legacy tree was retired 2026-06-12: without hourly prices
