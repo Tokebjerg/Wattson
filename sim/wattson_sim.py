@@ -2540,6 +2540,49 @@ def test_peak_reserve():
     return checks
 
 
+def test_peak_reserve_sunny_release():
+    """v0.24.34 — the summer-overnight floor fix. peak_reserve_pct must RELEASE the
+    evening-peak reserve overnight when the next 24h of forecast solar can refill the
+    usable band >= PEAK_RESERVE_RELEASE_MARGIN(2.5)x over — otherwise the pack holds
+    ~50% all night and buys grid instead of discharging to min_soc (live 2026-06-28→29:
+    held 51%). The OLD body credited solar only before a knife-edge morning-price
+    first_peak, which on a sunny next-day excluded the whole midday and pinned the floor.
+    A low-solar next-day MUST keep the full reserve (the strict 2.5x margin is the guard)."""
+    checks = []
+    base = datetime(2026, 6, 28, 0, 0, tzinfo=timezone.utc)
+    def at(h):
+        return base + timedelta(hours=h)
+    # ~30h price curve: overnight 1.70, a small MORNING bump 06-09 (1.95 > 1.70+0.15 -> it
+    # becomes first_peak and would exclude the midday), cheap midday, evening peak 17-22 (3.0).
+    def price(h):
+        hod = h % 24
+        if 6 <= hod <= 9: return 1.95
+        if 17 <= hod <= 22: return 3.0
+        if 11 <= hod <= 15: return 0.6
+        return 1.70
+    price_slots = [models.PriceSlot(start=at(h), spot_price=price(h), tariff=0.0,
+                                    total_import_price=price(h), export_value=max(0.0, price(h))) for h in range(30)]
+    sunny = [models.SolarSlot(start=at(h), pv_estimate_kwh=(7.0 if 9 <= (h % 24) <= 16 else 0.0)) for h in range(30)]
+    cloudy = [models.SolarSlot(start=at(h), pv_estimate_kwh=(0.4 if 10 <= (h % 24) <= 14 else 0.0)) for h in range(30)]
+    load = {h: 600.0 for h in range(24)}
+    now = at(2)  # 02:00 — an overnight hour, the floor that pinned 51% live
+    M = planner.RESERVE_HOLD_MARGIN
+    r_sunny = planner.peak_reserve_pct(price_slots, now, sunny, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M)
+    r_cloudy = planner.peak_reserve_pct(price_slots, now, cloudy, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M)
+    checks.append((f"sunny next-day -> peak reserve RELEASED to 0 (overnight discharges to min_soc) [{r_sunny:.0f}%]",
+                   r_sunny == 0.0, str(r_sunny)))
+    checks.append((f"low-solar next-day -> peak reserve KEPT > 0 (evening peak protected) [{r_cloudy:.0f}%]",
+                   r_cloudy > 0.0, str(r_cloudy)))
+    # The shared release test: True on the sunny forecast, False on the low-solar one.
+    band_sunny = planner.forecast_refills_band(sunny, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=planner.PEAK_RESERVE_RELEASE_MARGIN)
+    band_cloudy = planner.forecast_refills_band(cloudy, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=planner.PEAK_RESERVE_RELEASE_MARGIN)
+    checks.append(("forecast_refills_band: True (sunny) / False (low-solar)", band_sunny and not band_cloudy, f"{band_sunny}/{band_cloudy}"))
+    # The strict peak margin (2.5) is stricter than the learned-reserve margin (1.5).
+    checks.append(("PEAK_RESERVE_RELEASE_MARGIN stricter than the learned-reserve margin",
+                   planner.PEAK_RESERVE_RELEASE_MARGIN > planner.SOLAR_RESERVE_RELEASE_MARGIN, f"{planner.PEAK_RESERVE_RELEASE_MARGIN}"))
+    return checks
+
+
 def _plan_engine_day():
     """Shared fixture for the Fase A plan-engine tests: a full synthetic day with a
     cheap night, expensive morning, cheap sunny midday incl. one negative-total hour
@@ -3360,6 +3403,7 @@ def main():
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
                          ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),
                          ("FORECAST PEAK-RESERVE (A+B)", test_peak_reserve),
+                         ("PEAK-RESERVE SUNNY RELEASE (summer overnight floor)", test_peak_reserve_sunny_release),
                          ("FASE A · DAY PLAN (plan-drevet motor)", test_day_plan),
                          ("FASE A · SLOT EXECUTION (stabil tuple)", test_plan_execution),
                          ("SELL-SAFE INVARIANT (Deye trickle+sell quirk)", test_sell_safe_invariant),

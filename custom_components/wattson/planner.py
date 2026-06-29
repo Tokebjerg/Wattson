@@ -108,6 +108,12 @@ SELL_REFILL_MARGIN = 1.2
 # overnight/evening hours down to the hard min and refill free from tomorrow's sun.
 SOLAR_RESERVE_RELEASE_MARGIN = 1.5
 SOLAR_RESERVE_HORIZON_H = 24
+# Same idea applied to the EVENING-PEAK reserve (peak_reserve_pct), but with a STRICTER
+# margin: the peak reserve is the last line against a real evening peak, so only a
+# decisively sunny next-day forecast (surplus >= this x the usable band over the next
+# horizon) may release it. Fixes the summer "battery holds ~51% overnight + buys grid"
+# bug where peak_reserve only credited solar BEFORE a knife-edge morning-price first_peak.
+PEAK_RESERVE_RELEASE_MARGIN = 2.5
 
 # Sell-throttle charge current (v0.24.15): while SELLING surplus with a CHEAPER
 # same-day refill window ahead, the charge register is dropped to this so the pack
@@ -252,6 +258,36 @@ def future_solar_surplus_kwh(slots, solar_by_start, load_hourly_w, after_start, 
     return total
 
 
+def forecast_refills_band(
+    solar_slots,
+    load_hourly_w,
+    now,
+    *,
+    usable_pct,
+    capacity_kwh,
+    horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
+    margin: float,
+) -> bool:
+    """True when the forecast solar SURPLUS over the next ``horizon_hours`` can refill
+    the whole usable SOC band at least ``margin``x over — i.e. the coming sun is so
+    abundant that holding a reserve now is pointless (it refills for free). The window
+    spans the night to the next day's sun, so an overnight hour correctly sees the
+    coming day's full midday solar. Shared by solar_aware_reserve_pct (learned reserve,
+    margin 1.5) and peak_reserve_pct (evening-peak reserve, stricter margin 2.5)."""
+    band_kwh = max(0.0, usable_pct) / 100.0 * max(0.0, capacity_kwh)
+    if band_kwh <= 0.0:
+        return False
+    horizon_end = now + timedelta(hours=horizon_hours)
+    avg_load_w = (sum(load_hourly_w.values()) / len(load_hourly_w)) if load_hourly_w else 0.0
+    surplus_kwh = 0.0
+    for s in solar_slots:
+        if s.start <= now or s.start > horizon_end:
+            continue
+        load_kwh = (load_hourly_w.get(s.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
+        surplus_kwh += max(0.0, s.pv_estimate_kwh - load_kwh)
+    return surplus_kwh >= band_kwh * margin
+
+
 def solar_aware_reserve_pct(
     learned_reserve_pct,
     *,
@@ -277,18 +313,8 @@ def solar_aware_reserve_pct(
     Mirrors peak_reserve_pct's cheap-refill credit (A1, v0.24.8)."""
     if learned_reserve_pct <= 0.0:
         return learned_reserve_pct
-    band_kwh = max(0.0, usable_pct) / 100.0 * max(0.0, capacity_kwh)
-    if band_kwh <= 0.0:
-        return learned_reserve_pct
-    horizon_end = now + timedelta(hours=horizon_hours)
-    avg_load_w = (sum(load_hourly_w.values()) / len(load_hourly_w)) if load_hourly_w else 0.0
-    surplus_kwh = 0.0
-    for s in solar_slots:
-        if s.start <= now or s.start > horizon_end:
-            continue
-        load_kwh = (load_hourly_w.get(s.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
-        surplus_kwh += max(0.0, s.pv_estimate_kwh - load_kwh)
-    if surplus_kwh >= band_kwh * margin:
+    if forecast_refills_band(solar_slots, load_hourly_w, now, usable_pct=usable_pct,
+                             capacity_kwh=capacity_kwh, horizon_hours=horizon_hours, margin=margin):
         return 0.0
     return learned_reserve_pct
 
@@ -502,6 +528,19 @@ def peak_reserve_pct(
     """
     current = current_price_slot(price_slots, now)
     if current is None:
+        return 0.0
+    # Sunny-release (summer overnight fix): when the next 24h of forecast solar surplus
+    # can refill the whole usable band >= PEAK_RESERVE_RELEASE_MARGIN (2.5)x over, the
+    # coming day's sun fills the pack before the next evening peak regardless — so holding
+    # any peak reserve overnight just forces grid imports now and curtails the free sun
+    # later. Release it. This is the ONLY thing that releases the per-slot peak reserve on
+    # a sunny day (solar_aware_reserve_pct releases only the LEARNED reserve). The body
+    # below otherwise credited solar ONLY before a knife-edge morning-price first_peak,
+    # which excluded the whole midday on a sunny next-day and pinned the ~51% overnight
+    # floor. The strict 2.5x margin keeps every low-solar/winter night at full reserve.
+    if forecast_refills_band(solar_slots, load_hourly_w, now,
+                             usable_pct=max(0.0, max_soc - min_soc), capacity_kwh=capacity_kwh,
+                             margin=PEAK_RESERVE_RELEASE_MARGIN):
         return 0.0
     price_now = current.total_import_price
     later = [s for s in price_slots
