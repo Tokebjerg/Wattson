@@ -592,6 +592,23 @@ def peak_reserve_pct(
     return max(0.0, base_reserve_pct - refill_credit_pct)
 
 
+TOU_CAPACITY_STEP_PCT = 5.0  # the Deye quantizes each TOU time-point's capacity SOC% to
+# this step on read-back (verified live: number.*_time_point_N_capacity step=5.0). A
+# FRACTIONAL setpoint (e.g. 50.6) can never equal the 5%-quantized read-back, so the 6 TOU
+# registers rewrite EVERY tick — a limit cycle that was ~95% of the daily register writes
+# (weekly-eval 2026-06-29). Snap the setpoint to the step so it converges.
+
+
+def _snap_tou_capacity(pct: float, *, up: bool) -> float:
+    """Snap a TOU capacity SOC% to the inverter's native 5% step. ``up=True`` (discharge
+    FLOORS) rounds UP so the enforced reserve never drops below the intended floor;
+    ``up=False`` (charge TARGETS) rounds DOWN so the pack never charges above the intended
+    cap (LFP calendar-aging care). Both round toward the SAFE direction."""
+    step = TOU_CAPACITY_STEP_PCT
+    q = (math.ceil(pct / step) if up else math.floor(pct / step)) * step
+    return float(q)
+
+
 def tou_setpoint(
     plan: BatteryPlan,
     *,
@@ -622,11 +639,14 @@ def tou_setpoint(
         # Battery care: a plan may cap its own grid-charge target below max_soc
         # (LFP calendar aging at 100 %); absorb/force-charge plans leave it None.
         target = plan.charge_target_soc_pct if plan.charge_target_soc_pct is not None else max_soc
-        return (float(min(max_soc, target)), True)
+        # Round the charge target DOWN to the step so it never charges above the care cap.
+        return (_snap_tou_capacity(float(min(max_soc, target)), up=False), True)
     if plan.strategy == "OVERRIDE_DISCHARGE":
-        return (float(min_soc), False)
-    # Every other state covers the house down to the discharge floor.
-    return (float(discharge_floor), False)
+        return (_snap_tou_capacity(float(min_soc), up=True), False)
+    # Every other state covers the house down to the discharge floor. Round the floor UP
+    # to the step (never let the inverter discharge below the intended reserve), clamped
+    # to max_soc, so the setpoint is a clean 5-multiple that converges (no limit cycle).
+    return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
 
 
 # Strategies that bypass the anti-hunt dwell — they apply immediately, never held:

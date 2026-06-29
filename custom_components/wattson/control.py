@@ -208,7 +208,13 @@ class KlatremisController:
             return []
         if current is not None:
             try:
-                if abs(float(current.state) - value) < 0.1:
+                # Honour the entity's native step: the Deye quantizes a TOU capacity to a
+                # 5% step on read-back, so a value already within half a step IS converged
+                # — comparing with a flat 0.1 made every fractional setpoint re-write every
+                # tick (a limit cycle). max(0.1, step/2) is never LESS tolerant than before.
+                step = current.attributes.get("step")
+                tol = max(0.1, float(step) / 2.0) if step else 0.1
+                if abs(float(current.state) - value) < tol:
                     return []
             except (TypeError, ValueError):
                 pass

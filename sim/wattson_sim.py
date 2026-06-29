@@ -1801,21 +1801,37 @@ def test_tou_management():
     for degraded in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
         checks.append((f"TOU: {degraded} leaves TOU untouched (None)", ss(P(strategy=degraded, reason=""), soc_pct=50, **kw) == (None, None), degraded))
 
+    # #1 (limit-cycle fix, weekly-eval 2026-06-29): a FRACTIONAL discharge floor snaps to
+    # the inverter's 5% step (UP — the reserve never drops) so the TOU register converges
+    # instead of re-writing every tick. Charge targets snap DOWN (never above the care cap).
+    fr = P(strategy="DISCHARGE_TO_LOAD", reason="")
+    checks.append(("TOU snap: fractional floor 50.6 -> 55 (5-multiple, rounded UP so the reserve never drops)",
+                   ss(fr, soc_pct=60, min_soc=15, discharge_floor=50.6, max_soc=100) == (55.0, False),
+                   str(ss(fr, soc_pct=60, min_soc=15, discharge_floor=50.6, max_soc=100))))
+    checks.append(("TOU snap: every fractional floor returns a multiple of 5",
+                   all(ss(fr, soc_pct=60, min_soc=15, discharge_floor=f, max_soc=100)[0] % 5 == 0
+                       for f in (15.0, 27.3, 49.9, 50.6, 31.2)), "snapped"))
+
     # Control write: the plan's TOU values are written to ALL 6 time-points.
     class _State:
-        def __init__(self, v): self.state = str(v)
+        def __init__(self, v, step=None): self.state = str(v); self.attributes = {"step": step} if step else {}
 
     class _States:
-        def __init__(self, init): self._m = {k: _State(v) for k, v in init.items()}
+        def __init__(self, init, step=None): self._m = {k: _State(v, step) for k, v in init.items()}; self._step = step
         def get(self, eid): return self._m.get(eid)
-        def set(self, eid, v): self._m[eid] = _State(v)
+        def set(self, eid, v): self._m[eid] = _State(v, self._step)
 
     class _Services:
-        def __init__(self, states): self.states = states; self.calls = []
+        # step != None simulates the inverter QUANTIZING the read-back to its native step
+        # (the Deye snaps a TOU capacity to 5%), so a fractional setpoint can be exercised.
+        def __init__(self, states, step=None): self.states = states; self.calls = []; self._step = step
         async def async_call(self, domain, service, data, blocking=False):
             self.calls.append((domain, service, data)); eid = data["entity_id"]
             if domain == "switch": self.states.set(eid, "on" if service == "turn_on" else "off")
-            elif domain == "number": self.states.set(eid, data["value"])
+            elif domain == "number":
+                v = data["value"]
+                if self._step: v = round(float(v) / self._step) * self._step
+                self.states.set(eid, v)
 
     class _Hass:
         def __init__(self, s, sv): self.states = s; self.services = sv
@@ -1841,6 +1857,23 @@ def test_tou_management():
     ctrl2 = control.KlatremisController(_Hass(states2, _Services(states2)))
     asyncio.run(ctrl2.apply_battery_plan(mp, P(strategy="HOLD", reason=""), datetime(2026, 6, 9, 21, 1, tzinfo=timezone(timedelta(hours=2)))))
     checks.append(("TOU write: None intent leaves the registers untouched", all(states2.get(e).state == "99" for e in mp.tou_capacity_numbers), "untouched"))
+
+    # #1b/#3: against a step-QUANTIZING inverter mock (snaps the read-back to 5%), a TOU
+    # capacity write CONVERGES on the 2nd tick (0 re-writes) instead of cycling forever.
+    # Drive a RAW fractional setpoint (50.6) to exercise the step-aware skip tolerance; with
+    # the old abs<0.1 and the 5%-snapped read-back (50.0) this re-wrote all 6 every tick —
+    # the limit cycle that was ~95% of the daily register writes.
+    qstates = _States({eid: "15" for eid in mp.tou_capacity_numbers}, step=5.0)
+    qsvc = _Services(qstates, step=5.0)
+    qctrl = control.KlatremisController(_Hass(qstates, qsvc))
+    fplan = P(strategy="DISCHARGE_TO_LOAD", reason="", desired_tou_capacity_pct=50.6, desired_tou_charge_enable=False)
+    asyncio.run(qctrl.apply_battery_plan(mp, fplan, datetime(2026, 6, 9, 22, 0, tzinfo=timezone(timedelta(hours=2)))))
+    n1 = sum(1 for c in qsvc.calls if c[0] == "number")
+    qsvc.calls.clear()
+    asyncio.run(qctrl.apply_battery_plan(mp, fplan, datetime(2026, 6, 9, 22, 1, tzinfo=timezone(timedelta(hours=2)))))
+    n2 = sum(1 for c in qsvc.calls if c[0] == "number")
+    checks.append((f"TOU converges: fractional 50.6 vs 5%-quantized read-back re-writes 0 on tick 2 (was 6/tick = the limit cycle) [{n1}->{n2}]",
+                   n1 == 6 and n2 == 0, f"{n1}->{n2}"))
 
     return checks
 

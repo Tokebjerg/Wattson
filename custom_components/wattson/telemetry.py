@@ -85,8 +85,13 @@ class TelemetryMixin:
         # O1: register-write / strategy-flap churn visibility (the flapping class).
         self.register_writes_today: int = 0
         self.battery_strategy_changes_today: int = 0
+        # register_tuple_changes = times the DESIRED physical-register tuple actually
+        # changed (a real decision flip), immune to the write-convergence re-write noise
+        # that inflates register_writes_today. This is the meaningful stability KPI.
+        self.register_tuple_changes_today: int = 0
         self._churn_day = None
         self._last_churn_strategy: str | None = None
+        self._last_register_tuple = None
         # O3: battery-health telemetry — equivalent full cycles + time at SOC extremes.
         self.battery_cycles_today: float = 0.0
         self.battery_minutes_above_95_today: float = 0.0
@@ -310,12 +315,29 @@ class TelemetryMixin:
             self._churn_day = today
             self.register_writes_today = 0
             self.battery_strategy_changes_today = 0
+            self.register_tuple_changes_today = 0
         self.register_writes_today += len(actions or [])
-        strat = plan.battery.strategy if (plan is not None and plan.battery is not None) else None
+        b = plan.battery if (plan is not None) else None
+        strat = b.strategy if b is not None else None
         if strat is not None:
             if self._last_churn_strategy is not None and strat != self._last_churn_strategy:
                 self.battery_strategy_changes_today += 1
             self._last_churn_strategy = strat
+        if b is not None:
+            # The DESIRED physical-register tuple. Many strategy LABELS write the identical
+            # tuple by design (execute_slot), so battery_strategy_changes over-counts; this
+            # counts only a real register decision flip.
+            tup = (
+                getattr(b, "desired_solar_sell", None),
+                getattr(b, "desired_grid_charge", None),
+                getattr(b, "desired_max_charge_current_a", None),
+                getattr(b, "desired_discharge_current_a", None),
+                getattr(b, "desired_tou_capacity_pct", None),
+                getattr(b, "desired_tou_charge_enable", None),
+            )
+            if self._last_register_tuple is not None and tup != self._last_register_tuple:
+                self.register_tuple_changes_today += 1
+            self._last_register_tuple = tup
 
     # ------------------------------------------------------------------ #
     # O3: battery-health telemetry

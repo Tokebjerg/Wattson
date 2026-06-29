@@ -451,6 +451,9 @@ class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
             self.coordinator.battery_strategy_changes_today = int(
                 float(last_state.attributes.get("battery_strategy_changes") or 0)
             )
+            self.coordinator.register_tuple_changes_today = int(
+                float(last_state.attributes.get("register_tuple_changes") or 0)
+            )
             self.coordinator._churn_day = dt_util.now().date()
         except (TypeError, ValueError):
             return
@@ -461,7 +464,10 @@ class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {"battery_strategy_changes": self.coordinator.battery_strategy_changes_today}
+        return {
+            "battery_strategy_changes": self.coordinator.battery_strategy_changes_today,
+            "register_tuple_changes": self.coordinator.register_tuple_changes_today,
+        }
 
 
 class WattsonBatteryHealthSensor(CoordinatorEntity, RestoreSensor):
