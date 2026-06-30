@@ -38,7 +38,7 @@ from .const import (
 )
 from .deye_contract import TRICKLE_CHARGE_A
 from .horizon import current_price_slot
-from .learning import solar_bias_factor
+from .learning import forecast_confidence, solar_bias_factor
 from .planner import value_increment_kr
 
 
@@ -118,11 +118,22 @@ class TelemetryMixin:
         # (forecast minus actual while there was no sink). Restored by its sensor.
         self.curtailed_today_kwh: float = 0.0
         self.curtailed_negative_kwh: float = 0.0
+        # Self-diagnosis: grid energy imported today while the battery HAD usable charge
+        # and was NOT deliberately grid-charging — the "bought grid while the battery sat
+        # idle above the floor" pattern the user kept catching by hand. Surfaced as an alert.
+        self.avoidable_grid_kwh_today: float = 0.0
+        self._avoidable_day = None
+        self._avoidable_last_tick = None
         self._curtail_day = None
         self._curtail_last_tick: datetime | None = None
         self._solar_bias_factor: float = solar_bias_factor(
             entry_value(entry, CONF_SOLAR_BIAS_HISTORY, []) or [],
             min_days=SOLAR_BIAS_MIN_DAYS, lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
+        )
+        # #5: confidence in the solar forecast from the SAME ratio history — scales the
+        # reserve-release threshold up after recent optimistic forecasts. 1.0 = no penalty.
+        self._forecast_confidence: float = forecast_confidence(
+            entry_value(entry, CONF_SOLAR_BIAS_HISTORY, []) or [], min_days=SOLAR_BIAS_MIN_DAYS,
         )
 
     # ------------------------------------------------------------------ #
@@ -403,6 +414,9 @@ class TelemetryMixin:
                     history, min_days=SOLAR_BIAS_MIN_DAYS,
                     lo=SOLAR_BIAS_MIN_FACTOR, hi=SOLAR_BIAS_MAX_FACTOR,
                 )
+                self._forecast_confidence = forecast_confidence(
+                    history, min_days=SOLAR_BIAS_MIN_DAYS,
+                )
             self._solar_accum_day = today
             self._solar_actual_wh = 0.0
             self._solar_forecast_wh = 0.0
@@ -521,3 +535,41 @@ class TelemetryMixin:
         self.curtailed_today_kwh += inc
         if state.current_sell_price is not None and state.current_sell_price <= 0:
             self.curtailed_negative_kwh += inc
+
+    def _accumulate_avoidable_grid(self, plan) -> None:
+        """Self-diagnosis: grid energy (kWh) imported today while the battery was ABOVE its
+        floor and NOT deliberately grid-charging — the house pulled from the grid while the
+        pack sat idle with usable charge. This is the recurring "bought grid at night / Ren
+        sol took from grid" pattern, made measurable so Wattson can ALERT on it instead of
+        waiting for the user to notice. Capped at the ~70 A the pack could have delivered;
+        deliberate grid-charge / paid negative-price import is excluded."""
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._avoidable_day != today:
+            self._avoidable_day = today
+            self.avoidable_grid_kwh_today = 0.0
+            self._avoidable_last_tick = None
+        last = self._avoidable_last_tick
+        self._avoidable_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        strat = plan.battery.strategy if (plan is not None and plan.battery is not None) else None
+        if strat in ("GRID_CHARGE", "ABSORB_NEGATIVE", "OVERRIDE_CHARGE", "HOLD_FULL", "BLOCK_NEGATIVE_EXPORT"):
+            return  # deliberate import / hold — not avoidable
+        soc = state.battery_soc_pct
+        if soc is None:
+            return
+        grid_in = max(0.0, state.grid_import_power_w or 0.0)
+        batt = state.battery_power_w or 0.0  # <0 charging, >0 discharging
+        # Avoidable only when: meaningful import, the pack has usable charge well above the
+        # hard min, AND the pack is not already discharging hard (if it is, the import is the
+        # unavoidable bit beyond the ~70 A cap, not idle-while-buying).
+        if grid_in <= 300.0 or soc <= 25.0 or batt >= 2000.0:
+            return
+        self.avoidable_grid_kwh_today += min(grid_in, 3500.0) * dt_hours / 1000.0

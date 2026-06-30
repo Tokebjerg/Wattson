@@ -352,7 +352,8 @@ class WattsonCurtailedSolarSensor(CoordinatorEntity, RestoreSensor):
         return {
             "negative_price_kwh": round(neg, 2),
             "unintended_kwh": round(max(0.0, total - neg), 2),
-            "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm.",
+            "avoidable_grid_kwh": round(getattr(self.coordinator, "avoidable_grid_kwh_today", 0.0), 2),
+            "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm. avoidable_grid_kwh = strøm købt mens batteriet havde brugbar ladning.",
         }
 
 

@@ -111,6 +111,24 @@ def solar_bias_factor(
     return max(lo, min(hi, median))
 
 
+FORECAST_CONFIDENCE_FLOOR = 0.6
+
+
+def forecast_confidence(daily_ratios: Iterable[float], *, min_days: int) -> float:
+    """Confidence in ``[FORECAST_CONFIDENCE_FLOOR, 1.0]`` in the SOLAR forecast, from recent
+    (actual ÷ forecast) day ratios. Low when forecasts have recently been OPTIMISTIC (actual
+    < forecast): the WORST recent ratio is exactly the downside a reserve-release must guard
+    against (release the reserve, then the promised sun under-delivers, then buy at the peak).
+
+    Returns 1.0 (full confidence — release threshold untouched) until ``min_days`` of history
+    exist, so the engine is never timid on day one; floored so a single freak day (snow,
+    sensor glitch) can't fully suppress the release. Mirrors solar_bias_factor's robustness."""
+    values = [r for r in daily_ratios if isinstance(r, (int, float)) and r > 0]
+    if len(values) < max(1, min_days):
+        return 1.0
+    return max(FORECAST_CONFIDENCE_FLOOR, min(1.0, min(values)))
+
+
 def predicted_load_kwh(
     profile: LoadProfile | None, start_hour: int, hours: int, hourly: dict[int, float] | None = None
 ) -> float:

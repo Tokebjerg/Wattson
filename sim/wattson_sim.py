@@ -1875,6 +1875,22 @@ def test_tou_management():
     checks.append((f"TOU converges: fractional 50.6 vs 5%-quantized read-back re-writes 0 on tick 2 (was 6/tick = the limit cycle) [{n1}->{n2}]",
                    n1 == 6 and n2 == 0, f"{n1}->{n2}"))
 
+    # #4 (mock-fidelity audit, v0.24.36): the step-aware convergence skip must hold for ANY
+    # native register step, not just the TOU's 5%. A live audit of the writable Deye registers
+    # found only TWO step sizes — TOU capacity = step 5 (the limit-cycle culprit, fixed above)
+    # and charge/discharge/sell currents = step 1 (no quantization gap) — and the sim mock now
+    # models per-entity step generally (round(v/step)*step). Prove the skip generalises: for
+    # each step a setpoint already within half a step of the quantized read-back issues 0
+    # writes, while one a full step away issues exactly 1.
+    for step, readback, within, beyond in ((1.0, "70", 70.4, 72.0), (5.0, "50", 52.4, 57.0)):
+        fstates = _States({"number.fid": readback}, step=step)
+        fsvc = _Services(fstates, step=step)
+        fctrl = control.KlatremisController(_Hass(fstates, fsvc))
+        w_skip = asyncio.run(fctrl._set_number_best_effort("number.fid", within))
+        w_write = asyncio.run(fctrl._set_number_best_effort("number.fid", beyond))
+        checks.append((f"mock fidelity step={step}: within-half-step skips, full-step writes [{len(w_skip)},{len(w_write)}]",
+                       len(w_skip) == 0 and len(w_write) == 1, f"skip={w_skip} write={w_write}"))
+
     return checks
 
 
@@ -2613,6 +2629,39 @@ def test_peak_reserve_sunny_release():
     # The strict peak margin (2.5) is stricter than the learned-reserve margin (1.5).
     checks.append(("PEAK_RESERVE_RELEASE_MARGIN stricter than the learned-reserve margin",
                    planner.PEAK_RESERVE_RELEASE_MARGIN > planner.SOLAR_RESERVE_RELEASE_MARGIN, f"{planner.PEAK_RESERVE_RELEASE_MARGIN}"))
+
+    # #5 (forecast-confidence, v0.24.36): the confidence helper + the release penalty.
+    fc = learning.forecast_confidence
+    checks.append(("forecast_confidence: 1.0 with no history (never timid on day one)",
+                   fc([], min_days=3) == 1.0, str(fc([], min_days=3))))
+    checks.append(("forecast_confidence: 1.0 below min_days even with a bad ratio",
+                   fc([0.70, 0.71], min_days=3) == 1.0, str(fc([0.70, 0.71], min_days=3))))
+    checks.append(("forecast_confidence: tracks the WORST recent ratio (0.70) once min_days met",
+                   abs(fc([1.03, 0.70, 1.11, 1.08, 0.99], min_days=3) - 0.70) < 1e-9,
+                   str(fc([1.03, 0.70, 1.11, 1.08, 0.99], min_days=3))))
+    checks.append(("forecast_confidence: a freak day floors at 0.6, never below",
+                   fc([0.4, 0.45, 0.5], min_days=3) == 0.6, str(fc([0.4, 0.45, 0.5], min_days=3))))
+    checks.append(("forecast_confidence: optimistic ratios clamp at 1.0 (no bonus release)",
+                   fc([1.2, 1.5, 1.3], min_days=3) == 1.0, str(fc([1.2, 1.5, 1.3], min_days=3))))
+    # A MARGINAL forecast whose surplus clears the 2.5x band at full confidence but NOT at the
+    # 0.6 floor (penalty 1.4x): low confidence must demand more sun before releasing the reserve.
+    marginal = [models.SolarSlot(start=at(h), pv_estimate_kwh=(3.4 if 9 <= (h % 24) <= 16 else 0.0)) for h in range(30)]
+    band_full = planner.forecast_refills_band(marginal, load, now, usable_pct=85.0, capacity_kwh=10.0,
+                                              margin=planner.PEAK_RESERVE_RELEASE_MARGIN, confidence=1.0)
+    band_low = planner.forecast_refills_band(marginal, load, now, usable_pct=85.0, capacity_kwh=10.0,
+                                             margin=planner.PEAK_RESERVE_RELEASE_MARGIN, confidence=0.6)
+    checks.append((f"confidence penalty: marginal forecast releases at conf=1.0 but HOLDS at conf=0.6 [{band_full}/{band_low}]",
+                   band_full and not band_low, f"{band_full}/{band_low}"))
+    # End-to-end through peak_reserve_pct: same marginal forecast, reserve released vs kept.
+    r_full = planner.peak_reserve_pct(price_slots, now, marginal, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M, confidence=1.0)
+    r_low = planner.peak_reserve_pct(price_slots, now, marginal, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M, confidence=0.6)
+    checks.append((f"peak_reserve_pct: low confidence KEEPS the reserve a high-confidence forecast would release [{r_full:.0f}/{r_low:.0f}]",
+                   r_full == 0.0 and r_low > 0.0, f"{r_full}/{r_low}"))
+    # Backtest-safety: confidence=1.0 (the default the harness uses) is byte-identical to no arg.
+    checks.append(("confidence=1.0 default leaves forecast_refills_band unchanged (backtest-safe)",
+                   planner.forecast_refills_band(sunny, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=M)
+                   == planner.forecast_refills_band(sunny, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=M, confidence=1.0),
+                   "identical"))
     return checks
 
 

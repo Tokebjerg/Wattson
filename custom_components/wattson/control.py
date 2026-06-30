@@ -184,13 +184,20 @@ class KlatremisController:
         # Deye TOU management: keep all time-points identical to the plan's intent,
         # so the (unknown) active slot always carries Wattson's discharge floor /
         # charge target instead of a stale manual value that silently blocks it.
-        # BEST-EFFORT (2026-06-12): the inverter sometimes reverts TOU capacity
-        # writes outright (observed: every value but the panel-set one bounced
-        # back all night), and these registers are a belt on top of the real
-        # control (grid-charge switch + currents) — so failures here must NEVER
-        # count toward the degraded/contention bookkeeping. Before this, the
-        # nightly revert loop tripped a false "competing controller" back-off of
-        # ALL battery control every ~12 minutes.
+        # BEST-EFFORT (2026-06-12, clarified post-v0.24.35): TOU capacity writes stay OFF
+        # the convergence/contention books for TWO distinct reasons — keep BOTH in mind
+        # before ever moving them onto the accounted path:
+        #   (1) Genuine hardware revert (load-bearing, has NOT gone away): the inverter
+        #       sometimes bounces a TOU capacity write outright (observed: every value but
+        #       the panel-set one reverted all night). Re-asserting the SAME value into a
+        #       revert is exactly what is_contended() flags, so on the accounted path a
+        #       genuine revert false-trips a "competing controller" back-off of ALL battery
+        #       control every ~12 min. This is why best-effort must stay.
+        #   (2) The v0.24.35 limit cycle (a fractional setpoint vs the inverter's 5%-quantized
+        #       read-back re-writing every tick) is now fixed AT SOURCE by the step-aware skip
+        #       in _set_number_best_effort below — NOT by best-effort routing itself.
+        # These are a belt on top of the real control (grid-charge switch + currents), so a
+        # failure here must never gate the rest.
         if plan.desired_tou_capacity_pct is not None:
             for entity_id in mapping.tou_capacity_numbers:
                 actions.extend(await self._set_number_best_effort(entity_id, plan.desired_tou_capacity_pct))

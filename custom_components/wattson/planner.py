@@ -114,6 +114,12 @@ SOLAR_RESERVE_HORIZON_H = 24
 # horizon) may release it. Fixes the summer "battery holds ~51% overnight + buys grid"
 # bug where peak_reserve only credited solar BEFORE a knife-edge morning-price first_peak.
 PEAK_RESERVE_RELEASE_MARGIN = 2.5
+# Forecast-confidence (#5): both reserve releases lean on the solar FORECAST. When recent
+# forecasts have been optimistic (actual < forecast — e.g. a recent 0.70 ratio), demand
+# proportionally MORE surplus before releasing, scaled by this gain. confidence=1.0 (full,
+# or no learned history yet) leaves the release threshold untouched; confidence=0.6 (the
+# clamp floor) lifts it ~40%. Only ever makes the release MORE conservative, never less.
+FORECAST_CONFIDENCE_PENALTY_K = 1.0
 
 # Sell-throttle charge current (v0.24.15): while SELLING surplus with a CHEAPER
 # same-day refill window ahead, the charge register is dropped to this so the pack
@@ -267,13 +273,18 @@ def forecast_refills_band(
     capacity_kwh,
     horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
     margin: float,
+    confidence: float = 1.0,
 ) -> bool:
     """True when the forecast solar SURPLUS over the next ``horizon_hours`` can refill
     the whole usable SOC band at least ``margin``x over — i.e. the coming sun is so
     abundant that holding a reserve now is pointless (it refills for free). The window
     spans the night to the next day's sun, so an overnight hour correctly sees the
     coming day's full midday solar. Shared by solar_aware_reserve_pct (learned reserve,
-    margin 1.5) and peak_reserve_pct (evening-peak reserve, stricter margin 2.5)."""
+    margin 1.5) and peak_reserve_pct (evening-peak reserve, stricter margin 2.5).
+
+    ``confidence`` in [0,1] (#5) scales the threshold UP when recent forecasts have been
+    optimistic, so an unreliable forecast must clear a bigger surplus before we release the
+    reserve. 1.0 = full confidence / no history → threshold unchanged."""
     band_kwh = max(0.0, usable_pct) / 100.0 * max(0.0, capacity_kwh)
     if band_kwh <= 0.0:
         return False
@@ -285,7 +296,8 @@ def forecast_refills_band(
             continue
         load_kwh = (load_hourly_w.get(s.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
         surplus_kwh += max(0.0, s.pv_estimate_kwh - load_kwh)
-    return surplus_kwh >= band_kwh * margin
+    penalty = 1.0 + FORECAST_CONFIDENCE_PENALTY_K * (1.0 - max(0.0, min(1.0, confidence)))
+    return surplus_kwh >= band_kwh * margin * penalty
 
 
 def solar_aware_reserve_pct(
@@ -298,6 +310,7 @@ def solar_aware_reserve_pct(
     capacity_kwh,
     horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
     margin: float = SOLAR_RESERVE_RELEASE_MARGIN,
+    confidence: float = 1.0,
 ) -> float:
     """Release (-> 0) the LEARNED self-use reserve when the forecast solar surplus
     over the next ``horizon_hours`` can refill the whole usable SOC band at least
@@ -314,7 +327,8 @@ def solar_aware_reserve_pct(
     if learned_reserve_pct <= 0.0:
         return learned_reserve_pct
     if forecast_refills_band(solar_slots, load_hourly_w, now, usable_pct=usable_pct,
-                             capacity_kwh=capacity_kwh, horizon_hours=horizon_hours, margin=margin):
+                             capacity_kwh=capacity_kwh, horizon_hours=horizon_hours,
+                             margin=margin, confidence=confidence):
         return 0.0
     return learned_reserve_pct
 
@@ -509,6 +523,7 @@ def peak_reserve_pct(
     max_soc: float,
     margin: float,
     discharge_rate_kwh: float | None = None,
+    confidence: float = 1.0,
 ) -> float:
     """SOC% to HOLD BACK now for upcoming same-day hours that are markedly more
     expensive than the current hour (> price_now + ``margin``).
@@ -540,7 +555,7 @@ def peak_reserve_pct(
     # floor. The strict 2.5x margin keeps every low-solar/winter night at full reserve.
     if forecast_refills_band(solar_slots, load_hourly_w, now,
                              usable_pct=max(0.0, max_soc - min_soc), capacity_kwh=capacity_kwh,
-                             margin=PEAK_RESERVE_RELEASE_MARGIN):
+                             margin=PEAK_RESERVE_RELEASE_MARGIN, confidence=confidence):
         return 0.0
     price_now = current.total_import_price
     later = [s for s in price_slots
@@ -745,6 +760,7 @@ def build_day_plan(
     discharge_current_a: float = 70.0,
     battery_care_soc: float = 100.0,
     grid_charge_rate_kwh: float | None = None,
+    forecast_confidence: float = 1.0,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -805,6 +821,7 @@ def build_day_plan(
                 view.slots, task.start, state.solar_slots, load_hourly_w,
                 capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
                 margin=RESERVE_HOLD_MARGIN, discharge_rate_kwh=discharge_rate,
+                confidence=forecast_confidence,
             )
             floor = max(base_floor, min_soc + reserve)
         # Estimated lookahead slots (today's price shape copied forward until the

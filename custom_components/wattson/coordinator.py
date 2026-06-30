@@ -518,6 +518,50 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             notification_id=nid,
         )
 
+    def _check_anomalies(self) -> None:
+        """Self-diagnosis: surface (once per day, on the transition to tripped) the patterns
+        the user kept catching by hand — avoidable grid imports, a register limit cycle,
+        unintended curtailment, and stale Deye data — so Wattson EXPLAINS itself via a
+        notification instead of the user having to dig. Pure observability; best-effort."""
+        today = dt_util.now().date()
+        if getattr(self, "_anomaly_day", None) != today:
+            self._anomaly_day = today
+            self._anomalies_fired: set[str] = set()
+
+        def alert(key: str, title: str, msg: str) -> None:
+            if key in self._anomalies_fired:
+                return
+            self._anomalies_fired.add(key)
+            try:
+                from homeassistant.components import persistent_notification
+                persistent_notification.async_create(
+                    self.hass, msg, title=title,
+                    notification_id=f"wattson_anomaly_{key}_{self.config_entry.entry_id}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        st = self.site_state
+        if st is not None and getattr(st, "stale_required_entities", None):
+            alert("stale", "Wattson: inverter-data forældet",
+                  "Deye-sensorerne er ikke opdateret for nylig — Wattson holder sidste-sikre "
+                  "tilstand og styrer ikke før data er friske igen. Tjek klatremis/Modbus-forbindelsen.")
+        if self.avoidable_grid_kwh_today >= 1.0:
+            alert("avoidable_grid", "Wattson: købte strøm trods ladning på batteriet",
+                  f"~{self.avoidable_grid_kwh_today:.1f} kWh er hentet fra nettet i dag mens batteriet "
+                  "havde brugbar ladning over gulvet og ikke lå til grid-ladning. Tjek om reserven/gulvet "
+                  "er sat for højt for dagen (fx en solrig dag hvor batteriet kunne dække huset).")
+        if self.register_writes_today >= 2000 and self.register_tuple_changes_today <= 60:
+            alert("limit_cycle", "Wattson: mistanke om register-limit-cycle",
+                  f"{self.register_writes_today} register-skrivninger i dag, men kun "
+                  f"{self.register_tuple_changes_today} reelle beslutnings-skift — et register konvergerer "
+                  "måske ikke (skriver samme værdi hver tick mod et kvantiseret read-back).")
+        unintended = max(0.0, self.curtailed_today_kwh - self.curtailed_negative_kwh)
+        if unintended >= 1.5:
+            alert("curtailment", "Wattson: uventet sol-curtailment",
+                  f"~{unintended:.1f} kWh sol ser ud til at være tabt i dag (ud over bevidst negativ-pris-"
+                  "curtailment) — en mulig MPPT-stall / over-produktions-regression. Tjek PV-strenge + solar_sell.")
+
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
         await self.async_request_refresh()
@@ -808,6 +852,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             now=self.site_state.timestamp,
             usable_pct=max(0.0, _max_soc - _min_soc),
             capacity_kwh=_capacity,
+            confidence=self._forecast_confidence,
         )
 
         # ---- Fase A plan engine: the day plan is the boss. Rebuild only when ----
@@ -830,6 +875,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         _plan_fp = (
             self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge,
             round(learned_reserve_pct / 5.0), _grid_charge_rate,
+            round(self._forecast_confidence, 2),
         )
         _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
         _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -862,6 +908,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 discharge_current_a=self.battery_discharge_current,
                 battery_care_soc=self.battery_care_soc,
                 grid_charge_rate_kwh=_grid_charge_rate,
+                forecast_confidence=self._forecast_confidence,
             )
             self._day_plan_fp = _plan_fp
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
@@ -1328,6 +1375,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         else:
             self.last_actions = []
         self._sync_repairs()
+        # Self-diagnosis runs AFTER control is applied and must NEVER be able to break the
+        # control loop — it is pure observability. Swallow + log any error here.
+        try:
+            self._accumulate_avoidable_grid(self.control_plan)
+            self._check_anomalies()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Wattson self-diagnosis failed (non-fatal): %s", err)
         return self.control_plan
 
     async def _async_apply_plan(self, plan: ControlPlan, now: datetime) -> None:
