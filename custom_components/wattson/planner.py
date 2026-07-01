@@ -14,6 +14,7 @@ from .const import (
     BATTERY_OVERRIDE_CHARGE,
     BATTERY_OVERRIDE_DISCHARGE,
     BATTERY_OVERRIDE_HOLD,
+    BATTERY_OVERRIDE_SOLAR_CHARGE,
     BATTERY_WEAR_COST,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
@@ -684,6 +685,7 @@ DWELL_EXEMPT_STRATEGIES = frozenset({
     "PROTECT",
     "BLOCK_NEGATIVE_EXPORT",
     "OVERRIDE_CHARGE",
+    "OVERRIDE_SOLAR_CHARGE",
     "OVERRIDE_DISCHARGE",
     "OVERRIDE_HOLD",
     "DISCHARGE_TO_LOAD",
@@ -2423,6 +2425,28 @@ def build_override_battery_plan(
             strategy="OVERRIDE_CHARGE",
             reason="Manual override: forced charge" + (" + selling the PV surplus" if _sell else " (grid)"),
             desired_grid_charge=True,
+            desired_solar_sell=_sell,
+            desired_energy_priority="Load first",
+            desired_limit_control_mode="Zero export to CT",
+            desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=default_charge_current_a,
+            desired_discharge_current_a=(default_discharge_current_a if _sell else 0.0),
+        )
+    if action == BATTERY_OVERRIDE_SOLAR_CHARGE:
+        # Like force-charge, but NEVER buys from the grid — the pack fills ONLY from the PV
+        # surplus left after the house (Load first, and PV absorption is FORCED on this
+        # firmware regardless of the TOU grid-charge enable, so a sunny surplus still lifts
+        # the pack to 100 %). grid_charge=False is the whole point vs OVERRIDE_CHARGE; the
+        # tou_setpoint else-branch leaves TOU charge-enable OFF (no grid top-up). When export
+        # pays, the surplus the pack can't absorb is SOLD rather than curtailed (rides with
+        # discharge OPEN; the CT clamp under Zero-export-to-CT still blocks battery->grid, so
+        # only true PV overflow exports, and Load first keeps the charge ahead of the sell);
+        # at a zero/negative price, sell OFF + discharge 0 = hold-and-fill, curtail overflow.
+        _sell = bool(export_pays)
+        return BatteryPlan(
+            strategy="OVERRIDE_SOLAR_CHARGE",
+            reason="Manual override: solar-only charge (no grid)" + (" + selling the PV surplus" if _sell else ""),
+            desired_grid_charge=False,
             desired_solar_sell=_sell,
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",

@@ -560,8 +560,9 @@ class TelemetryMixin:
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return
         strat = plan.battery.strategy if (plan is not None and plan.battery is not None) else None
-        if strat in ("GRID_CHARGE", "ABSORB_NEGATIVE", "OVERRIDE_CHARGE", "HOLD_FULL", "BLOCK_NEGATIVE_EXPORT"):
-            return  # deliberate import / hold — not avoidable
+        if strat in ("GRID_CHARGE", "ABSORB_NEGATIVE", "OVERRIDE_CHARGE", "HOLD_FULL",
+                     "BLOCK_NEGATIVE_EXPORT", "OVERRIDE_SOLAR_CHARGE", "OVERRIDE_HOLD"):
+            return  # deliberate import / hold (incl. user overrides that block discharge) — not avoidable
         soc = state.battery_soc_pct
         if soc is None:
             return

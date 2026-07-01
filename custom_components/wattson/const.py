@@ -330,11 +330,13 @@ OVERRIDE_MAX_MINUTES = 720
 
 BATTERY_OVERRIDE_AUTO = "auto"            # no override; follow the AI plan
 BATTERY_OVERRIDE_CHARGE = "force_charge"  # force grid-charging now
+BATTERY_OVERRIDE_SOLAR_CHARGE = "force_charge_solar"  # charge from SOLAR surplus only, never grid
 BATTERY_OVERRIDE_DISCHARGE = "force_discharge"  # force discharge/sell now
 BATTERY_OVERRIDE_HOLD = "force_hold"      # hold SOC (no charge, no discharge)
 BATTERY_OVERRIDE_OPTIONS = [
     BATTERY_OVERRIDE_AUTO,
     BATTERY_OVERRIDE_CHARGE,
+    BATTERY_OVERRIDE_SOLAR_CHARGE,
     BATTERY_OVERRIDE_DISCHARGE,
     BATTERY_OVERRIDE_HOLD,
 ]

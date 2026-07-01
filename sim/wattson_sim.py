@@ -1925,6 +1925,34 @@ def test_e_override():
     checks.append(("force_charge + sell opens the discharge (stall-safe, not 0A)", chg_sell.desired_discharge_current_a == 50.0, str(chg_sell.desired_discharge_current_a)))
     checks.append(("force_charge + sell still grid-charges", chg_sell.desired_grid_charge is True, str(chg_sell.desired_grid_charge)))
 
+    # NEW (v0.24.37): solar-only charge — fills the pack from PV surplus but NEVER buys grid.
+    # It IS force-charge with grid-charge OFF: house first (Load first), PV absorption is forced
+    # on this firmware so the pack still fills, and tou_setpoint leaves the TOU grid-charge
+    # enable OFF (no grid top-up).
+    sol = planner.build_override_battery_plan(
+        const.BATTERY_OVERRIDE_SOLAR_CHARGE, export_limit_default_w=6000.0,
+        default_charge_current_a=40.0, default_discharge_current_a=50.0,
+    )
+    checks.append(("force_charge_solar -> OVERRIDE_SOLAR_CHARGE", sol.strategy == "OVERRIDE_SOLAR_CHARGE", sol.strategy))
+    checks.append(("solar-charge NEVER grid-charges (the whole point vs force_charge)", sol.desired_grid_charge is False, str(sol.desired_grid_charge)))
+    checks.append(("solar-charge absorbs at the default charge current", sol.desired_max_charge_current_a == 40.0, str(sol.desired_max_charge_current_a)))
+    checks.append(("solar-charge (no export pay) holds+fills: sell OFF + discharge 0", sol.desired_solar_sell is False and sol.desired_discharge_current_a == 0.0, f"{sol.desired_solar_sell}/{sol.desired_discharge_current_a}"))
+    checks.append(("solar-charge keeps Load first + Zero export to CT (house first, no battery->grid)", sol.desired_energy_priority == "Load first" and sol.desired_limit_control_mode == "Zero export to CT", f"{sol.desired_energy_priority}/{sol.desired_limit_control_mode}"))
+    # The TOU grid-charge enable MUST stay OFF for solar-charge (else it grid-buys); contrast
+    # force_charge which returns enable=True.
+    _, sol_tou_en = planner.tou_setpoint(sol, soc_pct=50.0, min_soc=15.0, discharge_floor=30.0, max_soc=100.0)
+    _, chg_tou_en = planner.tou_setpoint(chg, soc_pct=50.0, min_soc=15.0, discharge_floor=30.0, max_soc=100.0)
+    checks.append((f"solar-charge leaves TOU grid-charge enable OFF (force_charge=ON) [{sol_tou_en}/{chg_tou_en}]", sol_tou_en is False and chg_tou_en is True, f"{sol_tou_en}/{chg_tou_en}"))
+    # When export pays, solar-charge SELLS the overflow (discharge OPEN, stall-safe) but STILL no grid.
+    sol_sell = planner.build_override_battery_plan(
+        const.BATTERY_OVERRIDE_SOLAR_CHARGE, export_limit_default_w=6000.0,
+        default_charge_current_a=40.0, default_discharge_current_a=50.0, export_pays=True,
+    )
+    checks.append(("solar-charge + export pays -> sells overflow, discharge OPEN, STILL no grid",
+                   sol_sell.desired_solar_sell is True and sol_sell.desired_discharge_current_a == 50.0 and sol_sell.desired_grid_charge is False,
+                   f"sell={sol_sell.desired_solar_sell} dis={sol_sell.desired_discharge_current_a} grid={sol_sell.desired_grid_charge}"))
+    checks.append(("solar-charge is dwell-exempt (user override applies immediately)", planner.mode_dwell_exempt("OVERRIDE_SOLAR_CHARGE") is True, str(planner.mode_dwell_exempt("OVERRIDE_SOLAR_CHARGE"))))
+
     dis = planner.build_override_battery_plan(
         const.BATTERY_OVERRIDE_DISCHARGE, export_limit_default_w=6000.0,
         default_charge_current_a=40.0, default_discharge_current_a=50.0,
