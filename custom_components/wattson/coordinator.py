@@ -167,6 +167,7 @@ from .planner import (
     build_override_ev_plan,
     effective_solar_surplus_w,
     ev_current_within_deadband,
+    ev_covers_dips_from_battery,
     ev_drawing_real_power,
     profile_for,
     should_prioritize_ev_solar,
@@ -1262,17 +1263,34 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     and _cur_slot.export_value > 0.0
                 )
                 _sell_full_surplus = _ev_pack_full and _export_pays
+                # The open-discharge "cover dips from the battery" behaviour is ONLY for
+                # solar-only ("Ren sol"), where the car is capped at the PV surplus so the
+                # pack net-charges and only brief dips drain it (user pref 2026-06-24). In
+                # full-speed / scheduled the car pulls FAR more than the PV (e.g. 11 kW),
+                # and with load_includes_ev the battery would "cover the house" straight
+                # into the car — draining the pack (user report 2026-07-02: "full hastighed
+                # trak også fra batteriet"). So OUTSIDE solar-only the pack is PROTECTED:
+                # discharge=0 (never fed the car) + sell OFF (so discharge=0 never rides
+                # with sell=ON, the stall pair). PV can still CHARGE it; the car takes grid.
+                _is_solar_ev = ev_covers_dips_from_battery(ev_plan.mode)
                 battery_plan = replace(
                     battery_plan,
                     strategy="EV_SOLAR_PRIORITY",
                     reason=(
-                        f"{battery_plan.reason} | EV solar-only: PV to the car first; the "
-                        "house battery covers cloud dips (from battery, not grid)"
-                        + (
-                            f"; pack full + export pays {_cur_slot.export_value:.2f} kr "
-                            "-> selling the surplus the car can't absorb (else curtailed)"
-                            if _sell_full_surplus
-                            else ""
+                        f"{battery_plan.reason} | " + (
+                            (
+                                "EV solar-only: PV to the car first; the house battery covers "
+                                "cloud dips (from battery, not grid)"
+                                + (
+                                    f"; pack full + export pays {_cur_slot.export_value:.2f} kr "
+                                    "-> selling the surplus the car can't absorb (else curtailed)"
+                                    if _sell_full_surplus
+                                    else ""
+                                )
+                            )
+                            if _is_solar_ev
+                            else "EV full-speed/planlagt: bilen tager nettet; huset-batteriet "
+                            "BESKYTTES (afladning 0 — trækkes aldrig ind i bilen)"
                         )
                     ),
                     desired_grid_charge=False,
@@ -1288,7 +1306,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # below and at full (see below), so sell=ON never rides with
                     # discharge=0. "Load first" + the CT clamp (v0.24.2) serve car/house
                     # first and block battery->grid; only true PV surplus is exported.
-                    desired_solar_sell=_sell_full_surplus,
+                    desired_solar_sell=(_sell_full_surplus if _is_solar_ev else False),
                     desired_energy_priority="Load first",
                     desired_limit_control_mode="Zero export to CT",
                     # Full-rate charge register: the battery absorbs whatever surplus
@@ -1305,7 +1323,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     # full pack), and the CT clamp still blocks battery->grid (an open
                     # discharge only covers the load). Also removes the old 98% discharge
                     # flap entirely (the register is now a constant 70A, never toggled).
-                    desired_discharge_current_a=self.battery_discharge_current,
+                    # OUTSIDE solar-only: 0 A — the pack must NOT discharge into a full-speed
+                    # /scheduled car (which pulls far more than PV); it holds + PV charges it.
+                    desired_discharge_current_a=(
+                        self.battery_discharge_current if _is_solar_ev else 0.0
+                    ),
                 )
 
         # Negative TOTAL import price (spot + tariff): you are PAID to import, so

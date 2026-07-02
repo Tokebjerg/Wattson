@@ -2544,6 +2544,19 @@ def ev_drawing_real_power(state: SiteState, min_draw_w: float = EV_SOLAR_PRIORIT
     return (state.easee_power_w or 0.0) >= min_draw_w
 
 
+def ev_covers_dips_from_battery(ev_mode: str) -> bool:
+    """Whether, while the car is actively charging, the house battery may DISCHARGE to
+    cover the load (which includes the car on this load_includes_ev setup).
+
+    True ONLY for solar-only ("Ren sol"): there the car is capped at the PV surplus, so
+    the pack net-charges on sun and the open discharge only covers brief cloud DIPS (user
+    pref 2026-06-24). In every other mode (full-speed, scheduled, manual override) the car
+    pulls far more than the PV, so an open discharge would drain the pack straight into the
+    car — the user's 2026-07-02 report ("full hastighed trak også fra batteriet"). Those
+    modes therefore hold discharge=0 (the car takes the grid; PV can still CHARGE the pack)."""
+    return ev_mode == EV_MODE_SOLAR_ONLY
+
+
 def should_prioritize_ev_solar(
     ev_plan: EvPlan,
     *,

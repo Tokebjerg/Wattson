@@ -1924,6 +1924,22 @@ def test_robustness_hardening():
     checks.append(("cold guard: warm pack -> unchanged (grid-charges)", warm.desired_grid_charge is True, str(warm.desired_grid_charge)))
     checks.append(("cold guard: unknown temp -> unchanged (guard inactive, backtest-safe)", unknown.desired_grid_charge is True, str(unknown.desired_grid_charge)))
     checks.append(("cold guard: non-charge plan untouched", nogc.desired_grid_charge is False, str(nogc.desired_grid_charge)))
+
+    # v0.24.40 EV battery-protect (user report: full-speed drew from the battery). Only
+    # solar-only may open the discharge to cover dips FROM the battery; every other mode
+    # holds discharge=0 so a full-speed/scheduled car (which pulls far more than PV) is
+    # never fed from the pack. Enumerate the modes as a regression guard.
+    cov = planner.ev_covers_dips_from_battery
+    checks.append(("EV protect: solar_only COVERS dips from battery (open discharge)",
+                   cov(const.EV_MODE_SOLAR_ONLY) is True, "solar_only"))
+    checks.append(("EV protect: full_speed does NOT (battery protected, discharge 0)",
+                   cov(const.EV_MODE_FULL_SPEED) is False, "full_speed"))
+    checks.append(("EV protect: scheduled_cheapest does NOT drain the pack",
+                   cov(const.EV_MODE_SCHEDULED_CHEAPEST) is False, "scheduled_cheapest"))
+    checks.append(("EV protect: scheduled_periods does NOT drain the pack",
+                   cov(const.EV_MODE_SCHEDULED) is False, "scheduled_periods"))
+    checks.append(("EV protect: a manual override mode does NOT drain the pack",
+                   cov("override_charge") is False, "override_charge"))
     return checks
 
 
