@@ -15,6 +15,7 @@ from .const import (
     BATTERY_OVERRIDE_DISCHARGE,
     BATTERY_OVERRIDE_HOLD,
     BATTERY_OVERRIDE_SOLAR_CHARGE,
+    BATTERY_ROUND_TRIP_EFFICIENCY,
     BATTERY_WEAR_COST,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
@@ -220,6 +221,20 @@ def required_spread(profile: ProfileWeights) -> float:
     return profile.profit_margin + BATTERY_WEAR_COST
 
 
+def arbitrage_worthwhile(price_now: float, max_after: float | None, profile: ProfileWeights) -> bool:
+    """#10: is buying/holding to arbitrage against a later expensive hour worth it?
+
+    A kWh stored now only returns ``BATTERY_ROUND_TRIP_EFFICIENCY`` of usable energy
+    later, so the later avoided price is DISCOUNTED by the round-trip loss before the
+    spread must still clear the profit margin + wear. Without this, a knife-edge spread
+    like buy-1.00 / avoid-1.15 looks profitable but is ~break-even after the ~10 %
+    conversion loss — so the pack cycled for nothing. Reduces to the old additive
+    `(max_after - price) >= required_spread` when efficiency is 1.0."""
+    if max_after is None:
+        return False
+    return max_after * BATTERY_ROUND_TRIP_EFFICIENCY - price_now >= required_spread(profile)
+
+
 class _HorizonView:
     """Ranked view of the remaining price horizon for a single tick + profile."""
 
@@ -358,6 +373,24 @@ def near_full_buffer_active(
     if active_prev:
         return soc_pct >= (max_soc_pct - release_margin)
     return soc_pct >= (max_soc_pct - engage_margin)
+
+
+def apply_cold_guard(plan, temperature_c: float | None, *, min_charge_temp_c: float):
+    """#5 LFP safety: never COMMAND battery charging when the pack is below the
+    cold-charge limit — charging a lithium cell below ~0 °C plates lithium and
+    permanently degrades it. Disables ONLY the grid-charge Wattson commands (PV
+    absorption is firmware-forced and the BMS limits it independently); discharge to
+    cover the house is untouched. No-op when the temperature is unknown or safe, so
+    warm-weather behaviour — and the whole backtest, which has no temp — is unchanged."""
+    if temperature_c is None or temperature_c >= min_charge_temp_c:
+        return plan
+    if not getattr(plan, "desired_grid_charge", False):
+        return plan
+    return replace(
+        plan,
+        desired_grid_charge=False,
+        reason=(plan.reason + f" · KOLD-GUARD: batteri {temperature_c:.0f}°C < {min_charge_temp_c:.0f}°C → grid-ladning blokeret (LFP-beskyttelse)"),
+    )
 
 
 def apply_sell_throttle(
@@ -1137,7 +1170,7 @@ def _horizon_battery_plan(
     is_cheap = current.start in view.cheap_starts
     is_expensive = current.start in view.expensive_starts
     max_after = view.max_price_after(current.start)
-    worthwhile = max_after is not None and (max_after - price) >= required_spread(profile)
+    worthwhile = arbitrage_worthwhile(price, max_after, profile)
     # Discharge floor = profile reserve, raised to also cover the learned reserve
     # (predicted self-use) so we don't sell/discharge energy we'll soon need.
     discharge_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
@@ -1386,7 +1419,7 @@ def _build_schedule(
         is_cheap = slot.start in view.cheap_starts
         is_expensive = slot.start in view.expensive_starts
         max_after = view.max_price_after(slot.start)
-        worthwhile = max_after is not None and (max_after - slot.total_import_price) >= required_spread(profile)
+        worthwhile = arbitrage_worthwhile(slot.total_import_price, max_after, profile)
 
         price_high = slot.total_import_price >= view.mean_price and (slot.export_value or 0) > 0
         deficit_kwh = max(load_kwh - solar_kwh, 0.0)

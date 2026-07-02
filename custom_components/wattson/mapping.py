@@ -286,6 +286,16 @@ def build_site_state(
     ) or 0.0
     battery_soc = _read_float(hass, mapping.battery_soc_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
     battery_power = _read_float(hass, mapping.battery_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
+    # #5: battery pack temperature for the cold-charge guard — fully OPTIONAL. Derived
+    # from the battery-power entity's prefix (klatremis: ..._battery_output_power ->
+    # ..._battery_temperature); any other naming simply yields None and disables the
+    # guard. Never raises missing/stale issues (absent = feature off, not a fault).
+    battery_temp: float | None = None
+    if mapping.battery_power_entity and "_battery" in mapping.battery_power_entity:
+        _temp_eid = mapping.battery_power_entity.rsplit("_battery", 1)[0] + "_battery_temperature"
+        battery_temp = _read_float(hass, _temp_eid, missing=[], issues=[], stale=[], stale_seconds=stale_seconds * 20)
+        if battery_temp is not None and not (-40.0 <= battery_temp <= 90.0):
+            battery_temp = None  # implausible reading -> ignore
     inverter_online = _read_bool(hass, mapping.inverter_online_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     inverter_status = _read_string(hass, mapping.inverter_status_entity, missing=missing, stale=stale, stale_seconds=stale_seconds) or "unknown"
 
@@ -369,6 +379,7 @@ def build_site_state(
         grid_export_power_w=grid_export,
         battery_soc_pct=battery_soc,
         battery_power_w=battery_power,
+        battery_temperature_c=battery_temp,
         inverter_online=bool(inverter_online),
         inverter_status=inverter_status,
         easee_online=easee_online,

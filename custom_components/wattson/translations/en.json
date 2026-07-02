@@ -165,7 +165,12 @@
           "allow_negative_export": "Allow export during negative prices",
           "cheap_price_threshold": "Cheap price threshold",
           "expensive_price_threshold": "Expensive price threshold",
-          "battery_capacity_kwh": "Battery capacity (kWh)"
+          "battery_capacity_kwh": "Battery capacity (kWh)",
+          "battery_care_max_soc": "Battery-care max SOC (%) — charge cap vs LFP aging (98 recommended; 100 = max savings, 95 = gentlest)",
+          "reserve_hold_margin": "Reserve-hold margin (kr/kWh) — how much pricier a peak must be to hold reserve",
+          "ev_retune_seconds": "EV re-tune interval (s) — minimum time between offered-current changes",
+          "ev_full_release_margin_pct": "Ren-sol full-battery release margin (%) — hysteresis band (min 4)",
+          "grid_charge_rate_kwh": "Measured grid-charge rate (kWh/h) — used in the cheap-hour projection"
         }
       },
       "ev_settings": {
@@ -233,6 +238,10 @@
     },
     "anomaly_curtailment": {
       "title": "Wattson anomaly: unexpected solar curtailment",
+      "description": "{details}"
+    },
+    "anomaly_cold": {
+      "title": "Wattson anomaly: battery too cold to charge",
       "description": "{details}"
     }
   }

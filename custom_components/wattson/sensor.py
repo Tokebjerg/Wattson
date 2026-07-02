@@ -162,6 +162,15 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             # #5/v0.24.36: the reserve-release confidence derived from the same ratios —
             # 1.0 = full trust, 0.6 floor = recent optimistic forecasts hold more reserve.
             "forecast_confidence": round(getattr(c, "_forecast_confidence", 1.0), 3),
+            # #12 (observe-only): today's actual/forecast ratio per time-of-day bucket —
+            # measures whether morning/midday/evening forecasts are biased differently
+            # (not yet applied to control). null until a bucket has meaningful forecast.
+            "time_of_day_bias_today": {
+                b: round(getattr(c, "_tod_actual_wh", {}).get(b, 0.0)
+                         / getattr(c, "_tod_forecast_wh", {}).get(b, 0.0), 3)
+                if getattr(c, "_tod_forecast_wh", {}).get(b, 0.0) > 200.0 else None
+                for b in ("morning", "midday", "evening")
+            },
         },
     ),
     WattsonSensorDescription(
@@ -260,6 +269,17 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "issues": site_state.issues,
                 "last_actions": getattr(self.coordinator, "last_actions", []),
                 "safe_reasons": control_plan.safe_reasons if control_plan else [],
+                # #6 heartbeat: gap before the last tick (a big value = a stall/restart
+                # trace). #3 data-source health: which planning feeds are live.
+                "seconds_since_previous_tick": round(getattr(self.coordinator, "_prev_tick_gap_s", 0.0)),
+                "data_sources": {
+                    "prices": "ok" if site_state.price_slots else "unavailable",
+                    "solar_forecast": (
+                        "fallback" if getattr(self.coordinator, "_solar_forecast_degraded", False)
+                        else ("ok" if site_state.solar_slots else "unavailable")
+                    ),
+                    "battery_temp": "ok" if site_state.battery_temperature_c is not None else "n/a",
+                },
             }
         return None
 
@@ -518,10 +538,22 @@ class WattsonBatteryHealthSensor(CoordinatorEntity, RestoreSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "minutes_above_95": round(self.coordinator.battery_minutes_above_95_today),
-            "minutes_below_20": round(self.coordinator.battery_minutes_below_20_today),
+        c = self.coordinator
+        attrs: dict[str, Any] = {
+            "minutes_above_95": round(c.battery_minutes_above_95_today),
+            "minutes_below_20": round(c.battery_minutes_below_20_today),
         }
+        st = getattr(c, "site_state", None)
+        temp = getattr(st, "battery_temperature_c", None) if st is not None else None
+        if temp is not None:
+            attrs["temperature_c"] = round(temp, 1)
+        # #7: effective-capacity estimate once a meaningful discharge segment (>=15%
+        # SOC traversed today) has accumulated — observe-only, not fed to control.
+        drop = getattr(c, "_cap_soc_drop", 0.0)
+        if drop >= 15.0:
+            attrs["estimated_capacity_kwh"] = round(c._cap_dis_wh / 1000.0 / (drop / 100.0), 1)
+            attrs["capacity_soc_span_pct"] = round(drop)
+        return attrs
 
 
 class WattsonGridChargeSensor(CoordinatorEntity, RestoreSensor):

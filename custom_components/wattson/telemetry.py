@@ -100,10 +100,24 @@ class TelemetryMixin:
         self.battery_minutes_below_20_today: float = 0.0
         self._bh_day = None
         self._bh_last_tick: datetime | None = None
+        # #7 (observe-only): back out the pack's EFFECTIVE capacity from a clean
+        # discharge segment — energy delivered ÷ SOC% dropped. Accumulated over the
+        # day; exposed as a sensor attribute, NOT fed into any decision (an aged LFP
+        # loses 2-3%/yr, so this is the future signal for capacity-aware planning).
+        self._cap_dis_wh: float = 0.0
+        self._cap_soc_drop: float = 0.0
+        self._cap_last_soc: float | None = None
         # Solar-bias learning.
         self._solar_accum_day = None
         self._solar_actual_wh: float = 0.0
         self._solar_forecast_wh: float = 0.0
+        # #12 (observe-first): per-time-of-day actual/forecast Wh so we can SEE whether
+        # morning vs midday vs evening forecasts are biased differently before splitting
+        # the single bias factor into buckets. Exposed on the bias sensor; NOT applied to
+        # any decision yet (the whole stall family was morning-marginal, so this is the
+        # measurement that would justify a bucketed correction later).
+        self._tod_actual_wh: dict[str, float] = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
+        self._tod_forecast_wh: dict[str, float] = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
         self._solar_last_tick: datetime | None = None
         self._solar_bias_persisted_at: datetime | None = None
         # Restore the running day's accumulation (persisted ~15-minutely):
@@ -384,6 +398,9 @@ class TelemetryMixin:
             self.battery_cycles_today = 0.0
             self.battery_minutes_above_95_today = 0.0
             self.battery_minutes_below_20_today = 0.0
+            self._cap_dis_wh = 0.0
+            self._cap_soc_drop = 0.0
+            self._cap_last_soc = None
         last = self._bh_last_tick
         self._bh_last_tick = now
         if state is None or last is None:
@@ -392,10 +409,17 @@ class TelemetryMixin:
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return
         capacity_kwh = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        discharge_kwh = max(0.0, state.battery_power_w) / 1000.0 * dt_hours
         if capacity_kwh > 0:
-            discharge_kwh = max(0.0, state.battery_power_w) / 1000.0 * dt_hours
             self.battery_cycles_today += discharge_kwh / capacity_kwh
         soc = state.battery_soc_pct
+        # #7: effective-capacity estimate — sum delivered energy against the SOC% it
+        # cost, but ONLY on genuine discharge ticks (>100 W out, SOC actually falling)
+        # so charge/idle/PV-blend never pollute it. estimated = Wh ÷ (ΔSOC/100).
+        if state.battery_power_w > 100.0 and self._cap_last_soc is not None and soc < self._cap_last_soc:
+            self._cap_dis_wh += discharge_kwh * 1000.0
+            self._cap_soc_drop += (self._cap_last_soc - soc)
+        self._cap_last_soc = soc
         minutes = dt_hours * 60.0
         if soc >= 95.0:
             self.battery_minutes_above_95_today += minutes
@@ -437,6 +461,8 @@ class TelemetryMixin:
             self._solar_accum_day = today
             self._solar_actual_wh = 0.0
             self._solar_forecast_wh = 0.0
+            self._tod_actual_wh = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
+            self._tod_forecast_wh = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
             self._solar_last_tick = None
         forecast_w = self._current_solar_forecast_w()
         last = self._solar_last_tick
@@ -454,6 +480,11 @@ class TelemetryMixin:
             return
         self._solar_actual_wh += max(0.0, state.pv_power_w) * dt_hours
         self._solar_forecast_wh += forecast_w * dt_hours
+        # #12: same accumulation split by time-of-day bucket (local hour).
+        _hod = dt_util.now().hour
+        _bucket = "morning" if _hod < 11 else ("midday" if _hod < 16 else "evening")
+        self._tod_actual_wh[_bucket] += max(0.0, state.pv_power_w) * dt_hours
+        self._tod_forecast_wh[_bucket] += forecast_w * dt_hours
         # Persist the running day every ~15 min so a restart resumes instead of
         # wiping it (HA debounces the actual storage write).
         if (

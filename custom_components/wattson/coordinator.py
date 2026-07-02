@@ -13,6 +13,7 @@ from homeassistant.util import dt as dt_util
 
 from .config import entry_value, merged_entry_config, update_entry_options
 from .const import (
+    BATTERY_MIN_CHARGE_TEMP_C,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
     CONF_AUTOMATION_ENABLED,
@@ -138,7 +139,7 @@ from .deye_contract import floor_sell_safe
 from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
-from .models import Capabilities, ControlPlan, EntityMapping, SiteState
+from .models import Capabilities, ControlPlan, EntityMapping, SiteState, SolarSlot
 from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
@@ -152,6 +153,7 @@ from .planner import (
     build_day_plan,
     execute_slot,
     mode_dwell_exempt,
+    apply_cold_guard,
     apply_sell_throttle,
     near_full_buffer_active,
     SCHEDULE_GRID_CHARGE_RATE_KWH,
@@ -257,6 +259,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
         self._load_samples: list[tuple[datetime, float]] = []
         self._repairs_state: dict[str, list] = {}
+        # #6 heartbeat: the last successful tick + the gap before it, so a stall or
+        # restart leaves a visible trace on site_status (a big gap in history). The
+        # coordinator can't alarm on its OWN freeze, but the gap is recorded the tick
+        # AFTER recovery, and DataUpdateCoordinator marks entities unavailable on a
+        # failing update. Volatile by design (a restart is exactly what it surfaces).
+        self._last_tick_at: datetime | None = None
+        self._prev_tick_gap_s: float = 0.0
+        # ---- #4 restart-audit: state below _restore_override_state is INTENTIONALLY
+        # volatile (re-derives within seconds/minutes, so persisting it adds risk for
+        # no gain): EV sticky holds (_ev_active_until, _ev_solar_hold_until), the
+        # near-full + sell-ceiling hysteresis latches (_ev_full_buffer_active,
+        # _sell_ceiling_active), dwell timers, contention windows, surplus/load
+        # sample buffers, the anomaly-fired set + digest day (both re-cleared/re-sent
+        # via the issue registry / a fresh 07:00 pass). PERSISTED state (must survive a
+        # restart) lives in config-entry options or RestoreSensor: overrides (+expiry),
+        # savings/cycle/curtailment/grid-charge totals, the solar-bias history. ----
 
     async def async_startup(self) -> None:
         await self._async_update_load_profile()
@@ -438,6 +456,41 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ],
         )
 
+    def _apply_solar_fallback(self) -> None:
+        """#3 robustness: if Solcast goes dark (empty forecast) reuse the last good
+        hour-of-day PV profile instead of planning as if the sun will never shine —
+        which over-sizes the reserve and buys grid overnight. Learns the profile from
+        every non-empty forecast and substitutes a date-stamped copy for today+tomorrow
+        when the live one is empty. In-memory: after a RESTART during an outage there is
+        nothing to fall back on until the next good forecast (acceptable edge). Sets
+        ``_solar_forecast_degraded`` for the site_status data-sources attribute. Runs
+        BEFORE the bias correction so the fallback is bias-corrected like a live forecast."""
+        state = self.site_state
+        if state is None:
+            return
+        if state.solar_slots:
+            prof: dict[int, float] = {}
+            for s in state.solar_slots:
+                prof[dt_util.as_local(s.start).hour] = s.pv_estimate_kwh
+            if prof:
+                self._last_solar_profile = prof
+            self._solar_forecast_degraded = False
+            return
+        prof = getattr(self, "_last_solar_profile", {})
+        if not prof:
+            self._solar_forecast_degraded = False
+            return
+        midnight = dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        fallback = [
+            SolarSlot(start=midnight + timedelta(days=day, hours=hour), pv_estimate_kwh=prof[hour])
+            for day in range(2)
+            for hour in range(24)
+            if prof.get(hour, 0.0) > 0.0
+        ]
+        if fallback:
+            self.site_state = replace(state, solar_slots=fallback)
+            self._solar_forecast_degraded = True
+
     def _apply_solar_bias(self) -> None:
         """Scale the (raw) Solcast forecast slots by the learned correction factor
         so planning uses bias-corrected production. Call AFTER _accumulate_solar_bias
@@ -532,7 +585,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # so a guard on the in-memory set would strand a pre-restart issue forever).
             try:
                 from homeassistant.helpers import issue_registry as ir
-                for k in ("stale", "avoidable_grid", "limit_cycle", "curtailment"):
+                for k in ("stale", "avoidable_grid", "limit_cycle", "curtailment", "cold"):
                     ir.async_delete_issue(self.hass, DOMAIN, f"anomaly_{k}_{self.config_entry.entry_id}")
             except Exception:  # noqa: BLE001
                 pass
@@ -582,6 +635,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             alert("curtailment", "Wattson: uventet sol-curtailment",
                   f"~{unintended:.1f} kWh sol ser ud til at være tabt i dag (ud over bevidst negativ-pris-"
                   "curtailment) — en mulig MPPT-stall / over-produktions-regression. Tjek PV-strenge + solar_sell.")
+        temp = getattr(st, "battery_temperature_c", None) if st is not None else None
+        if temp is not None and temp < BATTERY_MIN_CHARGE_TEMP_C:
+            alert("cold", "Wattson: batteriet er for koldt til opladning",
+                  f"Batteri-temperatur {temp:.0f} °C er under {BATTERY_MIN_CHARGE_TEMP_C:.0f} °C — Wattson blokerer "
+                  "grid-opladning for at beskytte LFP-cellerne (lithium-plating ved ladning under frysepunktet). "
+                  "Sol-opladning styres af inverterens BMS; afladning er upåvirket.")
 
     def _maybe_daily_digest(self) -> None:
         """#14: ONE morning notification (first tick after 07:00 local) with the night's
@@ -896,6 +955,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # so the planner/schedule see bias-corrected production.
         self._accumulate_solar_bias()
         self._accumulate_curtailment()
+        # #3: substitute the last-good forecast if Solcast is dark — AFTER the bias/
+        # curtailment accumulators (they must see the real, empty forecast and skip),
+        # BEFORE the bias scaling + planner (which get the bias-corrected fallback).
+        self._apply_solar_fallback()
         self._apply_solar_bias()
 
         # Phase D: refresh the learned load profile at most every few hours and
@@ -1326,6 +1389,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             pv_power_w=self.site_state.pv_power_w,
             load_power_w=self.site_state.load_power_w,
         )
+        # #5: LFP cold-charge guard — never command grid-charging a freezing pack. Runs
+        # AFTER the throttle so it has the final say on the grid-charge flag; no-op above
+        # the floor or when the temperature sensor is absent (guard inactive).
+        battery_plan = apply_cold_guard(
+            battery_plan, self.site_state.battery_temperature_c,
+            min_charge_temp_c=BATTERY_MIN_CHARGE_TEMP_C,
+        )
 
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
@@ -1460,6 +1530,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._maybe_daily_digest()
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Wattson self-diagnosis failed (non-fatal): %s", err)
+        # #6 heartbeat: record this tick + the gap since the previous one.
+        _tick_now = dt_util.utcnow()
+        if self._last_tick_at is not None:
+            self._prev_tick_gap_s = (_tick_now - self._last_tick_at).total_seconds()
+        self._last_tick_at = _tick_now
         return self.control_plan
 
     async def _async_apply_plan(self, plan: ControlPlan, now: datetime) -> None:

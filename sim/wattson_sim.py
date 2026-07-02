@@ -1895,6 +1895,39 @@ def test_tou_management():
 
 
 # --------------------------------------------------------------------------- #
+# 12a1. v0.24.39 robustness/engine hardening — cold guard (#5) + RTE (#10).
+# --------------------------------------------------------------------------- #
+def test_robustness_hardening():
+    checks = []
+    prof = planner.profile_for("blue")
+    R = planner.required_spread(prof)
+    # #10 RTE: a spread that clears the additive margin by a hair is NO LONGER worthwhile
+    # once the ~10% round-trip loss is charged against the recovered energy; a comfortably
+    # large spread still passes; no later peak is never worthwhile.
+    checks.append((f"RTE: knife-edge spread ({R+0.05:.2f}>R) fails after round-trip loss",
+                   not planner.arbitrage_worthwhile(1.0, 1.0 + R + 0.05, prof), f"R={R:.2f}"))
+    checks.append(("RTE: large spread still worthwhile",
+                   planner.arbitrage_worthwhile(1.0, 1.0 + R + 1.0, prof), "ok"))
+    checks.append(("RTE: no later peak -> not worthwhile",
+                   not planner.arbitrage_worthwhile(1.0, None, prof), "None"))
+    checks.append(("RTE: efficiency 1.0 would reduce to the old additive test",
+                   const.BATTERY_ROUND_TRIP_EFFICIENCY < 1.0, str(const.BATTERY_ROUND_TRIP_EFFICIENCY)))
+    # #5 cold guard: block grid-charge below the LFP floor; no-op warm/unknown/non-charge.
+    def P(gc):
+        return models.BatteryPlan(strategy="GRID_CHARGE", reason="r", desired_grid_charge=gc)
+    T = const.BATTERY_MIN_CHARGE_TEMP_C
+    cold = planner.apply_cold_guard(P(True), -3.0, min_charge_temp_c=T)
+    warm = planner.apply_cold_guard(P(True), 12.0, min_charge_temp_c=T)
+    unknown = planner.apply_cold_guard(P(True), None, min_charge_temp_c=T)
+    nogc = planner.apply_cold_guard(P(False), -3.0, min_charge_temp_c=T)
+    checks.append(("cold guard: freezing pack -> grid-charge BLOCKED", cold.desired_grid_charge is False, str(cold.desired_grid_charge)))
+    checks.append(("cold guard: warm pack -> unchanged (grid-charges)", warm.desired_grid_charge is True, str(warm.desired_grid_charge)))
+    checks.append(("cold guard: unknown temp -> unchanged (guard inactive, backtest-safe)", unknown.desired_grid_charge is True, str(unknown.desired_grid_charge)))
+    checks.append(("cold guard: non-charge plan untouched", nogc.desired_grid_charge is False, str(nogc.desired_grid_charge)))
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 12a2. DST transition days — the 23h/25h Danish days must not break the plan.
 # --------------------------------------------------------------------------- #
 def test_dst_transitions():
@@ -3716,6 +3749,7 @@ def main():
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("ANTI-HUNT MODE DWELL", test_mode_dwell),
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
+                         ("ROBUSTHED/MOTOR · KULDE-GUARD (#5) + RTE (#10)", test_robustness_hardening),
                          ("DST / SOMMERTID · 23h/25h PLAN-DAGE", test_dst_transitions),
                          ("COORDINATOR-HARNESS · EV-LOOP TIMING (ægte _async_apply_ev)", test_coordinator_ev_harness),
                          ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),

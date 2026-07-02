@@ -165,7 +165,12 @@
           "allow_negative_export": "Tillad eksport ved negative priser",
           "cheap_price_threshold": "Billig pris tærskel",
           "expensive_price_threshold": "Dyr pris tærskel",
-          "battery_capacity_kwh": "Batterikapacitet (kWh)"
+          "battery_capacity_kwh": "Batterikapacitet (kWh)",
+          "battery_care_max_soc": "Batteri-pleje maks-SOC (%) — lade-loft mod LFP-slid (98 anbefalet; 100 = mest besparelse, 95 = mest skånsom)",
+          "reserve_hold_margin": "Reserve-hold-margin (kr/kWh) — hvor meget dyrere en spids skal være for at holde reserve",
+          "ev_retune_seconds": "EV re-tune-interval (sek.) — mindste tid mellem ændringer af tilbudt ladestrøm",
+          "ev_full_release_margin_pct": "Ren-sol fuldt-batteri release-margin (%) — hysterese-bånd (min. 4)",
+          "grid_charge_rate_kwh": "Målt net-lade-rate (kWh/t) — bruges i billig-time-projektionen"
         }
       },
       "ev_settings": {
@@ -233,6 +238,10 @@
     },
     "anomaly_curtailment": {
       "title": "Wattson-anomali: uventet sol-curtailment",
+      "description": "{details}"
+    },
+    "anomaly_cold": {
+      "title": "Wattson-anomali: batteriet for koldt til opladning",
       "description": "{details}"
     }
   }

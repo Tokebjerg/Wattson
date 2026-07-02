@@ -165,6 +165,9 @@ class SiteState:
     current_sell_price: float | None
     forecast_today_kwh: float | None
     ev_soc_pct: float | None = None
+    # #5: battery pack temperature (°C) if the inverter exposes it — used ONLY as a
+    # cold-charge safety guard. None (not available) leaves every decision unchanged.
+    battery_temperature_c: float | None = None
     stale_entities: list[str] = field(default_factory=list)
     stale_required_entities: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)

@@ -173,7 +173,12 @@ DEFAULT_SOLAR_CHARGE_PRIORITY_SOC = 50.0
 # force-charge still fill to max_soc, and SOLAR charging cannot be capped on this
 # firmware (see deye_contract.py).
 CONF_BATTERY_CARE_MAX_SOC = "battery_care_max_soc"
-DEFAULT_BATTERY_CARE_MAX_SOC = 95.0
+# #13: 98 % is the recommended middle — recovers most of the ~30-40 kr/winter that a
+# 95 % cap costs (the pack can't cover the evening peak from a 95 % start on some
+# winter days) while still keeping a 2 % headroom off the 100 % calendar-aging shelf
+# LFP dislikes. Set 100 for max savings (more top-of-charge aging) or 95 for the most
+# conservative longevity. PV self-charge is firmware-forced and never capped by this.
+DEFAULT_BATTERY_CARE_MAX_SOC = 98.0
 # Tunables promoted to options (2026-06-12, extended 2026-06-24): change without a deploy.
 CONF_EV_RETUNE_SECONDS = "ev_retune_seconds"          # EV offered-current re-tune cadence
 CONF_RESERVE_HOLD_MARGIN = "reserve_hold_margin"      # peak-reserve hold spread (kr/kWh)
@@ -378,6 +383,14 @@ LEGACY_BATTERY_MODE_MAP = {
 # DKK/kWh cycling penalty added to a profile's required arbitrage margin so the
 # planner does not chase small gains and wear the battery (simple wear model).
 BATTERY_WEAR_COST = 0.10
+# #5: LFP cold-charge safety floor (°C). Charging a lithium cell below ~0 °C plates
+# lithium and permanently degrades it, so Wattson never COMMANDS grid-charging below
+# this. Conservative 2 °C margin over the 0 °C cell limit. Discharge is unaffected.
+BATTERY_MIN_CHARGE_TEMP_C = 2.0
+# #10: one-way round-trip efficiency (fraction) of a grid->battery->house cycle on
+# this pack+inverter. A stored kWh only offsets ~this much grid import, so buying to
+# arbitrage is only worth it when the price spread also covers the conversion loss.
+BATTERY_ROUND_TRIP_EFFICIENCY = 0.90
 
 SERVICE_REPLAN = "replan"
 SERVICE_PAUSE = "pause"
