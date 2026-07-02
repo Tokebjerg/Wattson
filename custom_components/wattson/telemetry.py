@@ -27,6 +27,7 @@ from .const import (
     CONF_SOLAR_BIAS_HISTORY,
     CONF_SOLAR_BIAS_INTRADAY,
     DEFAULT_BATTERY_MAX_SOC,
+    EV_MODE_SOLAR_ONLY,
     EXPORT_STUCK_GRID_W,
     SOLAR_BIAS_MAX_DAYS,
     SOLAR_BIAS_MAX_FACTOR,
@@ -39,7 +40,7 @@ from .const import (
 from .deye_contract import TRICKLE_CHARGE_A
 from .horizon import current_price_slot
 from .learning import forecast_confidence, solar_bias_factor
-from .planner import value_increment_kr
+from .planner import effective_solar_surplus_w, value_increment_kr
 
 
 class TelemetryMixin:
@@ -47,6 +48,7 @@ class TelemetryMixin:
 
     def _telemetry_init(self, entry) -> None:
         self.value_today_kr: float = 0.0
+        self.value_yesterday_kr: float = 0.0  # #14: captured at day rollover for the digest
         self.value_total_kr: float = 0.0
         self._value_day = None
         self._value_last_tick: datetime | None = None
@@ -124,6 +126,17 @@ class TelemetryMixin:
         self.avoidable_grid_kwh_today: float = 0.0
         self._avoidable_day = None
         self._avoidable_last_tick = None
+        # #8/#5 (weekly-eval, SHADOW-first): EV "Ren sol" telemetry — OUTCOME (grid-backed
+        # kWh while the car charges in solar mode, the P4 metric) + CAUSE (the surplus
+        # signal the loop USES vs the reclaim-less SHADOW signal; their gap is the
+        # suspected reclaimable double-count). Observe-only: never touches control.
+        self.ev_solar_grid_backed_kwh: float = 0.0
+        self.ev_solar_ev_kwh: float = 0.0
+        self._evsh_used_wh: float = 0.0    # time-weighted surplus-signal sums (W·h)
+        self._evsh_shadow_wh: float = 0.0
+        self._evsh_hours: float = 0.0
+        self._evsh_day = None
+        self._evsh_last_tick: datetime | None = None
         self._curtail_day = None
         self._curtail_last_tick: datetime | None = None
         self._solar_bias_factor: float = solar_bias_factor(
@@ -169,7 +182,11 @@ class TelemetryMixin:
         now = dt_util.utcnow()
         today = dt_util.now().date()
         if self._value_day != today:
-            # New local day: reset today's figure. The lifetime total is never reset.
+            # New local day: capture yesterday's final figure for the morning digest,
+            # then reset today's. The lifetime total is never reset. (In-memory only —
+            # after a restart the digest simply omits the yesterday line.)
+            if self._value_day is not None:
+                self.value_yesterday_kr = self.value_today_kr
             self._value_day = today
             self.value_today_kr = 0.0
         last = self._value_last_tick
@@ -574,3 +591,46 @@ class TelemetryMixin:
         if grid_in <= 300.0 or soc <= 25.0 or batt >= 2000.0:
             return
         self.avoidable_grid_kwh_today += min(grid_in, 3500.0) * dt_hours / 1000.0
+
+    def _accumulate_ev_shadow(self, plan) -> None:
+        """#8/#5: EV "Ren sol" shadow telemetry (observe-only, weekly-eval #6 SHADOW step).
+
+        While the car actually charges in solar-only mode, integrate:
+          - OUTCOME: grid-backed EV energy = ∫min(EV draw, grid import) — how much of the
+            "solar" charge the meter says came from the grid (the old P4 sensor);
+          - CAUSE: the surplus signal the live loop uses (with the battery-charge
+            'reclaimable' term) vs the SHADOW signal without it. The reclaim term is
+            suspected of DOUBLE-COUNTING on this house's derived load (load = pv+grid+batt
+            already nets out the battery charge, so pv−load already contains it) — the
+            time-weighted gap between the two makes the over-offer measurable BEFORE any
+            control change is risked in the EV regression zone."""
+        state = self.site_state
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._evsh_day != today:
+            self._evsh_day = today
+            self.ev_solar_grid_backed_kwh = 0.0
+            self.ev_solar_ev_kwh = 0.0
+            self._evsh_used_wh = 0.0
+            self._evsh_shadow_wh = 0.0
+            self._evsh_hours = 0.0
+            self._evsh_last_tick = None
+        ev_mode = getattr(plan.ev, "mode", None) if (plan is not None and plan.ev is not None) else None
+        ev_draw = max(0.0, (state.easee_power_w or 0.0)) if state is not None else 0.0
+        if state is None or ev_mode != EV_MODE_SOLAR_ONLY or ev_draw < 500.0:
+            self._evsh_last_tick = None  # only integrate contiguous solar-charging time
+            return
+        last = self._evsh_last_tick
+        self._evsh_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        grid_in = max(0.0, state.grid_import_power_w or 0.0)
+        self.ev_solar_ev_kwh += ev_draw * dt_hours / 1000.0
+        self.ev_solar_grid_backed_kwh += min(ev_draw, grid_in) * dt_hours / 1000.0
+        can_reclaim = bool(getattr(self, "battery_control_enabled", False))
+        self._evsh_used_wh += effective_solar_surplus_w(state, can_reclaim) * dt_hours
+        self._evsh_shadow_wh += effective_solar_surplus_w(state, False) * dt_hours
+        self._evsh_hours += dt_hours

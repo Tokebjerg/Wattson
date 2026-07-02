@@ -159,6 +159,9 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         attrs_fn=lambda c: {
             "days_observed": len(getattr(c, "solar_bias_history", []) or []),
             "recent_ratios": list(getattr(c, "solar_bias_history", []) or [])[-7:],
+            # #5/v0.24.36: the reserve-release confidence derived from the same ratios —
+            # 1.0 = full trust, 0.6 floor = recent optimistic forecasts hold more reserve.
+            "forecast_confidence": round(getattr(c, "_forecast_confidence", 1.0), 3),
         },
     ),
     WattsonSensorDescription(
@@ -220,6 +223,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonBatteryHealthSensor(coordinator, entry))
     entities.append(WattsonGridChargeSensor(coordinator, entry))
     entities.append(WattsonHonestSavingsTotalSensor(coordinator, entry))
+    entities.append(WattsonEvSolarShadowSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -694,6 +698,55 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
             "wanted_hours": plan["wanted_hours"],
             "note": plan["note"],
             "hours": plan["hours"],
+        }
+
+
+class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
+    """#8/#5 (observe-only): grid-backed EV energy while charging in "Ren sol" today,
+    plus the surplus-signal SHADOW comparison (the signal the loop uses WITH the
+    reclaim term vs. WITHOUT it) as attributes — the measurement that decides whether
+    the suspected reclaimable double-count fix ever ships. Revives the P4 sensor's
+    unique_id so the orphaned entity comes back to life. Daily; resets on restart."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:car-electric-outline"
+    _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_name = "EV Grid Backed Solar Mode Today"
+        self._attr_unique_id = f"{entry.entry_id}_ev_solar_grid_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.ev_solar_grid_backed_kwh, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        c = self.coordinator
+        hours = getattr(c, "_evsh_hours", 0.0)
+        used = (c._evsh_used_wh / hours) if hours > 0 else None
+        shadow = (c._evsh_shadow_wh / hours) if hours > 0 else None
+        over = (
+            round((used - shadow) / shadow * 100.0, 1)
+            if (used is not None and shadow is not None and shadow > 50.0)
+            else None
+        )
+        ev_kwh = c.ev_solar_ev_kwh
+        return {
+            "ev_kwh_solar_mode": round(ev_kwh, 2),
+            "grid_fraction_pct": round(c.ev_solar_grid_backed_kwh / ev_kwh * 100.0, 1) if ev_kwh > 0.05 else None,
+            "surplus_used_avg_w": round(used) if used is not None else None,
+            "surplus_shadow_avg_w": round(shadow) if shadow is not None else None,
+            "overoffer_pct": over,
+            "hours_observed": round(hours, 2),
+            "note": "Skygge-måling (uge-eval #6): 'used' er overskuds-signalet Ren sol styrer efter (med reclaim-led), 'shadow' er uden. Gabet = mistænkt dobbelt-tælling. Ren observation — styringen er uændret.",
         }
 
 

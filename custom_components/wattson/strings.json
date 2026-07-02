@@ -218,6 +218,22 @@
     "degraded_writes": {
       "title": "Wattson: a setting did not take effect",
       "description": "Wattson wrote these settings but the device never confirmed the change: {entities}. The device may be offline or rejecting commands."
+    },
+    "anomaly_stale": {
+      "title": "Wattson-anomali: inverter-data forældet",
+      "description": "{details}"
+    },
+    "anomaly_avoidable_grid": {
+      "title": "Wattson-anomali: købte strøm trods ladning på batteriet",
+      "description": "{details}"
+    },
+    "anomaly_limit_cycle": {
+      "title": "Wattson-anomali: mistanke om register-limit-cycle",
+      "description": "{details}"
+    },
+    "anomaly_curtailment": {
+      "title": "Wattson-anomali: uventet sol-curtailment",
+      "description": "{details}"
     }
   }
 }

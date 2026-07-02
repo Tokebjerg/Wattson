@@ -135,6 +135,12 @@ def analyze(path):
 
 
 def main(paths):
+    # --check (CI/W1): turn the study into a GATE — exit nonzero on any analyzer error
+    # or a mean plan-vs-oracle efficiency below the floor. The floor (85%) sits under
+    # the long-standing ~90% baseline, so it trips on a real economic regression, not
+    # on day-to-day noise.
+    check = "--check" in paths
+    paths = [p for p in paths if p != "--check"]
     results = []
     for p in paths:
         results.append(analyze(p))
@@ -168,6 +174,19 @@ def main(paths):
         print(f"  missed-discharge days: {a['days_with_missed_discharge']}")
         print(f"  neg-export days: {a['days_with_neg_export']}")
         print(f"  worst headroom: " + ", ".join(f"{w['date']}({w['headroom']:+.2f})" for w in a['worst_headroom_days']))
+    if check:
+        problems = []
+        if not ok:
+            problems.append("no days analyzed")
+        agg = out.get("aggregate") or {}
+        if agg.get("n_errors"):
+            problems.append(f"{agg['n_errors']} day(s) errored")
+        if agg and agg.get("mean_efficiency_pct", 0.0) < 85.0:
+            problems.append(f"mean efficiency {agg.get('mean_efficiency_pct')}% < 85% floor")
+        if problems:
+            print("CHECK FAILED: " + "; ".join(problems))
+            return 1
+        print(f"CHECK OK: {len(ok)} days, 0 errors, mean eff {agg.get('mean_efficiency_pct')}% >= 85%")
     return 0
 
 

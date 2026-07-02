@@ -527,6 +527,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if getattr(self, "_anomaly_day", None) != today:
             self._anomaly_day = today
             self._anomalies_fired: set[str] = set()
+            # New day: clear yesterday's anomaly Repairs unconditionally (cheap no-ops when
+            # absent; the registry persists across restarts while _anomalies_fired does not,
+            # so a guard on the in-memory set would strand a pre-restart issue forever).
+            try:
+                from homeassistant.helpers import issue_registry as ir
+                for k in ("stale", "avoidable_grid", "limit_cycle", "curtailment"):
+                    ir.async_delete_issue(self.hass, DOMAIN, f"anomaly_{k}_{self.config_entry.entry_id}")
+            except Exception:  # noqa: BLE001
+                pass
 
         def alert(key: str, title: str, msg: str) -> None:
             if key in self._anomalies_fired:
@@ -537,6 +546,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 persistent_notification.async_create(
                     self.hass, msg, title=title,
                     notification_id=f"wattson_anomaly_{key}_{self.config_entry.entry_id}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # #16: also surface it in Settings → Repairs so anomalies collect in one
+            # place with a dismiss flow (the notification alone is easy to swipe away).
+            try:
+                from homeassistant.helpers import issue_registry as ir
+                ir.async_create_issue(
+                    self.hass, DOMAIN, f"anomaly_{key}_{self.config_entry.entry_id}",
+                    is_fixable=False, severity=ir.IssueSeverity.WARNING,
+                    translation_key=f"anomaly_{key}",
+                    translation_placeholders={"details": msg},
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -561,6 +582,61 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             alert("curtailment", "Wattson: uventet sol-curtailment",
                   f"~{unintended:.1f} kWh sol ser ud til at være tabt i dag (ud over bevidst negativ-pris-"
                   "curtailment) — en mulig MPPT-stall / over-produktions-regression. Tjek PV-strenge + solar_sell.")
+
+    def _maybe_daily_digest(self) -> None:
+        """#14: ONE morning notification (first tick after 07:00 local) with the night's
+        facts and today's plan — turns the "user notices something and asks" loop into
+        Wattson reporting itself. Pure observability; the caller exception-isolates it.
+        In-memory day flag: a restart after 07 re-sends, replacing the same notification."""
+        now_local = dt_util.now()
+        if now_local.hour < 7:
+            return
+        today = now_local.date()
+        if getattr(self, "_digest_day", None) == today:
+            return
+        self._digest_day = today
+        lines: list[str] = []
+        y = getattr(self, "value_yesterday_kr", 0.0)
+        if y:
+            lines.append(f"**I går:** {y:.2f} kr tjent/sparet.")
+        gc = self.grid_charge_kwh_today
+        if gc >= 0.05:
+            avg = self.grid_charge_cost_today_kr / gc
+            lines.append(f"**I nat:** ladede {gc:.1f} kWh fra nettet til snit {avg:.2f} kr/kWh (planlagt billig-ladning).")
+        else:
+            lines.append("**I nat:** ingen net-ladning — batteriet/solen dækkede huset.")
+        av = getattr(self, "avoidable_grid_kwh_today", 0.0)
+        if av >= 0.3:
+            lines.append(f"⚠️ {av:.1f} kWh købt fra nettet mens batteriet havde brugbar ladning (se anomali-alarm).")
+        st = self.site_state
+        if st is not None and st.battery_soc_pct is not None:
+            lines.append(f"**Batteri nu:** {st.battery_soc_pct:.0f} %.")
+        if st is not None and st.solar_slots:
+            kwh = sum(
+                s.pv_estimate_kwh for s in st.solar_slots
+                if s.start.astimezone(now_local.tzinfo).date() == today
+            )
+            conf = getattr(self, "_forecast_confidence", 1.0)
+            lines.append(f"**Solprognose i dag:** ~{kwh:.0f} kWh (tillid {conf:.2f}).")
+        plan = self.control_plan
+        if plan is not None and plan.schedule:
+            counts: dict[str, int] = {}
+            for t in plan.schedule:
+                counts[t.action] = counts.get(t.action, 0) + 1
+            bits = [f"{counts[a]} t {label}" for a, label in
+                    (("GRID_CHARGE", "net-ladning"), ("SOLAR_CHARGE", "sol-ladning"),
+                     ("EXPORT", "salg"), ("DISCHARGE", "afladning")) if counts.get(a)]
+            if bits:
+                lines.append("**Plan i dag:** " + ", ".join(bits) + ".")
+        try:
+            from homeassistant.components import persistent_notification
+            persistent_notification.async_create(
+                self.hass, "\n\n".join(lines) or "Ingen data endnu.",
+                title="Wattson morgen-status",
+                notification_id=f"wattson_digest_{self.config_entry.entry_id}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
@@ -1379,7 +1455,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # control loop — it is pure observability. Swallow + log any error here.
         try:
             self._accumulate_avoidable_grid(self.control_plan)
+            self._accumulate_ev_shadow(self.control_plan)
             self._check_anomalies()
+            self._maybe_daily_digest()
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Wattson self-diagnosis failed (non-fatal): %s", err)
         return self.control_plan

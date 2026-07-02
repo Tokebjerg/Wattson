@@ -1895,6 +1895,211 @@ def test_tou_management():
 
 
 # --------------------------------------------------------------------------- #
+# 12a2. DST transition days — the 23h/25h Danish days must not break the plan.
+# --------------------------------------------------------------------------- #
+def test_dst_transitions():
+    """#2/CI (v0.24.38): build_day_plan over BOTH Europe/Copenhagen DST days —
+    spring-forward 2026-03-29 (02:00→03:00 skipped, 23 UTC-hours) and fall-back
+    2026-10-25 (02:00 repeats, 25 UTC-hours). The engine works in tz-aware UTC
+    instants end-to-end, so hourly slots across the jump must plan cleanly: no
+    exception, full remaining horizon, projected SOC populated. A regression net
+    for any naive local-hour arithmetic ever creeping in."""
+    checks = []
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/Copenhagen")
+    for label, y, m, d, expect_hours in (
+        ("spring-forward 29/3 (23h)", 2026, 3, 29, 23),
+        ("fall-back 25/10 (25h)", 2026, 10, 25, 25),
+    ):
+        start_utc = datetime(y, m, d, 0, 0, tzinfo=tz).astimezone(timezone.utc)
+        end_utc = (datetime(y, m, d, 23, 0, tzinfo=tz) + timedelta(hours=1)).astimezone(timezone.utc)
+        n_hours = int((end_utc - start_utc).total_seconds() // 3600)
+        checks.append((f"DST {label}: the local day spans {expect_hours} UTC hours", n_hours == expect_hours, str(n_hours)))
+        price_slots, solar_slots = [], []
+        for i in range(n_hours):
+            s = start_utc + timedelta(hours=i)
+            hod = s.astimezone(tz).hour
+            price = 2.5 if 17 <= hod <= 21 else (0.8 if hod <= 5 else 1.4)
+            price_slots.append(models.PriceSlot(start=s, spot_price=price, tariff=0.0,
+                                                total_import_price=price, export_value=max(0.0, price - 0.8)))
+            solar_slots.append(models.SolarSlot(start=s, pv_estimate_kwh=(3.0 if 9 <= hod <= 15 else 0.0)))
+        now = start_utc + timedelta(minutes=90)  # inside hour 1, BEFORE the 02:00 jump
+        st = models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=600.0, load_includes_ev=False,
+            grid_power_w=600.0, grid_import_power_w=600.0, grid_export_power_w=0.0,
+            battery_soc_pct=55.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.8, current_sell_price=0.0, forecast_today_kwh=20.0,
+            price_slots=price_slots, solar_slots=solar_slots,
+        )
+        try:
+            dp = planner.build_day_plan(
+                st, battery_mode=const.BATTERY_MODE_BLUE, min_soc=15, max_soc=100,
+                capacity_kwh=10.0, load_hourly_w={h: 600.0 for h in range(24)},
+            )
+            n_slots = len(dp.slots) if dp else 0
+            socs_ok = dp is not None and all(s.projected_soc_pct is not None for s in dp.slots)
+            checks.append((f"DST {label}: plan builds through the jump [{n_slots} slots]",
+                           dp is not None and n_slots >= expect_hours - 2, f"slots={n_slots}"))
+            checks.append((f"DST {label}: projected SOC populated across the transition",
+                           socs_ok, "ok" if socs_ok else "missing"))
+        except Exception as err:  # noqa: BLE001
+            checks.append((f"DST {label}: build_day_plan must not raise", False, f"{type(err).__name__}: {err}"))
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# 12a3. Coordinator tick-harness — the REAL _async_apply_ev under a controlled
+# clock. The v0.24.9 regression class (green sim, live car-cycling) existed
+# precisely because coordinator TIMING was untestable offline; this section
+# closes that for the current-gating half of the loop. The solar-dip-hold
+# (P1/P2 in _async_update_data) remains live-verified only.
+# --------------------------------------------------------------------------- #
+def _coordinator_module():
+    """Import wattson.coordinator under the sim's HA stubs (extended on demand)."""
+    if "homeassistant.config_entries" not in sys.modules:
+        ce_mod = types.ModuleType("homeassistant.config_entries")
+
+        class ConfigEntry:  # marker type only
+            pass
+
+        ce_mod.ConfigEntry = ConfigEntry
+        sys.modules["homeassistant.config_entries"] = ce_mod
+        sys.modules["homeassistant"].config_entries = ce_mod
+    if "homeassistant.helpers.update_coordinator" not in sys.modules:
+        helpers = sys.modules.get("homeassistant.helpers") or types.ModuleType("homeassistant.helpers")
+
+        class DataUpdateCoordinator:
+            # The real class is generic (DataUpdateCoordinator[ControlPlan]).
+            def __class_getitem__(cls, item):
+                return cls
+
+            def __init__(self, *a, **k):
+                pass
+
+        uc = types.ModuleType("homeassistant.helpers.update_coordinator")
+        uc.DataUpdateCoordinator = DataUpdateCoordinator
+        helpers.update_coordinator = uc
+        sys.modules["homeassistant.helpers"] = helpers
+        sys.modules["homeassistant.helpers.update_coordinator"] = uc
+        sys.modules["homeassistant"].helpers = helpers
+    return importlib.import_module("wattson.coordinator")
+
+
+def test_coordinator_ev_harness():
+    """#1 (v0.24.38): drive the SHIPPING WattsonCoordinator._async_apply_ev — not a
+    copy — through timed scenarios. The instance is built with object.__new__ (skips
+    the HA-only __init__), only the attributes the method reads are set, and `now`
+    is advanced tick by tick. Locks the four live-won anti-cycling protections:
+    (a) ±deadband current wiggles never reach the charger, (b) material current
+    changes are rate-limited to one per EV_CURRENT_RETUNE_SECONDS, (c) structural
+    changes apply immediately, (d) the stuck-car nudge re-asserts at its own slow
+    cadence and stops when charging — plus the write cooldown retry."""
+    import asyncio
+
+    checks = []
+    co_mod = _coordinator_module()
+
+    class _Entry:
+        options: dict = {}
+        data: dict = {}
+        entry_id = "harness"
+
+    class _Easee:
+        def __init__(self):
+            self.calls = []
+
+        async def apply_ev_plan(self, mapping, state, ev):
+            self.calls.append((ev.desired_action, ev.desired_amps, ev.desired_circuit_currents))
+            return [f"easee:{ev.desired_action}:{ev.desired_amps}A"]
+
+    def make_co(status="charging"):
+        co = object.__new__(co_mod.WattsonCoordinator)
+        co.ev_control_enabled = True
+        co.config_entry = _Entry()
+        co.mapping = None
+        co._easee = _Easee()
+        co._last_ev_fp = None
+        co._last_ev_amps = None
+        co._last_ev_currents = None
+        co._last_ev_current_change_at = None
+        co._last_ev_resume_retry_at = None
+        co._last_ev_write_at = None
+        co.site_state = models.SiteState(
+            timestamp=datetime(2026, 6, 30, 10, 0, tzinfo=timezone.utc),
+            pv_power_w=4000.0, load_power_w=800.0, load_includes_ev=True,
+            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+            battery_soc_pct=60.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status=status, easee_power_w=2300.0, easee_session_kwh=1.0,
+            easee_phase_mode="auto", current_buy_price=1.0, current_sell_price=0.3,
+            forecast_today_kwh=40.0, price_slots=[], solar_slots=[],
+        )
+        return co
+
+    def ev(amps, action="resume", enabled=True):
+        return types.SimpleNamespace(ev=models.EvPlan(
+            mode="solar_only", reason="", desired_enabled=enabled, desired_amps=amps,
+            desired_circuit_currents=(amps, amps, amps), desired_phase_mode="auto_phase",
+            desired_action=action,
+        ))
+
+    t0 = datetime(2026, 6, 30, 10, 0, tzinfo=timezone.utc)
+
+    def at(s):
+        return t0 + timedelta(seconds=s)
+
+    # (a) Deadband: after the initial apply, ±1 A solar wiggles for 2 min → ZERO calls.
+    co = make_co()
+    asyncio.run(co._async_apply_ev(ev(10), at(0)))
+    n0 = len(co._easee.calls)
+    for i, amps in enumerate((11, 9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10)):
+        asyncio.run(co._async_apply_ev(ev(amps), at(10 + i * 10)))
+    checks.append((f"harness deadband: ±1A wiggles for 2 min → 0 charger calls [{len(co._easee.calls) - n0}]",
+                   n0 == 1 and len(co._easee.calls) == n0, str(co._easee.calls)))
+
+    # (b) Re-tune rate limit: material 10↔16 A flips every 30 s for 6 min apply EXACTLY
+    # once per 90 s window — calls at t0,90,180,270,360 (5 total), never per-tick (13).
+    co = make_co()
+    for i in range(13):
+        amps = 10 if (i % 2 == 0) else 16
+        asyncio.run(co._async_apply_ev(ev(amps), at(i * 30)))
+    checks.append((f"harness retune: 10↔16A flips every 30s → exactly 5 calls in 6 min (1 per 90s) [{len(co._easee.calls)}]",
+                   len(co._easee.calls) == 5, str(len(co._easee.calls))))
+
+    # (c) Structural change applies immediately (no 90 s wait), only the 10 s write
+    # cooldown gates it: current change at t0, action flip at t15 → applied.
+    co = make_co()
+    asyncio.run(co._async_apply_ev(ev(10), at(0)))
+    asyncio.run(co._async_apply_ev(ev(10, action="pause", enabled=False), at(15)))
+    checks.append((f"harness structural: action flip applies immediately despite retune window [{len(co._easee.calls)}]",
+                   len(co._easee.calls) == 2, str(co._easee.calls)))
+
+    # (d) Stuck-car nudge: plan wants charging, charger stays awaiting_start → re-assert
+    # at t0 then every 60 s (4 calls over 3 min, ticking every 10 s) — and STOPS the
+    # moment the car actually charges.
+    co = make_co(status="awaiting_start")
+    for i in range(19):
+        asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
+    n_nudge = len(co._easee.calls)
+    co.site_state = replace(co.site_state, easee_status="charging")
+    for i in range(19, 25):
+        asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
+    checks.append((f"harness nudge: awaiting_start re-asserted 1/60s (4 in 3 min), stops when charging [{n_nudge}→{len(co._easee.calls)}]",
+                   n_nudge == 4 and len(co._easee.calls) == n_nudge, f"{n_nudge}/{len(co._easee.calls)}"))
+
+    # (e) Write cooldown: a second structural change 5 s after the first is HELD and
+    # retried — applied cleanly at t15 (fp not falsely marked as applied at t5).
+    co = make_co()
+    asyncio.run(co._async_apply_ev(ev(10), at(0)))
+    blocked = asyncio.run(co._async_apply_ev(ev(10, enabled=False), at(5)))
+    applied = asyncio.run(co._async_apply_ev(ev(10, enabled=False), at(15)))
+    checks.append((f"harness cooldown: change at +5s held (retry), applied at +15s [{len(co._easee.calls)}]",
+                   blocked == [] and len(applied) == 1 and len(co._easee.calls) == 2, f"{blocked}/{applied}"))
+
+    return checks
+
+
+# --------------------------------------------------------------------------- #
 # 12b. Phase E — timed manual override (forced action, auto-resume).
 # --------------------------------------------------------------------------- #
 def test_e_override():
@@ -3511,6 +3716,8 @@ def main():
                          ("PHASE E2 · COOLDOWNS + MASTER LOCK", test_e2_master_lock),
                          ("ANTI-HUNT MODE DWELL", test_mode_dwell),
                          ("DST / SOMMERTID · LOCAL-TIME TIMESTAMP", test_dst_local_time),
+                         ("DST / SOMMERTID · 23h/25h PLAN-DAGE", test_dst_transitions),
+                         ("COORDINATOR-HARNESS · EV-LOOP TIMING (ægte _async_apply_ev)", test_coordinator_ev_harness),
                          ("NEGATIVE-PRICE ABSORPTION (paid to import)", test_negative_import_absorb),
                          ("FORECAST PEAK-RESERVE (A+B)", test_peak_reserve),
                          ("PEAK-RESERVE SUNNY RELEASE (summer overnight floor)", test_peak_reserve_sunny_release),
