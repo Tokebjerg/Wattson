@@ -1564,9 +1564,12 @@ def test_phase_gaps():
     checks.append(("ready-by: reason names the deadline", "before 05:00" in sched(3, 5).reason, sched(3, 5).reason))
 
     # ---- EV-forbedringer (helårs plug & play) ------------------------------- #
-    # Solar-only + deadline: grid-complete in the cheapest hours before the
-    # deadline when the sun can't deliver (winter/grey days) — without a deadline,
-    # solar-only still never grid-charges.
+    # "Ren sol" is PURE SOLAR (v0.24.44, user 2026-07-02): a ready-by ("Klar senest")
+    # deadline must NOT force a grid/battery top-up in solar_only — it used to
+    # grid-complete before the deadline, but with the EV drawing, EV_SOLAR_PRIORITY
+    # holds discharge OPEN so that "grid" completion drained the house battery into the
+    # car after sunset. The car now PAUSES when there is no solar surplus, WHATEVER the
+    # deadline. (Deadline grid-charging lives in scheduled_cheapest.)
     def solar(now_h, ready_hour=-1, surplus=0.0, soc=80.0, threshold=0.0):
         st = ev_state(at(now_h))
         st = replace_state(st, battery_soc_pct=soc)
@@ -1581,20 +1584,17 @@ def test_phase_gaps():
         return _dc.replace(st, **kw)
 
     p_backup = solar(3, ready_hour=5, surplus=0.0)
-    checks.append(("solar-only + deadline + no sun -> grid-completes in a cheapest pre-deadline hour",
-                   p_backup.desired_action == "resume" and p_backup.desired_amps == 16 and "grid-completing" in p_backup.reason,
+    checks.append(("Ren sol + deadline + no sun -> PAUSES (no grid/battery completion — user fix)",
+                   p_backup.desired_action == "pause" and "grid-completing" not in p_backup.reason,
                    f"{p_backup.desired_action}/{p_backup.reason[:60]}"))
-    p_backup_out = solar(0, ready_hour=5, surplus=0.0)
-    checks.append(("solar-only deadline backup pauses OUTSIDE the cheapest pre-deadline hours",
-                   p_backup_out.desired_action == "pause", f"{p_backup_out.desired_action}/{p_backup_out.reason[:50]}"))
     p_nodeadline = solar(3, ready_hour=-1, surplus=0.0)
-    checks.append(("solar-only WITHOUT deadline still never grid-charges (unchanged)",
+    checks.append(("Ren sol WITHOUT deadline never grid-charges (unchanged)",
                    p_nodeadline.desired_action == "pause", p_nodeadline.desired_action))
-    p_gated_backup = solar(3, ready_hour=5, surplus=0.0, soc=30.0, threshold=50.0)
-    checks.append(("deadline grid-backup bypasses the house-battery SOLAR gate (grid steals no sun)",
-                   p_gated_backup.desired_action == "resume", f"{p_gated_backup.desired_action}/{p_gated_backup.reason[:50]}"))
+    p_gated = solar(3, ready_hour=5, surplus=0.0, soc=30.0, threshold=50.0)
+    checks.append(("Ren sol + deadline + low battery still PAUSES (no deadline grid-backup)",
+                   p_gated.desired_action == "pause", f"{p_gated.desired_action}/{p_gated.reason[:50]}"))
     p_sun_first = solar(3, ready_hour=5, surplus=3000.0)
-    checks.append(("solar-only + deadline still prefers SUN when surplus exists",
+    checks.append(("Ren sol + deadline still charges when SUN surplus exists (dips unaffected)",
                    p_sun_first.desired_action == "resume" and "Solar surplus" in p_sun_first.reason, p_sun_first.reason[:50]))
 
     # Cheapest-mode solar opportunism: outside the cheapest grid hours a surplus

@@ -2166,26 +2166,18 @@ def build_ev_plan(
                 desired_phase_mode="auto_phase",
             )
 
-        # "Klar senest"-backup: solar-only used to mean the car NEVER charged on
-        # sunless (winter/grey) days. With a ready-by deadline set, grid-complete in
-        # the cheapest hours before the deadline instead — year-round plug & play:
-        # sun when there is sun, cheapest grid when there isn't. Grid charging does
-        # not compete with the house battery for SOLAR, so the battery-threshold
-        # gate deliberately does not block this path.
-        deadline = _ready_deadline()
-        if deadline is not None:
-            cheapest = _in_cheapest_before(deadline, ev_required_hours)
-            if cheapest is not None and cheapest[0]:
-                return EvPlan(
-                    mode=ev_mode,
-                    reason=(
-                        f"Solar shortfall — grid-completing in a cheapest hour ({cheapest[1]:.2f}) "
-                        f"before {int(ev_ready_hour):02d}:00"
-                    ),
-                    desired_enabled=True,
-                    desired_amps=int(ev_max_amps),
-                    desired_action="resume",
-                )
+        # "Ren sol" is PURE SOLAR (user, 2026-07-02): the ready-by ("Klar senest")
+        # deadline must NOT force a grid/battery top-up in solar_only. It used to
+        # grid-complete in the cheapest hours before the deadline on a solar shortfall
+        # ("year-round plug & play") — but with the EV drawing, EV_SOLAR_PRIORITY holds
+        # the discharge OPEN, so that "grid" completion actually DRAINED the house
+        # battery into the car after sunset (live 2026-07-02, 21:18: PV ~155 W, pack
+        # 100->80 %). The car now simply PAUSES when there is no solar surplus (falls
+        # through below); the battery still covers BRIEF real-sun dips via the
+        # coordinator's dip-hold + EV_SOLAR_PRIORITY (unchanged), so a passing cloud is
+        # ridden from the pack, never the grid. For a guaranteed ready-by-deadline that
+        # DOES buy cheap grid, use "Planlagt billigste" (scheduled_cheapest) — that is
+        # the mode whose whole purpose is deadline grid-charging.
 
         if battery_gated:
             return EvPlan(
