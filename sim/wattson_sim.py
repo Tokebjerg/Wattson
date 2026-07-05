@@ -2190,18 +2190,24 @@ def test_coordinator_ev_harness():
     sk._ev_soak_last_step_at = None
     sk._ev_soak_import_since = None
     st0 = datetime(2026, 7, 2, 13, 0, tzinfo=timezone.utc)
-    a_engage = sk._ev_soak_ramp_step(st0, was_active=False, grid_import_w=0.0, ev_max_amps=16)
+    def soak(t_s, was, grid=0.0, batt=0.0):
+        return sk._ev_soak_ramp_step(st0 + timedelta(seconds=t_s), was_active=was,
+                                     grid_import_w=grid, battery_power_w=batt, ev_max_amps=16)
+    a_engage = soak(0, False)
     checks.append(("soak wiring: engage starts at 6 A", a_engage == 6, str(a_engage)))
-    ramp = [sk._ev_soak_ramp_step(st0 + timedelta(seconds=130 * i), was_active=True, grid_import_w=0.0, ev_max_amps=16)
-            for i in range(1, 6)]
-    checks.append((f"soak wiring: RAMPS 6->8->10->12->14->16 while grid ~0 (the bug guard) {ramp}",
+    ramp = [soak(130 * i, True) for i in range(1, 6)]
+    checks.append((f"soak wiring: RAMPS 6->8->10->12->14->16 while grid~0 + battery~0 (bug guard) {ramp}",
                    ramp == [8, 10, 12, 14, 16], str(ramp)))
-    checks.append(("soak wiring: capped at max, holds at 16",
-                   sk._ev_soak_ramp_step(st0 + timedelta(seconds=900), was_active=True, grid_import_w=0.0, ev_max_amps=16) == 16, "16"))
-    sk._ev_soak_ramp_step(st0 + timedelta(seconds=1000), was_active=True, grid_import_w=1500.0, ev_max_amps=16)  # import starts
-    a_back = sk._ev_soak_ramp_step(st0 + timedelta(seconds=1050), was_active=True, grid_import_w=1500.0, ev_max_amps=16)  # 50s -> persistent
+    checks.append(("soak wiring: capped at max, holds at 16", soak(900, True) == 16, "16"))
+    soak(1000, True, grid=1500.0)  # grid import starts
+    a_back = soak(1050, True, grid=1500.0)  # 50s -> persistent -> back off
     checks.append((f"soak wiring: persistent grid import backs off one step (16->14) {a_back}", a_back == 14, str(a_back)))
-    a_reengage = sk._ev_soak_ramp_step(st0 + timedelta(seconds=1200), was_active=False, grid_import_w=0.0, ev_max_amps=16)
+    # v0.24.43: the BATTERY-draw overshoot (grid ~0 but the pack covers the over-offered car).
+    soak(1200, True, grid=0.0, batt=2000.0)  # battery discharging 2 kW into the car, grid ~0
+    a_batt = soak(1250, True, grid=0.0, batt=2000.0)  # 50s persistent -> back off despite grid ~0
+    checks.append((f"soak wiring: persistent BATTERY discharge backs off even with grid ~0 (14->12) {a_batt}",
+                   a_batt == 12, str(a_batt)))
+    a_reengage = soak(1400, False)
     checks.append(("soak wiring: re-engage after a gap resets to 6 A", a_reengage == 6, str(a_reengage)))
 
     return checks

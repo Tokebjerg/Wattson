@@ -14,6 +14,7 @@ from homeassistant.util import dt as dt_util
 from .config import entry_value, merged_entry_config, update_entry_options
 from .const import (
     BATTERY_MIN_CHARGE_TEMP_C,
+    EV_SOAK_BATTERY_DRAW_W,
     EV_SOAK_IMPORT_HOLD_SECONDS,
     EV_SOAK_IMPORT_W,
     EV_SOAK_MIN_PV_W,
@@ -714,21 +715,29 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         except Exception:  # noqa: BLE001
             pass
 
-    def _ev_soak_ramp_step(self, now, *, was_active: bool, grid_import_w, ev_max_amps: int) -> int:
+    def _ev_soak_ramp_step(self, now, *, was_active: bool, grid_import_w, battery_power_w, ev_max_amps: int) -> int:
         """One hill-climb step of the EV curtailment-soak offered current (called only while
         the gate is open). ``was_active`` = the soak ran last tick; on the engage EDGE
-        (was_active False) it starts fresh at 6 A, otherwise it ramps against grid import:
-        +2 A once the step interval elapses while grid ~0, -2 A when import persists past the
-        debounce, floored at 6 A, capped at ``ev_max_amps``. Returns the offered amps.
-        Extracted so the coordinator harness can drive it over a controlled clock — the
-        v0.24.41 wiring bug (re-init at 6 A EVERY tick, so it never ramped) lived exactly
-        here and is now regression-tested."""
+        (was_active False) it starts fresh at 6 A, otherwise it ramps against the OVERSHOOT
+        signal: +2 A once the step interval elapses while there is no overshoot, -2 A when
+        overshoot persists past the debounce, floored at 6 A, capped at ``ev_max_amps``.
+
+        OVERSHOOT = grid import > EV_SOAK_IMPORT_W OR battery DISCHARGE > EV_SOAK_BATTERY_DRAW_W
+        (battery_power_w > 0 == discharging). The battery term is CRITICAL (v0.24.43): in
+        solar_only the discharge register is OPEN, so an over-offered car is covered by the
+        PACK, not the grid — a grid-only climb never sees it and drains the pack to empty.
+        With the battery term the loop settles at car ~= PV (battery ~0, grid ~0). Extracted
+        so the coordinator harness can drive it over a controlled clock (also the v0.24.41
+        wiring-bug guard: re-init at 6 A every tick meant it never ramped)."""
         if not was_active:
             self._ev_soak_amps = EV_SOAK_START_A
             self._ev_soak_last_step_at = now
             self._ev_soak_import_since = None
-        importing = max(0.0, grid_import_w or 0.0) > EV_SOAK_IMPORT_W
-        if importing:
+        overshoot = (
+            max(0.0, grid_import_w or 0.0) > EV_SOAK_IMPORT_W
+            or (battery_power_w or 0.0) > EV_SOAK_BATTERY_DRAW_W
+        )
+        if overshoot:
             if self._ev_soak_import_since is None:
                 self._ev_soak_import_since = now
         else:
@@ -742,7 +751,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             or (now - self._ev_soak_last_step_at).total_seconds() >= EV_SOAK_STEP_SECONDS
         )
         new_amps = ev_soak_next_amps(
-            self._ev_soak_amps, importing=importing, import_persistent=import_persistent,
+            self._ev_soak_amps, importing=overshoot, import_persistent=import_persistent,
             step_due=step_due, start_a=EV_SOAK_START_A, step_a=EV_SOAK_STEP_A, max_a=ev_max_amps,
         )
         if new_amps != self._ev_soak_amps:
@@ -1255,7 +1264,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 self._ev_curtailment_soak_active = True
                 _soak_amps = self._ev_soak_ramp_step(
                     now, was_active=_soak_was_active,
-                    grid_import_w=self.site_state.grid_import_power_w, ev_max_amps=ev_max_amps,
+                    grid_import_w=self.site_state.grid_import_power_w,
+                    battery_power_w=self.site_state.battery_power_w, ev_max_amps=ev_max_amps,
                 )
                 ev_plan = replace(
                     ev_plan,

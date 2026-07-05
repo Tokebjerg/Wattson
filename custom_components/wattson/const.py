@@ -317,7 +317,14 @@ EV_SOAK_START_A = 6                   # 1-phase minimum start
 EV_SOAK_STEP_A = 2                    # ramp increment (== the apply-layer current deadband)
 EV_SOAK_STEP_SECONDS = 120           # hold ~2 min between ramp-up steps (> the 90s retune)
 EV_SOAK_IMPORT_W = 400.0             # grid import above this = the car overshot the PV
-EV_SOAK_IMPORT_HOLD_SECONDS = 45     # import must persist this long before backing off (debounce)
+# CRITICAL (v0.24.43): in solar_only the battery discharge is OPEN (EV_SOLAR_PRIORITY covers
+# dips from the pack), so when the car overshoots the PV the BATTERY silently covers the gap
+# and GRID stays ~0 — masking the overshoot from a grid-only hill-climb, which then ramps to
+# max and DRAINS the pack into the car. So the overshoot signal must ALSO trip on battery
+# DISCHARGE (battery_power_w > 0). This is exactly the spec's "back off if the battery starts
+# being used wrong". The pack settles at car ~= PV (battery ~0, grid ~0).
+EV_SOAK_BATTERY_DRAW_W = 300.0       # battery discharge above this = the car overshot the PV
+EV_SOAK_IMPORT_HOLD_SECONDS = 45     # overshoot must persist this long before backing off (debounce)
 
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan
