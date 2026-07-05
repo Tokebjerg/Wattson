@@ -71,6 +71,17 @@ BATTERY -> GRID (the no-export rule)
   expresses real intent: grid-charge hours, force-charge/hold overrides, and
   EV-solar priority (don't drain the house battery into the car).
 
+EV CURTAILMENT-SOAK IS REGISTER-NEUTRAL (v0.24.41)
+  When the inverter curtails PV at a full pack + blocked/negative export, the
+  EV curtailment-soak uses the car as a controlled dump-load. It is PURELY an
+  EV-offer change (Easee amps / circuit currents) driven by a grid-import
+  hill-climb — it NEVER writes a battery/inverter register. solar_sell stays
+  OFF (set by the battery plan, not the soak), discharge stays OPEN (EV-solar
+  priority in solar_only), Zero-export-to-CT + Load-first are untouched. So the
+  soak cannot form the solar_sell=ON + discharge=0 stall pair, cannot export
+  the battery, and cannot violate any invariant above — verify any change to it
+  keeps that separation (offer-only), do NOT let it reach into the battery plan.
+
 LIVE-CACHE BAN (three strikes: v0.8.2 discharge, v0.12.1 charge, v0.18.2
 export limit)
   Never initialise a default from a LIVE register read — a restart while a

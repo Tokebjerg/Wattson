@@ -2557,6 +2557,56 @@ def ev_covers_dips_from_battery(ev_mode: str) -> bool:
     return ev_mode == EV_MODE_SOLAR_ONLY
 
 
+def ev_curtailment_soak_gate(
+    *,
+    ev_mode: str,
+    ev_connected: bool,
+    export_blocked: bool,
+    soc_pct: float,
+    max_soc_pct: float,
+    pv_power_w: float | None,
+    near_full_margin_pct: float,
+    min_pv_w: float,
+) -> bool:
+    """v0.24.41 — whether to run the EV curtailment-soak (use the car as a controlled
+    dump-load for solar the inverter is CURTAILING). ALL must hold: solar_only mode; the
+    charger connected/ready; export blocked or <=0 (so a full pack + no export = the
+    inverter throttles PV); the battery full/near-full (can't absorb the surplus itself);
+    and real daylight (some PV to reclaim). Deliberately does NOT trust the measured
+    surplus — that signal is suppressed by the very curtailment we're detecting; the
+    caller's grid-import hill-climb discovers the true reclaimable amount instead."""
+    return bool(
+        ev_mode == EV_MODE_SOLAR_ONLY
+        and ev_connected
+        and export_blocked
+        and soc_pct >= (max_soc_pct - near_full_margin_pct)
+        and (pv_power_w or 0.0) >= min_pv_w
+    )
+
+
+def ev_soak_next_amps(
+    prev_amps: int,
+    *,
+    importing: bool,
+    import_persistent: bool,
+    step_due: bool,
+    start_a: int,
+    step_a: int,
+    max_a: int,
+) -> int:
+    """v0.24.41 — one hill-climb step for the curtailment-soak offered current, keyed on
+    GRID IMPORT (not the curtailment-suppressed surplus). Persistent grid import means the
+    car has overshot the available PV → back OFF one step. Grid ~0 (the extra draw is
+    covered by previously-curtailed PV) + the step interval elapsed → ramp UP one step,
+    capped at ``max_a``. Never drops below ``start_a`` (the 1-phase minimum). It only ever
+    ADJUSTS the offer — it never pauses the session (the v0.24.9 cycling lesson)."""
+    if import_persistent:
+        return max(start_a, prev_amps - step_a)
+    if not importing and step_due and prev_amps < max_a:
+        return min(max_a, prev_amps + step_a)
+    return prev_amps
+
+
 def should_prioritize_ev_solar(
     ev_plan: EvPlan,
     *,

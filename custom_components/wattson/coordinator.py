@@ -14,6 +14,13 @@ from homeassistant.util import dt as dt_util
 from .config import entry_value, merged_entry_config, update_entry_options
 from .const import (
     BATTERY_MIN_CHARGE_TEMP_C,
+    EV_SOAK_IMPORT_HOLD_SECONDS,
+    EV_SOAK_IMPORT_W,
+    EV_SOAK_MIN_PV_W,
+    EV_SOAK_NEAR_FULL_MARGIN_PCT,
+    EV_SOAK_START_A,
+    EV_SOAK_STEP_A,
+    EV_SOAK_STEP_SECONDS,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
     CONF_AUTOMATION_ENABLED,
@@ -168,7 +175,9 @@ from .planner import (
     effective_solar_surplus_w,
     ev_current_within_deadband,
     ev_covers_dips_from_battery,
+    ev_curtailment_soak_gate,
     ev_drawing_real_power,
+    ev_soak_next_amps,
     profile_for,
     should_prioritize_ev_solar,
     tou_setpoint,
@@ -242,6 +251,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # below the engage point — so we hold that state until SOC falls past the
         # (deeper) release band, instead of flapping the registers at the boundary.
         self._ev_full_buffer_active: bool = False
+        # EV curtailment-soak (v0.24.41): hill-climb state for using the car as a dump-load
+        # for solar the inverter curtails at negative export + full battery. Volatile by
+        # design (re-derives within a couple of minutes; a restart just re-starts at 6 A).
+        self._ev_curtailment_soak_active: bool = False
+        self._ev_soak_amps: int = EV_SOAK_START_A
+        self._ev_soak_last_step_at: datetime | None = None
+        self._ev_soak_import_since: datetime | None = None
         # S2: sticky sell-ceiling for the reactive path — latch the full-battery sell
         # flag on at >=max_soc, release only below max_soc-NEAR_FULL, so the overnight
         # 99<->100 SOC tick doesn't flap the solar_sell switch.
@@ -1158,6 +1174,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if forced_ev is not None:
                 ev_plan = forced_ev
 
+        self._ev_curtailment_soak_active = False
         if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
             normalized_status = (self.site_state.easee_status or "").lower()
@@ -1165,6 +1182,73 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 (self.site_state.easee_power_w or 0.0) >= 200.0
                 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
             )
+
+            # EV curtailment-soak (v0.24.41): when export is blocked/<=0 AND the battery is
+            # full/near-full, the inverter CURTAILS PV, so the measured surplus that normally
+            # sizes the offer is artificially low and starves the car while free solar is
+            # thrown away. Use the car as a controlled dump-load: OVERRIDE the offer with a
+            # hill-climb on GRID IMPORT — ramp up while grid ~0 (the extra draw is covered by
+            # previously-curtailed PV), back off when grid import persists. Pure EV-offer
+            # override; the battery/inverter registers (sell OFF, Zero export to CT, Load
+            # first) are untouched by this — the EV_SOLAR_PRIORITY block below still runs.
+            _soak_slot = (
+                current_price_slot(self.site_state.price_slots, self.site_state.timestamp)
+                if self.site_state.price_slots else None
+            )
+            _soak_export_blocked = negative_price_active or (
+                _soak_slot is not None and _soak_slot.export_value is not None
+                and _soak_slot.export_value <= 0.0
+            )
+            _soak_max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
+            if ev_curtailment_soak_gate(
+                ev_mode=self.ev_mode,
+                ev_connected=ev_session_active,
+                export_blocked=bool(_soak_export_blocked),
+                soc_pct=self.site_state.battery_soc_pct,
+                max_soc_pct=_soak_max_soc,
+                pv_power_w=self.site_state.pv_power_w,
+                near_full_margin_pct=EV_SOAK_NEAR_FULL_MARGIN_PCT,
+                min_pv_w=EV_SOAK_MIN_PV_W,
+            ):
+                if not self._ev_curtailment_soak_active:
+                    # (re-)engage: this flag is reset to False every tick above, so
+                    # "not active" here means the gate just (re)opened -> start at 6 A.
+                    self._ev_soak_amps = EV_SOAK_START_A
+                    self._ev_soak_last_step_at = now
+                    self._ev_soak_import_since = None
+                self._ev_curtailment_soak_active = True
+                _grid_in = max(0.0, self.site_state.grid_import_power_w or 0.0)
+                _importing = _grid_in > EV_SOAK_IMPORT_W
+                if _importing:
+                    if self._ev_soak_import_since is None:
+                        self._ev_soak_import_since = now
+                else:
+                    self._ev_soak_import_since = None
+                _import_persistent = (
+                    self._ev_soak_import_since is not None
+                    and (now - self._ev_soak_import_since).total_seconds() >= EV_SOAK_IMPORT_HOLD_SECONDS
+                )
+                _step_due = (
+                    self._ev_soak_last_step_at is None
+                    or (now - self._ev_soak_last_step_at).total_seconds() >= EV_SOAK_STEP_SECONDS
+                )
+                _new_amps = ev_soak_next_amps(
+                    self._ev_soak_amps, importing=_importing, import_persistent=_import_persistent,
+                    step_due=_step_due, start_a=EV_SOAK_START_A, step_a=EV_SOAK_STEP_A, max_a=ev_max_amps,
+                )
+                if _new_amps != self._ev_soak_amps:
+                    self._ev_soak_amps = _new_amps
+                    self._ev_soak_last_step_at = now
+                    self._ev_soak_import_since = None  # settle after any step
+                ev_plan = replace(
+                    ev_plan,
+                    reason=f"Negative export: using EV as solar curtailment soak ({self._ev_soak_amps} A)",
+                    desired_enabled=True,
+                    desired_amps=self._ev_soak_amps,
+                    desired_circuit_currents=(self._ev_soak_amps, self._ev_soak_amps, self._ev_soak_amps),
+                    desired_phase_mode="auto_phase",
+                    desired_action="resume",
+                )
             if ev_plan.desired_action == "resume" and ev_plan.desired_enabled is True:
                 # Hold a solar-driven EV session through short PV dips to avoid rapid pause/resume flapping.
                 self._ev_solar_hold_until = now + timedelta(minutes=3)

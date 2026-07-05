@@ -301,6 +301,24 @@ EV_CURRENT_RETUNE_SECONDS = 90
 # negative-price morning after a mode switch). Stops the instant the car charges.
 EV_RESUME_RETRY_SECONDS = 60
 
+# EV curtailment-soak (v0.24.41): in solar_only, when export is blocked/negative AND the
+# battery is full/near-full, the Deye CURTAILS PV (no sink) and the MEASURED surplus is
+# artificially low — so the normal surplus-sized EV offer starves the car while free solar
+# is thrown away (~16-18 kWh/day observed). Use the car as a controlled dump-load: ignore
+# the (wrong) measured surplus and HILL-CLIMB the offered current against GRID IMPORT — ramp
+# up while grid stays ~0 (the extra draw is covered by previously-curtailed PV), back off
+# when grid import persists (the car has overshot the available PV → it would pull the grid).
+# Purely an EV-offer override: it never touches the battery/inverter registers, so the Deye
+# contract (solar_sell OFF at negative export, Zero export to CT, Load first, no discharge=0
+# +sell=ON stall pair) is intact by construction.
+EV_SOAK_NEAR_FULL_MARGIN_PCT = 5.0    # engage when soc >= max_soc - this (battery can't absorb)
+EV_SOAK_MIN_PV_W = 800.0              # only in real daylight (some PV present to reclaim)
+EV_SOAK_START_A = 6                   # 1-phase minimum start
+EV_SOAK_STEP_A = 2                    # ramp increment (== the apply-layer current deadband)
+EV_SOAK_STEP_SECONDS = 120           # hold ~2 min between ramp-up steps (> the 90s retune)
+EV_SOAK_IMPORT_W = 400.0             # grid import above this = the car overshot the PV
+EV_SOAK_IMPORT_HOLD_SECONDS = 45     # import must persist this long before backing off (debounce)
+
 # Phase E part 2: per-device write cooldowns (anti-flap). Wattson never writes to
 # the inverter / charger more often than this, so a rapidly oscillating plan
 # cannot hammer the hardware.

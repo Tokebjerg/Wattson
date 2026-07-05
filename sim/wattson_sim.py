@@ -1940,6 +1940,42 @@ def test_robustness_hardening():
                    cov(const.EV_MODE_SCHEDULED) is False, "scheduled_periods"))
     checks.append(("EV protect: a manual override mode does NOT drain the pack",
                    cov("override_charge") is False, "override_charge"))
+
+    # v0.24.41 EV curtailment-soak — use the car as a dump-load for curtailed solar.
+    gate = planner.ev_curtailment_soak_gate
+    G = dict(ev_mode=const.EV_MODE_SOLAR_ONLY, ev_connected=True, export_blocked=True,
+             soc_pct=100.0, max_soc_pct=100.0, pv_power_w=3300.0,
+             near_full_margin_pct=const.EV_SOAK_NEAR_FULL_MARGIN_PCT, min_pv_w=const.EV_SOAK_MIN_PV_W)
+    checks.append(("soak gate: full battery + neg export + connected + PV -> ACTIVE",
+                   gate(**G) is True, "active"))
+    checks.append(("soak gate: positive export (not blocked) -> INACTIVE (accept crit)",
+                   gate(**{**G, "export_blocked": False}) is False, "inactive"))
+    checks.append(("soak gate: not near full -> INACTIVE",
+                   gate(**{**G, "soc_pct": 70.0}) is False, "inactive"))
+    checks.append(("soak gate: not solar_only (full_speed) -> INACTIVE",
+                   gate(**{**G, "ev_mode": const.EV_MODE_FULL_SPEED}) is False, "inactive"))
+    checks.append(("soak gate: charger not connected -> INACTIVE",
+                   gate(**{**G, "ev_connected": False}) is False, "inactive"))
+    checks.append(("soak gate: night / no PV -> INACTIVE",
+                   gate(**{**G, "pv_power_w": 0.0}) is False, "inactive"))
+    # Hill-climb: ramp up while grid ~0, back off on persistent import, floor at start, cap at max.
+    nxt = planner.ev_soak_next_amps
+    S = dict(start_a=const.EV_SOAK_START_A, step_a=const.EV_SOAK_STEP_A, max_a=16)
+    checks.append(("soak climb: grid ~0 + step due -> ramp UP",
+                   nxt(6, importing=False, import_persistent=False, step_due=True, **S) == 8, "8"))
+    checks.append(("soak climb: grid ~0 but step NOT due -> hold",
+                   nxt(8, importing=False, import_persistent=False, step_due=False, **S) == 8, "8"))
+    checks.append(("soak climb: persistent import -> back OFF one step",
+                   nxt(12, importing=True, import_persistent=True, step_due=True, **S) == 10, "10"))
+    checks.append(("soak climb: brief import (not persistent) -> hold (debounce)",
+                   nxt(12, importing=True, import_persistent=False, step_due=True, **S) == 12, "12"))
+    checks.append(("soak climb: never below the 6A start floor",
+                   nxt(6, importing=True, import_persistent=True, step_due=True, **S) == 6, "6"))
+    checks.append(("soak climb: capped at max (no ramp past it)",
+                   nxt(16, importing=False, import_persistent=False, step_due=True, **S) == 16, "16"))
+    # Accept crit: the engaged offer is >= the 6A minimum (the coordinator starts here).
+    checks.append(("soak: minimum engaged offer is 6A (>= 1-phase minimum)",
+                   const.EV_SOAK_START_A == 6, str(const.EV_SOAK_START_A)))
     return checks
 
 
