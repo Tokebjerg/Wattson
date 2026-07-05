@@ -714,6 +714,43 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         except Exception:  # noqa: BLE001
             pass
 
+    def _ev_soak_ramp_step(self, now, *, was_active: bool, grid_import_w, ev_max_amps: int) -> int:
+        """One hill-climb step of the EV curtailment-soak offered current (called only while
+        the gate is open). ``was_active`` = the soak ran last tick; on the engage EDGE
+        (was_active False) it starts fresh at 6 A, otherwise it ramps against grid import:
+        +2 A once the step interval elapses while grid ~0, -2 A when import persists past the
+        debounce, floored at 6 A, capped at ``ev_max_amps``. Returns the offered amps.
+        Extracted so the coordinator harness can drive it over a controlled clock — the
+        v0.24.41 wiring bug (re-init at 6 A EVERY tick, so it never ramped) lived exactly
+        here and is now regression-tested."""
+        if not was_active:
+            self._ev_soak_amps = EV_SOAK_START_A
+            self._ev_soak_last_step_at = now
+            self._ev_soak_import_since = None
+        importing = max(0.0, grid_import_w or 0.0) > EV_SOAK_IMPORT_W
+        if importing:
+            if self._ev_soak_import_since is None:
+                self._ev_soak_import_since = now
+        else:
+            self._ev_soak_import_since = None
+        import_persistent = (
+            self._ev_soak_import_since is not None
+            and (now - self._ev_soak_import_since).total_seconds() >= EV_SOAK_IMPORT_HOLD_SECONDS
+        )
+        step_due = (
+            self._ev_soak_last_step_at is None
+            or (now - self._ev_soak_last_step_at).total_seconds() >= EV_SOAK_STEP_SECONDS
+        )
+        new_amps = ev_soak_next_amps(
+            self._ev_soak_amps, importing=importing, import_persistent=import_persistent,
+            step_due=step_due, start_a=EV_SOAK_START_A, step_a=EV_SOAK_STEP_A, max_a=ev_max_amps,
+        )
+        if new_amps != self._ev_soak_amps:
+            self._ev_soak_amps = new_amps
+            self._ev_soak_last_step_at = now
+            self._ev_soak_import_since = None  # settle after any step
+        return self._ev_soak_amps
+
     async def async_pause(self, minutes: int = 60) -> None:
         self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
         await self.async_request_refresh()
@@ -1174,6 +1211,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if forced_ev is not None:
                 ev_plan = forced_ev
 
+        # Save last tick's soak state BEFORE resetting, so the engage-edge check below
+        # (init amps only on the FIRST tick the gate opens) survives the per-tick reset.
+        # Resetting the live flag every tick is what makes it False whenever the gate is
+        # not met OR this block isn't entered (non-solar-only / manual override).
+        _soak_was_active = self._ev_curtailment_soak_active
         self._ev_curtailment_soak_active = False
         if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
@@ -1210,42 +1252,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 near_full_margin_pct=EV_SOAK_NEAR_FULL_MARGIN_PCT,
                 min_pv_w=EV_SOAK_MIN_PV_W,
             ):
-                if not self._ev_curtailment_soak_active:
-                    # (re-)engage: this flag is reset to False every tick above, so
-                    # "not active" here means the gate just (re)opened -> start at 6 A.
-                    self._ev_soak_amps = EV_SOAK_START_A
-                    self._ev_soak_last_step_at = now
-                    self._ev_soak_import_since = None
                 self._ev_curtailment_soak_active = True
-                _grid_in = max(0.0, self.site_state.grid_import_power_w or 0.0)
-                _importing = _grid_in > EV_SOAK_IMPORT_W
-                if _importing:
-                    if self._ev_soak_import_since is None:
-                        self._ev_soak_import_since = now
-                else:
-                    self._ev_soak_import_since = None
-                _import_persistent = (
-                    self._ev_soak_import_since is not None
-                    and (now - self._ev_soak_import_since).total_seconds() >= EV_SOAK_IMPORT_HOLD_SECONDS
+                _soak_amps = self._ev_soak_ramp_step(
+                    now, was_active=_soak_was_active,
+                    grid_import_w=self.site_state.grid_import_power_w, ev_max_amps=ev_max_amps,
                 )
-                _step_due = (
-                    self._ev_soak_last_step_at is None
-                    or (now - self._ev_soak_last_step_at).total_seconds() >= EV_SOAK_STEP_SECONDS
-                )
-                _new_amps = ev_soak_next_amps(
-                    self._ev_soak_amps, importing=_importing, import_persistent=_import_persistent,
-                    step_due=_step_due, start_a=EV_SOAK_START_A, step_a=EV_SOAK_STEP_A, max_a=ev_max_amps,
-                )
-                if _new_amps != self._ev_soak_amps:
-                    self._ev_soak_amps = _new_amps
-                    self._ev_soak_last_step_at = now
-                    self._ev_soak_import_since = None  # settle after any step
                 ev_plan = replace(
                     ev_plan,
-                    reason=f"Negative export: using EV as solar curtailment soak ({self._ev_soak_amps} A)",
+                    reason=f"Negative export: using EV as solar curtailment soak ({_soak_amps} A)",
                     desired_enabled=True,
-                    desired_amps=self._ev_soak_amps,
-                    desired_circuit_currents=(self._ev_soak_amps, self._ev_soak_amps, self._ev_soak_amps),
+                    desired_amps=_soak_amps,
+                    desired_circuit_currents=(_soak_amps, _soak_amps, _soak_amps),
                     desired_phase_mode="auto_phase",
                     desired_action="resume",
                 )

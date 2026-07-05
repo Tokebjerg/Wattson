@@ -2181,6 +2181,29 @@ def test_coordinator_ev_harness():
     checks.append((f"harness cooldown: change at +5s held (retry), applied at +15s [{len(co._easee.calls)}]",
                    blocked == [] and len(applied) == 1 and len(co._easee.calls) == 2, f"{blocked}/{applied}"))
 
+    # v0.24.42 — EV curtailment-soak ramp over a controlled clock (the v0.24.41 wiring bug:
+    # re-init at 6 A every tick, so it NEVER ramped despite grid ~0). Drives the SHIPPING
+    # _ev_soak_ramp_step directly.
+    sk = object.__new__(co_mod.WattsonCoordinator)
+    sk._ev_curtailment_soak_active = False
+    sk._ev_soak_amps = 6
+    sk._ev_soak_last_step_at = None
+    sk._ev_soak_import_since = None
+    st0 = datetime(2026, 7, 2, 13, 0, tzinfo=timezone.utc)
+    a_engage = sk._ev_soak_ramp_step(st0, was_active=False, grid_import_w=0.0, ev_max_amps=16)
+    checks.append(("soak wiring: engage starts at 6 A", a_engage == 6, str(a_engage)))
+    ramp = [sk._ev_soak_ramp_step(st0 + timedelta(seconds=130 * i), was_active=True, grid_import_w=0.0, ev_max_amps=16)
+            for i in range(1, 6)]
+    checks.append((f"soak wiring: RAMPS 6->8->10->12->14->16 while grid ~0 (the bug guard) {ramp}",
+                   ramp == [8, 10, 12, 14, 16], str(ramp)))
+    checks.append(("soak wiring: capped at max, holds at 16",
+                   sk._ev_soak_ramp_step(st0 + timedelta(seconds=900), was_active=True, grid_import_w=0.0, ev_max_amps=16) == 16, "16"))
+    sk._ev_soak_ramp_step(st0 + timedelta(seconds=1000), was_active=True, grid_import_w=1500.0, ev_max_amps=16)  # import starts
+    a_back = sk._ev_soak_ramp_step(st0 + timedelta(seconds=1050), was_active=True, grid_import_w=1500.0, ev_max_amps=16)  # 50s -> persistent
+    checks.append((f"soak wiring: persistent grid import backs off one step (16->14) {a_back}", a_back == 14, str(a_back)))
+    a_reengage = sk._ev_soak_ramp_step(st0 + timedelta(seconds=1200), was_active=False, grid_import_w=0.0, ev_max_amps=16)
+    checks.append(("soak wiring: re-engage after a gap resets to 6 A", a_reengage == 6, str(a_reengage)))
+
     return checks
 
 
