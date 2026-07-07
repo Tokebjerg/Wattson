@@ -2990,20 +2990,22 @@ def test_peak_reserve_sunny_release():
                    fc([0.4, 0.45, 0.5], min_days=3) == 0.6, str(fc([0.4, 0.45, 0.5], min_days=3))))
     checks.append(("forecast_confidence: optimistic ratios clamp at 1.0 (no bonus release)",
                    fc([1.2, 1.5, 1.3], min_days=3) == 1.0, str(fc([1.2, 1.5, 1.3], min_days=3))))
-    # A MARGINAL forecast whose surplus clears the 2.5x band at full confidence but NOT at the
-    # 0.6 floor (penalty 1.4x): low confidence must demand more sun before releasing the reserve.
+    # v0.24.45: the confidence PENALTY is DISABLED (FORECAST_CONFIDENCE_PENALTY_K=0) — it
+    # compounded the summer overnight over-hold (2 nights of avoidable grid). So confidence
+    # no longer changes the release: a marginal forecast that clears the (now 2.0x) band
+    # releases at BOTH full and low confidence. `forecast_confidence` stays observe-only.
     marginal = [models.SolarSlot(start=at(h), pv_estimate_kwh=(3.4 if 9 <= (h % 24) <= 16 else 0.0)) for h in range(30)]
     band_full = planner.forecast_refills_band(marginal, load, now, usable_pct=85.0, capacity_kwh=10.0,
                                               margin=planner.PEAK_RESERVE_RELEASE_MARGIN, confidence=1.0)
     band_low = planner.forecast_refills_band(marginal, load, now, usable_pct=85.0, capacity_kwh=10.0,
                                              margin=planner.PEAK_RESERVE_RELEASE_MARGIN, confidence=0.6)
-    checks.append((f"confidence penalty: marginal forecast releases at conf=1.0 but HOLDS at conf=0.6 [{band_full}/{band_low}]",
-                   band_full and not band_low, f"{band_full}/{band_low}"))
-    # End-to-end through peak_reserve_pct: same marginal forecast, reserve released vs kept.
+    checks.append((f"confidence penalty DISABLED: confidence no longer changes the release (both release) [{band_full}/{band_low}]",
+                   band_full and band_low, f"{band_full}/{band_low}"))
+    # End-to-end through peak_reserve_pct: same marginal forecast releases the reserve at any confidence.
     r_full = planner.peak_reserve_pct(price_slots, now, marginal, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M, confidence=1.0)
     r_low = planner.peak_reserve_pct(price_slots, now, marginal, load, capacity_kwh=10.0, min_soc=15, max_soc=100, margin=M, confidence=0.6)
-    checks.append((f"peak_reserve_pct: low confidence KEEPS the reserve a high-confidence forecast would release [{r_full:.0f}/{r_low:.0f}]",
-                   r_full == 0.0 and r_low > 0.0, f"{r_full}/{r_low}"))
+    checks.append((f"peak_reserve_pct: penalty off -> low confidence does NOT keep extra reserve [{r_full:.0f}/{r_low:.0f}]",
+                   r_full == 0.0 and r_low == 0.0, f"{r_full}/{r_low}"))
     # Backtest-safety: confidence=1.0 (the default the harness uses) is byte-identical to no arg.
     checks.append(("confidence=1.0 default leaves forecast_refills_band unchanged (backtest-safe)",
                    planner.forecast_refills_band(sunny, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=M)

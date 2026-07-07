@@ -110,18 +110,22 @@ SELL_REFILL_MARGIN = 1.2
 # overnight/evening hours down to the hard min and refill free from tomorrow's sun.
 SOLAR_RESERVE_RELEASE_MARGIN = 1.5
 SOLAR_RESERVE_HORIZON_H = 24
-# Same idea applied to the EVENING-PEAK reserve (peak_reserve_pct), but with a STRICTER
-# margin: the peak reserve is the last line against a real evening peak, so only a
-# decisively sunny next-day forecast (surplus >= this x the usable band over the next
-# horizon) may release it. Fixes the summer "battery holds ~51% overnight + buys grid"
-# bug where peak_reserve only credited solar BEFORE a knife-edge morning-price first_peak.
-PEAK_RESERVE_RELEASE_MARGIN = 2.5
-# Forecast-confidence (#5): both reserve releases lean on the solar FORECAST. When recent
-# forecasts have been optimistic (actual < forecast — e.g. a recent 0.70 ratio), demand
-# proportionally MORE surplus before releasing, scaled by this gain. confidence=1.0 (full,
-# or no learned history yet) leaves the release threshold untouched; confidence=0.6 (the
-# clamp floor) lifts it ~40%. Only ever makes the release MORE conservative, never less.
-FORECAST_CONFIDENCE_PENALTY_K = 1.0
+# Same idea applied to the EVENING-PEAK reserve (peak_reserve_pct), but with a stricter
+# margin: the peak reserve is the last line against a real evening peak, so a clearly-sunny
+# next-day forecast (surplus >= this x the usable band over the next horizon) releases it.
+# 2.0 (v0.24.45, was 2.5): a 2.5x band = 21 kWh surplus over-held the pack ~15% overnight on
+# solidly-sunny summer nights whose forecast landed just under 21 kWh — so it bought ~1.5 kWh
+# at night (avoidable-grid anomaly, 2 nights running) instead of discharging to min_soc and
+# refilling free from the day's sun. 2.0x = ~17 kWh still refills a 10 kWh pack 2x over, and
+# winter/low-solar days (surplus a few kWh) stay far below it, so they keep the full reserve.
+PEAK_RESERVE_RELEASE_MARGIN = 2.0
+# Forecast-confidence (#5): both reserve releases lean on the solar FORECAST. The penalty
+# (raise the release threshold when recent forecasts were optimistic) is DISABLED (K=0,
+# v0.24.45): with min(recent_ratios) two cloudy days dropped confidence to ~0.68 and lifted
+# the threshold ~32% for a week, COMPOUNDING the overnight over-hold above — its guard
+# (release-then-cloudy-surprise) is rare and speculative, the over-hold cost is nightly and
+# real. `forecast_confidence` stays exposed on the bias sensor as an OBSERVE-ONLY metric.
+FORECAST_CONFIDENCE_PENALTY_K = 0.0
 
 # Sell-throttle charge current (v0.24.15): while SELLING surplus with a CHEAPER
 # same-day refill window ahead, the charge register is dropped to this so the pack
