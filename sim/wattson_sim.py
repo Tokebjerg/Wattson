@@ -1941,6 +1941,27 @@ def test_robustness_hardening():
     checks.append(("EV protect: a manual override mode does NOT drain the pack",
                    cov("override_charge") is False, "override_charge"))
 
+    # v0.24.46 GLOBAL EV-battery-protect — the pack is never discharged into the car outside
+    # solar_only, on ANY path (full_speed / scheduled / manual EV override). The per-mode
+    # EV_SOLAR_PRIORITY block only runs for solar_only, so this is the catch-all guard.
+    prot = planner.apply_ev_battery_protect
+    def BP(strategy="DISCHARGE_TO_LOAD", dis=70.0, sell=False):
+        return models.BatteryPlan(strategy=strategy, reason="r", desired_discharge_current_a=dis, desired_solar_sell=sell)
+    checks.append(("EV-protect: non-solar EV charging + open discharge -> forced to 0 (car takes grid)",
+                   prot(BP(dis=70.0), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 0.0, "0"))
+    checks.append(("EV-protect: non-solar EV charging + discharge=None (default 70A) -> forced to 0",
+                   prot(BP(dis=None), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 0.0, "0"))
+    checks.append(("EV-protect: solar_only KEEPS the open discharge (covers dips)",
+                   prot(BP(dis=70.0), ev_charging=True, ev_covers_dips=True).desired_discharge_current_a == 70.0, "70"))
+    checks.append(("EV-protect: EV not charging -> battery untouched (covers house normally)",
+                   prot(BP(dis=70.0), ev_charging=False, ev_covers_dips=False).desired_discharge_current_a == 70.0, "70"))
+    checks.append(("EV-protect: force-discharge battery override respected (explicit drain intent)",
+                   prot(BP(strategy="OVERRIDE_DISCHARGE", dis=70.0, sell=True), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 70.0, "70"))
+    checks.append(("EV-protect: dis=0 + sell=ON + non-solar EV -> sell forced OFF (breaks the stall pair)",
+                   prot(BP(strategy="SELL_SOLAR_PEAK", dis=0.0, sell=True), ev_charging=True, ev_covers_dips=False).desired_solar_sell is False, "sell off"))
+    checks.append(("EV-protect: already dis=0 + sell off -> no-op (not draining the car)",
+                   prot(BP(strategy="GRID_CHARGE", dis=0.0, sell=False), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 0.0, "0"))
+
     # v0.24.41 EV curtailment-soak — use the car as a dump-load for curtailed solar.
     gate = planner.ev_curtailment_soak_gate
     G = dict(ev_mode=const.EV_MODE_SOLAR_ONLY, ev_connected=True, export_blocked=True,

@@ -397,6 +397,33 @@ def apply_cold_guard(plan, temperature_c: float | None, *, min_charge_temp_c: fl
     )
 
 
+def apply_ev_battery_protect(plan, *, ev_charging: bool, ev_covers_dips: bool):
+    """The house battery must NEVER be discharged to charge the car — EXCEPT in solar_only
+    ("Ren sol"), where it covers brief PV dips (``ev_covers_dips``). Everywhere else
+    (full_speed, scheduled, a manual EV override, negative-price force) the car pulls from
+    the GRID: with load_includes_ev + Load first + an OPEN discharge, the inverter would
+    otherwise cover the car's draw from the pack. This is the GLOBAL guard (v0.24.46) — the
+    per-mode EV_SOLAR_PRIORITY block only runs for solar_only, so full_speed / scheduled / a
+    manual EV override never reached its protection and drained the pack into the car
+    (user 2026-07-02/06). When the EV is charging and NOT solar_only, force discharge=0 (+
+    sell OFF, so discharge=0 never rides with sell=ON — the stall pair). No-op when the EV
+    isn't charging, in solar_only, when discharge is already 0 with sell off (grid-charge /
+    hold — not draining), or on an explicit force-discharge battery override."""
+    if not ev_charging or ev_covers_dips:
+        return plan
+    if plan.strategy == "OVERRIDE_DISCHARGE":  # explicit battery-drain intent — respect it
+        return plan
+    dis = getattr(plan, "desired_discharge_current_a", None)
+    if dis == 0.0 and not getattr(plan, "desired_solar_sell", False):
+        return plan  # already not discharging and not selling -> not feeding the car
+    return replace(
+        plan,
+        desired_discharge_current_a=0.0,
+        desired_solar_sell=False,
+        reason=(plan.reason + " | EV-beskyt: batteriet lader ikke bilen (kun Ren sol dækker dips) — bilen tager nettet"),
+    )
+
+
 def apply_sell_throttle(
     plan,
     *,

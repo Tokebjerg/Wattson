@@ -162,6 +162,7 @@ from .planner import (
     execute_slot,
     mode_dwell_exempt,
     apply_cold_guard,
+    apply_ev_battery_protect,
     apply_sell_throttle,
     near_full_buffer_active,
     SCHEDULE_GRID_CHARGE_RATE_KWH,
@@ -1624,6 +1625,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             )
         else:
             discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
+        # EV-BATTERY PROTECT (v0.24.46, user rule 2026-07-06): the house battery must NEVER
+        # be discharged to charge the car — except solar_only, which covers dips. The per-mode
+        # EV_SOLAR_PRIORITY block only runs for solar_only, so full_speed / scheduled / a
+        # MANUAL EV OVERRIDE never reached its protection and the pack drained into the car.
+        # This GLOBAL guard runs on the FINAL battery plan (AI or override), so every EV path
+        # is covered. ``ev_covers_dips_from_battery`` is True only for solar_only.
+        _ev_wants_charge = ev_plan.desired_enabled is True and ev_plan.desired_action == "resume"
+        battery_plan = apply_ev_battery_protect(
+            battery_plan,
+            ev_charging=_ev_wants_charge,
+            ev_covers_dips=ev_covers_dips_from_battery(ev_plan.mode),
+        )
         tou_cap, tou_charge = tou_setpoint(
             battery_plan, soc_pct=self.site_state.battery_soc_pct,
             min_soc=min_soc, discharge_floor=discharge_floor, max_soc=max_soc,
