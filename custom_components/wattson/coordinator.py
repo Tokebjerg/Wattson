@@ -1028,6 +1028,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._despike_derived_load()
         self._apply_price_vat()
         self._accumulate_value()
+        self._accumulate_import_savings()
         self._accumulate_export_revenue()
         self._accumulate_counterfactual()
         self._accumulate_battery_health()

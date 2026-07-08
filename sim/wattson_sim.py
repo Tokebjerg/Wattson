@@ -1375,8 +1375,8 @@ def test_f_savings():
         return datetime(2026, 7, 8, hour, minute, tzinfo=CEST)
 
     slots = [
-        models.PriceSlot(start=at(12), spot_price=1.0, tariff=0.0, total_import_price=1.0, export_value=0.7),
-        models.PriceSlot(start=at(13), spot_price=0.1, tariff=0.0, total_import_price=0.1, export_value=-0.2),
+        models.PriceSlot(start=at(12), spot_price=2.0, tariff=0.0, total_import_price=2.0, export_value=0.7),
+        models.PriceSlot(start=at(13), spot_price=-0.5, tariff=0.0, total_import_price=-0.5, export_value=-0.2),
     ]
 
     def estate(now, export_w):
@@ -1385,7 +1385,7 @@ def test_f_savings():
             grid_power_w=-export_w, grid_import_power_w=0.0, grid_export_power_w=export_w,
             battery_soc_pct=80.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
             easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
-            easee_phase_mode="auto", current_buy_price=1.0, current_sell_price=0.1,
+            easee_phase_mode="auto", current_buy_price=0.1, current_sell_price=0.1,
             forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
         )
 
@@ -1394,15 +1394,19 @@ def test_f_savings():
         dtmod.now = lambda: current
         coord.site_state = estate(current, 6000.0)
         coord._accumulate_export_revenue()  # primes last_tick; no revenue yet
+        coord._accumulate_import_savings()
         current = at(12, 2)
         coord.site_state = estate(current, 6000.0)
         coord._accumulate_export_revenue()
+        coord._accumulate_import_savings()
         current = at(13, 0)
         coord.site_state = estate(current, 3000.0)
         coord._accumulate_export_revenue()  # hour gap is skipped by the gap cap
+        coord._accumulate_import_savings()
         current = at(13, 2)
         coord.site_state = estate(current, 3000.0)
         coord._accumulate_export_revenue()
+        coord._accumulate_import_savings()
     finally:
         dtmod.utcnow = saved_utcnow
         dtmod.now = saved_now
@@ -1419,6 +1423,20 @@ def test_f_savings():
                    )), str((coord.export_revenue_today_kr, coord.export_revenue_week_kr, coord.export_revenue_month_kr, coord.export_revenue_total_kr))))
     checks.append(("export revenue telemetry tracks exported kWh beside DKK",
                    abs(coord.export_revenue_kwh_today - 0.3) < 1e-6, str(coord.export_revenue_kwh_today)))
+    # 1 kW avoided import for 2 min @ 2.0 = 0.0667 kr; the negative import-price
+    # interval still counts as self-supplied kWh, but not as saved money.
+    expected_import_savings = 1.0 * (2.0 / 60.0) * 2.0
+    checks.append(("import savings telemetry uses slot buy price and excludes negative-price import income",
+                   abs(coord.import_savings_today_kr - expected_import_savings) < 1e-6, str(coord.import_savings_today_kr)))
+    checks.append(("import savings telemetry books daily/weekly/monthly/lifetime buckets",
+                   all(abs(x - expected_import_savings) < 1e-6 for x in (
+                       coord.import_savings_today_kr,
+                       coord.import_savings_week_kr,
+                       coord.import_savings_month_kr,
+                       coord.import_savings_total_kr,
+                   )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_total_kr))))
+    checks.append(("import savings telemetry tracks self-supplied kWh beside DKK",
+                   abs(coord.import_savings_kwh_today - (2.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
     return checks
 
 

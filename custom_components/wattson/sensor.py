@@ -18,6 +18,7 @@ from .config import entry_value
 from .const import (
     DOMAIN,
     NAME,
+    CONF_BUY_PRICE_ENTITY,
     CONF_SELL_PRICE_ENTITY,
     CONF_EV_REQUIRED_HOURS,
     DEFAULT_EV_REQUIRED_HOURS,
@@ -227,6 +228,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities.append(WattsonSavingsSensor(coordinator, entry))
     entities.append(WattsonSavingsTotalSensor(coordinator, entry))
     for period in ("today", "week", "month", "total"):
+        entities.append(WattsonImportSavingsSensor(coordinator, entry, period))
+    for period in ("today", "week", "month", "total"):
         entities.append(WattsonExportRevenueSensor(coordinator, entry, period))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
@@ -324,6 +327,107 @@ class WattsonSavingsSensor(CoordinatorEntity, RestoreSensor):
     @property
     def native_value(self) -> float:
         return round(self.coordinator.value_today_kr, 2)
+
+
+class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
+    """Actual avoided import cost, priced with the configured buy price."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    _NAMES = {
+        "today": "Import Savings Today",
+        "week": "Import Savings Week",
+        "month": "Import Savings Month",
+        "total": "Import Savings Total",
+    }
+    _SAVINGS_ATTRS = {
+        "today": "import_savings_today_kr",
+        "week": "import_savings_week_kr",
+        "month": "import_savings_month_kr",
+        "total": "import_savings_total_kr",
+    }
+    _KWH_ATTRS = {
+        "today": "import_savings_kwh_today",
+        "week": "import_savings_kwh_week",
+        "month": "import_savings_kwh_month",
+        "total": "import_savings_kwh_total",
+    }
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry, period: str) -> None:
+        super().__init__(coordinator)
+        if period not in self._NAMES:
+            raise ValueError(f"Unsupported import savings period: {period}")
+        self._entry = entry
+        self._period = period
+        self._attr_name = self._NAMES[period]
+        self._attr_unique_id = f"{entry.entry_id}_import_savings_{period}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if not self._last_state_matches_period(last_state.last_updated):
+            return
+        try:
+            setattr(self.coordinator, self._savings_attr, float(last_state.state))
+            setattr(self.coordinator, self._kwh_attr, float(last_state.attributes.get("saved_kwh") or 0.0))
+            self._mark_restored_period()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def _savings_attr(self) -> str:
+        return self._SAVINGS_ATTRS[self._period]
+
+    @property
+    def _kwh_attr(self) -> str:
+        return self._KWH_ATTRS[self._period]
+
+    def _last_state_matches_period(self, last_updated: datetime) -> bool:
+        if self._period == "total":
+            return True
+        last_local = dt_util.as_local(last_updated)
+        now_local = dt_util.now()
+        if self._period == "today":
+            return last_local.date() == now_local.date()
+        if self._period == "week":
+            return last_local.date().isocalendar()[:2] == now_local.date().isocalendar()[:2]
+        return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+
+    def _mark_restored_period(self) -> None:
+        today = dt_util.now().date()
+        if self._period == "today":
+            self.coordinator._import_savings_day = today
+        elif self._period == "week":
+            self.coordinator._import_savings_week = today.isocalendar()[:2]
+        elif self._period == "month":
+            self.coordinator._import_savings_month = (today.year, today.month)
+
+    @property
+    def native_value(self) -> float:
+        return round(getattr(self.coordinator, self._savings_attr, 0.0), 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        kwh = float(getattr(self.coordinator, self._kwh_attr, 0.0) or 0.0)
+        savings = float(getattr(self.coordinator, self._savings_attr, 0.0) or 0.0)
+        return {
+            "saved_kwh": round(kwh, 3),
+            "avg_buy_price_kr_kwh": round(savings / kwh, 3) if kwh > 0.001 else None,
+            "price_source": entry_value(self._entry, CONF_BUY_PRICE_ENTITY, None),
+            "note": "Faktisk besparelse: undgået net-import × Wattsons buy-price pr. tick. Salg og betalt negativpris-import er ikke med; negative købspriser tæller som 0 kr.",
+        }
 
 
 class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):

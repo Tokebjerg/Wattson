@@ -52,6 +52,21 @@ class TelemetryMixin:
         self.value_total_kr: float = 0.0
         self._value_day = None
         self._value_last_tick: datetime | None = None
+        # Actual avoided import cost: self-supplied load valued at the configured
+        # buy-price entity via the slot import price. Export and paid-to-import
+        # income stay out of this metric.
+        self.import_savings_today_kr: float = 0.0
+        self.import_savings_week_kr: float = 0.0
+        self.import_savings_month_kr: float = 0.0
+        self.import_savings_total_kr: float = 0.0
+        self.import_savings_kwh_today: float = 0.0
+        self.import_savings_kwh_week: float = 0.0
+        self.import_savings_kwh_month: float = 0.0
+        self.import_savings_kwh_total: float = 0.0
+        self._import_savings_day = None
+        self._import_savings_week = None
+        self._import_savings_month = None
+        self._import_savings_last_tick: datetime | None = None
         # Actual revenue from selling power to the grid, priced with the configured
         # sell-price entity (EDS2 in the user's setup) via the slot export value.
         self.export_revenue_today_kr: float = 0.0
@@ -231,6 +246,59 @@ class TelemetryMixin:
         )
         self.value_today_kr += inc
         self.value_total_kr += inc
+
+    # ------------------------------------------------------------------ #
+    # Actual import savings
+    # ------------------------------------------------------------------ #
+    def _accumulate_import_savings(self) -> None:
+        """Accumulate avoided grid-import cost, period-bucketed.
+
+        This is the clean "sparet" number: load that was not bought from the
+        grid, valued with the buy-price horizon. Negative import prices are
+        clamped to 0 because avoiding paid import is not a saving.
+        """
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._import_savings_day != today:
+            self._import_savings_day = today
+            self.import_savings_today_kr = 0.0
+            self.import_savings_kwh_today = 0.0
+        iso_week = today.isocalendar()[:2]
+        if self._import_savings_week != iso_week:
+            self._import_savings_week = iso_week
+            self.import_savings_week_kr = 0.0
+            self.import_savings_kwh_week = 0.0
+        month = (today.year, today.month)
+        if self._import_savings_month != month:
+            self._import_savings_month = month
+            self.import_savings_month_kr = 0.0
+            self.import_savings_kwh_month = 0.0
+
+        last = self._import_savings_last_tick
+        self._import_savings_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        import_price, _ = self._tick_prices()
+        if import_price is None:
+            return
+        saved_kwh = max(0.0, state.load_power_w - state.grid_import_power_w) / 1000.0 * dt_hours
+        if saved_kwh <= 0.0:
+            return
+        savings = saved_kwh * max(0.0, import_price)
+        self.import_savings_today_kr += savings
+        self.import_savings_week_kr += savings
+        self.import_savings_month_kr += savings
+        self.import_savings_total_kr += savings
+        self.import_savings_kwh_today += saved_kwh
+        self.import_savings_kwh_week += saved_kwh
+        self.import_savings_kwh_month += saved_kwh
+        self.import_savings_kwh_total += saved_kwh
 
     # ------------------------------------------------------------------ #
     # Actual export revenue
