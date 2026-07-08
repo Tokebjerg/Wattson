@@ -286,6 +286,18 @@ class TelemetryMixin:
             self._import_savings_year = today.year
             self.import_savings_year_kr = 0.0
             self.import_savings_kwh_year = 0.0
+        # A newly added yearly sensor has no restore state yet. Keep the
+        # inclusive period invariant true: year must never be lower than the
+        # already-restored current day/week/month buckets.
+        if self._import_savings_day == today:
+            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_today_kr)
+            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_today)
+        if self._import_savings_week == iso_week:
+            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_week_kr)
+            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_week)
+        if self._import_savings_month == month:
+            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_month_kr)
+            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_month)
 
         last = self._import_savings_last_tick
         self._import_savings_last_tick = now
@@ -346,6 +358,18 @@ class TelemetryMixin:
             self._export_revenue_year = today.year
             self.export_revenue_year_kr = 0.0
             self.export_revenue_kwh_year = 0.0
+        # A newly added yearly sensor has no restore state yet. Keep the
+        # inclusive period invariant true: year must never be lower than the
+        # already-restored current day/week/month buckets.
+        if self._export_revenue_day == today:
+            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_today_kr)
+            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_today)
+        if self._export_revenue_week == iso_week:
+            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_week_kr)
+            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_week)
+        if self._export_revenue_month == month:
+            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_month_kr)
+            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_month)
 
         last = self._export_revenue_last_tick
         self._export_revenue_last_tick = now

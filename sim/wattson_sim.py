@@ -1407,6 +1407,22 @@ def test_f_savings():
         coord.site_state = estate(current, 3000.0)
         coord._accumulate_export_revenue()
         coord._accumulate_import_savings()
+        # Simulate the first deploy of a new yearly sensor: day/week/month
+        # restored, but year is still at 0. The accumulator should floor the
+        # inclusive yearly bucket to the current shorter period before adding
+        # future ticks.
+        coord.export_revenue_year_kr = 0.0
+        coord.export_revenue_kwh_year = 0.0
+        coord.import_savings_year_kr = 0.0
+        coord.import_savings_kwh_year = 0.0
+        coord._export_revenue_year = current.date().year
+        coord._import_savings_year = current.date().year
+        coord._export_revenue_last_tick = None
+        coord._import_savings_last_tick = None
+        current = at(13, 4)
+        coord.site_state = estate(current, 0.0)
+        coord._accumulate_export_revenue()
+        coord._accumulate_import_savings()
     finally:
         dtmod.utcnow = saved_utcnow
         dtmod.now = saved_now
@@ -1446,6 +1462,11 @@ def test_f_savings():
     checks.append(("net value yearly parts are import savings year + export revenue year",
                    abs(expected_net_value - (coord.import_savings_year_kr + coord.export_revenue_year_kr)) < 1e-6,
                    str((coord.import_savings_year_kr, coord.export_revenue_year_kr))))
+    checks.append(("new yearly buckets are floored to restored current month values",
+                   coord.export_revenue_year_kr >= coord.export_revenue_month_kr
+                   and coord.import_savings_year_kr >= coord.import_savings_month_kr,
+                   str((coord.export_revenue_year_kr, coord.export_revenue_month_kr,
+                        coord.import_savings_year_kr, coord.import_savings_month_kr))))
     return checks
 
 
