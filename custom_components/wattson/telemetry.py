@@ -43,6 +43,17 @@ from .learning import forecast_confidence, solar_bias_factor
 from .planner import effective_solar_surplus_w, value_increment_kr
 
 
+EV_SOLAR_VALUE_PERIODS = ("today", "week", "month", "year", "total")
+EV_SOLAR_VALUE_ATTRS = {
+    "savings": "ev_solar_savings_{period}_kr",
+    "gross": "ev_solar_gross_savings_{period}_kr",
+    "forgone": "ev_solar_forgone_export_{period}_kr",
+    "pure_kwh": "ev_solar_pure_kwh_{period}",
+    "grid_backed_kwh": "ev_solar_grid_backed_kwh_{period}",
+    "ev_kwh": "ev_solar_ev_kwh_{period}",
+}
+
+
 class TelemetryMixin:
     """Accumulator state + per-tick methods, mixed into the coordinator."""
 
@@ -181,6 +192,11 @@ class TelemetryMixin:
         # suspected reclaimable double-count). Observe-only: never touches control.
         self.ev_solar_grid_backed_kwh: float = 0.0
         self.ev_solar_ev_kwh: float = 0.0
+        for period in EV_SOLAR_VALUE_PERIODS:
+            self._reset_ev_solar_value_period(period)
+        self._ev_solar_savings_week = None
+        self._ev_solar_savings_month = None
+        self._ev_solar_savings_year = None
         self._evsh_used_wh: float = 0.0    # time-weighted surplus-signal sums (W·h)
         self._evsh_shadow_wh: float = 0.0
         self._evsh_hours: float = 0.0
@@ -820,10 +836,22 @@ class TelemetryMixin:
             self._evsh_day = today
             self.ev_solar_grid_backed_kwh = 0.0
             self.ev_solar_ev_kwh = 0.0
+            self._reset_ev_solar_value_period("today")
             self._evsh_used_wh = 0.0
             self._evsh_shadow_wh = 0.0
             self._evsh_hours = 0.0
             self._evsh_last_tick = None
+        iso_week = today.isocalendar()[:2]
+        if self._ev_solar_savings_week != iso_week:
+            self._ev_solar_savings_week = iso_week
+            self._reset_ev_solar_value_period("week")
+        month = (today.year, today.month)
+        if self._ev_solar_savings_month != month:
+            self._ev_solar_savings_month = month
+            self._reset_ev_solar_value_period("month")
+        if self._ev_solar_savings_year != today.year:
+            self._ev_solar_savings_year = today.year
+            self._reset_ev_solar_value_period("year")
         ev_mode = getattr(plan.ev, "mode", None) if (plan is not None and plan.ev is not None) else None
         ev_draw = max(0.0, (state.easee_power_w or 0.0)) if state is not None else 0.0
         if state is None or ev_mode != EV_MODE_SOLAR_ONLY or ev_draw < 500.0:
@@ -837,9 +865,53 @@ class TelemetryMixin:
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return
         grid_in = max(0.0, state.grid_import_power_w or 0.0)
-        self.ev_solar_ev_kwh += ev_draw * dt_hours / 1000.0
-        self.ev_solar_grid_backed_kwh += min(ev_draw, grid_in) * dt_hours / 1000.0
+        ev_kwh = ev_draw * dt_hours / 1000.0
+        grid_backed_kwh = min(ev_draw, grid_in) * dt_hours / 1000.0
+        pure_kwh = max(0.0, ev_kwh - grid_backed_kwh)
+        import_price, export_price = self._tick_prices()
+        gross_savings = pure_kwh * max(0.0, import_price or 0.0)
+        forgone_export = pure_kwh * max(0.0, export_price or 0.0)
+        net_savings = gross_savings - forgone_export
+        self.ev_solar_ev_kwh += ev_kwh
+        self.ev_solar_grid_backed_kwh += grid_backed_kwh
+        for period in EV_SOLAR_VALUE_PERIODS:
+            self._book_ev_solar_value(
+                period,
+                net_savings=net_savings,
+                gross_savings=gross_savings,
+                forgone_export=forgone_export,
+                pure_kwh=pure_kwh,
+                grid_backed_kwh=grid_backed_kwh,
+                ev_kwh=ev_kwh,
+            )
         can_reclaim = bool(getattr(self, "battery_control_enabled", False))
         self._evsh_used_wh += effective_solar_surplus_w(state, can_reclaim) * dt_hours
         self._evsh_shadow_wh += effective_solar_surplus_w(state, False) * dt_hours
         self._evsh_hours += dt_hours
+
+    def _reset_ev_solar_value_period(self, period: str) -> None:
+        for attr_template in EV_SOLAR_VALUE_ATTRS.values():
+            setattr(self, attr_template.format(period=period), 0.0)
+
+    def _book_ev_solar_value(
+        self,
+        period: str,
+        *,
+        net_savings: float,
+        gross_savings: float,
+        forgone_export: float,
+        pure_kwh: float,
+        grid_backed_kwh: float,
+        ev_kwh: float,
+    ) -> None:
+        increments = {
+            "savings": net_savings,
+            "gross": gross_savings,
+            "forgone": forgone_export,
+            "pure_kwh": pure_kwh,
+            "grid_backed_kwh": grid_backed_kwh,
+            "ev_kwh": ev_kwh,
+        }
+        for metric, increment in increments.items():
+            attr = EV_SOLAR_VALUE_ATTRS[metric].format(period=period)
+            setattr(self, attr, float(getattr(self, attr, 0.0) or 0.0) + increment)

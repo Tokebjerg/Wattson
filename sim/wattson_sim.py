@@ -1377,6 +1377,8 @@ def test_f_savings():
     slots = [
         models.PriceSlot(start=at(12), spot_price=2.0, tariff=0.0, total_import_price=2.0, export_value=0.7),
         models.PriceSlot(start=at(13), spot_price=-0.5, tariff=0.0, total_import_price=-0.5, export_value=-0.2),
+        models.PriceSlot(start=at(14), spot_price=2.0, tariff=0.0, total_import_price=2.0, export_value=0.5),
+        models.PriceSlot(start=at(15), spot_price=2.0, tariff=0.0, total_import_price=2.0, export_value=-0.2),
     ]
 
     def estate(now, export_w):
@@ -1385,6 +1387,16 @@ def test_f_savings():
             grid_power_w=-export_w, grid_import_power_w=0.0, grid_export_power_w=export_w,
             battery_soc_pct=80.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
             easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.1, current_sell_price=0.1,
+            forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
+        )
+
+    def evstate(now, ev_w, grid_import_w):
+        return models.SiteState(
+            timestamp=now, pv_power_w=7000.0, load_power_w=1000.0 + ev_w, load_includes_ev=True,
+            grid_power_w=grid_import_w, grid_import_power_w=grid_import_w, grid_export_power_w=0.0,
+            battery_soc_pct=80.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="charging", easee_power_w=ev_w, easee_session_kwh=0.0,
             easee_phase_mode="auto", current_buy_price=0.1, current_sell_price=0.1,
             forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
         )
@@ -1423,6 +1435,19 @@ def test_f_savings():
         coord.site_state = estate(current, 0.0)
         coord._accumulate_export_revenue()
         coord._accumulate_import_savings()
+        ev_solar_plan = types.SimpleNamespace(ev=types.SimpleNamespace(mode=const.EV_MODE_SOLAR_ONLY))
+        current = at(14, 0)
+        coord.site_state = evstate(current, 7000.0, 1000.0)
+        coord._accumulate_ev_shadow(ev_solar_plan)  # primes EV solar tick; no value yet
+        current = at(14, 2)
+        coord.site_state = evstate(current, 7000.0, 1000.0)
+        coord._accumulate_ev_shadow(ev_solar_plan)
+        current = at(15, 0)
+        coord.site_state = evstate(current, 6000.0, 0.0)
+        coord._accumulate_ev_shadow(ev_solar_plan)  # hour gap is skipped by the gap cap
+        current = at(15, 2)
+        coord.site_state = evstate(current, 6000.0, 0.0)
+        coord._accumulate_ev_shadow(ev_solar_plan)
     finally:
         dtmod.utcnow = saved_utcnow
         dtmod.now = saved_now
@@ -1467,6 +1492,34 @@ def test_f_savings():
                    and coord.import_savings_year_kr >= coord.import_savings_month_kr,
                    str((coord.export_revenue_year_kr, coord.export_revenue_month_kr,
                         coord.import_savings_year_kr, coord.import_savings_month_kr))))
+    expected_ev_solar_ev_kwh = 7.0 * (2.0 / 60.0) + 6.0 * (2.0 / 60.0)
+    expected_ev_solar_grid_kwh = 1.0 * (2.0 / 60.0)
+    expected_ev_solar_pure_kwh = expected_ev_solar_ev_kwh - expected_ev_solar_grid_kwh
+    expected_ev_solar_gross = expected_ev_solar_pure_kwh * 2.0
+    expected_ev_solar_forgone = 0.2 * 0.5
+    expected_ev_solar_net = expected_ev_solar_gross - expected_ev_solar_forgone
+    checks.append(("EV solar savings values non-grid EV energy in solar-only mode",
+                   abs(coord.ev_solar_savings_today_kr - expected_ev_solar_net) < 1e-6,
+                   str(coord.ev_solar_savings_today_kr)))
+    checks.append(("EV solar savings subtracts positive forgone export but not negative export",
+                   abs(coord.ev_solar_gross_savings_today_kr - expected_ev_solar_gross) < 1e-6
+                   and abs(coord.ev_solar_forgone_export_today_kr - expected_ev_solar_forgone) < 1e-6,
+                   str((coord.ev_solar_gross_savings_today_kr, coord.ev_solar_forgone_export_today_kr))))
+    checks.append(("EV solar savings tracks pure/grid-backed/total EV kWh",
+                   abs(coord.ev_solar_pure_kwh_today - expected_ev_solar_pure_kwh) < 1e-6
+                   and abs(coord.ev_solar_grid_backed_kwh_today - expected_ev_solar_grid_kwh) < 1e-6
+                   and abs(coord.ev_solar_ev_kwh_today - expected_ev_solar_ev_kwh) < 1e-6,
+                   str((coord.ev_solar_pure_kwh_today, coord.ev_solar_grid_backed_kwh_today, coord.ev_solar_ev_kwh_today))))
+    checks.append(("EV solar savings books daily/weekly/monthly/yearly/lifetime buckets",
+                   all(abs(x - expected_ev_solar_net) < 1e-6 for x in (
+                       coord.ev_solar_savings_today_kr,
+                       coord.ev_solar_savings_week_kr,
+                       coord.ev_solar_savings_month_kr,
+                       coord.ev_solar_savings_year_kr,
+                       coord.ev_solar_savings_total_kr,
+                   )), str((coord.ev_solar_savings_today_kr, coord.ev_solar_savings_week_kr,
+                            coord.ev_solar_savings_month_kr, coord.ev_solar_savings_year_kr,
+                            coord.ev_solar_savings_total_kr))))
     return checks
 
 

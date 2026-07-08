@@ -232,6 +232,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(WattsonExportRevenueSensor(coordinator, entry, period))
     for period in ("today", "week", "month", "year", "total"):
         entities.append(WattsonNetValueSensor(coordinator, entry, period))
+    for period in ("today", "week", "month", "year", "total"):
+        entities.append(WattsonEvSolarSavingsSensor(coordinator, entry, period))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
@@ -585,6 +587,176 @@ class WattsonNetValueSensor(CoordinatorEntity, SensorEntity):
             "saved_kwh": round(float(getattr(self.coordinator, self._IMPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
             "export_kwh": round(float(getattr(self.coordinator, self._EXPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
             "note": "Ny hoved-KPI: faktisk besparelse fra undgået net-import + faktisk salgsindtægt fra net-eksport. Erstatter legacy Savings Today som daglig headline.",
+        }
+
+
+class WattsonEvSolarSavingsSensor(CoordinatorEntity, RestoreSensor):
+    """Economic share from EV charging while Wattson is in solar-only mode."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:car-electric"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    _NAMES = {
+        "today": "EV Solar Savings Today",
+        "week": "EV Solar Savings Week",
+        "month": "EV Solar Savings Month",
+        "year": "EV Solar Savings Year",
+        "total": "EV Solar Savings Total",
+    }
+    _VALUE_ATTRS = {
+        "today": "ev_solar_savings_today_kr",
+        "week": "ev_solar_savings_week_kr",
+        "month": "ev_solar_savings_month_kr",
+        "year": "ev_solar_savings_year_kr",
+        "total": "ev_solar_savings_total_kr",
+    }
+    _GROSS_ATTRS = {
+        "today": "ev_solar_gross_savings_today_kr",
+        "week": "ev_solar_gross_savings_week_kr",
+        "month": "ev_solar_gross_savings_month_kr",
+        "year": "ev_solar_gross_savings_year_kr",
+        "total": "ev_solar_gross_savings_total_kr",
+    }
+    _FORGONE_ATTRS = {
+        "today": "ev_solar_forgone_export_today_kr",
+        "week": "ev_solar_forgone_export_week_kr",
+        "month": "ev_solar_forgone_export_month_kr",
+        "year": "ev_solar_forgone_export_year_kr",
+        "total": "ev_solar_forgone_export_total_kr",
+    }
+    _PURE_KWH_ATTRS = {
+        "today": "ev_solar_pure_kwh_today",
+        "week": "ev_solar_pure_kwh_week",
+        "month": "ev_solar_pure_kwh_month",
+        "year": "ev_solar_pure_kwh_year",
+        "total": "ev_solar_pure_kwh_total",
+    }
+    _GRID_KWH_ATTRS = {
+        "today": "ev_solar_grid_backed_kwh_today",
+        "week": "ev_solar_grid_backed_kwh_week",
+        "month": "ev_solar_grid_backed_kwh_month",
+        "year": "ev_solar_grid_backed_kwh_year",
+        "total": "ev_solar_grid_backed_kwh_total",
+    }
+    _EV_KWH_ATTRS = {
+        "today": "ev_solar_ev_kwh_today",
+        "week": "ev_solar_ev_kwh_week",
+        "month": "ev_solar_ev_kwh_month",
+        "year": "ev_solar_ev_kwh_year",
+        "total": "ev_solar_ev_kwh_total",
+    }
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry, period: str) -> None:
+        super().__init__(coordinator)
+        if period not in self._NAMES:
+            raise ValueError(f"Unsupported EV solar savings period: {period}")
+        self._entry = entry
+        self._period = period
+        self._attr_name = self._NAMES[period]
+        self._attr_unique_id = f"{entry.entry_id}_ev_solar_savings_{period}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
+            return
+        if not self._last_state_matches_period(last_state.last_updated):
+            return
+        try:
+            setattr(self.coordinator, self._value_attr, float(last_state.state))
+            setattr(self.coordinator, self._gross_attr, float(last_state.attributes.get("gross_avoided_import_kr") or 0.0))
+            setattr(self.coordinator, self._forgone_attr, float(last_state.attributes.get("forgone_export_kr") or 0.0))
+            setattr(self.coordinator, self._pure_kwh_attr, float(last_state.attributes.get("pure_solar_ev_kwh") or 0.0))
+            setattr(self.coordinator, self._grid_kwh_attr, float(last_state.attributes.get("grid_backed_ev_kwh") or 0.0))
+            setattr(self.coordinator, self._ev_kwh_attr, float(last_state.attributes.get("ev_kwh_solar_mode") or 0.0))
+            self._mark_restored_period()
+        except (TypeError, ValueError):
+            return
+
+    @property
+    def _value_attr(self) -> str:
+        return self._VALUE_ATTRS[self._period]
+
+    @property
+    def _gross_attr(self) -> str:
+        return self._GROSS_ATTRS[self._period]
+
+    @property
+    def _forgone_attr(self) -> str:
+        return self._FORGONE_ATTRS[self._period]
+
+    @property
+    def _pure_kwh_attr(self) -> str:
+        return self._PURE_KWH_ATTRS[self._period]
+
+    @property
+    def _grid_kwh_attr(self) -> str:
+        return self._GRID_KWH_ATTRS[self._period]
+
+    @property
+    def _ev_kwh_attr(self) -> str:
+        return self._EV_KWH_ATTRS[self._period]
+
+    def _last_state_matches_period(self, last_updated: datetime) -> bool:
+        if self._period == "total":
+            return True
+        last_local = dt_util.as_local(last_updated)
+        now_local = dt_util.now()
+        if self._period == "today":
+            return last_local.date() == now_local.date()
+        if self._period == "week":
+            return last_local.date().isocalendar()[:2] == now_local.date().isocalendar()[:2]
+        if self._period == "month":
+            return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+        return last_local.year == now_local.year
+
+    def _mark_restored_period(self) -> None:
+        today = dt_util.now().date()
+        if self._period == "today":
+            self.coordinator._evsh_day = today
+            self.coordinator.ev_solar_ev_kwh = float(getattr(self.coordinator, self._ev_kwh_attr, 0.0) or 0.0)
+            self.coordinator.ev_solar_grid_backed_kwh = float(getattr(self.coordinator, self._grid_kwh_attr, 0.0) or 0.0)
+        elif self._period == "week":
+            self.coordinator._ev_solar_savings_week = today.isocalendar()[:2]
+        elif self._period == "month":
+            self.coordinator._ev_solar_savings_month = (today.year, today.month)
+        elif self._period == "year":
+            self.coordinator._ev_solar_savings_year = today.year
+
+    @property
+    def native_value(self) -> float:
+        return round(getattr(self.coordinator, self._value_attr, 0.0), 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        value = float(getattr(self.coordinator, self._value_attr, 0.0) or 0.0)
+        gross = float(getattr(self.coordinator, self._gross_attr, 0.0) or 0.0)
+        forgone = float(getattr(self.coordinator, self._forgone_attr, 0.0) or 0.0)
+        pure_kwh = float(getattr(self.coordinator, self._pure_kwh_attr, 0.0) or 0.0)
+        grid_kwh = float(getattr(self.coordinator, self._grid_kwh_attr, 0.0) or 0.0)
+        ev_kwh = float(getattr(self.coordinator, self._ev_kwh_attr, 0.0) or 0.0)
+        return {
+            "pure_solar_ev_kwh": round(pure_kwh, 3),
+            "ev_kwh_solar_mode": round(ev_kwh, 3),
+            "grid_backed_ev_kwh": round(grid_kwh, 3),
+            "grid_fraction_pct": round(grid_kwh / ev_kwh * 100.0, 1) if ev_kwh > 0.001 else None,
+            "gross_avoided_import_kr": round(gross, 2),
+            "forgone_export_kr": round(forgone, 2),
+            "avg_net_value_kr_kwh": round(value / pure_kwh, 3) if pure_kwh > 0.001 else None,
+            "avg_buy_price_kr_kwh": round(gross / pure_kwh, 3) if pure_kwh > 0.001 else None,
+            "avg_forgone_export_kr_kwh": round(forgone / pure_kwh, 3) if pure_kwh > 0.001 else None,
+            "buy_price_source": entry_value(self._entry, CONF_BUY_PRICE_ENTITY, None),
+            "sell_price_source": entry_value(self._entry, CONF_SELL_PRICE_ENTITY, None),
+            "note": "Fordelingssensor: EV-ladning i Ren sol uden målt netstøtte × buy-price minus positiv sell-price som mistet salgsindtægt. Ikke ekstra oven i Net Value; den viser hvor meget af værdien der kan tilskrives bilen.",
         }
 
 
