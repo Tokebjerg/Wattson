@@ -1352,6 +1352,73 @@ def test_f_savings():
     checks.append(("zero dt -> no value", v(2000, 0, 0, 2.0, 0.5, 0.0) == 0.0, str(v(2000, 0, 0, 2.0, 0.5, 0.0))))
     # Combined avoided + export.
     checks.append(("combined avoided + export", abs(v(3000, 1000, 500, 1.0, 0.6, 1.0) - (2.0 * 1.0 + 0.5 * 0.6)) < 1e-6, str(v(3000, 1000, 500, 1.0, 0.6, 1.0))))
+
+    telemetry = importlib.import_module("wattson.telemetry")
+
+    class DummyTelemetry(telemetry.TelemetryMixin):
+        pass
+
+    class DummyEntry:
+        data = {}
+        options = {}
+
+    coord = object.__new__(DummyTelemetry)
+    coord.config_entry = DummyEntry()
+    coord._telemetry_init(DummyEntry())
+    dtmod = sys.modules["homeassistant.util.dt"]
+    saved_utcnow = dtmod.utcnow
+    saved_now = dtmod.now
+    CEST = timezone(timedelta(hours=2))
+    current = datetime(2026, 7, 8, 12, 0, tzinfo=CEST)
+
+    def at(hour, minute=0):
+        return datetime(2026, 7, 8, hour, minute, tzinfo=CEST)
+
+    slots = [
+        models.PriceSlot(start=at(12), spot_price=1.0, tariff=0.0, total_import_price=1.0, export_value=0.7),
+        models.PriceSlot(start=at(13), spot_price=0.1, tariff=0.0, total_import_price=0.1, export_value=-0.2),
+    ]
+
+    def estate(now, export_w):
+        return models.SiteState(
+            timestamp=now, pv_power_w=7000.0, load_power_w=1000.0, load_includes_ev=False,
+            grid_power_w=-export_w, grid_import_power_w=0.0, grid_export_power_w=export_w,
+            battery_soc_pct=80.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=1.0, current_sell_price=0.1,
+            forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
+        )
+
+    try:
+        dtmod.utcnow = lambda: current.astimezone(timezone.utc)
+        dtmod.now = lambda: current
+        coord.site_state = estate(current, 6000.0)
+        coord._accumulate_export_revenue()  # primes last_tick; no revenue yet
+        current = at(12, 2)
+        coord.site_state = estate(current, 6000.0)
+        coord._accumulate_export_revenue()
+        current = at(13, 0)
+        coord.site_state = estate(current, 3000.0)
+        coord._accumulate_export_revenue()  # hour gap is skipped by the gap cap
+        current = at(13, 2)
+        coord.site_state = estate(current, 3000.0)
+        coord._accumulate_export_revenue()
+    finally:
+        dtmod.utcnow = saved_utcnow
+        dtmod.now = saved_now
+
+    # 6 kW for 2 min @ 0.7 = 0.14 kr, then 3 kW for 2 min @ -0.2 = -0.02 kr.
+    checks.append(("export revenue telemetry uses slot sell price and keeps negative export prices signed",
+                   abs(coord.export_revenue_today_kr - 0.12) < 1e-6, str(coord.export_revenue_today_kr)))
+    checks.append(("export revenue telemetry books daily/weekly/monthly/lifetime buckets",
+                   all(abs(x - 0.12) < 1e-6 for x in (
+                       coord.export_revenue_today_kr,
+                       coord.export_revenue_week_kr,
+                       coord.export_revenue_month_kr,
+                       coord.export_revenue_total_kr,
+                   )), str((coord.export_revenue_today_kr, coord.export_revenue_week_kr, coord.export_revenue_month_kr, coord.export_revenue_total_kr))))
+    checks.append(("export revenue telemetry tracks exported kWh beside DKK",
+                   abs(coord.export_revenue_kwh_today - 0.3) < 1e-6, str(coord.export_revenue_kwh_today)))
     return checks
 
 

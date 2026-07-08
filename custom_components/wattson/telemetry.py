@@ -52,6 +52,20 @@ class TelemetryMixin:
         self.value_total_kr: float = 0.0
         self._value_day = None
         self._value_last_tick: datetime | None = None
+        # Actual revenue from selling power to the grid, priced with the configured
+        # sell-price entity (EDS2 in the user's setup) via the slot export value.
+        self.export_revenue_today_kr: float = 0.0
+        self.export_revenue_week_kr: float = 0.0
+        self.export_revenue_month_kr: float = 0.0
+        self.export_revenue_total_kr: float = 0.0
+        self.export_revenue_kwh_today: float = 0.0
+        self.export_revenue_kwh_week: float = 0.0
+        self.export_revenue_kwh_month: float = 0.0
+        self.export_revenue_kwh_total: float = 0.0
+        self._export_revenue_day = None
+        self._export_revenue_week = None
+        self._export_revenue_month = None
+        self._export_revenue_last_tick: datetime | None = None
         # Counterfactual (#5): what today WOULD have cost without the battery
         # (deficit imports, surplus exports) vs what it actually costs.
         self.baseline_cost_today_kr: float = 0.0
@@ -217,6 +231,60 @@ class TelemetryMixin:
         )
         self.value_today_kr += inc
         self.value_total_kr += inc
+
+    # ------------------------------------------------------------------ #
+    # Actual export revenue
+    # ------------------------------------------------------------------ #
+    def _accumulate_export_revenue(self) -> None:
+        """Accumulate actual grid-export revenue, period-bucketed.
+
+        This is deliberately narrower than ``value_today_kr``: only measured
+        net export is counted, and it is priced with the current tick's export
+        value from the sell-price horizon. Negative export prices stay negative
+        so the sensor reflects the real cash effect of exporting in that hour.
+        """
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._export_revenue_day != today:
+            self._export_revenue_day = today
+            self.export_revenue_today_kr = 0.0
+            self.export_revenue_kwh_today = 0.0
+        iso_week = today.isocalendar()[:2]
+        if self._export_revenue_week != iso_week:
+            self._export_revenue_week = iso_week
+            self.export_revenue_week_kr = 0.0
+            self.export_revenue_kwh_week = 0.0
+        month = (today.year, today.month)
+        if self._export_revenue_month != month:
+            self._export_revenue_month = month
+            self.export_revenue_month_kr = 0.0
+            self.export_revenue_kwh_month = 0.0
+
+        last = self._export_revenue_last_tick
+        self._export_revenue_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        _, export_price = self._tick_prices()
+        if export_price is None:
+            return
+        export_kwh = max(0.0, state.grid_export_power_w) / 1000.0 * dt_hours
+        if export_kwh <= 0.0:
+            return
+        revenue = export_kwh * export_price
+        self.export_revenue_today_kr += revenue
+        self.export_revenue_week_kr += revenue
+        self.export_revenue_month_kr += revenue
+        self.export_revenue_total_kr += revenue
+        self.export_revenue_kwh_today += export_kwh
+        self.export_revenue_kwh_week += export_kwh
+        self.export_revenue_kwh_month += export_kwh
+        self.export_revenue_kwh_total += export_kwh
 
     # ------------------------------------------------------------------ #
     # #5: counterfactual savings vs NO battery
