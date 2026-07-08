@@ -58,28 +58,34 @@ class TelemetryMixin:
         self.import_savings_today_kr: float = 0.0
         self.import_savings_week_kr: float = 0.0
         self.import_savings_month_kr: float = 0.0
+        self.import_savings_year_kr: float = 0.0
         self.import_savings_total_kr: float = 0.0
         self.import_savings_kwh_today: float = 0.0
         self.import_savings_kwh_week: float = 0.0
         self.import_savings_kwh_month: float = 0.0
+        self.import_savings_kwh_year: float = 0.0
         self.import_savings_kwh_total: float = 0.0
         self._import_savings_day = None
         self._import_savings_week = None
         self._import_savings_month = None
+        self._import_savings_year = None
         self._import_savings_last_tick: datetime | None = None
         # Actual revenue from selling power to the grid, priced with the configured
         # sell-price entity (EDS2 in the user's setup) via the slot export value.
         self.export_revenue_today_kr: float = 0.0
         self.export_revenue_week_kr: float = 0.0
         self.export_revenue_month_kr: float = 0.0
+        self.export_revenue_year_kr: float = 0.0
         self.export_revenue_total_kr: float = 0.0
         self.export_revenue_kwh_today: float = 0.0
         self.export_revenue_kwh_week: float = 0.0
         self.export_revenue_kwh_month: float = 0.0
+        self.export_revenue_kwh_year: float = 0.0
         self.export_revenue_kwh_total: float = 0.0
         self._export_revenue_day = None
         self._export_revenue_week = None
         self._export_revenue_month = None
+        self._export_revenue_year = None
         self._export_revenue_last_tick: datetime | None = None
         # Counterfactual (#5): what today WOULD have cost without the battery
         # (deficit imports, surplus exports) vs what it actually costs.
@@ -276,6 +282,10 @@ class TelemetryMixin:
             self._import_savings_month = month
             self.import_savings_month_kr = 0.0
             self.import_savings_kwh_month = 0.0
+        if self._import_savings_year != today.year:
+            self._import_savings_year = today.year
+            self.import_savings_year_kr = 0.0
+            self.import_savings_kwh_year = 0.0
 
         last = self._import_savings_last_tick
         self._import_savings_last_tick = now
@@ -294,10 +304,12 @@ class TelemetryMixin:
         self.import_savings_today_kr += savings
         self.import_savings_week_kr += savings
         self.import_savings_month_kr += savings
+        self.import_savings_year_kr += savings
         self.import_savings_total_kr += savings
         self.import_savings_kwh_today += saved_kwh
         self.import_savings_kwh_week += saved_kwh
         self.import_savings_kwh_month += saved_kwh
+        self.import_savings_kwh_year += saved_kwh
         self.import_savings_kwh_total += saved_kwh
 
     # ------------------------------------------------------------------ #
@@ -330,6 +342,10 @@ class TelemetryMixin:
             self._export_revenue_month = month
             self.export_revenue_month_kr = 0.0
             self.export_revenue_kwh_month = 0.0
+        if self._export_revenue_year != today.year:
+            self._export_revenue_year = today.year
+            self.export_revenue_year_kr = 0.0
+            self.export_revenue_kwh_year = 0.0
 
         last = self._export_revenue_last_tick
         self._export_revenue_last_tick = now
@@ -348,10 +364,12 @@ class TelemetryMixin:
         self.export_revenue_today_kr += revenue
         self.export_revenue_week_kr += revenue
         self.export_revenue_month_kr += revenue
+        self.export_revenue_year_kr += revenue
         self.export_revenue_total_kr += revenue
         self.export_revenue_kwh_today += export_kwh
         self.export_revenue_kwh_week += export_kwh
         self.export_revenue_kwh_month += export_kwh
+        self.export_revenue_kwh_year += export_kwh
         self.export_revenue_kwh_total += export_kwh
 
     # ------------------------------------------------------------------ #

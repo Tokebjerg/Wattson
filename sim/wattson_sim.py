@@ -1414,13 +1414,14 @@ def test_f_savings():
     # 6 kW for 2 min @ 0.7 = 0.14 kr, then 3 kW for 2 min @ -0.2 = -0.02 kr.
     checks.append(("export revenue telemetry uses slot sell price and keeps negative export prices signed",
                    abs(coord.export_revenue_today_kr - 0.12) < 1e-6, str(coord.export_revenue_today_kr)))
-    checks.append(("export revenue telemetry books daily/weekly/monthly/lifetime buckets",
+    checks.append(("export revenue telemetry books daily/weekly/monthly/yearly/lifetime buckets",
                    all(abs(x - 0.12) < 1e-6 for x in (
                        coord.export_revenue_today_kr,
                        coord.export_revenue_week_kr,
                        coord.export_revenue_month_kr,
+                       coord.export_revenue_year_kr,
                        coord.export_revenue_total_kr,
-                   )), str((coord.export_revenue_today_kr, coord.export_revenue_week_kr, coord.export_revenue_month_kr, coord.export_revenue_total_kr))))
+                   )), str((coord.export_revenue_today_kr, coord.export_revenue_week_kr, coord.export_revenue_month_kr, coord.export_revenue_year_kr, coord.export_revenue_total_kr))))
     checks.append(("export revenue telemetry tracks exported kWh beside DKK",
                    abs(coord.export_revenue_kwh_today - 0.3) < 1e-6, str(coord.export_revenue_kwh_today)))
     # 1 kW avoided import for 2 min @ 2.0 = 0.0667 kr; the negative import-price
@@ -1428,19 +1429,23 @@ def test_f_savings():
     expected_import_savings = 1.0 * (2.0 / 60.0) * 2.0
     checks.append(("import savings telemetry uses slot buy price and excludes negative-price import income",
                    abs(coord.import_savings_today_kr - expected_import_savings) < 1e-6, str(coord.import_savings_today_kr)))
-    checks.append(("import savings telemetry books daily/weekly/monthly/lifetime buckets",
+    checks.append(("import savings telemetry books daily/weekly/monthly/yearly/lifetime buckets",
                    all(abs(x - expected_import_savings) < 1e-6 for x in (
                        coord.import_savings_today_kr,
                        coord.import_savings_week_kr,
                        coord.import_savings_month_kr,
+                       coord.import_savings_year_kr,
                        coord.import_savings_total_kr,
-                   )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_total_kr))))
+                   )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_year_kr, coord.import_savings_total_kr))))
     checks.append(("import savings telemetry tracks self-supplied kWh beside DKK",
                    abs(coord.import_savings_kwh_today - (2.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
     expected_net_value = expected_import_savings + 0.12
     checks.append(("net value headline is import savings + export revenue",
                    abs(expected_net_value - (coord.import_savings_today_kr + coord.export_revenue_today_kr)) < 1e-6,
                    str(expected_net_value)))
+    checks.append(("net value yearly parts are import savings year + export revenue year",
+                   abs(expected_net_value - (coord.import_savings_year_kr + coord.export_revenue_year_kr)) < 1e-6,
+                   str((coord.import_savings_year_kr, coord.export_revenue_year_kr))))
     return checks
 
 

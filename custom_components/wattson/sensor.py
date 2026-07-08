@@ -225,13 +225,12 @@ def _parse_window(value: str | None) -> Any:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[Any] = [WattsonSensor(coordinator, entry, description) for description in SENSORS]
-    entities.append(WattsonSavingsSensor(coordinator, entry))
     entities.append(WattsonSavingsTotalSensor(coordinator, entry))
-    for period in ("today", "week", "month", "total"):
+    for period in ("today", "week", "month", "year", "total"):
         entities.append(WattsonImportSavingsSensor(coordinator, entry, period))
-    for period in ("today", "week", "month", "total"):
+    for period in ("today", "week", "month", "year", "total"):
         entities.append(WattsonExportRevenueSensor(coordinator, entry, period))
-    for period in ("today", "week", "month", "total"):
+    for period in ("today", "week", "month", "year", "total"):
         entities.append(WattsonNetValueSensor(coordinator, entry, period))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
@@ -292,45 +291,6 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
         return None
 
 
-class WattsonSavingsSensor(CoordinatorEntity, RestoreSensor):
-    """Phase F: today's delivered value (avoided import + export), restored across restarts."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Savings Today"
-    _attr_icon = "mdi:piggy-bank"
-    _attr_native_unit_of_measurement = "DKK"
-    _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_state_class = SensorStateClass.TOTAL
-
-    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_savings_today"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=coordinator.display_name,
-            manufacturer=NAME,
-            model="Home Assistant Energy Orchestrator",
-        )
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        last_state = await self.async_get_last_state()
-        if last_state is None or last_state.state in (None, "unknown", "unavailable"):
-            return
-        try:
-            value = float(last_state.state)
-        except (TypeError, ValueError):
-            return
-        # Only restore if the saved value is from today (same local date).
-        if dt_util.as_local(last_state.last_updated).date() == dt_util.now().date():
-            self.coordinator.value_today_kr = value
-            self.coordinator._value_day = dt_util.now().date()
-
-    @property
-    def native_value(self) -> float:
-        return round(self.coordinator.value_today_kr, 2)
-
-
 class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
     """Actual avoided import cost, priced with the configured buy price."""
 
@@ -344,18 +304,21 @@ class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
         "today": "Import Savings Today",
         "week": "Import Savings Week",
         "month": "Import Savings Month",
+        "year": "Import Savings Year",
         "total": "Import Savings Total",
     }
     _SAVINGS_ATTRS = {
         "today": "import_savings_today_kr",
         "week": "import_savings_week_kr",
         "month": "import_savings_month_kr",
+        "year": "import_savings_year_kr",
         "total": "import_savings_total_kr",
     }
     _KWH_ATTRS = {
         "today": "import_savings_kwh_today",
         "week": "import_savings_kwh_week",
         "month": "import_savings_kwh_month",
+        "year": "import_savings_kwh_year",
         "total": "import_savings_kwh_total",
     }
 
@@ -405,7 +368,9 @@ class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
             return last_local.date() == now_local.date()
         if self._period == "week":
             return last_local.date().isocalendar()[:2] == now_local.date().isocalendar()[:2]
-        return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+        if self._period == "month":
+            return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+        return last_local.year == now_local.year
 
     def _mark_restored_period(self) -> None:
         today = dt_util.now().date()
@@ -415,6 +380,8 @@ class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
             self.coordinator._import_savings_week = today.isocalendar()[:2]
         elif self._period == "month":
             self.coordinator._import_savings_month = (today.year, today.month)
+        elif self._period == "year":
+            self.coordinator._import_savings_year = today.year
 
     @property
     def native_value(self) -> float:
@@ -445,18 +412,21 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
         "today": "Export Revenue Today",
         "week": "Export Revenue Week",
         "month": "Export Revenue Month",
+        "year": "Export Revenue Year",
         "total": "Export Revenue Total",
     }
     _REVENUE_ATTRS = {
         "today": "export_revenue_today_kr",
         "week": "export_revenue_week_kr",
         "month": "export_revenue_month_kr",
+        "year": "export_revenue_year_kr",
         "total": "export_revenue_total_kr",
     }
     _KWH_ATTRS = {
         "today": "export_revenue_kwh_today",
         "week": "export_revenue_kwh_week",
         "month": "export_revenue_kwh_month",
+        "year": "export_revenue_kwh_year",
         "total": "export_revenue_kwh_total",
     }
 
@@ -506,7 +476,9 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
             return last_local.date() == now_local.date()
         if self._period == "week":
             return last_local.date().isocalendar()[:2] == now_local.date().isocalendar()[:2]
-        return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+        if self._period == "month":
+            return (last_local.year, last_local.month) == (now_local.year, now_local.month)
+        return last_local.year == now_local.year
 
     def _mark_restored_period(self) -> None:
         today = dt_util.now().date()
@@ -516,6 +488,8 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
             self.coordinator._export_revenue_week = today.isocalendar()[:2]
         elif self._period == "month":
             self.coordinator._export_revenue_month = (today.year, today.month)
+        elif self._period == "year":
+            self.coordinator._export_revenue_year = today.year
 
     @property
     def native_value(self) -> float:
@@ -546,30 +520,35 @@ class WattsonNetValueSensor(CoordinatorEntity, SensorEntity):
         "today": "Net Value Today",
         "week": "Net Value Week",
         "month": "Net Value Month",
+        "year": "Net Value Year",
         "total": "Net Value Total",
     }
     _IMPORT_ATTRS = {
         "today": "import_savings_today_kr",
         "week": "import_savings_week_kr",
         "month": "import_savings_month_kr",
+        "year": "import_savings_year_kr",
         "total": "import_savings_total_kr",
     }
     _EXPORT_ATTRS = {
         "today": "export_revenue_today_kr",
         "week": "export_revenue_week_kr",
         "month": "export_revenue_month_kr",
+        "year": "export_revenue_year_kr",
         "total": "export_revenue_total_kr",
     }
     _IMPORT_KWH_ATTRS = {
         "today": "import_savings_kwh_today",
         "week": "import_savings_kwh_week",
         "month": "import_savings_kwh_month",
+        "year": "import_savings_kwh_year",
         "total": "import_savings_kwh_total",
     }
     _EXPORT_KWH_ATTRS = {
         "today": "export_revenue_kwh_today",
         "week": "export_revenue_kwh_week",
         "month": "export_revenue_kwh_month",
+        "year": "export_revenue_kwh_year",
         "total": "export_revenue_kwh_total",
     }
 
@@ -605,7 +584,7 @@ class WattsonNetValueSensor(CoordinatorEntity, SensorEntity):
             "export_revenue_kr": round(export_revenue, 2),
             "saved_kwh": round(float(getattr(self.coordinator, self._IMPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
             "export_kwh": round(float(getattr(self.coordinator, self._EXPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
-            "note": "Ny hoved-KPI: faktisk besparelse fra undgået net-import + faktisk salgsindtægt fra net-eksport. Legacy Savings Today bevares uændret for historik.",
+            "note": "Ny hoved-KPI: faktisk besparelse fra undgået net-import + faktisk salgsindtægt fra net-eksport. Erstatter legacy Savings Today som daglig headline.",
         }
 
 

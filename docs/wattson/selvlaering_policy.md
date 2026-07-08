@@ -19,7 +19,9 @@ Brug `ha_get_history` / `ha_eval_template` på mindst:
   `sensor.wattson_site_status`, `sensor.bryggers_wattson_plan_schedule`
 - `sensor.wattson_battery_soc`, `sensor.wattson_pv_power`, `sensor.wattson_load_power`,
   `sensor.wattson_grid_power`
-- `sensor.bryggers_wattson_savings_today` (+ uge/måned)
+- `sensor.bryggers_wattson_net_value_today`,
+  `sensor.bryggers_wattson_import_savings_today`,
+  `sensor.bryggers_wattson_export_revenue_today` (+ uge/måned/år/total)
 - EV: `sensor.ehut8c3w_power`, `sensor.ehut8c3w_status`, `sensor.ehut8c3w_session_energy`
 - Priser: `sensor.energi_data_service` (raw_today/raw_tomorrow), `sensor.wattson_current_buy_price`
 - Sol-prognose: `sensor.solcast_pv_forecast_forecast_today/_tomorrow`
