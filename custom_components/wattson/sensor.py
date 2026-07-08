@@ -231,6 +231,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(WattsonImportSavingsSensor(coordinator, entry, period))
     for period in ("today", "week", "month", "total"):
         entities.append(WattsonExportRevenueSensor(coordinator, entry, period))
+    for period in ("today", "week", "month", "total"):
+        entities.append(WattsonNetValueSensor(coordinator, entry, period))
     entities.append(WattsonCurtailedSolarSensor(coordinator, entry))
     entities.append(WattsonSavingsVsNoBatterySensor(coordinator, entry))
     entities.append(WattsonEvChargePlanSensor(coordinator, entry))
@@ -528,6 +530,82 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
             "avg_sell_price_kr_kwh": round(revenue / kwh, 3) if kwh > 0.001 else None,
             "price_source": entry_value(self._entry, CONF_SELL_PRICE_ENTITY, None),
             "note": "Faktisk salgsindtægt: målt net-eksport × Wattsons sell-price/EDS2 pris pr. tick. Negative eksportpriser trækker fra.",
+        }
+
+
+class WattsonNetValueSensor(CoordinatorEntity, SensorEntity):
+    """Transparent headline KPI: import savings + export revenue."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:cash-check"
+    _attr_native_unit_of_measurement = "DKK"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    _NAMES = {
+        "today": "Net Value Today",
+        "week": "Net Value Week",
+        "month": "Net Value Month",
+        "total": "Net Value Total",
+    }
+    _IMPORT_ATTRS = {
+        "today": "import_savings_today_kr",
+        "week": "import_savings_week_kr",
+        "month": "import_savings_month_kr",
+        "total": "import_savings_total_kr",
+    }
+    _EXPORT_ATTRS = {
+        "today": "export_revenue_today_kr",
+        "week": "export_revenue_week_kr",
+        "month": "export_revenue_month_kr",
+        "total": "export_revenue_total_kr",
+    }
+    _IMPORT_KWH_ATTRS = {
+        "today": "import_savings_kwh_today",
+        "week": "import_savings_kwh_week",
+        "month": "import_savings_kwh_month",
+        "total": "import_savings_kwh_total",
+    }
+    _EXPORT_KWH_ATTRS = {
+        "today": "export_revenue_kwh_today",
+        "week": "export_revenue_kwh_week",
+        "month": "export_revenue_kwh_month",
+        "total": "export_revenue_kwh_total",
+    }
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry, period: str) -> None:
+        super().__init__(coordinator)
+        if period not in self._NAMES:
+            raise ValueError(f"Unsupported net value period: {period}")
+        self._period = period
+        self._attr_name = self._NAMES[period]
+        self._attr_unique_id = f"{entry.entry_id}_net_value_{period}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    def _parts(self) -> tuple[float, float]:
+        import_savings = float(getattr(self.coordinator, self._IMPORT_ATTRS[self._period], 0.0) or 0.0)
+        export_revenue = float(getattr(self.coordinator, self._EXPORT_ATTRS[self._period], 0.0) or 0.0)
+        return import_savings, export_revenue
+
+    @property
+    def native_value(self) -> float:
+        import_savings, export_revenue = self._parts()
+        return round(import_savings + export_revenue, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        import_savings, export_revenue = self._parts()
+        return {
+            "import_savings_kr": round(import_savings, 2),
+            "export_revenue_kr": round(export_revenue, 2),
+            "saved_kwh": round(float(getattr(self.coordinator, self._IMPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
+            "export_kwh": round(float(getattr(self.coordinator, self._EXPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
+            "note": "Ny hoved-KPI: faktisk besparelse fra undgået net-import + faktisk salgsindtægt fra net-eksport. Legacy Savings Today bevares uændret for historik.",
         }
 
 

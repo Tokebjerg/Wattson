@@ -1437,6 +1437,10 @@ def test_f_savings():
                    )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_total_kr))))
     checks.append(("import savings telemetry tracks self-supplied kWh beside DKK",
                    abs(coord.import_savings_kwh_today - (2.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
+    expected_net_value = expected_import_savings + 0.12
+    checks.append(("net value headline is import savings + export revenue",
+                   abs(expected_net_value - (coord.import_savings_today_kr + coord.export_revenue_today_kr)) < 1e-6,
+                   str(expected_net_value)))
     return checks
 
 
