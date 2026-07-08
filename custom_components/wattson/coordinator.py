@@ -189,6 +189,19 @@ from .planner import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _ev_solar_effective_battery_threshold(
+    *, priority_enabled: bool, user_threshold: float, negative_price_active: bool
+) -> float:
+    """Threshold passed to EV solar charging; the UI number owns this gate."""
+    # Negative price blocks export, so let the EV soak surplus that would
+    # otherwise be curtailed even below the normal house-battery threshold.
+    if negative_price_active:
+        return 0.0
+    if not priority_enabled:
+        return 0.0
+    return max(0.0, float(user_threshold))
+
+
 class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=UPDATE_INTERVAL)
@@ -1181,19 +1194,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Phase C UI: scheduled window is built from the start/end hour numbers;
         # the house-battery threshold only applies when the priority toggle is on.
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
-        # The home-battery SOC plan has priority over EV solar charging: the car
-        # waits for solar until the house battery reaches the charge-priority SOC
-        # (and the user's own EV house-battery threshold, when that toggle is on).
-        effective_battery_threshold = max(
-            self.ev_solar_battery_threshold if self.ev_solar_battery_priority else 0.0,
-            solar_charge_priority,
+        # EV solar charging is gated by the user's EV house-battery threshold.
+        # The global solar charge-priority SOC still shapes the battery plan,
+        # but it must not silently override this UI number.
+        effective_battery_threshold = _ev_solar_effective_battery_threshold(
+            priority_enabled=self.ev_solar_battery_priority,
+            user_threshold=self.ev_solar_battery_threshold,
+            negative_price_active=negative_price_active,
         )
-        # EXCEPTION — negative price: export is blocked, so surplus the battery
-        # can't absorb would otherwise be CURTAILED. Let the EV soak it up instead
-        # (if connected & not full), even below the charge-priority SOC. The battery
-        # still charges first via its own plan; the EV only gets the true excess.
-        if negative_price_active:
-            effective_battery_threshold = 0.0
 
         ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_plan = build_ev_plan(

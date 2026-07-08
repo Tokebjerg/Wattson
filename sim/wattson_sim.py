@@ -1157,6 +1157,12 @@ def test_c_smartcharge():
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
     )
     checks.append(("solar threshold: battery 60% >= 50% -> resume", above.desired_action == "resume", above.reason))
+    ui_threshold = planner.build_ev_plan(
+        ev_state(at(12), soc=37, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=25,
+    )
+    checks.append(("solar threshold: user 25% allows EV solar at 37% house battery",
+                   ui_threshold.desired_action == "resume", ui_threshold.reason))
     # Negative-price relaxation: the coordinator drops the gate to 0 so the EV
     # absorbs surplus (that would otherwise be curtailed) even at a low battery SOC.
     neg_gate = planner.build_ev_plan(
@@ -2105,6 +2111,19 @@ def test_coordinator_ev_harness():
 
     checks = []
     co_mod = _coordinator_module()
+
+    effective_threshold = co_mod._ev_solar_effective_battery_threshold(
+        priority_enabled=True, user_threshold=25.0, negative_price_active=False)
+    checks.append(("coordinator EV solar threshold: UI number 25% is passed through unchanged",
+                   effective_threshold == 25.0, str(effective_threshold)))
+    priority_off_threshold = co_mod._ev_solar_effective_battery_threshold(
+        priority_enabled=False, user_threshold=25.0, negative_price_active=False)
+    checks.append(("coordinator EV solar threshold: priority off disables the house-battery gate",
+                   priority_off_threshold == 0.0, str(priority_off_threshold)))
+    negative_price_threshold = co_mod._ev_solar_effective_battery_threshold(
+        priority_enabled=True, user_threshold=25.0, negative_price_active=True)
+    checks.append(("coordinator EV solar threshold: negative price still relaxes the gate",
+                   negative_price_threshold == 0.0, str(negative_price_threshold)))
 
     class _Entry:
         options: dict = {}
