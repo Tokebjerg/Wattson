@@ -1177,6 +1177,13 @@ def test_c_smartcharge():
     lo = planner.build_ev_plan(base, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=200)
     checks.append(("averaged override high -> resume", hi.desired_action == "resume", hi.reason))
     checks.append(("averaged override low -> pause", lo.desired_action == "pause", lo.reason))
+    wait_hysteresis = planner.build_ev_plan(
+        ev_state(at(12), status="charger_wait", power=0.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=900,
+    )
+    checks.append(("solar_only: charger_wait uses active-session stop threshold and keeps trying",
+                   wait_hysteresis.desired_action == "resume", wait_hysteresis.reason))
 
     # --- 15-minute phase lock ---
     class MutStates:
@@ -1220,6 +1227,19 @@ def test_c_smartcharge():
         models.EvPlan(mode="solar_only", reason="", desired_phase_mode="auto_phase")))
     checks.append(("apply: desired auto_phase vs charger 'auto' issues no phase write",
                    not any("phase_mode=" in x for x in nw), str(nw)))
+    resume_order = asyncio.run(control.EaseeController(MutHass()).apply_ev_plan(
+        mp, ev_state(at(13), status="charger_wait", phase="auto"),
+        models.EvPlan(
+            mode="solar_only", reason="", desired_enabled=True, desired_amps=12,
+            desired_circuit_currents=(11, 11, 11), desired_action="resume",
+            desired_phase_mode="auto_phase",
+        )))
+    circuit_i = next((i for i, x in enumerate(resume_order) if "circuit_dynamic_limit" in x), -1)
+    limit_i = next((i for i, x in enumerate(resume_order) if "dynamic_limit=12A" in x), -1)
+    resume_i = next((i for i, x in enumerate(resume_order) if "action_command=resume" in x), -1)
+    checks.append(("apply: resume writes non-zero limits before action_command",
+                   -1 not in (circuit_i, limit_i, resume_i) and circuit_i < resume_i and limit_i < resume_i,
+                   str(resume_order)))
 
     # --- custom scheduled window (built from start/end hours, e.g. "01:00-05:00") ---
     def scheduled(now_h, window):
@@ -2211,6 +2231,15 @@ def test_coordinator_ev_harness():
         asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
     checks.append((f"harness nudge: awaiting_start re-asserted 1/60s (4 in 3 min), stops when charging [{n_nudge}→{len(co._easee.calls)}]",
                    n_nudge == 4 and len(co._easee.calls) == n_nudge, f"{n_nudge}/{len(co._easee.calls)}"))
+
+    # (d2) Live 2026-07-08: mapped Easee status stayed charger_wait with no current
+    # after resume landed while dynamic charger limit was 0 A. Treat it as the same
+    # stuck-start class as awaiting_start, so the full plan is re-asserted every 60 s.
+    co = make_co(status="charger_wait")
+    for i in range(19):
+        asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
+    checks.append((f"harness nudge: charger_wait re-asserted 1/60s like awaiting_start [{len(co._easee.calls)}]",
+                   len(co._easee.calls) == 4, str(co._easee.calls)))
 
     # (e) Write cooldown: a second structural change 5 s after the first is HELD and
     # retried — applied cleanly at t15 (fp not falsely marked as applied at t5).

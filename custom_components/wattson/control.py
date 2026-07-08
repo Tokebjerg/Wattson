@@ -317,31 +317,46 @@ class EaseeController:
 
     async def apply_ev_plan(self, mapping: EntityMapping, state: SiteState, plan: EvPlan) -> list[str]:
         actions: list[str] = []
+
+        async def apply_current_offer() -> None:
+            if plan.desired_circuit_currents is not None:
+                actions.extend(await self._set_circuit_dynamic_limit(mapping.easee_device_id, plan.desired_circuit_currents))
+            if plan.desired_amps is not None:
+                actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
+            if plan.desired_phase_mode is not None:
+                if self._normalize_phase_mode(state.easee_phase_mode) != self._normalize_phase_mode(plan.desired_phase_mode):
+                    now = state.timestamp
+                    locked = (
+                        self._last_phase_change_at is not None
+                        and (now - self._last_phase_change_at) < timedelta(minutes=EV_PHASE_LOCK_MINUTES)
+                    )
+                    if locked:
+                        actions.append(f"easee.phase_mode change suppressed ({EV_PHASE_LOCK_MINUTES}-min lock)")
+                    else:
+                        changed = await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode)
+                        if changed:
+                            self._last_phase_change_at = now
+                            actions.extend(changed)
+
         if plan.desired_enabled is not None and mapping.easee_enable_switch:
             actions.extend(await self._set_switch(mapping.easee_enable_switch, plan.desired_enabled))
+
+        # For resume, publish the actual current offer before the start command.
+        # Easee can stay in charger_wait/charger_disabled if resume lands while
+        # the dynamic charger/circuit limit is still 0 A.
+        resume_requested = plan.desired_action == "resume"
+        if resume_requested:
+            await apply_current_offer()
+
         if plan.desired_action:
-            if plan.desired_action == "pause" and state.easee_status == "awaiting_start":
+            status = (state.easee_status or "").lower()
+            if plan.desired_action == "pause" and status == "awaiting_start":
                 pass
-            elif plan.desired_action == "resume" and state.easee_status == "charging":
+            elif plan.desired_action == "resume" and status == "charging":
                 pass
             else:
                 actions.extend(await self._action(mapping.easee_device_id, plan.desired_action))
-        if plan.desired_circuit_currents is not None:
-            actions.extend(await self._set_circuit_dynamic_limit(mapping.easee_device_id, plan.desired_circuit_currents))
-        if plan.desired_amps is not None:
-            actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
-        if plan.desired_phase_mode is not None:
-            if self._normalize_phase_mode(state.easee_phase_mode) != self._normalize_phase_mode(plan.desired_phase_mode):
-                now = state.timestamp
-                locked = (
-                    self._last_phase_change_at is not None
-                    and (now - self._last_phase_change_at) < timedelta(minutes=EV_PHASE_LOCK_MINUTES)
-                )
-                if locked:
-                    actions.append(f"easee.phase_mode change suppressed ({EV_PHASE_LOCK_MINUTES}-min lock)")
-                else:
-                    changed = await self._set_phase_mode(mapping.easee_device_id, plan.desired_phase_mode)
-                    if changed:
-                        self._last_phase_change_at = now
-                        actions.extend(changed)
+
+        if not resume_requested:
+            await apply_current_offer()
         return actions

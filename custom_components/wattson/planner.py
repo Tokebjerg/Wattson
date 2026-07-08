@@ -17,6 +17,7 @@ from .const import (
     BATTERY_OVERRIDE_SOLAR_CHARGE,
     BATTERY_ROUND_TRIP_EFFICIENCY,
     BATTERY_WEAR_COST,
+    EV_ACTIVE_SESSION_STATUSES,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
     EV_MODE_SCHEDULED_CHEAPEST,
@@ -2169,7 +2170,7 @@ def build_ev_plan(
     if ev_mode == EV_MODE_SOLAR_ONLY:
         current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
         normalized_status = (state.easee_status or "").lower()
-        ev_session_active = current_ev_power_w >= 200.0 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
+        ev_session_active = current_ev_power_w >= 200.0 or normalized_status in EV_ACTIVE_SESSION_STATUSES
 
         # Phase C: use the smoothed (2-minute averaged) surplus when supplied by the
         # coordinator, otherwise the instantaneous value.
@@ -2322,7 +2323,7 @@ def build_ev_plan(
             # threshold + house-battery-first gate as solar-only mode.
             current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
             normalized_status = (state.easee_status or "").lower()
-            ev_session_active = current_ev_power_w >= 200.0 or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
+            ev_session_active = current_ev_power_w >= 200.0 or normalized_status in EV_ACTIVE_SESSION_STATUSES
             surplus_w = (
                 solar_surplus_override
                 if solar_surplus_override is not None

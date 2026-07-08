@@ -293,13 +293,23 @@ EV_CURRENT_DEADBAND_A = 2
 # changes gives the car a steady offer long enough to settle.
 EV_CURRENT_RETUNE_SECONDS = 90
 # When the plan WANTS the car charging but the charger is still awaiting_start /
-# ready_to_charge / paused (the car never actually started — a single resume
-# didn't wake it, or it was offered current capped by a stale circuit limit),
-# re-assert the full plan this often until it is genuinely drawing power. The
-# deadband/retune gating only fires on changes, so without this nudge a stuck
-# car sits in awaiting_start forever (observed 2026-06-13: ~50 min at 0 kW on a
-# negative-price morning after a mode switch). Stops the instant the car charges.
+# ready_to_charge / charger_wait / paused (the car never actually started — a
+# single resume didn't wake it, or it was offered current capped by a stale
+# circuit/charger limit), re-assert the full plan this often until it is
+# genuinely drawing power. The deadband/retune gating only fires on changes, so
+# without this nudge a stuck car sits waiting forever (observed 2026-06-13:
+# ~50 min at 0 kW on a negative-price morning after a mode switch; 2026-07-08:
+# Easee reported charger_wait / charger_disabled after a 0 A dynamic limit).
+# Stops the instant the car charges.
 EV_RESUME_RETRY_SECONDS = 60
+EV_CONNECTED_IDLE_STATUSES = {
+    "awaiting_start",
+    "ready_to_charge",
+    "charger_wait",
+    "charger_disabled",
+}
+EV_ACTIVE_SESSION_STATUSES = {"charging", *EV_CONNECTED_IDLE_STATUSES}
+EV_WAITING_TO_START_STATUSES = {*EV_CONNECTED_IDLE_STATUSES, "paused"}
 
 # EV curtailment-soak (v0.24.41): in solar_only, when export is blocked/negative AND the
 # battery is full/near-full, the Deye CURTAILS PV (no sink) and the MEASURED surplus is

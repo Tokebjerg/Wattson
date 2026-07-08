@@ -22,6 +22,8 @@ from .const import (
     EV_SOAK_START_A,
     EV_SOAK_STEP_A,
     EV_SOAK_STEP_SECONDS,
+    EV_ACTIVE_SESSION_STATUSES,
+    EV_WAITING_TO_START_STATUSES,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
     CONF_AUTOMATION_ENABLED,
@@ -1240,7 +1242,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             normalized_status = (self.site_state.easee_status or "").lower()
             ev_session_active = bool(
                 (self.site_state.easee_power_w or 0.0) >= 200.0
-                or normalized_status in {"charging", "ready_to_charge", "awaiting_start"}
+                or normalized_status in EV_ACTIVE_SESSION_STATUSES
             )
 
             # EV curtailment-soak (v0.24.41): when export is blocked/<=0 AND the battery is
@@ -1779,9 +1781,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # until it actually draws; the moment status is "charging" this stops, so
         # it never competes with the in-session anti-oscillation gating.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
-        not_yet_charging = (self.site_state.easee_status or "").lower() in (
-            "awaiting_start", "ready_to_charge", "paused",
-        )
+        not_yet_charging = (self.site_state.easee_status or "").lower() in EV_WAITING_TO_START_STATUSES
         nudge_stuck = (
             wants_charging
             and not_yet_charging
