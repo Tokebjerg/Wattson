@@ -26,3 +26,10 @@ enable_shadow_mode:
 disable_shadow_mode:
   name: Disable Shadow Mode
   description: Allow Wattson to execute control plans again.
+sync_value_sensors:
+  name: Sync Value Sensors
+  description: Reset the new Wattson value sensor families so import savings, export revenue, net value, and EV solar savings start from the same instant.
+  fields:
+    entry_id:
+      description: Optional config entry id.
+      example: "abcd1234"

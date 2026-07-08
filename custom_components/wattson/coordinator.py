@@ -998,6 +998,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
+    async def async_sync_value_sensors(self) -> None:
+        self._sync_value_sensor_baseline()
+        self.async_update_listeners()
+
     async def _async_update_data(self) -> ControlPlan:
         # Phase E: auto-resume — drop any manual override whose window elapsed.
         self._expire_overrides(dt_util.utcnow())

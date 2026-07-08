@@ -92,11 +92,12 @@ def _load_wattson():
     mapping = importlib.import_module("wattson.mapping")
     planner = importlib.import_module("wattson.planner")
     control = importlib.import_module("wattson.control")
-    return const, models, horizon, learning, mapping, planner, control
+    telemetry = importlib.import_module("wattson.telemetry")
+    return const, models, horizon, learning, mapping, planner, control, telemetry
 
 
 _install_ha_stubs()
-const, models, horizon, learning, mapping, planner, control = _load_wattson()
+const, models, horizon, learning, mapping, planner, control, telemetry = _load_wattson()
 safety = importlib.import_module("wattson.safety")
 deye_contract = importlib.import_module("wattson.deye_contract")
 State = sys.modules["homeassistant.core"].State
@@ -4031,6 +4032,74 @@ def test_solar_aware_reserve():
     return checks
 
 
+def test_value_sensor_baseline_sync():
+    checks = []
+
+    class DummyTelemetry(telemetry.TelemetryMixin):
+        pass
+
+    d = DummyTelemetry()
+    for period in ("today", "week", "month", "year", "total"):
+        setattr(d, f"import_savings_{period}_kr", 12.34)
+        setattr(d, f"import_savings_kwh_{period}", 5.67)
+        setattr(d, f"export_revenue_{period}_kr", 8.90)
+        setattr(d, f"export_revenue_kwh_{period}", 1.23)
+        for attr_template in telemetry.EV_SOLAR_VALUE_ATTRS.values():
+            setattr(d, attr_template.format(period=period), 4.56)
+    d.ev_solar_grid_backed_kwh = 1.0
+    d.ev_solar_ev_kwh = 2.0
+    d._evsh_used_wh = 3.0
+    d._evsh_shadow_wh = 4.0
+    d._evsh_hours = 5.0
+
+    d._sync_value_sensor_baseline()
+    today = sys.modules["homeassistant.util.dt"].now().date()
+    iso_week = today.isocalendar()[:2]
+    month = (today.year, today.month)
+
+    checks.append(("import savings periods reset",
+                   all(getattr(d, f"import_savings_{p}_kr") == 0.0
+                       and getattr(d, f"import_savings_kwh_{p}") == 0.0
+                       for p in ("today", "week", "month", "year", "total")),
+                   "import"))
+    checks.append(("export revenue periods reset",
+                   all(getattr(d, f"export_revenue_{p}_kr") == 0.0
+                       and getattr(d, f"export_revenue_kwh_{p}") == 0.0
+                       for p in ("today", "week", "month", "year", "total")),
+                   "export"))
+    checks.append(("EV solar savings periods reset",
+                   all(getattr(d, attr_template.format(period=p)) == 0.0
+                       for p in ("today", "week", "month", "year", "total")
+                       for attr_template in telemetry.EV_SOLAR_VALUE_ATTRS.values()),
+                   "ev-solar"))
+    checks.append(("period markers align to now",
+                   d._import_savings_day == today
+                   and d._export_revenue_day == today
+                   and d._evsh_day == today
+                   and d._import_savings_week == iso_week
+                   and d._export_revenue_week == iso_week
+                   and d._ev_solar_savings_week == iso_week
+                   and d._import_savings_month == month
+                   and d._export_revenue_month == month
+                   and d._ev_solar_savings_month == month
+                   and d._import_savings_year == today.year
+                   and d._export_revenue_year == today.year
+                   and d._ev_solar_savings_year == today.year,
+                   "markers"))
+    checks.append(("last ticks share one baseline instant",
+                   d._import_savings_last_tick is d._export_revenue_last_tick
+                   and d._export_revenue_last_tick is d._evsh_last_tick,
+                   "same object"))
+    checks.append(("EV shadow side counters reset",
+                   d.ev_solar_grid_backed_kwh == 0.0
+                   and d.ev_solar_ev_kwh == 0.0
+                   and d._evsh_used_wh == 0.0
+                   and d._evsh_shadow_wh == 0.0
+                   and d._evsh_hours == 0.0,
+                   "shadow"))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -4089,6 +4158,7 @@ def main():
                          ("PLAN PROJECTION THROTTLE-AWARE (v0.24.24: SOC curve reflects morning-sell)", test_plan_projection_throttle_aware),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
+                         ("VALUE SENSOR BASELINE SYNC", test_value_sensor_baseline_sync),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),
                          ("SOC-AWARE SCHEDULE", test_soc_schedule)):

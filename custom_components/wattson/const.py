@@ -434,6 +434,7 @@ SERVICE_SET_EV_MODE = "set_ev_mode"
 SERVICE_SET_BATTERY_MODE = "set_battery_mode"
 SERVICE_ENABLE_SHADOW_MODE = "enable_shadow_mode"
 SERVICE_DISABLE_SHADOW_MODE = "disable_shadow_mode"
+SERVICE_SYNC_VALUE_SENSORS = "sync_value_sensors"
 
 KNOWN_DEFAULTS = {
     CONF_PV1_POWER_ENTITY: "sensor.klatremishw_deye_pv1_power",

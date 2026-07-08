@@ -225,6 +225,49 @@ class TelemetryMixin:
         export_price = slot.export_value if (slot and slot.export_value is not None) else state.current_sell_price
         return import_price, export_price
 
+    def _sync_value_sensor_baseline(self) -> None:
+        """Start the four value sensor families from the same instant.
+
+        This intentionally covers only the new transparent KPI families:
+        import_savings, export_revenue, net_value (derived from the first two),
+        and ev_solar_savings. Legacy ``value_*`` / ``savings_*`` counters keep
+        their historical continuity.
+        """
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        iso_week = today.isocalendar()[:2]
+        month = (today.year, today.month)
+
+        for period in ("today", "week", "month", "year", "total"):
+            setattr(self, f"import_savings_{period}_kr", 0.0)
+            setattr(self, f"import_savings_kwh_{period}", 0.0)
+            setattr(self, f"export_revenue_{period}_kr", 0.0)
+            setattr(self, f"export_revenue_kwh_{period}", 0.0)
+            self._reset_ev_solar_value_period(period)
+
+        self._import_savings_day = today
+        self._import_savings_week = iso_week
+        self._import_savings_month = month
+        self._import_savings_year = today.year
+        self._import_savings_last_tick = now
+
+        self._export_revenue_day = today
+        self._export_revenue_week = iso_week
+        self._export_revenue_month = month
+        self._export_revenue_year = today.year
+        self._export_revenue_last_tick = now
+
+        self._evsh_day = today
+        self._ev_solar_savings_week = iso_week
+        self._ev_solar_savings_month = month
+        self._ev_solar_savings_year = today.year
+        self.ev_solar_grid_backed_kwh = 0.0
+        self.ev_solar_ev_kwh = 0.0
+        self._evsh_used_wh = 0.0
+        self._evsh_shadow_wh = 0.0
+        self._evsh_hours = 0.0
+        self._evsh_last_tick = now
+
     def _current_solar_forecast_w(self) -> float:
         """Raw (uncorrected) Solcast forecast for the current hour, in average W."""
         state = self.site_state
