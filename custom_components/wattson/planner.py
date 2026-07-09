@@ -18,6 +18,9 @@ from .const import (
     BATTERY_ROUND_TRIP_EFFICIENCY,
     BATTERY_WEAR_COST,
     EV_ACTIVE_SESSION_STATUSES,
+    EV_BATTERY_FIRST_SPILLOVER_BATTERY_DRAW_W,
+    EV_BATTERY_FIRST_SPILLOVER_EXPORT_BUFFER_W,
+    EV_BATTERY_FIRST_SPILLOVER_MIN_BATTERY_CHARGE_W,
     EV_MODE_FULL_SPEED,
     EV_MODE_SCHEDULED,
     EV_MODE_SCHEDULED_CHEAPEST,
@@ -399,17 +402,13 @@ def apply_cold_guard(plan, temperature_c: float | None, *, min_charge_temp_c: fl
 
 
 def apply_ev_battery_protect(plan, *, ev_charging: bool, ev_covers_dips: bool):
-    """The house battery must NEVER be discharged to charge the car — EXCEPT in solar_only
-    ("Ren sol"), where it covers brief PV dips (``ev_covers_dips``). Everywhere else
-    (full_speed, scheduled, a manual EV override, negative-price force) the car pulls from
-    the GRID: with load_includes_ev + Load first + an OPEN discharge, the inverter would
-    otherwise cover the car's draw from the pack. This is the GLOBAL guard (v0.24.46) — the
-    per-mode EV_SOLAR_PRIORITY block only runs for solar_only, so full_speed / scheduled / a
-    manual EV override never reached its protection and drained the pack into the car
-    (user 2026-07-02/06). When the EV is charging and NOT solar_only, force discharge=0 (+
-    sell OFF, so discharge=0 never rides with sell=ON — the stall pair). No-op when the EV
-    isn't charging, in solar_only, when discharge is already 0 with sell off (grid-charge /
-    hold — not draining), or on an explicit force-discharge battery override."""
+    """Guard the house battery while the EV is charging.
+
+    The house battery must not be discharged into the car unless the caller has
+    explicitly allowed solar-only dip coverage (``ev_covers_dips``). Battery-first
+    spillover passes ``ev_covers_dips=False`` even though the EV mode is solar_only:
+    that path may use measured export, but not stored battery energy.
+    """
     if not ev_charging or ev_covers_dips:
         return plan
     if plan.strategy == "OVERRIDE_DISCHARGE":  # explicit battery-drain intent — respect it
@@ -421,7 +420,7 @@ def apply_ev_battery_protect(plan, *, ev_charging: bool, ev_covers_dips: bool):
         plan,
         desired_discharge_current_a=0.0,
         desired_solar_sell=False,
-        reason=(plan.reason + " | EV-beskyt: batteriet lader ikke bilen (kun Ren sol dækker dips) — bilen tager nettet"),
+        reason=(plan.reason + " | EV-beskyt: batteriet lader ikke bilen"),
     )
 
 
@@ -2198,6 +2197,33 @@ def build_ev_plan(
                 desired_phase_mode="auto_phase",
             )
 
+        if battery_gated:
+            battery_charge_w = max(0.0, -(state.battery_power_w or 0.0))
+            battery_draw_w = max(0.0, state.battery_power_w or 0.0)
+            spillover_w = max(0.0, (state.grid_export_power_w or 0.0) - EV_BATTERY_FIRST_SPILLOVER_EXPORT_BUFFER_W)
+            min_single_phase_w = 6 * 235
+            spillover_available = (
+                battery_charge_w >= EV_BATTERY_FIRST_SPILLOVER_MIN_BATTERY_CHARGE_W
+                and battery_draw_w <= EV_BATTERY_FIRST_SPILLOVER_BATTERY_DRAW_W
+                and spillover_w >= min_single_phase_w
+            )
+            if spillover_available:
+                amps, circuit = _solar_currents(spillover_w, ev_session_active, current_ev_power_w)
+                return EvPlan(
+                    mode=ev_mode,
+                    reason=(
+                        f"House battery {state.battery_soc_pct:.0f}% below {ev_solar_battery_threshold:.0f}% "
+                        f"threshold, but {spillover_w:.0f}W measured export remains after battery-first charging; "
+                        "routing spillover solar to EV"
+                    ),
+                    desired_enabled=True,
+                    desired_amps=amps,
+                    desired_circuit_currents=circuit,
+                    desired_action="resume",
+                    desired_phase_mode="auto_phase",
+                    battery_first_spillover=True,
+                )
+
         # "Ren sol" is PURE SOLAR (user, 2026-07-02): the ready-by ("Klar senest")
         # deadline must NOT force a grid/battery top-up in solar_only. It used to
         # grid-complete in the cheapest hours before the deadline on a solar shortfall
@@ -2649,6 +2675,7 @@ def should_prioritize_ev_solar(
         and ev_plan.desired_enabled is True
         and ev_plan.desired_action == "resume"
         and ev_recently_active
+        and not getattr(ev_plan, "battery_first_spillover", False)
     )
 
 

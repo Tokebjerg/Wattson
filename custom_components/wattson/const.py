@@ -279,6 +279,13 @@ EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surpl
 # / awaiting_start at ~0 W must not cause surplus to be exported at low prices
 # while the house battery still has room to charge.
 EV_SOLAR_PRIORITY_MIN_DRAW_W = 500.0
+# While the user has enabled "fill house battery first", measured grid export
+# means the battery is already taking what the inverter can feed it. This export
+# may be offered to the EV as spillover, but keep a buffer so tiny meter wiggles
+# do not make the car pull grid/battery.
+EV_BATTERY_FIRST_SPILLOVER_EXPORT_BUFFER_W = 300.0
+EV_BATTERY_FIRST_SPILLOVER_MIN_BATTERY_CHARGE_W = 500.0
+EV_BATTERY_FIRST_SPILLOVER_BATTERY_DRAW_W = 200.0
 # Keep EV-solar priority engaged for this long after the car last drew real power,
 # so brief charger dips (awaiting_start <-> charging) do not flip the battery
 # strategy every few seconds (which would churn the inverter settings).

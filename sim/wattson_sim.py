@@ -1101,11 +1101,14 @@ def test_c_smartcharge():
     def pslot(h, total):
         return models.PriceSlot(start=at(h), spot_price=total, tariff=0.0, total_import_price=total, export_value=0.5)
 
-    def ev_state(now, soc=80.0, status="charging", power=0.0, pv=0.0, load=0.0, slots=None, phase="auto"):
+    def ev_state(
+        now, soc=80.0, status="charging", power=0.0, pv=0.0, load=0.0,
+        grid_export=0.0, grid_import=0.0, bat=0.0, slots=None, phase="auto",
+    ):
         return models.SiteState(
             timestamp=now, pv_power_w=pv, load_power_w=load, load_includes_ev=False,
-            grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
-            battery_soc_pct=soc, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            grid_power_w=grid_import - grid_export, grid_import_power_w=grid_import, grid_export_power_w=grid_export,
+            battery_soc_pct=soc, battery_power_w=bat, inverter_online=True, inverter_status="normal",
             easee_online=True, easee_status=status, easee_power_w=power, easee_session_kwh=0.0,
             easee_phase_mode=phase, current_buy_price=0.4, current_sell_price=0.6, forecast_today_kwh=0.0,
             price_slots=slots or [], solar_slots=[],
@@ -1153,6 +1156,30 @@ def test_c_smartcharge():
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
     )
     checks.append(("solar threshold: battery 40% < 50% -> pause", below.desired_action == "pause" and "threshold" in below.reason, below.reason))
+    spillover = planner.build_ev_plan(
+        ev_state(at(12), soc=44, pv=8629, load=1899, grid_export=3168, bat=-3633),
+        ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=32, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=90,
+    )
+    checks.append(("solar threshold spillover: export after battery charge feeds EV",
+                   spillover.desired_action == "resume"
+                   and spillover.battery_first_spillover is True
+                   and spillover.desired_circuit_currents == (12, 0, 0),
+                   f"{spillover.desired_action}/{spillover.desired_circuit_currents}/{spillover.reason}"))
+    no_battery_charge = planner.build_ev_plan(
+        ev_state(at(12), soc=44, pv=8629, load=1899, grid_export=3168, bat=0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=32, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=90,
+    )
+    checks.append(("solar threshold spillover: export alone is not enough if battery is not charging",
+                   no_battery_charge.desired_action == "pause", no_battery_charge.reason))
+    battery_draw = planner.build_ev_plan(
+        ev_state(at(12), soc=44, pv=6000, load=5000, grid_export=2000, bat=300),
+        ev_mode=const.EV_MODE_SOLAR_ONLY,
+        ev_max_amps=32, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=90,
+    )
+    checks.append(("solar threshold spillover: battery draw blocks EV",
+                   battery_draw.desired_action == "pause", battery_draw.reason))
     above = planner.build_ev_plan(
         ev_state(at(12), soc=60, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
@@ -2814,6 +2841,10 @@ def test_ev_solar_priority_gate():
         )
 
     resume = models.EvPlan(mode="solar_only", reason="", desired_enabled=True, desired_action="resume")
+    spillover_resume = models.EvPlan(
+        mode="solar_only", reason="", desired_enabled=True, desired_action="resume",
+        battery_first_spillover=True,
+    )
     pause = models.EvPlan(mode="solar_only", reason="", desired_enabled=False, desired_action="pause")
 
     # ev_drawing_real_power: distinguishes a real session from enabled-but-idle.
@@ -2824,6 +2855,9 @@ def test_ev_solar_priority_gate():
     # should_prioritize_ev_solar: sticky boolean drives battery deprioritization.
     sp = planner.should_prioritize_ev_solar
     checks.append(("resume + recently active -> prioritize EV", sp(resume, battery_control_enabled=True, ev_recently_active=True) is True, "active"))
+    checks.append(("battery-first spillover -> do NOT prioritize EV over battery",
+                   sp(spillover_resume, battery_control_enabled=True, ev_recently_active=True) is False,
+                   "spillover"))
     checks.append(("resume but not recently active -> battery charges instead", sp(resume, battery_control_enabled=True, ev_recently_active=False) is False, "idle"))
     checks.append(("paused -> do NOT prioritize", sp(pause, battery_control_enabled=True, ev_recently_active=True) is False, "pause"))
     checks.append(("battery control disabled -> do NOT prioritize", sp(resume, battery_control_enabled=False, ev_recently_active=True) is False, "no batt ctrl"))

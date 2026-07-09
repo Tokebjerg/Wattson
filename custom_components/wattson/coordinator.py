@@ -1250,6 +1250,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 (self.site_state.easee_power_w or 0.0) >= 200.0
                 or normalized_status in EV_ACTIVE_SESSION_STATUSES
             )
+            _battery_first_gate_active = bool(
+                effective_battery_threshold
+                and self.site_state.battery_soc_pct < effective_battery_threshold
+            )
 
             # EV curtailment-soak (v0.24.41): when export is blocked/<=0 AND the battery is
             # full/near-full, the inverter CURTAILS PV, so the measured surplus that normally
@@ -1293,7 +1297,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     desired_phase_mode="auto_phase",
                     desired_action="resume",
                 )
-            if ev_plan.desired_action == "resume" and ev_plan.desired_enabled is True:
+            if (
+                ev_plan.desired_action == "resume"
+                and ev_plan.desired_enabled is True
+                and not getattr(ev_plan, "battery_first_spillover", False)
+            ):
                 # Hold a solar-driven EV session through short PV dips to avoid rapid pause/resume flapping.
                 self._ev_solar_hold_until = now + timedelta(minutes=3)
             elif (
@@ -1301,6 +1309,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 and ev_session_active
                 and self._ev_solar_hold_until is not None
                 and now < self._ev_solar_hold_until
+                and not _battery_first_gate_active
             ):
                 # Re-assert the LAST-SENT values: the structural fingerprint and
                 # the currents stay identical, so the apply layer writes NOTHING
@@ -1648,10 +1657,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # This GLOBAL guard runs on the FINAL battery plan (AI or override), so every EV path
         # is covered. ``ev_covers_dips_from_battery`` is True only for solar_only.
         _ev_wants_charge = ev_plan.desired_enabled is True and ev_plan.desired_action == "resume"
+        _ev_covers_dips = (
+            ev_covers_dips_from_battery(ev_plan.mode)
+            and not getattr(ev_plan, "battery_first_spillover", False)
+        )
         battery_plan = apply_ev_battery_protect(
             battery_plan,
             ev_charging=_ev_wants_charge,
-            ev_covers_dips=ev_covers_dips_from_battery(ev_plan.mode),
+            ev_covers_dips=_ev_covers_dips,
         )
         tou_cap, tou_charge = tou_setpoint(
             battery_plan, soc_pct=self.site_state.battery_soc_pct,

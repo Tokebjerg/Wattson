@@ -218,6 +218,7 @@ class EvPlan:
     desired_circuit_currents: tuple[int, int, int] | None = None
     desired_phase_mode: str | None = None
     desired_action: str | None = None
+    battery_first_spillover: bool = False
 
 
 @dataclass(frozen=True)
