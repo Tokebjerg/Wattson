@@ -4188,6 +4188,15 @@ def test_rolling_planner_upgrade():
 
     checks = []
     co_mod = _coordinator_module()
+    legacy_mapping = mapping.build_entity_mapping(BASE_CONFIG)
+    explicit_agnostic_mapping = mapping.build_entity_mapping({
+        **BASE_CONFIG,
+        const.CONF_EV_SOC_ENTITY: "",
+    })
+    checks.append(("legacy config entries inherit the documented EV SOC sensor",
+                   legacy_mapping.ev_soc_entity == const.DEFAULT_EV_SOC_ENTITY
+                   and explicit_agnostic_mapping.ev_soc_entity == "",
+                   f"{legacy_mapping.ev_soc_entity}/{explicit_agnostic_mapping.ev_soc_entity}"))
 
     base_reason = {
         "pending_reason": None,

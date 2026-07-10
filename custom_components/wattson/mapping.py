@@ -37,6 +37,7 @@ from .const import (
     CONF_SOLAR_SELL_SWITCH,
     CONF_TOU_ENABLE_SWITCH,
     CONF_TOU_TIME_POINT_PREFIX,
+    DEFAULT_EV_SOC_ENTITY,
     DEFAULT_TOU_TIME_POINT_PREFIX,
     TOU_TIME_POINT_COUNT,
     KNOWN_DEFAULTS,
@@ -89,7 +90,10 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
         easee_session_entity=config.get(CONF_EASEE_SESSION_ENTITY),
         easee_phase_mode_entity=config.get(CONF_EASEE_PHASE_MODE_ENTITY),
         easee_online_entity=config.get(CONF_EASEE_ONLINE_ENTITY),
-        ev_soc_entity=config.get(CONF_EV_SOC_ENTITY),
+        # Older config entries predate the optional EV-SOC field. Use Wattson's
+        # documented default only when the key is absent; an explicitly empty
+        # value still means "car-agnostic" and is respected.
+        ev_soc_entity=config.get(CONF_EV_SOC_ENTITY, DEFAULT_EV_SOC_ENTITY),
         buy_price_entity=config.get(CONF_BUY_PRICE_ENTITY),
         sell_price_entity=config.get(CONF_SELL_PRICE_ENTITY),
         forecast_today_entity=config.get(CONF_FORECAST_TODAY_ENTITY),
