@@ -4474,6 +4474,57 @@ def test_rolling_planner_upgrade():
         ev_windows="00:00-06:00", load_hourly_w=load,
         ev_solar_min_surplus_w=1400.0,
     )
+    full_idle_ev_load = planner.projected_ev_load_by_start(
+        replace(state, ev_soc_pct=100.0, easee_status="connected", easee_power_w=0.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_windows="00:00-06:00", load_hourly_w=load,
+        ev_solar_min_surplus_w=1400.0, ev_target_soc=100.0,
+    )
+    full_active_ev_load = planner.projected_ev_load_by_start(
+        replace(state, ev_soc_pct=100.0, easee_status="charging", easee_power_w=2300.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_windows="00:00-06:00", load_hourly_w=load,
+        ev_solar_min_surplus_w=1400.0, ev_target_soc=100.0,
+    )
+    checks.append(("full idle EV is removed from the solar load projection",
+                   full_idle_ev_load == {} and bool(full_active_ev_load),
+                   f"idle={full_idle_ev_load} active={full_active_ev_load}"))
+    released_with_full_ev = planner.solar_aware_reserve_pct(
+        15.0,
+        solar_slots=[replace(slot, pv_estimate10_kwh=slot.pv_estimate_kwh) for slot in state.solar_slots],
+        load_hourly_w=load,
+        now=state.timestamp,
+        usable_pct=85.0,
+        capacity_kwh=10.0,
+        ev_load_by_start=full_idle_ev_load,
+    )
+    checks.append(("full idle EV no longer prevents sunny-day reserve release to min SOC",
+                   released_with_full_ev == 0.0,
+                   str(released_with_full_ev)))
+
+    balanced_prices = [
+        models.PriceSlot(start=base, spot_price=0.4, tariff=0.0, total_import_price=0.4, export_value=0.2),
+        models.PriceSlot(start=base + timedelta(hours=1), spot_price=2.0, tariff=0.0, total_import_price=2.0, export_value=0.5),
+    ]
+    balanced_state = replace(
+        state,
+        battery_soc_pct=35.0,
+        price_slots=balanced_prices,
+        solar_slots=[models.SolarSlot(start=base, pv_estimate_kwh=7.049)],
+    )
+    balanced_tasks, _, _ = planner.dp_schedule(
+        balanced_state,
+        profile=planner.profile_for("blue"),
+        min_soc=15.0,
+        max_soc=100.0,
+        capacity_kwh=10.0,
+        load_hourly_w={base.hour: 783.0, (base.hour + 1) % 24: 3500.0},
+        ev_load_by_start={base: 6.2660000001},
+        ev_battery_protected=False,
+    )
+    checks.append(("sub-watt solar/EV rounding balance cannot open positive-price grid charge",
+                   bool(balanced_tasks) and balanced_tasks[0].action != "GRID_CHARGE",
+                   balanced_tasks[0].action if balanced_tasks else "no plan"))
     no_ev_plan = planner.build_day_plan(
         state, battery_mode="blue", min_soc=15, max_soc=100,
         capacity_kwh=10.0, load_hourly_w=load,

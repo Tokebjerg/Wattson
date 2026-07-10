@@ -1752,7 +1752,7 @@ def dp_schedule(
             base_revenue = export * exp_p
             best = INF
             best_j = si
-            if deficit > 0:
+            if deficit > _DP_EPS:
                 # Deficit hour: choose discharge in [0 .. min(deficit, rate, s-floor)]
                 # or grid-charge upward. (No surplus -> no PV charge.)
                 max_dis = min(deficit, dis_rate, max(0.0, s - floor_kwh))
@@ -2617,6 +2617,20 @@ def projected_ev_load_by_start(
         return {}
 
     if ev_mode == EV_MODE_SOLAR_ONLY:
+        # A connected but idle car that has already reached its known target is
+        # not a future solar load. Keeping a full car in the projection consumed
+        # every forecast PV-surplus hour, which falsely retained the learned
+        # battery reserve and could schedule grid charging on a very sunny day.
+        # If the charger is genuinely drawing, keep projecting it: the configured
+        # SOC sensor may belong to another car, while live power is authoritative.
+        if (
+            not ev_charge_until_complete
+            and state.ev_soc_pct is not None
+            and ev_target_soc > 0.0
+            and state.ev_soc_pct >= ev_target_soc
+            and ev_runtime_state(state) != "charging"
+        ):
+            return {}
         solar_by_start = {slot.start: slot for slot in state.solar_slots}
         load_hourly_w = load_hourly_w or {}
         projected: dict[datetime, float] = {}
