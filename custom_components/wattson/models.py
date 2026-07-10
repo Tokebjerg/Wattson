@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 
 @dataclass(frozen=True)
@@ -229,7 +229,8 @@ class PlanTask:
     action: str  # SOLAR_CHARGE | GRID_CHARGE | DISCHARGE | EXPORT | LIMIT_EXPORT | IDLE
     total_import_price: float
     pv_estimate_kwh: float | None = None
-    load_estimate_kwh: float | None = None  # expected house consumption this hour
+    load_estimate_kwh: float | None = None  # expected total consumption incl. EV
+    ev_load_estimate_kwh: float | None = None
     projected_soc_pct: float | None = None
     reason: str = ""
 
@@ -253,17 +254,19 @@ class SlotPlan:
     total_import_price: float
     export_value: float | None = None
     projected_soc_pct: float | None = None
+    ev_load_estimate_kwh: float | None = None
     reason: str = ""
 
 
 @dataclass(frozen=True)
 class DayPlan:
-    """The committed plan for the (local) day: built by build_day_plan, executed
-    slot-by-slot. Rebuilt only on day change / horizon growth / large deviation."""
+    """The committed rolling plan, rebuilt on cadence and material events."""
 
     built_at: datetime
     day: object  # datetime.date of the plan's first slot
     slots: tuple[SlotPlan, ...] = ()
+    tasks: tuple[PlanTask, ...] = ()
+    initial_soc_pct: float | None = None
 
     def slot_for(self, now: datetime) -> SlotPlan | None:
         current = None
@@ -274,6 +277,29 @@ class DayPlan:
                 break
         if current is not None and (now - current.start).total_seconds() < 3600:
             return current
+        return None
+
+    def expected_soc_at(self, now: datetime) -> float | None:
+        """Interpolate the committed SOC curve at ``now`` for drift detection."""
+        if self.initial_soc_pct is None or not self.slots:
+            return None
+        for index, slot in enumerate(self.slots):
+            if not (slot.start <= now < slot.start + timedelta(hours=1)):
+                continue
+            end_soc = slot.projected_soc_pct
+            if end_soc is None:
+                return None
+            start_soc = (
+                self.initial_soc_pct
+                if index == 0
+                else self.slots[index - 1].projected_soc_pct
+            )
+            if start_soc is None:
+                return None
+            effective_start = max(slot.start, self.built_at) if index == 0 else slot.start
+            duration = max(1.0, (slot.start + timedelta(hours=1) - effective_start).total_seconds())
+            progress = max(0.0, min(1.0, (now - effective_start).total_seconds() / duration))
+            return float(start_soc) + (float(end_soc) - float(start_soc)) * progress
         return None
 
 
@@ -290,3 +316,7 @@ class ControlPlan:
     schedule: list[PlanTask] = field(default_factory=list)
     next_cheap_window: str | None = None
     next_expensive_window: str | None = None
+    version: str = ""
+    decision_code: str = ""
+    replan_reason: str | None = None
+    ev_runtime_state: str = "disconnected"

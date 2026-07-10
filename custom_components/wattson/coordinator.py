@@ -22,7 +22,6 @@ from .const import (
     EV_SOAK_START_A,
     EV_SOAK_STEP_A,
     EV_SOAK_STEP_SECONDS,
-    EV_ACTIVE_SESSION_STATUSES,
     EV_WAITING_TO_START_STATUSES,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
@@ -137,9 +136,14 @@ from .const import (
     EV_WRITE_COOLDOWN_SECONDS,
     EV_RESUME_RETRY_SECONDS,
     EV_CIRCUIT_LIMIT_REFRESH_SECONDS,
+    EV_SUPPORT_BACKOFF_HOLD_SECONDS,
+    EV_SUPPORT_GRID_IMPORT_W,
+    EV_SUPPORT_BATTERY_DRAW_W,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
     EV_CURRENT_RETUNE_SECONDS,
+    PLAN_REPLAN_INTERVAL_SECONDS,
+    PLAN_SOC_DEVIATION_PCT,
     MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
@@ -183,6 +187,8 @@ from .planner import (
     ev_curtailment_soak_gate,
     ev_drawing_real_power,
     ev_soak_next_amps,
+    ev_runtime_state,
+    projected_ev_load_by_start,
     profile_for,
     should_prioritize_ev_solar,
     tou_setpoint,
@@ -203,6 +209,69 @@ def _ev_solar_effective_battery_threshold(
     if not priority_enabled:
         return 0.0
     return max(0.0, float(user_threshold))
+
+
+def _rolling_replan_reason(
+    *,
+    pending_reason: str | None,
+    plan_missing: bool,
+    slot_missing: bool,
+    config_changed: bool,
+    horizon_grew: bool,
+    forecast_changed: bool,
+    previous_ev_connected: bool | None,
+    ev_connected: bool,
+    soc_deviation_pct: float | None,
+    interval_elapsed: bool,
+) -> str | None:
+    """Choose one stable, auditable reason for rebuilding the rolling plan."""
+    if pending_reason:
+        return pending_reason
+    if plan_missing:
+        return "plan_missing"
+    if slot_missing:
+        return "slot_expired"
+    if config_changed:
+        return "configuration_changed"
+    if horizon_grew:
+        return "price_horizon_changed"
+    if forecast_changed:
+        return "solar_forecast_changed"
+    if previous_ev_connected is not None and previous_ev_connected != ev_connected:
+        return "ev_connected" if ev_connected else "ev_disconnected"
+    if soc_deviation_pct is not None and abs(soc_deviation_pct) >= PLAN_SOC_DEVIATION_PCT:
+        return f"soc_deviation:{soc_deviation_pct:+.1f}pp"
+    if interval_elapsed:
+        return "rolling_15m"
+    return None
+
+
+def _ev_offer_is_lower(
+    old_amps: int | None,
+    old_currents: tuple[int, int, int] | None,
+    new_amps: int | None,
+    new_currents: tuple[int, int, int] | None,
+) -> bool:
+    """Compare total offered phase-current for asymmetric EV retuning."""
+    old_offer = sum(old_currents) if old_currents is not None else old_amps
+    new_offer = sum(new_currents) if new_currents is not None else new_amps
+    return old_offer is not None and new_offer is not None and new_offer < old_offer
+
+
+def _controlled_ev_surplus(
+    averaged_surplus_w: float,
+    instantaneous_surplus_w: float,
+    support_elapsed_seconds: float | None,
+) -> tuple[float, bool]:
+    """Slow upward signal, fast downward signal after persistent support."""
+    backoff = bool(
+        support_elapsed_seconds is not None
+        and support_elapsed_seconds >= EV_SUPPORT_BACKOFF_HOLD_SECONDS
+    )
+    return (
+        min(averaged_surplus_w, instantaneous_surplus_w) if backoff else averaged_surplus_w,
+        backoff,
+    )
 
 
 class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
@@ -256,6 +325,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Fase A plan engine: the committed day plan + its rebuild fingerprint.
         self._day_plan = None
         self._day_plan_fp: tuple[Any, ...] | None = None
+        self._last_replan_at: datetime | None = None
+        self._last_replan_reason: str = "startup"
+        self._pending_replan_reason: str | None = None
+        self._last_solar_forecast_fp: tuple[Any, ...] | None = None
+        self._last_price_horizon_fp: tuple[Any, ...] | None = None
+        self._last_ev_connected: bool | None = None
+        self.replan_count_today: int = 0
+        self._replan_count_day = None
         self._battery_contended_until: datetime | None = None
         self.battery_contended = False
         self.contended_entities: list[str] = []
@@ -282,6 +359,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # 99<->100 SOC tick doesn't flap the solar_sell switch.
         self._sell_ceiling_active: bool = False
         self._surplus_samples: list[tuple[datetime, float]] = []
+        self._ev_support_since: datetime | None = None
+        self._ev_support_backoff_active: bool = False
+        self._physical_writes_day = None
         self.load_profile: LoadProfile | None = None
         self._profile_built_at: datetime | None = None
         self._telemetry_init(entry)
@@ -537,7 +617,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             return
         self.site_state = replace(
             state,
-            solar_slots=[replace(s, pv_estimate_kwh=s.pv_estimate_kwh * factor) for s in state.solar_slots],
+            solar_slots=[
+                replace(
+                    s,
+                    pv_estimate_kwh=s.pv_estimate_kwh * factor,
+                    pv_estimate10_kwh=(s.pv_estimate10_kwh * factor if s.pv_estimate10_kwh is not None else None),
+                    pv_estimate90_kwh=(s.pv_estimate90_kwh * factor if s.pv_estimate90_kwh is not None else None),
+                )
+                for s in state.solar_slots
+            ],
         )
 
     def _sync_repairs(self) -> None:
@@ -1004,9 +1092,37 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._sync_value_sensor_baseline()
         self.async_update_listeners()
 
+    async def async_replan(self, reason: str = "manual") -> None:
+        """Invalidate the committed rolling plan and rebuild it on the next tick."""
+        self._pending_replan_reason = reason
+        await self.async_request_refresh()
+
+    def _reset_physical_write_counts_if_new_day(self) -> None:
+        today = dt_util.now().date()
+        if self._physical_writes_day == today:
+            return
+        self._physical_writes_day = today
+        self._klatremis.write_counts.clear()
+        self._easee.write_counts.clear()
+
+    @property
+    def physical_write_counts(self) -> dict[str, Any]:
+        by_entity = {
+            **dict(sorted(self._klatremis.write_counts.items())),
+            **dict(sorted(self._easee.write_counts.items())),
+        }
+        return {
+            "physical_units": {
+                "deye_inverter": sum(self._klatremis.write_counts.values()),
+                "easee_charger": sum(self._easee.write_counts.values()),
+            },
+            "by_entity": by_entity,
+        }
+
     async def _async_update_data(self) -> ControlPlan:
         # Phase E: auto-resume — drop any manual override whose window elapsed.
         self._expire_overrides(dt_util.utcnow())
+        self._reset_physical_write_counts_if_new_day()
         config = merged_entry_config(self.config_entry)
         self.mapping = build_entity_mapping(config)
         self.capabilities = build_capabilities(self.mapping)
@@ -1062,6 +1178,39 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         _allow_grid_charge = bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE))
         _allow_neg_export = bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT))
         _load_hourly = self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None
+        ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
+        ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
+        ev_solar_min_surplus_w = float(entry_value(
+            self.config_entry,
+            CONF_EV_SOLAR_MIN_SURPLUS_W,
+            DEFAULT_EV_SOLAR_MIN_SURPLUS_W,
+        ))
+        ev_required_hours = int(entry_value(
+            self.config_entry,
+            CONF_EV_REQUIRED_HOURS,
+            DEFAULT_EV_REQUIRED_HOURS,
+        ))
+        ev_charge_speed_pct_h = float(entry_value(
+            self.config_entry,
+            CONF_EV_CHARGE_SPEED_PCT_H,
+            DEFAULT_EV_CHARGE_SPEED_PCT_H,
+        ))
+        _ev_runtime = ev_runtime_state(self.site_state)
+        _ev_connected = _ev_runtime != "disconnected"
+        _ev_load_by_start = projected_ev_load_by_start(
+            self.site_state,
+            ev_mode=self.ev_mode,
+            ev_max_amps=ev_max_amps,
+            ev_windows=ev_windows,
+            load_hourly_w=_load_hourly,
+            ev_solar_min_surplus_w=ev_solar_min_surplus_w,
+            ev_required_hours=ev_required_hours,
+            ev_ready_hour=self.ev_ready_hour,
+            ev_target_soc=self.ev_target_soc,
+            ev_charge_speed_pct_h=ev_charge_speed_pct_h,
+            ev_charge_until_complete=self.ev_charge_until_complete,
+        )
+        _ev_battery_protected = self.ev_mode != EV_MODE_SOLAR_ONLY
 
         # Solar-aware reserve release (v0.24.14): when enough high-confidence
         # forecast solar is coming to refill the whole usable band, drop the learned
@@ -1079,49 +1228,85 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             usable_pct=max(0.0, _max_soc - _min_soc),
             capacity_kwh=_capacity,
             confidence=self._forecast_confidence,
+            ev_load_by_start=_ev_load_by_start,
         )
 
-        # ---- Fase A plan engine: the day plan is the boss. Rebuild only when ----
-        # missing/expired, the horizon grew (tomorrow's prices arrived), the SOC has
-        # deviated far from the plan's projection, or the battery config changed.
+        # Rolling plan: rebuild every 15 minutes and immediately on a new solar
+        # forecast, EV connect/disconnect, material SOC drift, horizon, or config.
         _now_local = self.site_state.timestamp
-        # Include the (solar-aware-RELEASED) learned reserve in the rebuild fingerprint,
-        # quantized to 5% buckets. Without it, a plan built while the reserve was high
-        # (e.g. just after a restart with empty solar_slots, or a momentarily low
-        # forecast) BAKES a high overnight discharge floor and is never rebuilt when
-        # solar_aware later drops the reserve to 0 — so the pack holds ~50% overnight
-        # and IMPORTS the house at the night price instead of discharging and refilling
-        # free from tomorrow's sun (live 2026-06-23/24: ~50% held, ~2.5 kWh bought at
-        # ~1.8 kr/night). Rebuilding when the reserve changes lets the released floor
-        # reach the overnight slots. Plan rebuilds write no registers, so this is cheap.
-        # Read the grid-charge-rate option here so a change to it (H4: no reload listener,
-        # options apply live) is part of the cache fingerprint and rebuilds the committed
-        # day plan — same lesson as the reserve in v0.24.23.
         _grid_charge_rate = float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH))
         _plan_fp = (
             self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge,
             round(learned_reserve_pct / 5.0), _grid_charge_rate,
             round(self._forecast_confidence, 2),
+            round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
+            round(self.battery_discharge_current, 1), round(self.battery_care_soc, 1),
+            self.ev_mode, ev_max_amps, ev_windows, ev_required_hours,
+            self.ev_ready_hour, round(self.ev_target_soc, 1),
+            round(ev_charge_speed_pct_h, 1), self.ev_charge_until_complete,
+            round(ev_solar_min_surplus_w), round(self.ev_solar_battery_threshold, 1),
+            (round(self.site_state.ev_soc_pct / 5.0) if self.site_state.ev_soc_pct is not None else None),
+        )
+        _solar_fp = tuple(
+            (
+                slot.start.isoformat(),
+                round(slot.pv_estimate_kwh, 3),
+                round(slot.pv_estimate10_kwh, 3) if slot.pv_estimate10_kwh is not None else None,
+                round(slot.pv_estimate90_kwh, 3) if slot.pv_estimate90_kwh is not None else None,
+            )
+            for slot in self.site_state.solar_slots
+            if slot.start >= _now_local.replace(minute=0, second=0, microsecond=0)
         )
         _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
-        _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
-        _soc_far_off = (
-            _slot is not None
-            and _slot.projected_soc_pct is not None
-            and abs(self.site_state.battery_soc_pct - _slot.projected_soc_pct) > 20.0
+        _price_fp = tuple(
+            (
+                slot.start.isoformat(),
+                round(slot.total_import_price, 4),
+                round(slot.export_value, 4) if slot.export_value is not None else None,
+                bool(slot.estimated),
+            )
+            for slot in self.site_state.price_slots
+            if slot.start >= _now_local.replace(minute=0, second=0, microsecond=0)
         )
-        if (
-            self._day_plan is None
-            or _slot is None
-            or self._day_plan_fp != _plan_fp
-            or _soc_far_off
+        _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
+        _expected_soc = self._day_plan.expected_soc_at(_now_local) if self._day_plan else None
+        _soc_deviation = (
+            self.site_state.battery_soc_pct - _expected_soc
+            if _expected_soc is not None
+            else None
+        )
+        _horizon_grew = bool(
+            (
+                self._last_price_horizon_fp is not None
+                and self._last_price_horizon_fp != _price_fp
+            )
             or (
-                _latest_price_start is not None
+                self._day_plan is not None
+                and _latest_price_start is not None
                 and self._day_plan.slots
                 and self._day_plan.slots[-1].start < _latest_price_start
             )
-        ):
-            self._day_plan = build_day_plan(
+        )
+        _replan_reason = _rolling_replan_reason(
+            pending_reason=self._pending_replan_reason,
+            plan_missing=self._day_plan is None,
+            slot_missing=self._day_plan is not None and _slot is None,
+            config_changed=self._day_plan is not None and self._day_plan_fp != _plan_fp,
+            horizon_grew=_horizon_grew,
+            forecast_changed=(
+                self._last_solar_forecast_fp is not None
+                and self._last_solar_forecast_fp != _solar_fp
+            ),
+            previous_ev_connected=self._last_ev_connected,
+            ev_connected=_ev_connected,
+            soc_deviation_pct=_soc_deviation,
+            interval_elapsed=(
+                self._last_replan_at is None
+                or (_now_local - self._last_replan_at).total_seconds() >= PLAN_REPLAN_INTERVAL_SECONDS
+            ),
+        )
+        if _replan_reason is not None and self.site_state.price_slots:
+            _new_day_plan = build_day_plan(
                 self.site_state,
                 battery_mode=self.battery_mode,
                 min_soc=_min_soc,
@@ -1135,9 +1320,26 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 battery_care_soc=self.battery_care_soc,
                 grid_charge_rate_kwh=_grid_charge_rate,
                 forecast_confidence=self._forecast_confidence,
+                ev_load_by_start=_ev_load_by_start,
+                ev_battery_protected=_ev_battery_protected,
             )
-            self._day_plan_fp = _plan_fp
+            if _new_day_plan is not None:
+                self._day_plan = _new_day_plan
+                self._day_plan_fp = _plan_fp
+                self._last_replan_at = _now_local
+                self._last_replan_reason = _replan_reason
+                self._last_solar_forecast_fp = _solar_fp
+                self._last_price_horizon_fp = _price_fp
+                self._last_ev_connected = _ev_connected
+                self._pending_replan_reason = None
+                _today = _now_local.date()
+                if self._replan_count_day != _today:
+                    self._replan_count_day = _today
+                    self.replan_count_today = 0
+                self.replan_count_today += 1
             _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
+        elif not self.site_state.price_slots:
+            self._last_replan_reason = "no_price_horizon"
 
         if _slot is not None:
             # The inverter mode is CONSTANT (Zero export to CT + Load first — the
@@ -1164,6 +1366,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
                 margin=self.reserve_hold_margin,
                 discharge_rate_kwh=battery_rate_kwh(self.battery_discharge_current),
+                ev_load_by_start=_ev_load_by_start,
+                ev_battery_protected=_ev_battery_protected,
             )
             # S2: latch the sell-ceiling with hysteresis (engage at max_soc, release
             # only below max_soc-NEAR_FULL) so the reactive sell flag doesn't flap on
@@ -1193,17 +1397,42 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 peak_reserve=peak_reserve,
                 battery_care_soc=self.battery_care_soc,
             )
-        # Phase C: smooth the solar surplus over a rolling window so the EV
-        # regulation reacts to a 2-minute average instead of 10s spikes.
+        # Asymmetric EV control: increases use the slow two-minute average;
+        # sustained grid/battery support switches decreases to instantaneous
+        # surplus after a 45-second cloud-dip allowance.
         sample_now = dt_util.utcnow()
-        self._surplus_samples.append((sample_now, effective_solar_surplus_w(self.site_state, self.battery_control_enabled)))
+        instantaneous_surplus = effective_solar_surplus_w(
+            self.site_state,
+            self.battery_control_enabled,
+        )
+        self._surplus_samples.append((sample_now, instantaneous_surplus))
         cutoff = sample_now - timedelta(seconds=EV_SURPLUS_AVERAGE_SECONDS)
         self._surplus_samples = [(t, v) for (t, v) in self._surplus_samples if t >= cutoff]
         averaged_surplus = sum(v for _, v in self._surplus_samples) / len(self._surplus_samples)
+        _ev_supported = bool(
+            self.ev_mode == EV_MODE_SOLAR_ONLY
+            and _ev_runtime == "charging"
+            and (
+                self.site_state.grid_import_power_w >= EV_SUPPORT_GRID_IMPORT_W
+                or self.site_state.battery_power_w >= EV_SUPPORT_BATTERY_DRAW_W
+            )
+        )
+        if _ev_supported:
+            if self._ev_support_since is None:
+                self._ev_support_since = sample_now
+        else:
+            self._ev_support_since = None
+        _support_elapsed = (
+            (sample_now - self._ev_support_since).total_seconds()
+            if self._ev_support_since is not None
+            else None
+        )
+        controlled_surplus, self._ev_support_backoff_active = _controlled_ev_surplus(
+            averaged_surplus,
+            instantaneous_surplus,
+            _support_elapsed,
+        )
 
-        # Phase C UI: scheduled window is built from the start/end hour numbers;
-        # the house-battery threshold only applies when the priority toggle is on.
-        ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
         # EV solar charging is gated by the user's EV house-battery threshold.
         # The global solar charge-priority SOC still shapes the battery plan,
         # but it must not silently override this UI number.
@@ -1213,20 +1442,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             negative_price_active=negative_price_active,
         )
 
-        ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_plan = build_ev_plan(
             self.site_state,
             ev_mode=self.ev_mode,
             ev_max_amps=ev_max_amps,
-            ev_solar_min_surplus_w=float(entry_value(self.config_entry, CONF_EV_SOLAR_MIN_SURPLUS_W, DEFAULT_EV_SOLAR_MIN_SURPLUS_W)),
+            ev_solar_min_surplus_w=ev_solar_min_surplus_w,
             ev_windows=ev_windows,
             can_reclaim_battery_charge=self.battery_control_enabled,
             ev_solar_battery_threshold=effective_battery_threshold,
-            ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
+            ev_required_hours=ev_required_hours,
             ev_ready_hour=self.ev_ready_hour,
-            solar_surplus_override=averaged_surplus,
+            solar_surplus_override=controlled_surplus,
             ev_target_soc=self.ev_target_soc,
-            ev_charge_speed_pct_h=float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
+            ev_charge_speed_pct_h=ev_charge_speed_pct_h,
             ev_min_soc=self.ev_min_soc,
             ev_charge_until_complete=self.ev_charge_until_complete,
         )
@@ -1247,11 +1475,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_curtailment_soak_active = False
         if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
-            normalized_status = (self.site_state.easee_status or "").lower()
-            ev_session_active = bool(
-                (self.site_state.easee_power_w or 0.0) >= 200.0
-                or normalized_status in EV_ACTIVE_SESSION_STATUSES
-            )
+            ev_is_connected = _ev_runtime != "disconnected"
+            ev_is_charging = _ev_runtime == "charging"
             _battery_first_gate_active = bool(
                 effective_battery_threshold
                 and self.site_state.battery_soc_pct < effective_battery_threshold
@@ -1276,7 +1501,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             _soak_max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
             if ev_curtailment_soak_gate(
                 ev_mode=self.ev_mode,
-                ev_connected=ev_session_active,
+                ev_connected=ev_is_connected,
                 export_blocked=bool(_soak_export_blocked),
                 soc_pct=self.site_state.battery_soc_pct,
                 max_soc_pct=_soak_max_soc,
@@ -1308,10 +1533,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 self._ev_solar_hold_until = now + timedelta(minutes=3)
             elif (
                 ev_plan.desired_action == "pause"
-                and ev_session_active
+                and ev_is_charging
                 and self._ev_solar_hold_until is not None
                 and now < self._ev_solar_hold_until
                 and not _battery_first_gate_active
+                and not self._ev_support_backoff_active
             ):
                 # Re-assert the LAST-SENT values: the structural fingerprint and
                 # the currents stay identical, so the apply layer writes NOTHING
@@ -1691,6 +1917,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             discharge_current_a=self.battery_discharge_current,
             battery_care_soc=self.battery_care_soc,
             grid_charge_rate_kwh=float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH)),
+            ev_load_by_start=_ev_load_by_start,
+            ev_battery_protected=_ev_battery_protected,
+            schedule_override=(
+                tuple(
+                    task for task in self._day_plan.tasks
+                    if task.start + timedelta(hours=1) > self.site_state.timestamp
+                )
+                if self._day_plan else None
+            ),
+            replan_reason=self._last_replan_reason,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:
@@ -1792,10 +2028,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             EV_CURRENT_DEADBAND_A,
         )
         # Rate-limit current changes: a material change is only applied once the
-        # re-tune interval has elapsed, so the offered current can't bounce and
-        # make the car cycle. Structural changes are always honoured immediately.
+        # re-tune interval has elapsed when RAMPING UP. Reductions apply immediately
+        # after the write cooldown so battery/grid support is removed quickly.
         retune_due = write_allowed(self._last_ev_current_change_at, self.ev_retune_seconds, now)
-        current_change_wanted = (not within_deadband) and retune_due
+        offer_is_lower = _ev_offer_is_lower(
+            self._last_ev_amps,
+            self._last_ev_currents,
+            ev.desired_amps,
+            ev.desired_circuit_currents,
+        )
+        current_change_wanted = (not within_deadband) and (offer_is_lower or retune_due)
         # Stuck-car nudge: the plan WANTS the car charging but the charger is still
         # awaiting_start / ready_to_charge / paused — the single resume that the
         # structural change sent didn't wake it. The deadband/retune gates only

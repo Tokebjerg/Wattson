@@ -69,6 +69,12 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         name="Last Decision Reason",
         icon="mdi:brain",
         value_fn=lambda c: c.control_plan.last_decision_reason if c.control_plan else None,
+        attrs_fn=lambda c: {
+            "version": c.control_plan.version,
+            "decision_code": c.control_plan.decision_code,
+            "replan_reason": c.control_plan.replan_reason,
+            "ev_runtime_state": c.control_plan.ev_runtime_state,
+        } if c.control_plan else None,
     ),
     WattsonSensorDescription(
         key="next_action",
@@ -202,6 +208,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "total_import_price": task.total_import_price,
                     "pv_estimate_kwh": task.pv_estimate_kwh,
                     "load_estimate_kwh": task.load_estimate_kwh,
+                    "ev_load_estimate_kwh": task.ev_load_estimate_kwh,
                     "projected_soc_pct": task.projected_soc_pct,
                 }
                 for task in c.control_plan.schedule
@@ -278,6 +285,18 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "issues": site_state.issues,
                 "last_actions": getattr(self.coordinator, "last_actions", []),
                 "safe_reasons": control_plan.safe_reasons if control_plan else [],
+                "version": control_plan.version if control_plan else None,
+                "decision_code": control_plan.decision_code if control_plan else None,
+                "replan_reason": control_plan.replan_reason if control_plan else None,
+                "last_replan_at": (
+                    self.coordinator._last_replan_at.isoformat()
+                    if getattr(self.coordinator, "_last_replan_at", None)
+                    else None
+                ),
+                "replans_today": getattr(self.coordinator, "replan_count_today", 0),
+                "ev_runtime_state": control_plan.ev_runtime_state if control_plan else None,
+                "ev_fast_backoff_active": getattr(self.coordinator, "_ev_support_backoff_active", False),
+                "physical_writes_today": getattr(self.coordinator, "physical_write_counts", {}),
                 # #6 heartbeat: gap before the last tick (a big value = a stall/restart
                 # trace). #3 data-source health: which planning feeds are live.
                 "seconds_since_previous_tick": round(getattr(self.coordinator, "_prev_tick_gap_s", 0.0)),
@@ -916,6 +935,16 @@ class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
             self.coordinator.register_tuple_changes_today = int(
                 float(last_state.attributes.get("register_tuple_changes") or 0)
             )
+            previous_writes = last_state.attributes.get("writes_by_entity") or {}
+            if isinstance(previous_writes, dict):
+                for key, value in previous_writes.items():
+                    target = (
+                        self.coordinator._easee.write_counts
+                        if str(key).startswith("easee.")
+                        else self.coordinator._klatremis.write_counts
+                    )
+                    target[str(key)] = max(target.get(str(key), 0), int(value))
+                self.coordinator._physical_writes_day = dt_util.now().date()
             self.coordinator._churn_day = dt_util.now().date()
         except (TypeError, ValueError):
             return
@@ -926,9 +955,12 @@ class WattsonChurnSensor(CoordinatorEntity, RestoreSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        physical = self.coordinator.physical_write_counts
         return {
             "battery_strategy_changes": self.coordinator.battery_strategy_changes_today,
             "register_tuple_changes": self.coordinator.register_tuple_changes_today,
+            "physical_units": physical["physical_units"],
+            "writes_by_entity": physical["by_entity"],
         }
 
 

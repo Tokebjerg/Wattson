@@ -32,6 +32,7 @@ class KlatremisController:
         # entity_id -> consecutive unconverged write attempts
         self._write_attempts: dict[str, int] = {}
         self.degraded_entities: set[str] = set()
+        self.write_counts: dict[str, int] = {}
         # Phase E part 2: (entity_id, value) -> timestamps of corrective writes (a
         # write that actually issued a service call because the value had drifted).
         # Keyed by VALUE too, so Wattson legitimately alternating a setting
@@ -39,6 +40,9 @@ class KlatremisController:
         # a real competing controller shows up as the SAME value being re-asserted
         # again and again because something keeps reverting it.
         self._write_history: dict[tuple[str, str], list[datetime]] = {}
+
+    def _count_write(self, key: str) -> None:
+        self.write_counts[key] = self.write_counts.get(key, 0) + 1
 
     def _record_write(self, entity_id: str | None, value, now: datetime | None) -> None:
         if not entity_id or now is None:
@@ -126,6 +130,7 @@ class KlatremisController:
             return []
         service = "turn_on" if enabled else "turn_off"
         await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, target_state, degraded)]
 
@@ -139,6 +144,7 @@ class KlatremisController:
             self._mark_converged(entity_id)
             return []
         await self.hass.services.async_call("select", "select_option", {"entity_id": entity_id, "option": option}, blocking=True)
+        self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, option, degraded)]
 
@@ -156,6 +162,7 @@ class KlatremisController:
             except (TypeError, ValueError):
                 pass
         await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, value, degraded)]
 
@@ -227,6 +234,7 @@ class KlatremisController:
             except (TypeError, ValueError):
                 pass
         await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        self._count_write(entity_id)
         return [f"{entity_id}={value} (best-effort)"]
 
     async def _set_switch_best_effort(self, entity_id: str | None, enabled: bool) -> list[str]:
@@ -240,6 +248,7 @@ class KlatremisController:
             return []
         service = "turn_on" if enabled else "turn_off"
         await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        self._count_write(entity_id)
         return [f"{entity_id}={target_state} (best-effort)"]
 
 
@@ -247,6 +256,10 @@ class EaseeController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
         self._last_phase_change_at = None  # datetime of the last 1<->3 phase switch
+        self.write_counts: dict[str, int] = {}
+
+    def _count_write(self, key: str) -> None:
+        self.write_counts[key] = self.write_counts.get(key, 0) + 1
 
     @staticmethod
     def _normalize_phase_mode(value: str | None) -> str | None:
@@ -274,18 +287,21 @@ class EaseeController:
             return []
         service = "turn_on" if enabled else "turn_off"
         await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        self._count_write("easee.enable")
         return [f"{entity_id}={target_state}"]
 
     async def _action(self, device_id: str | None, action: str | None) -> list[str]:
         if not device_id or not action:
             return []
         await self.hass.services.async_call("easee", "action_command", {"device_id": device_id, "action_command": action}, blocking=True)
+        self._count_write("easee.action")
         return [f"easee.action_command={action}"]
 
     async def _set_dynamic_limit(self, device_id: str | None, amps: int | None) -> list[str]:
         if not device_id or amps is None:
             return []
         await self.hass.services.async_call("easee", "set_charger_dynamic_limit", {"device_id": device_id, "current": amps}, blocking=True)
+        self._count_write("easee.charger_limit")
         return [f"easee.dynamic_limit={amps}A"]
 
     async def _set_circuit_dynamic_limit(
@@ -308,6 +324,7 @@ class EaseeController:
             },
             blocking=True,
         )
+        self._count_write("easee.circuit_limit")
         return [f"easee.circuit_dynamic_limit=({p1},{p2},{p3})A"]
 
     async def refresh_circuit_limit(
@@ -322,6 +339,7 @@ class EaseeController:
         if not device_id or not phase_mode:
             return []
         await self.hass.services.async_call("easee", "set_charger_phase_mode", {"device_id": device_id, "phase_mode": phase_mode}, blocking=True)
+        self._count_write("easee.phase_mode")
         return [f"easee.phase_mode={phase_mode}"]
 
     async def apply_ev_plan(self, mapping: EntityMapping, state: SiteState, plan: EvPlan) -> list[str]:

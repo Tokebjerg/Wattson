@@ -37,7 +37,7 @@ class WattsonReplanButton(_BaseButton):
         super().__init__(coordinator, entry, "Replan Now", "replan_now", "mdi:refresh")
 
     async def async_press(self) -> None:
-        await self._coordinator.async_request_refresh()
+        await self._coordinator.async_replan("manual_button")
 
 
 class WattsonPauseButton(_BaseButton):

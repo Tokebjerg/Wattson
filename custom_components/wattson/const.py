@@ -7,6 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
+INTEGRATION_VERSION = "0.24.58"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -304,6 +305,15 @@ EV_CURRENT_RETUNE_SECONDS = 90
 # limit while Wattson's plan is stable and the car can draw from the battery.
 EV_CIRCUIT_LIMIT_TTL_MINUTES = 2
 EV_CIRCUIT_LIMIT_REFRESH_SECONDS = 60
+# Rolling planner cadence and event thresholds.
+PLAN_REPLAN_INTERVAL_SECONDS = 15 * 60
+PLAN_SOC_DEVIATION_PCT = 7.5
+# Pure-solar EV control: tolerate short cloud dips, but use the instantaneous
+# surplus after sustained grid/battery support instead of waiting for the full
+# two-minute average to decay. Increases remain deliberately slow.
+EV_SUPPORT_BACKOFF_HOLD_SECONDS = 45
+EV_SUPPORT_GRID_IMPORT_W = 400.0
+EV_SUPPORT_BATTERY_DRAW_W = 500.0
 # When the plan WANTS the car charging but the charger is still awaiting_start /
 # ready_to_charge / charger_wait / paused (the car never actually started — a
 # single resume didn't wake it, or it was offered current capped by a stale

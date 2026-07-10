@@ -790,6 +790,8 @@ def test_write_verification():
     # first tick writes; subsequent ticks see "on" and no-op
     checks.append(("healthy write converges (1 write then no-ops)", actions[0] and not actions[1] and not actions[3], f"{actions}"))
     checks.append(("healthy entity not degraded", eid not in ctrl.degraded_entities, f"{ctrl.degraded_entities}"))
+    checks.append(("physical write audit counts only the real Deye service call",
+                   ctrl.write_counts == {eid: 1}, str(ctrl.write_counts)))
 
     # Case 2: stuck device -> degraded after MAX_WRITE_ATTEMPTS.
     states = MutStates({eid: "off"})
@@ -1325,14 +1327,17 @@ def test_c_smartcharge():
                    -1 not in (circuit_i, limit_i, resume_i) and circuit_i < resume_i and limit_i < resume_i,
                    str(resume_order)))
     ttl_hass = MutHass()
-    ttl_actions = asyncio.run(control.EaseeController(ttl_hass).refresh_circuit_limit(
-        mp, (9, 9, 9)))
+    ttl_controller = control.EaseeController(ttl_hass)
+    ttl_actions = asyncio.run(ttl_controller.refresh_circuit_limit(mp, (9, 9, 9)))
     ttl_calls = [call for call in ttl_hass.services.calls if call[1] == "set_circuit_dynamic_limit"]
     checks.append(("Easee circuit heartbeat uses the configured 2-minute TTL",
                    len(ttl_calls) == 1
                    and ttl_calls[0][2]["time_to_live"] == const.EV_CIRCUIT_LIMIT_TTL_MINUTES
                    and any("(9,9,9)" in action for action in ttl_actions),
                    str(ttl_calls)))
+    checks.append(("physical write audit records the Easee circuit unit",
+                   ttl_controller.write_counts == {"easee.circuit_limit": 1},
+                   str(ttl_controller.write_counts)))
 
     # --- custom scheduled window (built from start/end hours, e.g. "01:00-05:00") ---
     def scheduled(now_h, window):
@@ -2486,14 +2491,13 @@ def test_coordinator_ev_harness():
                    len(co._easee.refresh_calls) == 0,
                    str(co._easee.refresh_calls)))
 
-    # (b) Re-tune rate limit: material 10↔16 A flips every 30 s for 6 min apply EXACTLY
-    # once per 90 s window — calls at t0,90,180,270,360 (5 total), never per-tick (13).
+    # (b) Asymmetric re-tune: ramp-ups still wait 90 s; reductions apply immediately.
     co = make_co()
     for i in range(13):
         amps = 10 if (i % 2 == 0) else 16
         asyncio.run(co._async_apply_ev(ev(amps), at(i * 30)))
-    checks.append((f"harness retune: 10↔16A flips every 30s → exactly 5 calls in 6 min (1 per 90s) [{len(co._easee.calls)}]",
-                   len(co._easee.calls) == 5, str(len(co._easee.calls))))
+    checks.append((f"harness retune: decreases immediate, increases held to 90s → 7 calls in 6 min [{len(co._easee.calls)}]",
+                   len(co._easee.calls) == 7, str(len(co._easee.calls))))
 
     # (c) Structural change applies immediately (no 90 s wait), only the 10 s write
     # cooldown gates it: current change at t0, action flip at t15 → applied.
@@ -3333,6 +3337,22 @@ def test_peak_reserve_sunny_release():
     band_sunny = planner.forecast_refills_band(sunny, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=planner.PEAK_RESERVE_RELEASE_MARGIN)
     band_cloudy = planner.forecast_refills_band(cloudy, load, now, usable_pct=85.0, capacity_kwh=10.0, margin=planner.PEAK_RESERVE_RELEASE_MARGIN)
     checks.append(("forecast_refills_band: True (sunny) / False (low-solar)", band_sunny and not band_cloudy, f"{band_sunny}/{band_cloudy}"))
+    uncertain = [
+        models.SolarSlot(
+            start=at(h),
+            pv_estimate_kwh=(7.0 if 9 <= (h % 24) <= 16 else 0.0),
+            pv_estimate10_kwh=(0.4 if 9 <= (h % 24) <= 16 else 0.0),
+            pv_estimate90_kwh=(8.0 if 9 <= (h % 24) <= 16 else 0.0),
+        )
+        for h in range(30)
+    ]
+    band_uncertain = planner.forecast_refills_band(
+        uncertain, load, now, usable_pct=85.0, capacity_kwh=10.0,
+        margin=planner.PEAK_RESERVE_RELEASE_MARGIN,
+    )
+    checks.append(("reserve uses Solcast P10: sunny median but cloudy P10 keeps reserve",
+                   band_sunny and not band_uncertain,
+                   f"median={band_sunny}/p10={band_uncertain}"))
     # The strict peak margin (2.5) is stricter than the learned-reserve margin (1.5).
     checks.append(("PEAK_RESERVE_RELEASE_MARGIN stricter than the learned-reserve margin",
                    planner.PEAK_RESERVE_RELEASE_MARGIN > planner.SOLAR_RESERVE_RELEASE_MARGIN, f"{planner.PEAK_RESERVE_RELEASE_MARGIN}"))
@@ -4154,6 +4174,166 @@ def test_solar_aware_reserve():
     return checks
 
 
+def test_rolling_planner_upgrade():
+    """v0.24.58: rolling replans, EV-aware SOC, P10 reserve and audit contract."""
+    checks = []
+    co_mod = _coordinator_module()
+
+    base_reason = {
+        "pending_reason": None,
+        "plan_missing": False,
+        "slot_missing": False,
+        "config_changed": False,
+        "horizon_grew": False,
+        "forecast_changed": False,
+        "previous_ev_connected": True,
+        "ev_connected": True,
+        "soc_deviation_pct": 0.0,
+        "interval_elapsed": False,
+    }
+
+    def reason(**updates):
+        args = {**base_reason, **updates}
+        return co_mod._rolling_replan_reason(**args)
+
+    checks.append(("rolling plan replans every 15 minutes",
+                   reason(interval_elapsed=True) == "rolling_15m",
+                   str(reason(interval_elapsed=True))))
+    checks.append(("new Solcast forecast triggers immediate replan",
+                   reason(forecast_changed=True) == "solar_forecast_changed",
+                   str(reason(forecast_changed=True))))
+    checks.append(("EV connection and disconnection are explicit replan events",
+                   reason(previous_ev_connected=False, ev_connected=True) == "ev_connected"
+                   and reason(previous_ev_connected=True, ev_connected=False) == "ev_disconnected",
+                   "connect/disconnect"))
+    checks.append(("SOC drift threshold is 7.5pp (7.4 holds, 7.5 replans)",
+                   reason(soc_deviation_pct=7.4) is None
+                   and reason(soc_deviation_pct=7.5) == "soc_deviation:+7.5pp",
+                   f"{reason(soc_deviation_pct=7.4)}/{reason(soc_deviation_pct=7.5)}"))
+
+    avg_before, active_before = co_mod._controlled_ev_surplus(5000.0, 500.0, 44.0)
+    down_after, active_after = co_mod._controlled_ev_surplus(5000.0, 500.0, 45.0)
+    checks.append(("EV support debounce keeps cloud dips, then switches down to instant surplus",
+                   avg_before == 5000.0 and not active_before
+                   and down_after == 500.0 and active_after,
+                   f"{avg_before}/{down_after}"))
+
+    base = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    interp = models.DayPlan(
+        built_at=base + timedelta(minutes=15),
+        day=base.date(),
+        slots=(models.SlotPlan(
+            start=base, intent="SELF_CONSUME", sell=False, grid_charge=False,
+            tou_floor_pct=15.0, charge_current_a=None, total_import_price=1.0,
+            projected_soc_pct=80.0,
+        ),),
+        initial_soc_pct=60.0,
+    )
+    expected = interp.expected_soc_at(base + timedelta(minutes=30))
+    checks.append(("SOC deviation compares against interpolated rolling-plan SOC",
+                   expected is not None and abs(expected - 66.6667) < 0.01,
+                   str(expected)))
+
+    def pslot(h, price=1.0):
+        return models.PriceSlot(
+            start=base + timedelta(hours=h), spot_price=price, tariff=0.0,
+            total_import_price=price, export_value=0.4,
+        )
+
+    prices = [pslot(h) for h in range(6)]
+    solar = [models.SolarSlot(
+        start=base + timedelta(hours=h), pv_estimate_kwh=5.0,
+        pv_estimate10_kwh=1.0, pv_estimate90_kwh=6.0,
+    ) for h in range(6)]
+    state = models.SiteState(
+        timestamp=base, pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
+        grid_power_w=0.0, grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=50.0, battery_power_w=0.0, inverter_online=True,
+        inverter_status="normal", easee_online=True, easee_status="charger_wait",
+        easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=1.0, current_sell_price=0.4, forecast_today_kwh=30.0,
+        price_slots=prices, solar_slots=solar,
+    )
+    checks.append(("EV runtime distinguishes connected/waiting/charging/disconnected",
+                   planner.ev_runtime_state(replace(state, easee_status="connected")) == "connected"
+                   and planner.ev_runtime_state(state) == "waiting"
+                   and planner.ev_runtime_state(replace(state, easee_status="charging", easee_power_w=500.0)) == "charging"
+                   and planner.ev_runtime_state(replace(state, easee_status="disconnected")) == "disconnected",
+                   "four states"))
+    waiting_plan = planner.build_ev_plan(
+        state, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_solar_min_surplus_w=1400.0, ev_windows="00:00-06:00",
+        solar_surplus_override=1000.0,
+    )
+    charging_plan = planner.build_ev_plan(
+        replace(state, easee_status="charging", easee_power_w=500.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_solar_min_surplus_w=1400.0, ev_windows="00:00-06:00",
+        solar_surplus_override=1000.0,
+    )
+    checks.append(("waiting EV keeps the 1400W start threshold; only charging EV gets 840W stop hysteresis",
+                   waiting_plan.desired_action == "pause"
+                   and charging_plan.desired_action == "resume",
+                   f"{waiting_plan.desired_action}/{charging_plan.desired_action}"))
+
+    load = {h: 1000.0 for h in range(24)}
+    ev_load = planner.projected_ev_load_by_start(
+        state, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_windows="00:00-06:00", load_hourly_w=load,
+        ev_solar_min_surplus_w=1400.0,
+    )
+    no_ev_plan = planner.build_day_plan(
+        state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10.0, load_hourly_w=load,
+    )
+    with_ev_plan = planner.build_day_plan(
+        state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10.0, load_hourly_w=load,
+        ev_load_by_start=ev_load, ev_battery_protected=False,
+    )
+    checks.append(("solar EV load is visible and lowers the battery SOC projection",
+                   bool(ev_load)
+                   and with_ev_plan is not None and no_ev_plan is not None
+                   and any((task.ev_load_estimate_kwh or 0.0) > 0 for task in with_ev_plan.tasks)
+                   and with_ev_plan.tasks[-1].projected_soc_pct < no_ev_plan.tasks[-1].projected_soc_pct,
+                   f"ev={ev_load} soc={with_ev_plan.tasks[-1].projected_soc_pct if with_ev_plan else None}/{no_ev_plan.tasks[-1].projected_soc_pct if no_ev_plan else None}"))
+    checks.append(("economic SOC plan uses Solcast median, not P10",
+                   with_ev_plan is not None and with_ev_plan.tasks[0].pv_estimate_kwh == 5.0,
+                   str(with_ev_plan.tasks[0].pv_estimate_kwh if with_ev_plan else None)))
+
+    dark_state = replace(state, solar_slots=[])
+    protected_ev = {prices[0].start: 11.04}
+    base_dark = planner.build_day_plan(
+        dark_state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10.0, load_hourly_w=load,
+    )
+    protected_dark = planner.build_day_plan(
+        dark_state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10.0, load_hourly_w=load,
+        ev_load_by_start=protected_ev, ev_battery_protected=True,
+    )
+    checks.append(("non-solar EV load is projected but cannot drain the house battery",
+                   base_dark is not None and protected_dark is not None
+                   and protected_dark.tasks[0].ev_load_estimate_kwh == 11.04
+                   and protected_dark.tasks[0].projected_soc_pct == base_dark.tasks[0].projected_soc_pct,
+                   f"{protected_dark.tasks[0].projected_soc_pct if protected_dark else None}/{base_dark.tasks[0].projected_soc_pct if base_dark else None}"))
+
+    audit = planner.build_control_plan(
+        state,
+        battery_plan=models.BatteryPlan(strategy="IDLE", reason="audit"),
+        ev_plan=models.EvPlan(mode="solar_only", reason="waiting"),
+        safe_reasons=[], negative_price_active=False,
+        replan_reason="rolling_15m", schedule_override=(),
+    )
+    checks.append(("audit records version, decision code, replan reason and EV state",
+                   audit.version == const.INTEGRATION_VERSION
+                   and audit.decision_code == "BAT_IDLE__EV_WAITING_NONE"
+                   and audit.replan_reason == "rolling_15m"
+                   and audit.ev_runtime_state == "waiting",
+                   f"{audit.version}/{audit.decision_code}/{audit.replan_reason}/{audit.ev_runtime_state}"))
+    return checks
+
+
 def test_value_sensor_baseline_sync():
     checks = []
 
@@ -4280,6 +4460,7 @@ def main():
                          ("PLAN PROJECTION THROTTLE-AWARE (v0.24.24: SOC curve reflects morning-sell)", test_plan_projection_throttle_aware),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
+                         ("ROLLING PLAN · EV LOAD / P10 / AUDIT", test_rolling_planner_upgrade),
                          ("VALUE SENSOR BASELINE SYNC", test_value_sensor_baseline_sync),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),

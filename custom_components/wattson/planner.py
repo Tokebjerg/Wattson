@@ -17,6 +17,7 @@ from .const import (
     BATTERY_OVERRIDE_SOLAR_CHARGE,
     BATTERY_ROUND_TRIP_EFFICIENCY,
     BATTERY_WEAR_COST,
+    EV_CONNECTED_IDLE_STATUSES,
     EV_BATTERY_FIRST_SPILLOVER_BATTERY_DRAW_W,
     EV_BATTERY_FIRST_SPILLOVER_EXPORT_BUFFER_W,
     EV_BATTERY_FIRST_SPILLOVER_MIN_BATTERY_CHARGE_W,
@@ -27,6 +28,7 @@ from .const import (
     EV_OVERRIDE_CHARGE,
     EV_OVERRIDE_STOP,
     EV_SOLAR_PRIORITY_MIN_DRAW_W,
+    INTEGRATION_VERSION,
     LEGACY_BATTERY_MODE_MAP,
 )
 from .horizon import current_price_slot, remaining_price_slots
@@ -72,6 +74,18 @@ BATTERY_NOMINAL_VOLTAGE = 51.0
 def battery_rate_kwh(current_a: float) -> float:
     """Energy rate (kWh per hour) for a configured battery current limit."""
     return max(0.1, float(current_a)) * BATTERY_NOMINAL_VOLTAGE / 1000.0
+
+
+def ev_runtime_state(state: SiteState) -> str:
+    """Classify Easee into disconnected, connected, waiting, or charging."""
+    status = (state.easee_status or "").strip().lower()
+    if not state.easee_online or status in {"", "disconnected", "unknown", "unavailable"}:
+        return "disconnected"
+    if max(0.0, state.easee_power_w or 0.0) >= 200.0 or status == "charging":
+        return "charging"
+    if status in {*EV_CONNECTED_IDLE_STATUSES, "paused"}:
+        return "waiting"
+    return "connected"
 
 
 # Margin (kr/kWh) a later peak must exceed the CURRENT hour by before stored
@@ -297,6 +311,7 @@ def forecast_refills_band(
     horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
     margin: float,
     confidence: float = 1.0,
+    ev_load_by_start: dict[datetime, float] | None = None,
 ) -> bool:
     """True when the forecast solar SURPLUS over the next ``horizon_hours`` can refill
     the whole usable SOC band at least ``margin``x over — i.e. the coming sun is so
@@ -314,11 +329,20 @@ def forecast_refills_band(
     horizon_end = now + timedelta(hours=horizon_hours)
     avg_load_w = (sum(load_hourly_w.values()) / len(load_hourly_w)) if load_hourly_w else 0.0
     surplus_kwh = 0.0
+    ev_load_by_start = ev_load_by_start or {}
     for s in solar_slots:
         if s.start <= now or s.start > horizon_end:
             continue
         load_kwh = (load_hourly_w.get(s.start.hour, avg_load_w) / 1000.0) if load_hourly_w else 0.0
-        surplus_kwh += max(0.0, s.pv_estimate_kwh - load_kwh)
+        # Reserve release uses Solcast's conservative P10 band. The economic
+        # optimizer continues to use the median estimate.
+        conservative_solar = (
+            s.pv_estimate10_kwh
+            if s.pv_estimate10_kwh is not None
+            else s.pv_estimate_kwh
+        )
+        ev_kwh = max(0.0, ev_load_by_start.get(s.start, 0.0))
+        surplus_kwh += max(0.0, conservative_solar - load_kwh - ev_kwh)
     penalty = 1.0 + FORECAST_CONFIDENCE_PENALTY_K * (1.0 - max(0.0, min(1.0, confidence)))
     return surplus_kwh >= band_kwh * margin * penalty
 
@@ -334,6 +358,7 @@ def solar_aware_reserve_pct(
     horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
     margin: float = SOLAR_RESERVE_RELEASE_MARGIN,
     confidence: float = 1.0,
+    ev_load_by_start: dict[datetime, float] | None = None,
 ) -> float:
     """Release (-> 0) the LEARNED self-use reserve when the forecast solar surplus
     over the next ``horizon_hours`` can refill the whole usable SOC band at least
@@ -351,7 +376,8 @@ def solar_aware_reserve_pct(
         return learned_reserve_pct
     if forecast_refills_band(solar_slots, load_hourly_w, now, usable_pct=usable_pct,
                              capacity_kwh=capacity_kwh, horizon_hours=horizon_hours,
-                             margin=margin, confidence=confidence):
+                             margin=margin, confidence=confidence,
+                             ev_load_by_start=ev_load_by_start):
         return 0.0
     return learned_reserve_pct
 
@@ -588,6 +614,8 @@ def peak_reserve_pct(
     margin: float,
     discharge_rate_kwh: float | None = None,
     confidence: float = 1.0,
+    ev_load_by_start: dict[datetime, float] | None = None,
+    ev_battery_protected: bool = False,
 ) -> float:
     """SOC% to HOLD BACK now for upcoming same-day hours that are markedly more
     expensive than the current hour (> price_now + ``margin``).
@@ -619,7 +647,8 @@ def peak_reserve_pct(
     # floor. The strict 2.5x margin keeps every low-solar/winter night at full reserve.
     if forecast_refills_band(solar_slots, load_hourly_w, now,
                              usable_pct=max(0.0, max_soc - min_soc), capacity_kwh=capacity_kwh,
-                             margin=PEAK_RESERVE_RELEASE_MARGIN, confidence=confidence):
+                             margin=PEAK_RESERVE_RELEASE_MARGIN, confidence=confidence,
+                             ev_load_by_start=ev_load_by_start):
         return 0.0
     price_now = current.total_import_price
     later = [s for s in price_slots
@@ -629,19 +658,31 @@ def peak_reserve_pct(
         return 0.0
     first_peak = min(s.start for s in peaks)
     solar_by_start = {s.start: s for s in solar_slots}
+    ev_load_by_start = ev_load_by_start or {}
 
     def _solar(slot) -> float:
         pv = solar_by_start.get(slot.start)
-        return pv.pv_estimate_kwh if pv else 0.0
+        if pv is None:
+            return 0.0
+        return pv.pv_estimate10_kwh if pv.pv_estimate10_kwh is not None else pv.pv_estimate_kwh
 
-    def _load(hour: int) -> float:
+    def _house_load(hour: int) -> float:
         return (load_hourly_w.get(hour, 0.0) / 1000.0) if load_hourly_w else 0.0
+
+    def _battery_deficit(slot) -> float:
+        house = _house_load(slot.start.hour)
+        ev = max(0.0, ev_load_by_start.get(slot.start, 0.0))
+        protected_load = house if ev_battery_protected else house + ev
+        return max(0.0, protected_load - _solar(slot))
 
     rate_cap = discharge_rate_kwh if discharge_rate_kwh is not None else battery_rate_kwh(70.0)
     reserve_kwh = sum(
-        min(max(0.0, _load(s.start.hour) - _solar(s)), rate_cap) for s in peaks
+        min(_battery_deficit(s), rate_cap) for s in peaks
     )
-    refill_before = sum(max(0.0, _solar(s) - _load(s.start.hour))
+    refill_before = sum(max(
+        0.0,
+        _solar(s) - _house_load(s.start.hour) - max(0.0, ev_load_by_start.get(s.start, 0.0)),
+    )
                         for s in later if s.start < first_peak)
     net = max(0.0, reserve_kwh - refill_before)
     usable_pct = max(0.0, max_soc - min_soc)
@@ -826,6 +867,8 @@ def build_day_plan(
     battery_care_soc: float = 100.0,
     grid_charge_rate_kwh: float | None = None,
     forecast_confidence: float = 1.0,
+    ev_load_by_start: dict[datetime, float] | None = None,
+    ev_battery_protected: bool = False,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -858,6 +901,8 @@ def build_day_plan(
         discharge_rate_kwh=discharge_rate,
         grid_charge_rate_kwh=grid_charge_rate_kwh,
         battery_care_soc=battery_care_soc,
+        ev_load_by_start=ev_load_by_start,
+        ev_battery_protected=ev_battery_protected,
     )
     if not tasks:
         return None
@@ -887,6 +932,8 @@ def build_day_plan(
                 capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
                 margin=RESERVE_HOLD_MARGIN, discharge_rate_kwh=discharge_rate,
                 confidence=forecast_confidence,
+                ev_load_by_start=ev_load_by_start,
+                ev_battery_protected=ev_battery_protected,
             )
             floor = max(base_floor, min_soc + reserve)
         # Estimated lookahead slots (today's price shape copied forward until the
@@ -924,9 +971,16 @@ def build_day_plan(
             total_import_price=task.total_import_price,
             export_value=export_value,
             projected_soc_pct=task.projected_soc_pct,
+            ev_load_estimate_kwh=task.ev_load_estimate_kwh,
             reason=task.action,
         ))
-    return DayPlan(built_at=state.timestamp, day=plan_slots[0].start.date(), slots=tuple(plan_slots))
+    return DayPlan(
+        built_at=state.timestamp,
+        day=plan_slots[0].start.date(),
+        slots=tuple(plan_slots),
+        tasks=tuple(tasks),
+        initial_soc_pct=state.battery_soc_pct,
+    )
 
 
 def execute_slot(
@@ -1403,6 +1457,8 @@ def _build_schedule(
     charge_rate_kwh: float | None = None,
     discharge_rate_kwh: float | None = None,
     grid_charge_rate_kwh: float | None = None,
+    ev_load_by_start: dict[datetime, float] | None = None,
+    ev_battery_protected: bool = False,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """Build the forward-looking hourly plan with a battery-SOC projection.
 
@@ -1417,6 +1473,7 @@ def _build_schedule(
         return [], None, None
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
     load_hourly_w = load_hourly_w or {}
+    ev_load_by_start = ev_load_by_start or {}
 
     capacity_kwh = max(0.1, capacity_kwh)
     floor_pct = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
@@ -1439,20 +1496,30 @@ def _build_schedule(
     for slot in slots:
         pv = solar_by_start.get(slot.start)
         solar_kwh = pv.pv_estimate_kwh if pv else 0.0
-        load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
-        info.append((slot, solar_kwh, load_kwh, solar_kwh - load_kwh, pv is not None))
+        house_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
+        ev_kwh = max(0.0, ev_load_by_start.get(slot.start, 0.0))
+        load_kwh = house_kwh + ev_kwh
+        battery_load_kwh = house_kwh if ev_battery_protected else load_kwh
+        info.append((
+            slot,
+            solar_kwh,
+            load_kwh,
+            solar_kwh - load_kwh,
+            pv is not None,
+            ev_kwh,
+            max(0.0, battery_load_kwh - solar_kwh),
+        ))
 
     tasks: list[PlanTask] = []
     next_cheap: str | None = None
     next_expensive: str | None = None
-    for i, (slot, solar_kwh, load_kwh, surplus_kwh, has_pv) in enumerate(info):
+    for i, (slot, solar_kwh, load_kwh, surplus_kwh, has_pv, ev_kwh, deficit_kwh) in enumerate(info):
         is_cheap = slot.start in view.cheap_starts
         is_expensive = slot.start in view.expensive_starts
         max_after = view.max_price_after(slot.start)
         worthwhile = arbitrage_worthwhile(slot.total_import_price, max_after, profile)
 
         price_high = slot.total_import_price >= view.mean_price and (slot.export_value or 0) > 0
-        deficit_kwh = max(load_kwh - solar_kwh, 0.0)
         # Refill check: enough forecast LATER sun today to recharge the battery if we
         # sell this surplus now instead of storing it (same trigger as live control).
         future_solar_sched = sum(
@@ -1501,7 +1568,7 @@ def _build_schedule(
             # itself — and only if the forecast solar before the next expensive
             # window won't already fill it (don't pay for free sun).
             future_solar = 0.0
-            for (s2, _sk, _lk, surp2, _hp) in info[i + 1:]:
+            for (s2, _sk, _lk, surp2, _hp, _ev, _def) in info[i + 1:]:
                 if s2.start in view.expensive_starts:
                     break
                 future_solar += max(0.0, surp2)
@@ -1522,6 +1589,7 @@ def _build_schedule(
                 total_import_price=round(slot.total_import_price, 4),
                 pv_estimate_kwh=round(solar_kwh, 3) if has_pv else None,
                 load_estimate_kwh=round(load_kwh, 3) if load_kwh else None,
+                ev_load_estimate_kwh=round(ev_kwh, 3) if ev_kwh else None,
                 projected_soc_pct=round(soc_kwh / capacity_kwh * 100.0),
             )
         )
@@ -1574,6 +1642,8 @@ def dp_schedule(
     discharge_rate_kwh: float | None = None,
     grid_charge_rate_kwh: float | None = None,
     battery_care_soc: float = 100.0,
+    ev_load_by_start: dict[datetime, float] | None = None,
+    ev_battery_protected: bool = False,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """DP-optimal forward schedule (same contract as ``_build_schedule``)."""
     view = _horizon_view(state, profile)
@@ -1581,6 +1651,7 @@ def dp_schedule(
         return [], None, None
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
     load_hourly_w = load_hourly_w or {}
+    ev_load_by_start = ev_load_by_start or {}
 
     capacity_kwh = max(0.1, capacity_kwh)
     floor_pct = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
@@ -1596,8 +1667,17 @@ def dp_schedule(
     for slot in slots:
         pv = solar_by_start.get(slot.start)
         solar_kwh = pv.pv_estimate_kwh if pv else 0.0
-        load_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
-        hours.append((slot, solar_kwh, load_kwh, pv is not None))
+        house_kwh = load_hourly_w.get(slot.start.hour, 0.0) / 1000.0
+        ev_kwh = max(0.0, ev_load_by_start.get(slot.start, 0.0))
+        load_kwh = house_kwh + ev_kwh
+        solar_after_house = max(0.0, solar_kwh - house_kwh)
+        protected_grid_kwh = max(0.0, ev_kwh - solar_after_house) if ev_battery_protected else 0.0
+        battery_load_kwh = house_kwh if ev_battery_protected else load_kwh
+        battery_deficit_kwh = max(0.0, battery_load_kwh - solar_kwh)
+        hours.append((
+            slot, solar_kwh, load_kwh, pv is not None, ev_kwh,
+            battery_deficit_kwh, protected_grid_kwh,
+        ))
 
     step = capacity_kwh / 40.0
     max_kwh = max_soc / 100.0 * capacity_kwh
@@ -1611,9 +1691,10 @@ def dp_schedule(
         tuple(
             (s.start.isoformat(), round(s.total_import_price, 4),
              round(s.export_value, 4) if s.export_value is not None else None,
-             s.estimated, round(sk, 2), round(lk, 2))
-            for (s, sk, lk, _hp) in hours
+             s.estimated, round(sk, 2), round(lk, 2), round(ev, 2), round(pgrid, 2))
+            for (s, sk, lk, _hp, ev, _def, pgrid) in hours
         ),
+        ev_battery_protected,
     )
     cached = _DP_CACHE.get(fp)
     if cached is not None:
@@ -1623,7 +1704,7 @@ def dp_schedule(
     levels = [i * step for i in range(n_levels)]
     wear = BATTERY_WEAR_COST
     margin = profile.profit_margin
-    end_value = max(0.0, min(s.total_import_price for s, _sk, _lk, _hp in hours))
+    end_value = max(0.0, min(s.total_import_price for s, *_rest in hours))
     # The v0.7.3 free-sun rule, DP edition: don't BUY grid charge that the
     # forecast sun before the next expensive window would deliver for free —
     # night-charging into a sunny day displaces free storage 1:1 and forces the
@@ -1632,7 +1713,7 @@ def dp_schedule(
     sun_before_peak = [0.0] * len(hours)
     running = 0.0
     for t in range(len(hours) - 1, -1, -1):
-        slot_t, sk, lk, _hp = hours[t]
+        slot_t, sk, lk, _hp, _ev, _def, _pgrid = hours[t]
         if slot_t.start in view.expensive_starts:
             running = 0.0
         sun_before_peak[t] = running
@@ -1643,13 +1724,13 @@ def dp_schedule(
     value = [-(max(0.0, lv - floor_kwh)) * end_value for lv in levels]
     choice: list[list[int]] = []
     for t in range(len(hours) - 1, -1, -1):
-        slot, solar_kwh, load_kwh, _hp = hours[t]
+        slot, solar_kwh, load_kwh, _hp, _ev, deficit, protected_grid = hours[t]
         imp_p = slot.total_import_price
         exp_p = max(0.0, slot.export_value or 0.0)
         sellable = (slot.export_value is None) or (slot.export_value > 0)
         house_from_pv = min(solar_kwh, load_kwh)
-        deficit = max(0.0, load_kwh - solar_kwh)
         surplus = max(0.0, solar_kwh - load_kwh)
+        protected_grid_cost = protected_grid * imp_p
         nvalue = [INF] * n_levels
         nchoice = [0] * n_levels
         for si, s in enumerate(levels):
@@ -1675,12 +1756,12 @@ def dp_schedule(
                             continue  # battery care: plain grid charge stops at care SOC
                         if imp_p >= 0 and sun_before_peak[t] >= (max_kwh - s) - 1e-9:
                             continue  # free sun will fill the pack before the peak
-                        cost = (deficit + d) * imp_p + d * margin
+                        cost = protected_grid_cost + (deficit + d) * imp_p + d * margin
                     else:
                         dis = -d
                         if dis > max_dis + 1e-9:
                             continue
-                        cost = (deficit - dis) * imp_p + dis * wear
+                        cost = protected_grid_cost + (deficit - dis) * imp_p + dis * wear
                     tot = cost + value[j]
                     if tot < best:
                         best, best_j = tot, j
@@ -1700,14 +1781,14 @@ def dp_schedule(
                 for j, s2 in enumerate(levels):
                     d2 = s2 - s_after
                     if abs(d2) <= step / 2 + 1e-9:
-                        cost = -base_revenue  # nearest-bucket rounding, no action
+                        cost = protected_grid_cost - base_revenue  # nearest-bucket rounding, no battery action
                     elif d2 > 0 and imp_p < 0:
                         # Paid (negative-price) grid top-up ON TOP of forced PV charge:
                         # the grid part is throttled to grid_rate, and total intake
                         # (PV + grid) still can't exceed the pack's full rate.
                         if d2 > grid_rate + 1e-9 or pv_charge + d2 > rate + 1e-9:
                             continue
-                        cost = d2 * imp_p + d2 * margin - base_revenue
+                        cost = protected_grid_cost + d2 * imp_p + d2 * margin - base_revenue
                     else:
                         continue  # no discharge against a surplus; no paid top-up
                     tot = cost + value[j]
@@ -1724,11 +1805,10 @@ def dp_schedule(
     next_cheap: str | None = None
     next_expensive: str | None = None
     si = min(range(n_levels), key=lambda i: abs(levels[i] - soc0))
-    for t, (slot, solar_kwh, load_kwh, has_pv) in enumerate(hours):
+    for t, (slot, solar_kwh, load_kwh, has_pv, ev_kwh, deficit, _protected_grid) in enumerate(hours):
         s = levels[si]
         sj = choice[t][si]
         s2 = levels[sj]
-        deficit = max(0.0, load_kwh - solar_kwh)
         surplus = max(0.0, solar_kwh - load_kwh)
         sellable = (slot.export_value is None) or (slot.export_value > 0)
         pv_charge = min(surplus, rate, max(0.0, max_kwh - s))
@@ -1771,6 +1851,7 @@ def dp_schedule(
                 total_import_price=round(slot.total_import_price, 4),
                 pv_estimate_kwh=round(solar_kwh, 3) if has_pv else None,
                 load_estimate_kwh=round(load_kwh, 3) if load_kwh else None,
+                ev_load_estimate_kwh=round(ev_kwh, 3) if ev_kwh else None,
                 projected_soc_pct=round(s2 / capacity_kwh * 100.0),
             )
         )
@@ -1796,6 +1877,7 @@ def _schedule_expected_cost(
     max_kwh: float,
     rate: float,
     end_value: float,
+    ev_battery_protected: bool = False,
 ) -> float:
     """Expected cost (kr) of a schedule under the shared flow model.
 
@@ -1814,12 +1896,18 @@ def _schedule_expected_cost(
         pv = solar_by_start.get(task.start)
         solar_kwh = pv.pv_estimate_kwh if pv else 0.0
         load_kwh = task.load_estimate_kwh or 0.0
+        ev_kwh = task.ev_load_estimate_kwh or 0.0
+        house_kwh = max(0.0, load_kwh - ev_kwh)
+        solar_after_house = max(0.0, solar_kwh - house_kwh)
+        protected_grid = max(0.0, ev_kwh - solar_after_house) if ev_battery_protected else 0.0
+        battery_load = house_kwh if ev_battery_protected else load_kwh
         end = max(0.0, min(100.0, task.projected_soc_pct)) / 100.0 * capacity_kwh
         d = end - soc
-        deficit = max(0.0, load_kwh - solar_kwh)
+        deficit = max(0.0, battery_load - solar_kwh)
         surplus = max(0.0, solar_kwh - load_kwh)
         sellable = (slot.export_value is None) or (slot.export_value > 0)
         exp_p = max(0.0, slot.export_value or 0.0)
+        cost += protected_grid * slot.total_import_price
         if surplus > 0:
             pv_charge = min(surplus, rate, max(0.0, max_kwh - soc))
             grid_part = max(0.0, d - pv_charge)
@@ -1872,10 +1960,12 @@ def build_schedule_optimal(
         cost_dp = _schedule_expected_cost(
             dp[0], state, capacity_kwh=capacity_kwh, floor_kwh=floor_kwh,
             max_kwh=max_kwh, rate=rate, end_value=end_value,
+            ev_battery_protected=bool(kwargs.get("ev_battery_protected", False)),
         )
         cost_h = _schedule_expected_cost(
             heuristic[0], state, capacity_kwh=capacity_kwh, floor_kwh=floor_kwh,
             max_kwh=max_kwh, rate=rate, end_value=end_value,
+            ev_battery_protected=bool(kwargs.get("ev_battery_protected", False)),
         )
         # Conservative bias: the judge prices PLANS, and plans execute with some
         # drift — a sub-1-kr judged edge is inside that noise (the modelled
@@ -2095,7 +2185,8 @@ def build_ev_plan(
     ev_charge_until_complete: bool = False,
 ) -> EvPlan:
     normalized_status = (state.easee_status or "").strip().lower()
-    if not state.easee_online or normalized_status in {"", "disconnected", "unknown", "unavailable"}:
+    runtime_state = ev_runtime_state(state)
+    if runtime_state == "disconnected":
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
 
     current_phase_mode = (state.easee_phase_mode or "").lower()
@@ -2172,7 +2263,7 @@ def build_ev_plan(
 
     if ev_mode == EV_MODE_SOLAR_ONLY:
         current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
-        ev_session_active = current_ev_power_w >= 200.0 or normalized_status == "charging"
+        ev_session_active = runtime_state == "charging"
 
         # Phase C: use the smoothed (2-minute averaged) surplus when supplied by the
         # coordinator, otherwise the instantaneous value.
@@ -2351,7 +2442,7 @@ def build_ev_plan(
             # export value), so charge on it instead of pausing. Same surplus
             # threshold + house-battery-first gate as solar-only mode.
             current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
-            ev_session_active = current_ev_power_w >= 200.0 or normalized_status == "charging"
+            ev_session_active = runtime_state == "charging"
             surplus_w = (
                 solar_surplus_override
                 if solar_surplus_override is not None
@@ -2481,6 +2572,86 @@ def ev_cheapest_charge_hours(
             for s in horizon
         ],
     }
+
+
+def projected_ev_load_by_start(
+    state: SiteState,
+    *,
+    ev_mode: str,
+    ev_max_amps: int,
+    ev_windows: str,
+    load_hourly_w: dict[int, float] | None = None,
+    ev_solar_min_surplus_w: float = 1400.0,
+    ev_required_hours: int = 4,
+    ev_ready_hour: int = -1,
+    ev_target_soc: float = 0.0,
+    ev_charge_speed_pct_h: float = 15.0,
+    ev_charge_until_complete: bool = False,
+) -> dict[datetime, float]:
+    """Forecast hourly EV energy so the battery SOC curve includes the car.
+
+    Solar-only uses median Solcast surplus. Other modes use their scheduled
+    charging hours; their unmet EV load is marked battery-protected by the caller.
+    """
+    if ev_runtime_state(state) == "disconnected" or not state.price_slots:
+        return {}
+    slots = remaining_price_slots(state.price_slots, state.timestamp)[:SCHEDULE_MAX_HOURS]
+    if not slots:
+        return {}
+    phase_mode = (state.easee_phase_mode or "").lower()
+    phases = 1 if phase_mode in {"1_phase", "single", "one_phase", "one"} else 3
+    max_ev_kwh = max(0.0, int(ev_max_amps) * 230.0 * phases / 1000.0)
+    if max_ev_kwh <= 0.0:
+        return {}
+
+    if ev_mode == EV_MODE_SOLAR_ONLY:
+        solar_by_start = {slot.start: slot for slot in state.solar_slots}
+        load_hourly_w = load_hourly_w or {}
+        projected: dict[datetime, float] = {}
+        for slot in slots:
+            solar = solar_by_start.get(slot.start)
+            solar_kwh = solar.pv_estimate_kwh if solar else 0.0
+            house_kwh = max(0.0, load_hourly_w.get(slot.start.hour, 0.0)) / 1000.0
+            surplus_kwh = max(0.0, solar_kwh - house_kwh)
+            if surplus_kwh * 1000.0 >= ev_solar_min_surplus_w:
+                projected[slot.start] = round(min(max_ev_kwh, surplus_kwh), 3)
+        return projected
+
+    if ev_mode == EV_MODE_SCHEDULED_CHEAPEST:
+        overview = ev_cheapest_charge_hours(
+            state,
+            ev_required_hours=ev_required_hours,
+            ev_ready_hour=ev_ready_hour,
+            ev_target_soc=ev_target_soc,
+            ev_charge_speed_pct_h=ev_charge_speed_pct_h,
+            ev_charge_until_complete=ev_charge_until_complete,
+        )
+        selected = {
+            datetime.fromisoformat(item["hour"])
+            for item in (overview or {}).get("hours", [])
+            if item.get("charge")
+        }
+        return {slot.start: round(max_ev_kwh, 3) for slot in slots if slot.start in selected}
+
+    if ev_mode == EV_MODE_SCHEDULED:
+        windows = _parse_windows(ev_windows)
+        return {
+            slot.start: round(max_ev_kwh, 3)
+            for slot in slots
+            if _in_windows(slot.start, windows)
+        }
+
+    if ev_mode == EV_MODE_FULL_SPEED:
+        candidates = slots
+        if not ev_charge_until_complete:
+            wanted = max(1, int(ev_required_hours))
+            if state.ev_soc_pct is not None and ev_target_soc > 0:
+                wanted = 0 if state.ev_soc_pct >= ev_target_soc else max(1, math.ceil(
+                    (ev_target_soc - state.ev_soc_pct) / max(1.0, ev_charge_speed_pct_h)
+                ))
+            candidates = candidates[:wanted]
+        return {slot.start: round(max_ev_kwh, 3) for slot in candidates}
+    return {}
 
 
 def build_override_battery_plan(
@@ -2719,6 +2890,10 @@ def build_control_plan(
     discharge_current_a: float = 70.0,
     battery_care_soc: float = 100.0,
     grid_charge_rate_kwh: float | None = None,
+    ev_load_by_start: dict[datetime, float] | None = None,
+    ev_battery_protected: bool = False,
+    schedule_override: list[PlanTask] | tuple[PlanTask, ...] | None = None,
+    replan_reason: str | None = None,
 ) -> ControlPlan:
     next_action = battery_plan.strategy
     if ev_plan.desired_enabled is not None:
@@ -2726,27 +2901,46 @@ def build_control_plan(
     reasons = [battery_plan.reason, ev_plan.reason]
     if safe_reasons:
         reasons.extend(safe_reasons)
-    schedule, next_cheap_window, next_expensive_window = build_schedule_optimal(
-        state, profile_for(battery_mode), load_hourly_w,
-        capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
-        solar_charge_priority_soc=solar_charge_priority_soc,
-        charge_rate_kwh=battery_rate_kwh(charge_current_a),
-        discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
-        grid_charge_rate_kwh=grid_charge_rate_kwh,
-        battery_care_soc=battery_care_soc,
-    )
-    # Same throttle re-projection the committed day plan uses, so the dashboard
-    # "Automatiseringsopgaver" SOC curve reflects the morning-sell (not a false 100%).
-    schedule = reproject_tasks_with_throttle(
-        schedule, state, capacity_kwh=capacity_kwh, max_soc=max_soc,
-        charge_rate=battery_rate_kwh(charge_current_a), load_hourly_w=load_hourly_w,
-    )
+    if schedule_override is None:
+        schedule, next_cheap_window, next_expensive_window = build_schedule_optimal(
+            state, profile_for(battery_mode), load_hourly_w,
+            capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc, learned_reserve_pct=learned_reserve_pct,
+            solar_charge_priority_soc=solar_charge_priority_soc,
+            charge_rate_kwh=battery_rate_kwh(charge_current_a),
+            discharge_rate_kwh=battery_rate_kwh(discharge_current_a),
+            grid_charge_rate_kwh=grid_charge_rate_kwh,
+            battery_care_soc=battery_care_soc,
+            ev_load_by_start=ev_load_by_start,
+            ev_battery_protected=ev_battery_protected,
+        )
+        # Same throttle re-projection the committed rolling plan uses.
+        schedule = reproject_tasks_with_throttle(
+            schedule, state, capacity_kwh=capacity_kwh, max_soc=max_soc,
+            charge_rate=battery_rate_kwh(charge_current_a), load_hourly_w=load_hourly_w,
+        )
+    else:
+        schedule = list(schedule_override)
+        next_cheap_window = next(
+            (task.start.isoformat() for task in schedule if task.action == "GRID_CHARGE"),
+            None,
+        )
+        next_expensive_window = next(
+            (task.start.isoformat() for task in schedule if task.action == "DISCHARGE"),
+            None,
+        )
     last_decision_reason = " | ".join([reason for reason in reasons if reason])
     if len(last_decision_reason) > 255:
         # Home Assistant truncates entity states longer than 255 chars to
         # "unknown"; keep the reason within the limit (happens at startup when
         # the degraded-runtime reason lists every missing entity).
         last_decision_reason = last_decision_reason[:252] + "..."
+    runtime_state = ev_runtime_state(state)
+    ev_action = (ev_plan.desired_action or "none").upper()
+    decision_code = (
+        "SAFE_MODE"
+        if safe_reasons
+        else f"BAT_{battery_plan.strategy}__EV_{runtime_state}_{ev_action}".upper()
+    )
     return ControlPlan(
         battery=battery_plan,
         ev=ev_plan,
@@ -2758,4 +2952,8 @@ def build_control_plan(
         schedule=schedule,
         next_cheap_window=next_cheap_window,
         next_expensive_window=next_expensive_window,
+        version=INTEGRATION_VERSION,
+        decision_code=decision_code,
+        replan_reason=replan_reason,
+        ev_runtime_state=runtime_state,
     )
