@@ -624,6 +624,37 @@ def test_horizon():
     checks.append(("solar slots parsed", len(solar_slots) == 2 and abs(solar_slots[0].pv_estimate_kwh - 7.0) < 1e-6, f"got {len(solar_slots)}"))
     checks.append(("solar 10/90 bands parsed", solar_slots[0].pv_estimate10_kwh == 5.7 and solar_slots[0].pv_estimate90_kwh == 7.9, "bands"))
 
+    # Energi Data Service calculates raw_today/raw_tomorrow with its configured
+    # tariffs and VAT already included. Its tariff attributes are metadata, not
+    # additions Wattson should apply a second time.
+    eds_buy = {
+        "state": 0.74,
+        "attributes": {
+            "attribution": "Data provided by Energi Data Service",
+            "net_operator": "FLOW Elnet",
+            "raw_today": [
+                {"hour": "2026-06-07T14:00:00+02:00", "price": 0.74},
+            ],
+            "tariffs": {
+                "additional_tariffs": {"transmission": 0.05, "tax": 0.14},
+                "tariffs": {"14": 0.08},
+            },
+        },
+    }
+    eds_slots = [
+        slot for slot in horizon.build_price_slots(
+            FakeHass({"sensor.eds": eds_buy}), "sensor.eds", None
+        )
+        if not slot.estimated
+    ]
+    checks.append((
+        "EDS all-in raw price is not charged tariffs twice",
+        len(eds_slots) == 1
+        and abs(eds_slots[0].total_import_price - 0.74) < 1e-9
+        and eds_slots[0].tariff == 0.0,
+        f"got total={eds_slots[0].total_import_price if eds_slots else None} tariff={eds_slots[0].tariff if eds_slots else None}",
+    ))
+
     # Real HA stores the per-hour timestamps as datetime objects, not ISO
     # strings (they only look like strings once serialized to JSON). Regression
     # guard for that: feed datetime-typed hour/period_start.
@@ -1185,6 +1216,9 @@ def test_c_smartcharge():
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=50,
     )
     checks.append(("solar threshold: battery 60% >= 50% -> resume", above.desired_action == "resume", above.reason))
+    checks.append(("solar three-phase offer uses per-phase amps, not phase sum",
+                   above.desired_amps == 9 and above.desired_circuit_currents == (9, 9, 9),
+                   f"{above.desired_amps}/{above.desired_circuit_currents}"))
     ui_threshold = planner.build_ev_plan(
         ev_state(at(12), soc=37, pv=8000, load=1000), ev_mode=const.EV_MODE_SOLAR_ONLY,
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_solar_battery_threshold=25,
@@ -1205,13 +1239,35 @@ def test_c_smartcharge():
     lo = planner.build_ev_plan(base, ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=200)
     checks.append(("averaged override high -> resume", hi.desired_action == "resume", hi.reason))
     checks.append(("averaged override low -> pause", lo.desired_action == "pause", lo.reason))
-    wait_hysteresis = planner.build_ev_plan(
+    wait_below_start = planner.build_ev_plan(
         ev_state(at(12), status="charger_wait", power=0.0),
         ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
         ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=900,
     )
-    checks.append(("solar_only: charger_wait uses active-session stop threshold and keeps trying",
-                   wait_hysteresis.desired_action == "resume", wait_hysteresis.reason))
+    wait_above_start = planner.build_ev_plan(
+        ev_state(at(12), status="charger_wait", power=0.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=1500,
+    )
+    checks.append(("solar_only: waiting car uses full start threshold below 1400W",
+                   wait_below_start.desired_action == "pause", wait_below_start.reason))
+    checks.append(("solar_only: waiting car starts once full threshold is available",
+                   wait_above_start.desired_action == "resume", wait_above_start.reason))
+    disconnected = planner.build_ev_plan(
+        ev_state(at(12), status="disconnected", power=0.0),
+        ev_mode=const.EV_MODE_SOLAR_ONLY, ev_max_amps=16,
+        ev_solar_min_surplus_w=1400, ev_windows="x", solar_surplus_override=5000,
+    )
+    checks.append(("disconnected EV receives no control intent",
+                   disconnected.desired_action is None and disconnected.desired_amps is None,
+                   disconnected.reason))
+
+    charging_battery = ev_state(at(12), pv=6000, load=1000, bat=-3000)
+    surplus_with_legacy_flag = planner.effective_solar_surplus_w(charging_battery, True)
+    surplus_without_flag = planner.effective_solar_surplus_w(charging_battery, False)
+    checks.append(("battery charge is not added twice to EV solar surplus",
+                   surplus_with_legacy_flag == surplus_without_flag == 5000.0,
+                   f"{surplus_with_legacy_flag}/{surplus_without_flag}"))
 
     # --- 15-minute phase lock ---
     class MutStates:
@@ -1268,6 +1324,15 @@ def test_c_smartcharge():
     checks.append(("apply: resume writes non-zero limits before action_command",
                    -1 not in (circuit_i, limit_i, resume_i) and circuit_i < resume_i and limit_i < resume_i,
                    str(resume_order)))
+    ttl_hass = MutHass()
+    ttl_actions = asyncio.run(control.EaseeController(ttl_hass).refresh_circuit_limit(
+        mp, (9, 9, 9)))
+    ttl_calls = [call for call in ttl_hass.services.calls if call[1] == "set_circuit_dynamic_limit"]
+    checks.append(("Easee circuit heartbeat uses the configured 2-minute TTL",
+                   len(ttl_calls) == 1
+                   and ttl_calls[0][2]["time_to_live"] == const.EV_CIRCUIT_LIMIT_TTL_MINUTES
+                   and any("(9,9,9)" in action for action in ttl_actions),
+                   str(ttl_calls)))
 
     # --- custom scheduled window (built from start/end hours, e.g. "01:00-05:00") ---
     def scheduled(now_h, window):
@@ -2349,10 +2414,15 @@ def test_coordinator_ev_harness():
     class _Easee:
         def __init__(self):
             self.calls = []
+            self.refresh_calls = []
 
         async def apply_ev_plan(self, mapping, state, ev):
             self.calls.append((ev.desired_action, ev.desired_amps, ev.desired_circuit_currents))
             return [f"easee:{ev.desired_action}:{ev.desired_amps}A"]
+
+        async def refresh_circuit_limit(self, mapping, currents):
+            self.refresh_calls.append(currents)
+            return [f"easee:refresh:{currents}"]
 
     def make_co(status="charging"):
         co = object.__new__(co_mod.WattsonCoordinator)
@@ -2365,6 +2435,7 @@ def test_coordinator_ev_harness():
         co._last_ev_currents = None
         co._last_ev_current_change_at = None
         co._last_ev_resume_retry_at = None
+        co._last_ev_circuit_refresh_at = None
         co._last_ev_write_at = None
         co.site_state = models.SiteState(
             timestamp=datetime(2026, 6, 30, 10, 0, tzinfo=timezone.utc),
@@ -2389,7 +2460,8 @@ def test_coordinator_ev_harness():
     def at(s):
         return t0 + timedelta(seconds=s)
 
-    # (a) Deadband: after the initial apply, ±1 A solar wiggles for 2 min → ZERO calls.
+    # (a) Deadband: after the initial apply, ±1 A solar wiggles for 2 min cause no
+    # full-plan/current renegotiations. Circuit TTL heartbeats are tracked separately.
     co = make_co()
     asyncio.run(co._async_apply_ev(ev(10), at(0)))
     n0 = len(co._easee.calls)
@@ -2397,6 +2469,22 @@ def test_coordinator_ev_harness():
         asyncio.run(co._async_apply_ev(ev(amps), at(10 + i * 10)))
     checks.append((f"harness deadband: ±1A wiggles for 2 min → 0 charger calls [{len(co._easee.calls) - n0}]",
                    n0 == 1 and len(co._easee.calls) == n0, str(co._easee.calls)))
+
+    # Stable plans still renew Easee's temporary circuit cap every 60 seconds,
+    # before its 2-minute TTL can fall back to a higher offline limit.
+    co = make_co()
+    for i in range(19):
+        asyncio.run(co._async_apply_ev(ev(9), at(i * 10)))
+    checks.append(("harness TTL: stable charging plan gets 3 circuit-only renewals in 3 min",
+                   len(co._easee.calls) == 1 and len(co._easee.refresh_calls) == 3,
+                   f"full={len(co._easee.calls)} refresh={co._easee.refresh_calls}"))
+
+    co = make_co(status="disconnected")
+    for i in range(19):
+        asyncio.run(co._async_apply_ev(ev(9), at(i * 10)))
+    checks.append(("harness TTL: disconnected charger gets no circuit heartbeat",
+                   len(co._easee.refresh_calls) == 0,
+                   str(co._easee.refresh_calls)))
 
     # (b) Re-tune rate limit: material 10↔16 A flips every 30 s for 6 min apply EXACTLY
     # once per 90 s window — calls at t0,90,180,270,360 (5 total), never per-tick (13).

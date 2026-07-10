@@ -17,7 +17,6 @@ from .const import (
     BATTERY_OVERRIDE_SOLAR_CHARGE,
     BATTERY_ROUND_TRIP_EFFICIENCY,
     BATTERY_WEAR_COST,
-    EV_ACTIVE_SESSION_STATUSES,
     EV_BATTERY_FIRST_SPILLOVER_BATTERY_DRAW_W,
     EV_BATTERY_FIRST_SPILLOVER_EXPORT_BUFFER_W,
     EV_BATTERY_FIRST_SPILLOVER_MIN_BATTERY_CHARGE_W,
@@ -2061,10 +2060,12 @@ def effective_solar_surplus_w(state: SiteState, can_reclaim_battery_charge: bool
     """PV power available for the car right now (W).
 
     Shared by the planner and the coordinator's 2-minute averaging buffer so both
-    use the same surplus definition.
+    use the same surplus definition. ``can_reclaim_battery_charge`` remains in the
+    API for compatibility, but battery charging must not be added: PV minus house
+    load already represents the available allocation and adding battery power a
+    second time over-offers the car.
     """
     current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
-    reclaimable = abs(state.battery_power_w) if (can_reclaim_battery_charge and state.battery_power_w < -100.0) else 0.0
     if state.load_includes_ev:
         # Load already includes the EV session: add the measured EV power back
         # before estimating what PV remains for the car.
@@ -2073,7 +2074,7 @@ def effective_solar_surplus_w(state: SiteState, can_reclaim_battery_charge: bool
         # House load sensor excludes the charger: do not add EV power, or grid-backed
         # charging would be mistaken for extra solar surplus.
         surplus = max(0.0, state.pv_power_w - state.load_power_w)
-    return surplus + reclaimable
+    return surplus
 
 
 def build_ev_plan(
@@ -2093,7 +2094,8 @@ def build_ev_plan(
     ev_min_soc: float = 0.0,
     ev_charge_until_complete: bool = False,
 ) -> EvPlan:
-    if state.easee_status is None:
+    normalized_status = (state.easee_status or "").strip().lower()
+    if not state.easee_online or normalized_status in {"", "disconnected", "unknown", "unavailable"}:
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
 
     current_phase_mode = (state.easee_phase_mode or "").lower()
@@ -2145,7 +2147,9 @@ def build_ev_plan(
             ):
                 use_three_phase = False
             else:
-                return min(per_phase_amps * 3, 32), (per_phase_amps, per_phase_amps, per_phase_amps)
+                # Easee's charger dynamic limit is amps PER PHASE, just like the
+                # circuit tuple. Summing the three phases over-offers the charger.
+                return per_phase_amps, (per_phase_amps, per_phase_amps, per_phase_amps)
         per_phase_amps = max(6, min(int(math.floor(surplus_w / 235)), int(ev_max_amps)))
         return per_phase_amps, (per_phase_amps, 0, 0)
 
@@ -2168,8 +2172,7 @@ def build_ev_plan(
 
     if ev_mode == EV_MODE_SOLAR_ONLY:
         current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
-        normalized_status = (state.easee_status or "").lower()
-        ev_session_active = current_ev_power_w >= 200.0 or normalized_status in EV_ACTIVE_SESSION_STATUSES
+        ev_session_active = current_ev_power_w >= 200.0 or normalized_status == "charging"
 
         # Phase C: use the smoothed (2-minute averaged) surplus when supplied by the
         # coordinator, otherwise the instantaneous value.
@@ -2348,8 +2351,7 @@ def build_ev_plan(
             # export value), so charge on it instead of pausing. Same surplus
             # threshold + house-battery-first gate as solar-only mode.
             current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
-            normalized_status = (state.easee_status or "").lower()
-            ev_session_active = current_ev_power_w >= 200.0 or normalized_status in EV_ACTIVE_SESSION_STATUSES
+            ev_session_active = current_ev_power_w >= 200.0 or normalized_status == "charging"
             surplus_w = (
                 solar_surplus_override
                 if solar_surplus_override is not None

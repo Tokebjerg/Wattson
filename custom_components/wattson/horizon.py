@@ -5,8 +5,8 @@ Assistant entities, so the 24h planner (trin A2) can reason over the day rather
 than only the current instant.
 
 Data sources for this installation:
-- buy price  : Energi Data Service ``raw_today`` / ``raw_tomorrow`` (spot) +
-               ``tariffs`` (hourly grid tariff + flat additional tariffs)
+- buy price  : Energi Data Service ``raw_today`` / ``raw_tomorrow`` (already
+               including its configured tariffs and VAT)
 - sell price : Energi Data Service (export) ``raw_today`` / ``raw_tomorrow``
 - solar      : Solcast ``detailedHourly`` (pv_estimate kWh per hour, with 10/90)
 
@@ -83,6 +83,34 @@ def _raw_points(attrs: dict[str, Any]) -> list[dict[str, Any]]:
     return points
 
 
+def _raw_prices_include_tariffs(attrs: dict[str, Any]) -> bool:
+    """Return whether raw hourly prices are already all-in import prices.
+
+    Explicit provider metadata wins. Energi Data Service currently exposes no
+    such flag, so recognise its tariff-enabled attribute contract instead.
+    """
+    for key in (
+        "raw_prices_include_tariffs",
+        "price_includes_tariffs",
+        "prices_include_tariffs",
+    ):
+        if key not in attrs:
+            continue
+        value = attrs[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    attribution = str(attrs.get("attribution") or "").lower()
+    return (
+        "energi data service" in attribution
+        and isinstance(attrs.get("tariffs"), dict)
+        and bool(attrs.get("net_operator"))
+    )
+
+
 def _export_value_index(sell_attrs: dict[str, Any]) -> dict[datetime, float]:
     index: dict[datetime, float] = {}
     for item in _raw_points(sell_attrs):
@@ -104,7 +132,8 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
         return []
 
     tariffs_attr = buy_attrs.get("tariffs")
-    flat_total = _flat_tariff_total(tariffs_attr)
+    prices_include_tariffs = _raw_prices_include_tariffs(buy_attrs)
+    flat_total = 0.0 if prices_include_tariffs else _flat_tariff_total(tariffs_attr)
     export_index = _export_value_index(_attrs(hass, sell_entity))
 
     slots: list[PriceSlot] = []
@@ -124,7 +153,7 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
         # discard legitimate negative (ABSORB) prices.
         if not math.isfinite(spot):
             continue
-        tariff = _hourly_tariff(tariffs_attr, start.hour) + flat_total
+        tariff = 0.0 if prices_include_tariffs else _hourly_tariff(tariffs_attr, start.hour) + flat_total
         export_value = export_index.get(start)
         if export_value is not None and not math.isfinite(export_value):
             export_value = None

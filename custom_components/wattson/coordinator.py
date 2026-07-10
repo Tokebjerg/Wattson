@@ -136,6 +136,7 @@ from .const import (
     DEFAULT_EXPORT_LIMIT_W,
     EV_WRITE_COOLDOWN_SECONDS,
     EV_RESUME_RETRY_SECONDS,
+    EV_CIRCUIT_LIMIT_REFRESH_SECONDS,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
     EV_CURRENT_RETUNE_SECONDS,
@@ -242,6 +243,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_currents: tuple[int, int, int] | None = None
         self._last_ev_current_change_at: datetime | None = None
         self._last_ev_resume_retry_at: datetime | None = None
+        self._last_ev_circuit_refresh_at: datetime | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -1770,10 +1772,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return actions
 
     async def _async_apply_ev(self, plan: ControlPlan, now: datetime) -> list[str]:
-        """Apply the EV plan only when it changes (Easee service calls are not
-        idempotent), bounded by the EV cooldown. The charging current is gated by
-        a deadband so small solar wiggles don't make the charger renegotiate (and
-        the car cycle awaiting_start <-> charging)."""
+        """Apply EV changes and keep Easee's temporary circuit limit alive.
+
+        Full plan writes remain gated by the cooldown/current deadband. A stable
+        charging plan only renews the circuit limit, so its TTL cannot expire and
+        expose Easee's higher offline current limit.
+        """
         if not self.ev_control_enabled:
             return []
         ev = plan.ev
@@ -1800,20 +1804,45 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # until it actually draws; the moment status is "charging" this stops, so
         # it never competes with the in-session anti-oscillation gating.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
-        not_yet_charging = (self.site_state.easee_status or "").lower() in EV_WAITING_TO_START_STATUSES
+        easee_status = (self.site_state.easee_status or "").strip().lower()
+        not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES
         nudge_stuck = (
             wants_charging
             and not_yet_charging
             and write_allowed(self._last_ev_resume_retry_at, EV_RESUME_RETRY_SECONDS, now)
         )
-        if not structural_changed and not current_change_wanted and not nudge_stuck:
+        circuit_refresh_due = (
+            wants_charging
+            and bool(self.site_state.easee_online)
+            and easee_status not in {"", "disconnected", "unknown", "unavailable"}
+            and ev.desired_circuit_currents is not None
+            and any(current > 0 for current in ev.desired_circuit_currents)
+            and write_allowed(
+                self._last_ev_circuit_refresh_at,
+                EV_CIRCUIT_LIMIT_REFRESH_SECONDS,
+                now,
+            )
+        )
+        full_apply = structural_changed or current_change_wanted or nudge_stuck
+        if not full_apply and not circuit_refresh_due:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
             # Cooldown active: leave state unchanged so we retry next tick.
             return []
+        if not full_apply:
+            acts = await self._easee.refresh_circuit_limit(
+                self.mapping,
+                ev.desired_circuit_currents,
+            )
+            if acts:
+                self._last_ev_write_at = now
+                self._last_ev_circuit_refresh_at = now
+            return acts
         acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev)
         if acts:
             self._last_ev_write_at = now
+            if ev.desired_circuit_currents is not None:
+                self._last_ev_circuit_refresh_at = now
         if nudge_stuck:
             self._last_ev_resume_retry_at = now
         self._last_ev_fp = structural

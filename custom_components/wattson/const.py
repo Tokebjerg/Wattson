@@ -299,6 +299,11 @@ EV_CURRENT_DEADBAND_A = 2
 # current bounce 16A<->6A every ~15s and the car cycle. Rate-limiting current
 # changes gives the car a steady offer long enough to settle.
 EV_CURRENT_RETUNE_SECONDS = 90
+# Easee's circuit dynamic limit is temporary. Renew it well before the
+# integration's TTL expires, otherwise Easee falls back to its offline circuit
+# limit while Wattson's plan is stable and the car can draw from the battery.
+EV_CIRCUIT_LIMIT_TTL_MINUTES = 2
+EV_CIRCUIT_LIMIT_REFRESH_SECONDS = 60
 # When the plan WANTS the car charging but the charger is still awaiting_start /
 # ready_to_charge / charger_wait / paused (the car never actually started — a
 # single resume didn't wake it, or it was offered current capped by a stale

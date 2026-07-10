@@ -1172,9 +1172,7 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
 
 class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
     """#8/#5 (observe-only): grid-backed EV energy while charging in "Ren sol" today,
-    plus the surplus-signal SHADOW comparison (the signal the loop uses WITH the
-    reclaim term vs. WITHOUT it) as attributes — the measurement that decides whether
-    the suspected reclaimable double-count fix ever ships. Revives the P4 sensor's
+    plus the surplus-signal regression comparison as attributes. Revives the P4 sensor's
     unique_id so the orphaned entity comes back to life. Daily; resets on restart."""
 
     _attr_has_entity_name = True
@@ -1215,7 +1213,7 @@ class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
             "surplus_shadow_avg_w": round(shadow) if shadow is not None else None,
             "overoffer_pct": over,
             "hours_observed": round(hours, 2),
-            "note": "Skygge-måling (uge-eval #6): 'used' er overskuds-signalet Ren sol styrer efter (med reclaim-led), 'shadow' er uden. Gabet = mistænkt dobbelt-tælling. Ren observation — styringen er uændret.",
+            "note": "Regressionsvagt: 'used' og 'shadow' bruger nu samme korrigerede soloverskud. Gabet skal forblive 0%; grid-andelen viser fortsat faktisk netstøttet EV-ladning i Ren sol.",
         }
 
 

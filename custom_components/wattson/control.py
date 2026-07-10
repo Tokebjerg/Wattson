@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONTENTION_WINDOW_SECONDS,
     CONTENTION_WRITE_THRESHOLD,
+    EV_CIRCUIT_LIMIT_TTL_MINUTES,
     EV_PHASE_LOCK_MINUTES,
 )
 from .models import BatteryPlan, EntityMapping, EvPlan, SiteState
@@ -303,11 +304,19 @@ class EaseeController:
                 "current_p1": p1,
                 "current_p2": p2,
                 "current_p3": p3,
-                "time_to_live": 2,
+                "time_to_live": EV_CIRCUIT_LIMIT_TTL_MINUTES,
             },
             blocking=True,
         )
         return [f"easee.circuit_dynamic_limit=({p1},{p2},{p3})A"]
+
+    async def refresh_circuit_limit(
+        self,
+        mapping: EntityMapping,
+        currents: tuple[int, int, int] | None,
+    ) -> list[str]:
+        """Renew Easee's temporary circuit limit without renegotiating the plan."""
+        return await self._set_circuit_dynamic_limit(mapping.easee_device_id, currents)
 
     async def _set_phase_mode(self, device_id: str | None, phase_mode: str | None) -> list[str]:
         if not device_id or not phase_mode:

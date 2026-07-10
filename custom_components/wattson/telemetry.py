@@ -861,17 +861,13 @@ class TelemetryMixin:
         self.avoidable_grid_kwh_today += min(grid_in, 3500.0) * dt_hours / 1000.0
 
     def _accumulate_ev_shadow(self, plan) -> None:
-        """#8/#5: EV "Ren sol" shadow telemetry (observe-only, weekly-eval #6 SHADOW step).
+        """#8/#5: EV "Ren sol" outcome telemetry and surplus regression guard.
 
         While the car actually charges in solar-only mode, integrate:
           - OUTCOME: grid-backed EV energy = ∫min(EV draw, grid import) — how much of the
             "solar" charge the meter says came from the grid (the old P4 sensor);
-          - CAUSE: the surplus signal the live loop uses (with the battery-charge
-            'reclaimable' term) vs the SHADOW signal without it. The reclaim term is
-            suspected of DOUBLE-COUNTING on this house's derived load (load = pv+grid+batt
-            already nets out the battery charge, so pv−load already contains it) — the
-            time-weighted gap between the two makes the over-offer measurable BEFORE any
-            control change is risked in the EV regression zone."""
+          - GUARD: the live surplus signal vs the legacy reclaim-enabled call path.
+            They must remain equal after removing the battery-charge double count."""
         state = self.site_state
         now = dt_util.utcnow()
         today = dt_util.now().date()
