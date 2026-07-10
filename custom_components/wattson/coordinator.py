@@ -97,6 +97,7 @@ from .const import (
     SOLAR_BIAS_PERSIST_SECONDS,
     CONF_BATTERY_OVERRIDE_PERSIST,
     CONF_EV_OVERRIDE_PERSIST,
+    CONF_PAUSE_UNTIL_PERSIST,
     VALUE_MAX_TICK_SECONDS,
     DEFAULT_BATTERY_MIN_SOC,
     DEFAULT_BATTERY_MODE,
@@ -120,6 +121,8 @@ from .const import (
     DEFAULT_STALE_SECONDS,
     DOMAIN,
     EV_MODE_SOLAR_ONLY,
+    EV_MODES,
+    BATTERY_MODES,
     BATTERY_OVERRIDE_AUTO,
     BATTERY_OVERRIDE_OPTIONS,
     EV_OVERRIDE_AUTO,
@@ -154,7 +157,7 @@ from .deye_contract import floor_sell_safe
 from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
-from .models import Capabilities, ControlPlan, EntityMapping, SiteState, SolarSlot
+from .models import BatteryPlan, Capabilities, ControlPlan, EntityMapping, EvPlan, SiteState, SolarSlot
 from .horizon import current_price_slot
 from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
 from .models import LoadProfile
@@ -272,6 +275,90 @@ def _controlled_ev_surplus(
         min(averaged_surplus_w, instantaneous_surplus_w) if backoff else averaged_surplus_w,
         backoff,
     )
+
+
+def _clamp_battery_min_soc(value: float, max_soc: float) -> float:
+    return max(0.0, min(float(value), float(max_soc) - 1.0))
+
+
+def _clamp_battery_max_soc(value: float, min_soc: float) -> float:
+    return min(100.0, max(float(value), float(min_soc) + 1.0))
+
+
+def _clamp_ev_min_soc(value: float, target_soc: float) -> float:
+    return max(0.0, min(float(value), float(target_soc)))
+
+
+def _clamp_ev_target_soc(value: float, min_soc: float) -> float:
+    return min(100.0, max(float(value), float(min_soc)))
+
+
+def _manual_overflow_export_allowed(
+    state: SiteState,
+    *,
+    export_value: float | None,
+    max_soc_pct: float,
+    min_overflow_w: float = 150.0,
+) -> bool:
+    """Allow a manual charge override to export only true, measured overflow."""
+    measured_overflow_w = max(
+        state.grid_export_power_w,
+        state.pv_power_w - state.load_power_w,
+    )
+    return bool(
+        export_value is not None
+        and export_value > 0.0
+        and state.battery_soc_pct >= max_soc_pct - BATTERY_NEAR_FULL_MARGIN_PCT
+        and measured_overflow_w >= min_overflow_w
+    )
+
+
+def _build_guarded_manual_battery_plan(
+    action: str,
+    *,
+    export_limit_default_w: float | None,
+    charge_current_a: float,
+    discharge_current_a: float,
+    allow_overflow_export: bool,
+    battery_temperature_c: float | None,
+) -> BatteryPlan | None:
+    """Build the final manual plan with firmware and cell-safety guards applied."""
+    forced = build_override_battery_plan(
+        action,
+        export_limit_default_w=export_limit_default_w,
+        default_charge_current_a=charge_current_a,
+        default_discharge_current_a=discharge_current_a,
+        export_pays=allow_overflow_export,
+    )
+    if forced is None:
+        return None
+    forced = floor_sell_safe(forced)
+    return apply_cold_guard(
+        forced,
+        battery_temperature_c,
+        min_charge_temp_c=BATTERY_MIN_CHARGE_TEMP_C,
+    )
+
+
+def _control_safe_reasons(
+    state: SiteState,
+    *,
+    automation_enabled: bool,
+    pause_until: datetime | None,
+    now: datetime,
+) -> list[str]:
+    """Global Deye safety blockers; Easee faults stay in the EV fault domain."""
+    reasons: list[str] = []
+    if state.missing_entities:
+        reasons.append("Missing required entities")
+    if state.stale_required_entities:
+        reasons.append("Stale required entities")
+    reasons.extend(issue for issue in state.issues if issue not in state.ev_issues)
+    if not automation_enabled:
+        reasons.append("Automation disabled")
+    if pause_until is not None and now < pause_until:
+        reasons.append(f"Paused until {pause_until.isoformat()}")
+    return reasons
 
 
 class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
@@ -499,8 +586,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return base * max(0.4, getattr(profile, "confidence", 1.0))
 
     def _restore_override_state(self, entry) -> None:
-        """Resume persisted manual overrides that have not yet expired."""
+        """Resume persisted manual control windows that have not yet expired."""
         now = dt_util.utcnow()
+        pause_raw = entry_value(entry, CONF_PAUSE_UNTIL_PERSIST, None)
+        pause_until = dt_util.parse_datetime(pause_raw) if isinstance(pause_raw, str) else None
+        if pause_until is not None and pause_until > now:
+            self.pause_until = pause_until
         for conf, action_attr, until_attr in (
             (CONF_BATTERY_OVERRIDE_PERSIST, "battery_override", "battery_override_until"),
             (CONF_EV_OVERRIDE_PERSIST, "ev_override", "ev_override_until"),
@@ -517,6 +608,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     def _persist_override_state(self) -> None:
         update_entry_options(self.hass, self.config_entry, **{
+            CONF_PAUSE_UNTIL_PERSIST: self.pause_until.isoformat() if self.pause_until else None,
             CONF_BATTERY_OVERRIDE_PERSIST: (
                 {"action": self.battery_override, "until": self.battery_override_until.isoformat()}
                 if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until
@@ -866,8 +958,74 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_soak_import_since = None  # settle after any step
         return self._ev_soak_amps
 
+    def _reset_control_fingerprints(self) -> None:
+        """Force the next active tick to re-assert both physical plans."""
+        self._last_ev_fp = None
+        self._last_ev_amps = None
+        self._last_ev_currents = None
+        self._battery_mode_applied = None
+        self._battery_mode_at = None
+        self._battery_mode_strategy = None
+
+    async def _async_neutralize_control(
+        self,
+        *,
+        battery: bool,
+        ev: bool,
+        reason: str,
+    ) -> None:
+        """Put controlled hardware in a deterministic neutral state before stopping writes."""
+        mapping = self.mapping or build_entity_mapping(merged_entry_config(self.config_entry))
+        now = dt_util.utcnow()
+        actions: list[str] = []
+        if battery:
+            neutral = BatteryPlan(
+                strategy="NEUTRAL",
+                reason=f"Neutralized before {reason}",
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=self._default_export_limit_w or DEFAULT_EXPORT_LIMIT_W,
+                desired_charge_current_a=self.battery_charge_current,
+                desired_max_charge_current_a=self.battery_charge_current,
+                desired_discharge_current_a=self.battery_discharge_current,
+            )
+            tou_cap, tou_charge = tou_setpoint(
+                neutral,
+                soc_pct=self.site_state.battery_soc_pct if self.site_state else self.battery_min_soc,
+                min_soc=self.battery_min_soc,
+                discharge_floor=self.battery_min_soc,
+                max_soc=self.battery_max_soc,
+            )
+            neutral = replace(
+                neutral,
+                desired_tou_capacity_pct=tou_cap,
+                desired_tou_charge_enable=tou_charge,
+            )
+            try:
+                actions.extend(await self._klatremis.apply_battery_plan(mapping, neutral, now))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception("Could not neutralize Deye before %s: %s", reason, err)
+        if ev and self.site_state is not None:
+            neutral_ev = EvPlan(
+                mode="neutral",
+                reason=f"Neutralized before {reason}",
+                desired_enabled=False,
+                desired_action="pause",
+            )
+            try:
+                actions.extend(await self._easee.apply_ev_plan(mapping, self.site_state, neutral_ev))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception("Could not neutralize Easee before %s: %s", reason, err)
+        self.last_actions = actions
+        self._reset_control_fingerprints()
+
     async def async_pause(self, minutes: int = 60) -> None:
-        self.pause_until = dt_util.utcnow() + timedelta(minutes=minutes)
+        clamped = max(OVERRIDE_MIN_MINUTES, min(OVERRIDE_MAX_MINUTES, int(minutes)))
+        await self._async_neutralize_control(battery=True, ev=True, reason="pause")
+        self.pause_until = dt_util.utcnow() + timedelta(minutes=clamped)
+        self._persist_override_state()
         await self.async_request_refresh()
 
     async def async_resume(self) -> None:
@@ -877,7 +1035,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.battery_override_until = None
         self.ev_override = EV_OVERRIDE_AUTO
         self.ev_override_until = None
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
+        self._persist_override_state()
         await self.async_request_refresh()
 
     def _override_remaining_minutes(self, until: datetime | None) -> int | None:
@@ -894,18 +1053,88 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
     def ev_override_remaining_minutes(self) -> int | None:
         return self._override_remaining_minutes(self.ev_override_until)
 
+    def _override_execution_state(self, subsystem: str) -> dict[str, Any]:
+        action = self.battery_override if subsystem == "battery" else self.ev_override
+        until = self.battery_override_until if subsystem == "battery" else self.ev_override_until
+        if action == (BATTERY_OVERRIDE_AUTO if subsystem == "battery" else EV_OVERRIDE_AUTO):
+            return {"execution_status": "inactive", "blocked_by": [], "until": None}
+
+        blocked_by: list[str] = []
+        now = dt_util.utcnow()
+        if self.shadow_mode:
+            blocked_by.append("shadow_mode")
+        if not self.automation_enabled:
+            blocked_by.append("automation_disabled")
+        if self.pause_until is not None and now < self.pause_until:
+            blocked_by.append("paused")
+        if subsystem == "battery" and not self.battery_control_enabled:
+            blocked_by.append("battery_control_disabled")
+        if subsystem == "ev" and not self.ev_control_enabled:
+            blocked_by.append("ev_control_disabled")
+        if self.control_plan is not None and self.control_plan.safe_mode:
+            blocked_by.extend(
+                f"safe_mode:{reason}" for reason in self.control_plan.safe_reasons
+                if reason not in {"Automation disabled"}
+                and not reason.startswith("Paused until ")
+            )
+        if subsystem == "ev" and self.site_state is not None:
+            status = (self.site_state.easee_status or "").strip().lower()
+            if self.site_state.easee_online is False:
+                blocked_by.append("easee_offline")
+            if status in {"", "disconnected", "unknown", "unavailable"}:
+                blocked_by.append("ev_disconnected")
+            if (
+                self.site_state.ev_issues
+                or self.site_state.ev_missing_entities
+                or self.site_state.ev_stale_entities
+            ):
+                blocked_by.append("ev_telemetry_unavailable")
+        blocked_by = list(dict.fromkeys(blocked_by))
+        if blocked_by:
+            execution_status = "blocked"
+        elif self.control_plan is None:
+            execution_status = "pending"
+        elif subsystem == "battery":
+            expected = {
+                "force_charge": "OVERRIDE_CHARGE",
+                "force_charge_solar": "OVERRIDE_SOLAR_CHARGE",
+                "force_discharge": "OVERRIDE_DISCHARGE",
+                "force_hold": "OVERRIDE_HOLD",
+            }.get(action)
+            execution_status = "applied" if self.control_plan.battery.strategy == expected else "pending"
+        else:
+            expected = {"force_charge": "override_charge", "force_stop": "override_stop"}.get(action)
+            execution_status = "applied" if self.control_plan.ev.mode == expected else "pending"
+        return {
+            "execution_status": execution_status,
+            "blocked_by": blocked_by,
+            "until": until.isoformat() if until else None,
+        }
+
+    @property
+    def battery_override_execution(self) -> dict[str, Any]:
+        return self._override_execution_state("battery")
+
+    @property
+    def ev_override_execution(self) -> dict[str, Any]:
+        return self._override_execution_state("ev")
+
     def _expire_overrides(self, now: datetime) -> None:
         """Phase E auto-resume: drop overrides whose window has elapsed."""
         expired = False
+        if self.pause_until is not None and now >= self.pause_until:
+            self.pause_until = None
+            self._reset_control_fingerprints()
+            expired = True
         if self.battery_override != BATTERY_OVERRIDE_AUTO and self.battery_override_until and now >= self.battery_override_until:
             self.battery_override = BATTERY_OVERRIDE_AUTO
             self.battery_override_until = None
-            self._last_ev_fp = None
+            self._reset_control_fingerprints()
             expired = True
         if self.ev_override != EV_OVERRIDE_AUTO and self.ev_override_until and now >= self.ev_override_until:
             self.ev_override = EV_OVERRIDE_AUTO
             self.ev_override_until = None
-            self._last_ev_fp = None
+            self._reset_control_fingerprints()
             expired = True
         if expired:
             self._persist_override_state()
@@ -926,7 +1155,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.contended_entities = []
             self._klatremis.reset_write_history()
             self.battery_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         self._persist_override_state()
         await self.async_request_refresh()
 
@@ -939,14 +1168,20 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         else:
             self.pause_until = None
             self.ev_override_until = dt_util.utcnow() + timedelta(minutes=self.override_minutes)
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         self._persist_override_state()
         await self.async_request_refresh()
 
     async def async_set_override_minutes(self, minutes: int) -> None:
         clamped = max(OVERRIDE_MIN_MINUTES, min(OVERRIDE_MAX_MINUTES, int(minutes)))
         self.override_minutes = clamped
+        now = dt_util.utcnow()
+        if self.battery_override != BATTERY_OVERRIDE_AUTO:
+            self.battery_override_until = now + timedelta(minutes=clamped)
+        if self.ev_override != EV_OVERRIDE_AUTO:
+            self.ev_override_until = now + timedelta(minutes=clamped)
         update_entry_options(self.hass, self.config_entry, **{CONF_OVERRIDE_MINUTES: clamped})
+        self._persist_override_state()
         await self.async_request_refresh()
 
     @property
@@ -970,11 +1205,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return float(entry_value(self.config_entry, CONF_EV_RETUNE_SECONDS, EV_CURRENT_RETUNE_SECONDS))
 
     async def async_set_battery_min_soc(self, value: float) -> None:
-        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MIN_SOC: float(value)})
+        clamped = _clamp_battery_min_soc(value, self.battery_max_soc)
+        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MIN_SOC: clamped})
         await self.async_request_refresh()
 
     async def async_set_battery_max_soc(self, value: float) -> None:
-        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MAX_SOC: float(value)})
+        clamped = _clamp_battery_max_soc(value, self.battery_min_soc)
+        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MAX_SOC: clamped})
         await self.async_request_refresh()
 
     @property
@@ -1005,6 +1242,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def async_set_ev_mode(self, mode: str) -> None:
+        if mode not in EV_MODES:
+            return
         self.ev_mode = mode
         self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_MODE_DEFAULT: mode})
@@ -1035,9 +1274,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def async_set_ev_min_soc(self, percent: float) -> None:
-        self.ev_min_soc = float(percent)
+        self.ev_min_soc = _clamp_ev_min_soc(percent, self.ev_target_soc)
         self._last_ev_fp = None
-        update_entry_options(self.hass, self.config_entry, **{CONF_EV_MIN_SOC: float(percent)})
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_MIN_SOC: self.ev_min_soc})
         await self.async_request_refresh()
 
     async def async_set_ev_charge_until_complete(self, enabled: bool) -> None:
@@ -1047,9 +1286,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def async_set_ev_target_soc(self, percent: float) -> None:
-        self.ev_target_soc = float(percent)
+        self.ev_target_soc = _clamp_ev_target_soc(percent, self.ev_min_soc)
         self._last_ev_fp = None
-        update_entry_options(self.hass, self.config_entry, **{CONF_EV_TARGET_SOC: float(percent)})
+        update_entry_options(self.hass, self.config_entry, **{CONF_EV_TARGET_SOC: self.ev_target_soc})
         await self.async_request_refresh()
 
     async def async_set_ev_solar_battery_threshold(self, percent: float) -> None:
@@ -1059,32 +1298,42 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         await self.async_request_refresh()
 
     async def async_set_battery_mode(self, mode: str) -> None:
+        if mode not in BATTERY_MODES:
+            return
         self.battery_mode = mode
         self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_MODE_DEFAULT: mode})
         await self.async_request_refresh()
 
     async def async_set_shadow_mode(self, enabled: bool) -> None:
+        if enabled and not self.shadow_mode:
+            await self._async_neutralize_control(battery=True, ev=True, reason="shadow mode")
         self.shadow_mode = enabled
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         update_entry_options(self.hass, self.config_entry, **{CONF_SHADOW_MODE: enabled})
         await self.async_request_refresh()
 
     async def async_set_control_enabled(self, enabled: bool) -> None:
+        if not enabled and self.automation_enabled:
+            await self._async_neutralize_control(battery=True, ev=True, reason="automation disabled")
         self.automation_enabled = enabled
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         update_entry_options(self.hass, self.config_entry, **{CONF_AUTOMATION_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_battery_control_enabled(self, enabled: bool) -> None:
+        if not enabled and self.battery_control_enabled:
+            await self._async_neutralize_control(battery=True, ev=False, reason="battery control disabled")
         self.battery_control_enabled = enabled
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
     async def async_set_ev_control_enabled(self, enabled: bool) -> None:
+        if not enabled and self.ev_control_enabled:
+            await self._async_neutralize_control(battery=False, ev=True, reason="EV control disabled")
         self.ev_control_enabled = enabled
-        self._last_ev_fp = None
+        self._reset_control_fingerprints()
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_CONTROL_ENABLED: enabled})
         await self.async_request_refresh()
 
@@ -1776,14 +2025,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             pv_power_w=self.site_state.pv_power_w,
             load_power_w=self.site_state.load_power_w,
         )
-        # #5: LFP cold-charge guard — never command grid-charging a freezing pack. Runs
-        # AFTER the throttle so it has the final say on the grid-charge flag; no-op above
-        # the floor or when the temperature sensor is absent (guard inactive).
-        battery_plan = apply_cold_guard(
-            battery_plan, self.site_state.battery_temperature_c,
-            min_charge_temp_c=BATTERY_MIN_CHARGE_TEMP_C,
-        )
-
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
         if self.battery_override != BATTERY_OVERRIDE_AUTO:
@@ -1791,21 +2032,29 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 current_price_slot(self.site_state.price_slots, self.site_state.timestamp)
                 if self.site_state.price_slots else None
             )
-            _ov_export_pays = (
-                _ov_slot is not None and _ov_slot.export_value is not None and _ov_slot.export_value > 0.0
+            _ov_export_pays = _manual_overflow_export_allowed(
+                self.site_state,
+                export_value=_ov_slot.export_value if _ov_slot is not None else None,
+                max_soc_pct=_max_soc,
             )
-            forced_battery = build_override_battery_plan(
+            forced_battery = _build_guarded_manual_battery_plan(
                 self.battery_override,
                 export_limit_default_w=self._default_export_limit_w,
-                default_charge_current_a=self.battery_charge_current,
-                default_discharge_current_a=self.battery_discharge_current,
-                export_pays=_ov_export_pays,
+                charge_current_a=self.battery_charge_current,
+                discharge_current_a=self.battery_discharge_current,
+                allow_overflow_export=_ov_export_pays,
+                battery_temperature_c=self.site_state.battery_temperature_c,
             )
             if forced_battery is not None:
-                # The override bypassed the floor_sell_safe above (that ran on the AI plan),
-                # so re-run it: a selling override (OVERRIDE_CHARGE surplus-sell) must keep
-                # BOTH register sides open — never the sell + discharge=0 stall pair.
-                battery_plan = floor_sell_safe(forced_battery)
+                battery_plan = forced_battery
+
+        # #5: LFP cold-charge guard — never command grid-charging a freezing pack,
+        # including an explicit force-charge override. It runs after every planner
+        # and override transformation so manual intent cannot bypass the cell guard.
+        battery_plan = apply_cold_guard(
+            battery_plan, self.site_state.battery_temperature_c,
+            min_charge_temp_c=BATTERY_MIN_CHARGE_TEMP_C,
+        )
 
         # Anti-hunt mode dwell: a plan that flips strategy every tick (IDLE<->DISCHARGE
         # at a full battery) would toggle the inverter mode fast enough to make the Deye
@@ -1848,20 +2097,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 reason=f"{battery_plan.reason} | inverter-mode held {BATTERY_MODE_DWELL_SECONDS}s (anti-hunt)",
             )
 
-        safe_reasons: list[str] = []
-        if self.site_state.missing_entities:
-            safe_reasons.append("Missing required entities")
-        if self.site_state.stale_required_entities:
-            safe_reasons.append("Stale required entities")
-        if self.site_state.issues:
-            safe_reasons.extend(self.site_state.issues)
-        if not self.automation_enabled:
-            safe_reasons.append("Automation disabled")
-        if self.pause_until and dt_util.utcnow() < self.pause_until:
-            safe_reasons.append(f"Paused until {self.pause_until.isoformat()}")
-        if self.ev_control_enabled and self.site_state.easee_online is False:
-            safe_reasons.append("Easee reports offline")
-
+        safe_reasons = _control_safe_reasons(
+            self.site_state,
+            automation_enabled=self.automation_enabled,
+            pause_until=self.pause_until,
+            now=dt_util.utcnow(),
+        )
         # Deye TOU management: align the inverter's per-slot SOC floors with the
         # plan's intent so a stale TOU target can't silently block discharge (or
         # leak the battery during a price-rationed hold). Only the discharge floor
@@ -2016,6 +2257,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         """
         if not self.ev_control_enabled:
             return []
+        easee_status = (self.site_state.easee_status or "").strip().lower()
+        if (
+            self.site_state.easee_online is False
+            or easee_status in {"", "disconnected", "unknown", "unavailable"}
+            or self.site_state.ev_issues
+            or self.site_state.ev_missing_entities
+            or self.site_state.ev_stale_entities
+        ):
+            # EV is an independent fault domain: skip only Easee writes. Healthy
+            # battery control continues and the manual override exposes "blocked".
+            self._last_ev_fp = None
+            return []
         ev = plan.ev
         # Structural changes (mode / enable / phase / start-stop) always apply.
         structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
@@ -2046,7 +2299,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # until it actually draws; the moment status is "charging" this stops, so
         # it never competes with the in-session anti-oscillation gating.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
-        easee_status = (self.site_state.easee_status or "").strip().lower()
         not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES
         nudge_stuck = (
             wants_charging

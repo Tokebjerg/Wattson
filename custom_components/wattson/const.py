@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.24.58"
+INTEGRATION_VERSION = "0.24.59"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -230,6 +230,7 @@ SOLAR_BIAS_PERSIST_SECONDS = 900
 # resumes it instead of silently dropping the user's explicit instruction.
 CONF_BATTERY_OVERRIDE_PERSIST = "battery_override_persist"
 CONF_EV_OVERRIDE_PERSIST = "ev_override_persist"
+CONF_PAUSE_UNTIL_PERSIST = "pause_until_persist"
 SOLAR_BIAS_MIN_DAYS = 3            # days of history before the factor leaves 1.0
 SOLAR_BIAS_MAX_DAYS = 14           # rolling window of daily ratios kept
 SOLAR_BIAS_MIN_FACTOR = 0.55       # clamp floor (asymmetric): over-prediction is the
@@ -393,7 +394,7 @@ OVERRIDE_MAX_MINUTES = 720
 BATTERY_OVERRIDE_AUTO = "auto"            # no override; follow the AI plan
 BATTERY_OVERRIDE_CHARGE = "force_charge"  # force grid-charging now
 BATTERY_OVERRIDE_SOLAR_CHARGE = "force_charge_solar"  # charge from SOLAR surplus only, never grid
-BATTERY_OVERRIDE_DISCHARGE = "force_discharge"  # force discharge/sell now
+BATTERY_OVERRIDE_DISCHARGE = "force_discharge"  # force discharge to house load now
 BATTERY_OVERRIDE_HOLD = "force_hold"      # hold SOC (no charge, no discharge)
 BATTERY_OVERRIDE_OPTIONS = [
     BATTERY_OVERRIDE_AUTO,

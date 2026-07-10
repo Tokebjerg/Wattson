@@ -17,9 +17,35 @@ resume:
 set_ev_mode:
   name: Set EV Mode
   description: Change the active EV mode.
+  fields:
+    entry_id:
+      description: Optional config entry id.
+      example: "abcd1234"
+    ev_mode_default:
+      required: true
+      selector:
+        select:
+          options:
+            - full_speed
+            - solar_only
+            - scheduled_periods
+            - scheduled_cheapest
 set_battery_mode:
   name: Set Battery Mode
   description: Change the active battery mode.
+  fields:
+    entry_id:
+      description: Optional config entry id.
+      example: "abcd1234"
+    battery_mode_default:
+      required: true
+      selector:
+        select:
+          options:
+            - red
+            - blue
+            - green
+            - protect
 enable_shadow_mode:
   name: Enable Shadow Mode
   description: Disable writes and keep planning only.

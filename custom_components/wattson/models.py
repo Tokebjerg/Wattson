@@ -172,6 +172,11 @@ class SiteState:
     stale_required_entities: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    # EV telemetry faults are tracked separately so an unavailable Easee charger
+    # can block EV writes without disabling healthy Deye/battery control.
+    ev_stale_entities: list[str] = field(default_factory=list)
+    ev_missing_entities: list[str] = field(default_factory=list)
+    ev_issues: list[str] = field(default_factory=list)
     # Phase A planning horizon (empty until the price/forecast entities expose
     # hourly data). The reactive planner does not consume these yet — they are
     # ingested in trin A1 and used by the 24h planner in trin A2.

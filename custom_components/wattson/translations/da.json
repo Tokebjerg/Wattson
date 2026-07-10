@@ -26,7 +26,7 @@
           "auto": "Automatisk (AI)",
           "force_charge": "Tving opladning",
           "force_charge_solar": "Lad fra sol (ikke net)",
-          "force_discharge": "Tving afladning / salg",
+          "force_discharge": "Tving afladning til hus",
           "force_hold": "Hold (lad/aflad ikke)"
         }
       },

@@ -7,9 +7,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
 from .const import (
+    BATTERY_MODES,
     CONF_BATTERY_MODE_DEFAULT,
     CONF_EV_MODE_DEFAULT,
     DOMAIN,
+    EV_MODES,
+    OVERRIDE_MAX_MINUTES,
+    OVERRIDE_MIN_MINUTES,
     PLATFORMS,
     SERVICE_DISABLE_SHADOW_MODE,
     SERVICE_ENABLE_SHADOW_MODE,
@@ -36,7 +40,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     async def _handle_replan(call: ServiceCall) -> None:
         coordinator = _first_coordinator(hass, call.data.get("entry_id"))
         if coordinator is not None:
-            await coordinator.async_request_refresh()
+            await coordinator.async_replan("manual_service")
 
     async def _handle_pause(call: ServiceCall) -> None:
         coordinator = _first_coordinator(hass, call.data.get("entry_id"))
@@ -74,10 +78,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             await coordinator.async_sync_value_sensors()
 
     hass.services.async_register(DOMAIN, SERVICE_REPLAN, _handle_replan)
-    hass.services.async_register(DOMAIN, SERVICE_PAUSE, _handle_pause, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Optional("minutes", default=60): int}))
+    hass.services.async_register(DOMAIN, SERVICE_PAUSE, _handle_pause, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Optional("minutes", default=60): vol.All(vol.Coerce(int), vol.Range(min=OVERRIDE_MIN_MINUTES, max=OVERRIDE_MAX_MINUTES))}))
     hass.services.async_register(DOMAIN, SERVICE_RESUME, _handle_resume, schema=vol.Schema({vol.Optional("entry_id"): str}))
-    hass.services.async_register(DOMAIN, SERVICE_SET_EV_MODE, _handle_set_ev_mode, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Required(CONF_EV_MODE_DEFAULT): str}))
-    hass.services.async_register(DOMAIN, SERVICE_SET_BATTERY_MODE, _handle_set_battery_mode, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Required(CONF_BATTERY_MODE_DEFAULT): str}))
+    hass.services.async_register(DOMAIN, SERVICE_SET_EV_MODE, _handle_set_ev_mode, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Required(CONF_EV_MODE_DEFAULT): vol.In(EV_MODES)}))
+    hass.services.async_register(DOMAIN, SERVICE_SET_BATTERY_MODE, _handle_set_battery_mode, schema=vol.Schema({vol.Optional("entry_id"): str, vol.Required(CONF_BATTERY_MODE_DEFAULT): vol.In(BATTERY_MODES)}))
     hass.services.async_register(DOMAIN, SERVICE_ENABLE_SHADOW_MODE, _handle_enable_shadow, schema=vol.Schema({vol.Optional("entry_id"): str}))
     hass.services.async_register(DOMAIN, SERVICE_DISABLE_SHADOW_MODE, _handle_disable_shadow, schema=vol.Schema({vol.Optional("entry_id"): str}))
     hass.services.async_register(DOMAIN, SERVICE_SYNC_VALUE_SENSORS, _handle_sync_value_sensors, schema=vol.Schema({vol.Optional("entry_id"): str}))

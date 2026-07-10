@@ -295,6 +295,8 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 ),
                 "replans_today": getattr(self.coordinator, "replan_count_today", 0),
                 "ev_runtime_state": control_plan.ev_runtime_state if control_plan else None,
+                "battery_override": getattr(self.coordinator, "battery_override_execution", {}),
+                "ev_override": getattr(self.coordinator, "ev_override_execution", {}),
                 "ev_fast_backoff_active": getattr(self.coordinator, "_ev_support_backoff_active", False),
                 "physical_writes_today": getattr(self.coordinator, "physical_write_counts", {}),
                 # #6 heartbeat: gap before the last tick (a big value = a stall/restart

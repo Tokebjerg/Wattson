@@ -749,11 +749,14 @@ def tou_setpoint(
         discharge floor (min_soc + reserve);
       - grid-charging / force-charge -> the charge target (max_soc) + enable;
       - force-discharge -> min_soc (drain fully);
-      - degraded/safety (HOLD/PROTECT/BLOCK_NEGATIVE_EXPORT) -> (None, None),
-        leave TOU untouched.
+      - protect -> max SOC as a hard floor with grid charge disabled;
+      - degraded/safety (HOLD/BLOCK_NEGATIVE_EXPORT) -> (None, None), leave
+        TOU untouched.
     ``soc_pct`` is accepted for interface stability but no longer gates the floor.
     """
-    if plan.strategy in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
+    if plan.strategy == "PROTECT":
+        return (_snap_tou_capacity(float(max_soc), up=True), False)
+    if plan.strategy in ("HOLD", "BLOCK_NEGATIVE_EXPORT"):
         return (None, None)
     if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
         # Battery care: a plan may cap its own grid-charge target below max_soc
@@ -983,6 +986,12 @@ def build_day_plan(
     )
 
 
+def _battery_runtime_degraded(state: SiteState) -> bool:
+    """Only Deye/required-data faults may force the battery planner to HOLD."""
+    battery_issues = [issue for issue in state.issues if issue not in state.ev_issues]
+    return bool(battery_issues or state.stale_required_entities or state.missing_entities)
+
+
 def execute_slot(
     slot: SlotPlan,
     state: SiteState,
@@ -1008,7 +1017,7 @@ def execute_slot(
     profile = profile_for(battery_mode)
     window, negative_export_active = negative_export_flags(state)
 
-    if state.issues or state.stale_required_entities or state.missing_entities:
+    if _battery_runtime_degraded(state):
         return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
 
     intent = slot.intent
@@ -2008,7 +2017,7 @@ def build_battery_plan(
         )
     )
 
-    if state.issues or state.stale_required_entities or state.missing_entities:
+    if _battery_runtime_degraded(state):
         return BatteryPlan(strategy="HOLD", reason="Battery planner holding because runtime is degraded"), negative_export_active
 
     # Negative TOTAL import price (spot + tariff): you are PAID to import. Grid-charge
@@ -2055,10 +2064,13 @@ def build_battery_plan(
         return (
             BatteryPlan(
                 strategy="PROTECT",
-                reason="Battery protect mode active",
+                reason="Battery protect mode active: no discharge or export; solar charging remains available",
                 desired_grid_charge=False,
+                desired_solar_sell=False,
                 desired_energy_priority="Load first",
+                desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
+                desired_discharge_current_a=0.0,
             ),
             False,
         )
@@ -2698,6 +2710,9 @@ def build_override_battery_plan(
         # discharge OPEN; the CT clamp under Zero-export-to-CT still blocks battery->grid, so
         # only true PV overflow exports, and Load first keeps the charge ahead of the sell);
         # at a zero/negative price, sell OFF + discharge 0 = hold-and-fill, curtail overflow.
+        # ``export_pays`` is deliberately stricter than its historic name: the caller only
+        # sets it when export pays AND the pack is near-full AND a live solar overflow is
+        # measured. This keeps the action charge-only during ordinary daylight.
         _sell = bool(export_pays)
         return BatteryPlan(
             strategy="OVERRIDE_SOLAR_CHARGE",
@@ -2713,9 +2728,9 @@ def build_override_battery_plan(
     if action == BATTERY_OVERRIDE_DISCHARGE:
         return BatteryPlan(
             strategy="OVERRIDE_DISCHARGE",
-            reason="Manual override: forced discharge / sell",
+            reason="Manual override: forced discharge to house load",
             desired_grid_charge=False,
-            desired_solar_sell=True,
+            desired_solar_sell=False,
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
@@ -2730,6 +2745,7 @@ def build_override_battery_plan(
             desired_energy_priority="Load first",
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
+            desired_max_charge_current_a=0.0,
             desired_discharge_current_a=0.0,
         )
     return None
@@ -2860,6 +2876,8 @@ def build_override_ev_plan(action: str, *, ev_max_amps: int) -> EvPlan | None:
             reason="Manual override: forced EV charge",
             desired_enabled=True,
             desired_amps=int(ev_max_amps),
+            desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+            desired_phase_mode="auto_phase",
             desired_action="resume",
         )
     if action == EV_OVERRIDE_STOP:

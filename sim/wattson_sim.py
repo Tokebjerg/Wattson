@@ -63,6 +63,7 @@ def _install_ha_stubs() -> None:
     # planner reads local wall-clock for EV windows / ready-by deadline.
     ha_util_dt.now = lambda: datetime.now(timezone.utc).astimezone()
     ha_util_dt.as_local = lambda dt: dt.astimezone()
+    ha_util_dt.parse_datetime = lambda value: datetime.fromisoformat(value)
 
     ha.const = ha_const
     ha.core = ha_core
@@ -277,7 +278,7 @@ def simulate_tick(entities, s: Settings):
     if state.stale_required_entities:
         safe_reasons.append("Stale required entities")
     if state.issues:
-        safe_reasons.extend(state.issues)
+        safe_reasons.extend(issue for issue in state.issues if issue not in state.ev_issues)
 
     plan = planner.build_control_plan(
         state,
@@ -2090,8 +2091,11 @@ def test_tou_management():
     checks.append(("TOU: sell-solar -> discharge floor (no drain via discharge=0)", ss(sell, soc_pct=90, **kw) == (20.0, False), str(ss(sell, soc_pct=90, **kw))))
     checks.append(("TOU: override charge -> max + enable", ss(P(strategy="OVERRIDE_CHARGE", reason=""), soc_pct=50, **kw) == (100.0, True), "oc"))
     checks.append(("TOU: override discharge -> min_soc (full discharge)", ss(P(strategy="OVERRIDE_DISCHARGE", reason=""), soc_pct=50, **kw) == (15.0, False), "od"))
-    for degraded in ("HOLD", "PROTECT", "BLOCK_NEGATIVE_EXPORT"):
+    for degraded in ("HOLD", "BLOCK_NEGATIVE_EXPORT"):
         checks.append((f"TOU: {degraded} leaves TOU untouched (None)", ss(P(strategy=degraded, reason=""), soc_pct=50, **kw) == (None, None), degraded))
+    checks.append(("TOU: PROTECT installs max-SOC floor and disables grid charge",
+                   ss(P(strategy="PROTECT", reason=""), soc_pct=50, **kw) == (100.0, False),
+                   str(ss(P(strategy="PROTECT", reason=""), soc_pct=50, **kw))))
 
     # #1 (limit-cycle fix, weekly-eval 2026-06-29): a FRACTIONAL discharge floor snaps to
     # the inverter's 5% step (UP — the reserve never drops) so the TOU register converges
@@ -2635,12 +2639,13 @@ def test_e_override():
     )
     checks.append(("force_discharge -> OVERRIDE_DISCHARGE", dis.strategy == "OVERRIDE_DISCHARGE", dis.strategy))
     checks.append(("force_discharge does not grid-charge", dis.desired_grid_charge is False, str(dis.desired_grid_charge)))
-    checks.append(("force_discharge sells", dis.desired_solar_sell is True, str(dis.desired_solar_sell)))
+    checks.append(("force_discharge covers house without selling stored energy", dis.desired_solar_sell is False, str(dis.desired_solar_sell)))
     checks.append(("force_discharge uses default discharge current", dis.desired_discharge_current_a == 50.0, str(dis.desired_discharge_current_a)))
 
     hold = planner.build_override_battery_plan(const.BATTERY_OVERRIDE_HOLD, export_limit_default_w=6000.0)
     checks.append(("force_hold -> OVERRIDE_HOLD", hold.strategy == "OVERRIDE_HOLD", hold.strategy))
     checks.append(("force_hold neither charges nor sells", hold.desired_grid_charge is False and hold.desired_solar_sell is False, f"{hold.desired_grid_charge}/{hold.desired_solar_sell}"))
+    checks.append(("force_hold blocks solar charging (0A)", hold.desired_max_charge_current_a == 0.0, str(hold.desired_max_charge_current_a)))
     checks.append(("force_hold blocks discharge (0A)", hold.desired_discharge_current_a == 0.0, str(hold.desired_discharge_current_a)))
 
     # --- EV override plans ---
@@ -2649,6 +2654,9 @@ def test_e_override():
 
     ev_chg = planner.build_override_ev_plan(const.EV_OVERRIDE_CHARGE, ev_max_amps=16)
     checks.append(("EV force_charge resumes at max amps", ev_chg.desired_enabled is True and ev_chg.desired_amps == 16 and ev_chg.desired_action == "resume", f"{ev_chg.desired_enabled}/{ev_chg.desired_amps}/{ev_chg.desired_action}"))
+    checks.append(("EV force_charge clears stale solar cap on every phase",
+                   ev_chg.desired_circuit_currents == (16, 16, 16) and ev_chg.desired_phase_mode == "auto_phase",
+                   f"{ev_chg.desired_circuit_currents}/{ev_chg.desired_phase_mode}"))
 
     ev_stop = planner.build_override_ev_plan(const.EV_OVERRIDE_STOP, ev_max_amps=16)
     checks.append(("EV force_stop pauses", ev_stop.desired_enabled is False and ev_stop.desired_action == "pause", f"{ev_stop.desired_enabled}/{ev_stop.desired_action}"))
@@ -4176,6 +4184,8 @@ def test_solar_aware_reserve():
 
 def test_rolling_planner_upgrade():
     """v0.24.58: rolling replans, EV-aware SOC, P10 reserve and audit contract."""
+    import asyncio
+
     checks = []
     co_mod = _coordinator_module()
 
@@ -4210,6 +4220,12 @@ def test_rolling_planner_upgrade():
                    reason(soc_deviation_pct=7.4) is None
                    and reason(soc_deviation_pct=7.5) == "soc_deviation:+7.5pp",
                    f"{reason(soc_deviation_pct=7.4)}/{reason(soc_deviation_pct=7.5)}"))
+    checks.append(("manual SOC settings cannot cross their paired boundaries",
+                   co_mod._clamp_battery_min_soc(95.0, 90.0) == 89.0
+                   and co_mod._clamp_battery_max_soc(20.0, 25.0) == 26.0
+                   and co_mod._clamp_ev_min_soc(90.0, 80.0) == 80.0
+                   and co_mod._clamp_ev_target_soc(40.0, 50.0) == 50.0,
+                   "battery and EV min/max pairs remain ordered"))
 
     avg_before, active_before = co_mod._controlled_ev_surplus(5000.0, 500.0, 44.0)
     down_after, active_after = co_mod._controlled_ev_surplus(5000.0, 500.0, 45.0)
@@ -4254,6 +4270,182 @@ def test_rolling_planner_upgrade():
         current_buy_price=1.0, current_sell_price=0.4, forecast_today_kwh=30.0,
         price_slots=prices, solar_slots=solar,
     )
+
+    class _RuntimeEntry:
+        entry_id = "manual-runtime"
+        data = {}
+        options = {
+            const.CONF_BATTERY_MIN_SOC: 15.0,
+            const.CONF_BATTERY_MAX_SOC: 100.0,
+            const.CONF_BATTERY_CHARGE_CURRENT_A: 70.0,
+            const.CONF_BATTERY_DISCHARGE_CURRENT_A: 70.0,
+        }
+
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    restored = object.__new__(co_mod.WattsonCoordinator)
+    restored.pause_until = None
+    restored.battery_override = const.BATTERY_OVERRIDE_AUTO
+    restored.battery_override_until = None
+    restored.ev_override = const.EV_OVERRIDE_AUTO
+    restored.ev_override_until = None
+    restore_entry = _RuntimeEntry()
+    restore_entry.options = {
+        **_RuntimeEntry.options,
+        const.CONF_PAUSE_UNTIL_PERSIST: future.isoformat(),
+        const.CONF_BATTERY_OVERRIDE_PERSIST: {
+            "action": const.BATTERY_OVERRIDE_HOLD,
+            "until": future.isoformat(),
+        },
+    }
+    restored._restore_override_state(restore_entry)
+    checks.append(("pause and manual override survive a restart until their real expiry",
+                   restored.pause_until == future
+                   and restored.battery_override == const.BATTERY_OVERRIDE_HOLD
+                   and restored.battery_override_until == future,
+                   f"{restored.pause_until}/{restored.battery_override}"))
+
+    resumed = object.__new__(co_mod.WattsonCoordinator)
+    resumed.hass = object()
+    resumed.config_entry = _RuntimeEntry()
+    resumed.pause_until = future
+    resumed.battery_override = const.BATTERY_OVERRIDE_HOLD
+    resumed.battery_override_until = future
+    resumed.ev_override = const.EV_OVERRIDE_STOP
+    resumed.ev_override_until = future
+    resumed._last_ev_fp = ("old",)
+    resumed._last_ev_amps = 8
+    resumed._last_ev_currents = (8, 8, 8)
+    resumed._battery_mode_applied = (True,)
+    resumed._battery_mode_at = base
+    resumed._battery_mode_strategy = "OLD"
+    async def _refresh(): return None
+    resumed.async_request_refresh = _refresh
+    persisted = []
+    original_update = co_mod.update_entry_options
+    co_mod.update_entry_options = lambda hass, entry, **values: persisted.append(values)
+    try:
+        asyncio.run(resumed.async_resume())
+    finally:
+        co_mod.update_entry_options = original_update
+    checks.append(("resume persistently clears pause and both overrides",
+                   resumed.pause_until is None
+                   and resumed.battery_override == const.BATTERY_OVERRIDE_AUTO
+                   and resumed.ev_override == const.EV_OVERRIDE_AUTO
+                   and persisted
+                   and persisted[-1].get(const.CONF_PAUSE_UNTIL_PERSIST) is None
+                   and persisted[-1].get(const.CONF_BATTERY_OVERRIDE_PERSIST) is None
+                   and persisted[-1].get(const.CONF_EV_OVERRIDE_PERSIST) is None,
+                   str(persisted[-1] if persisted else None)))
+
+    class _BatteryAdapter:
+        def __init__(self): self.plans = []
+        async def apply_battery_plan(self, mapping_obj, plan_obj, now):
+            self.plans.append(plan_obj)
+            return ["battery-neutral"]
+
+    class _EvAdapter:
+        def __init__(self): self.plans = []
+        async def apply_ev_plan(self, mapping_obj, state_obj, plan_obj):
+            self.plans.append(plan_obj)
+            return ["ev-neutral"]
+
+    neutral = object.__new__(co_mod.WattsonCoordinator)
+    neutral.mapping = mapping.build_entity_mapping(BASE_CONFIG)
+    neutral.config_entry = _RuntimeEntry()
+    neutral.site_state = state
+    neutral._default_export_limit_w = 6000.0
+    neutral._klatremis = _BatteryAdapter()
+    neutral._easee = _EvAdapter()
+    neutral._last_ev_fp = ("old",)
+    neutral._last_ev_amps = 8
+    neutral._last_ev_currents = (8, 8, 8)
+    neutral._battery_mode_applied = (True,)
+    neutral._battery_mode_at = base
+    neutral._battery_mode_strategy = "OLD"
+    neutral.last_actions = []
+    asyncio.run(neutral._async_neutralize_control(battery=True, ev=True, reason="test"))
+    neutral_battery = neutral._klatremis.plans[-1]
+    neutral_ev = neutral._easee.plans[-1]
+    checks.append(("pause/disable neutralization clears forced hardware states first",
+                   neutral_battery.desired_grid_charge is False
+                   and neutral_battery.desired_solar_sell is False
+                   and neutral_battery.desired_discharge_current_a == 70.0
+                   and neutral_battery.desired_tou_charge_enable is False
+                   and neutral_ev.desired_enabled is False
+                   and neutral_ev.desired_action == "pause",
+                   f"{neutral_battery}/{neutral_ev}"))
+    near_full_overflow = replace(
+        state,
+        pv_power_w=6000.0,
+        load_power_w=1000.0,
+        grid_export_power_w=800.0,
+        battery_soc_pct=99.0,
+    )
+    checks.append(("manual solar charge exports only paid, measured overflow near full",
+                   co_mod._manual_overflow_export_allowed(
+                       near_full_overflow, export_value=0.4, max_soc_pct=100.0,
+                   )
+                   and not co_mod._manual_overflow_export_allowed(
+                       replace(near_full_overflow, battery_soc_pct=80.0),
+                       export_value=0.4, max_soc_pct=100.0,
+                   )
+                   and not co_mod._manual_overflow_export_allowed(
+                       replace(near_full_overflow, pv_power_w=800.0, load_power_w=1000.0, grid_export_power_w=0.0),
+                       export_value=0.4, max_soc_pct=100.0,
+                   )
+                   and not co_mod._manual_overflow_export_allowed(
+                       near_full_overflow, export_value=-0.1, max_soc_pct=100.0,
+                   ),
+                   "near-full + overflow + positive export required"))
+    cold_override = co_mod._build_guarded_manual_battery_plan(
+        const.BATTERY_OVERRIDE_CHARGE,
+        export_limit_default_w=6000.0,
+        charge_current_a=70.0,
+        discharge_current_a=70.0,
+        allow_overflow_export=False,
+        battery_temperature_c=0.0,
+    )
+    checks.append(("manual grid force-charge cannot bypass the LFP cold guard",
+                   cold_override is not None
+                   and cold_override.strategy == "OVERRIDE_CHARGE"
+                   and cold_override.desired_grid_charge is False
+                   and "KOLD-GUARD" in cold_override.reason,
+                   str(cold_override)))
+    ev_fault_state = replace(
+        state,
+        easee_online=False,
+        issues=["Easee telemetry unavailable"],
+        ev_issues=["Easee telemetry unavailable"],
+    )
+    checks.append(("Easee fault does not put healthy Deye control in global safe mode",
+                   co_mod._control_safe_reasons(
+                       ev_fault_state,
+                       automation_enabled=True,
+                       pause_until=None,
+                       now=base,
+                   ) == [],
+                   str(co_mod._control_safe_reasons(
+                       ev_fault_state,
+                       automation_enabled=True,
+                       pause_until=None,
+                       now=base,
+                   ))))
+    checks.append(("Easee fault does not force the battery planner into HOLD",
+                   not planner._battery_runtime_degraded(ev_fault_state),
+                   str(planner._battery_runtime_degraded(ev_fault_state))))
+    checks.append(("Deye fault still blocks global control",
+                   co_mod._control_safe_reasons(
+                       replace(ev_fault_state, issues=["Easee telemetry unavailable", "Inverter reports offline"]),
+                       automation_enabled=True,
+                       pause_until=None,
+                       now=base,
+                   ) == ["Inverter reports offline"],
+                   "battery fault retained"))
+    checks.append(("Deye fault still forces the battery planner into HOLD",
+                   planner._battery_runtime_degraded(
+                       replace(ev_fault_state, issues=["Easee telemetry unavailable", "Inverter reports offline"])
+                   ),
+                   "battery fault retained"))
     checks.append(("EV runtime distinguishes connected/waiting/charging/disconnected",
                    planner.ev_runtime_state(replace(state, easee_status="connected")) == "connected"
                    and planner.ev_runtime_state(state) == "waiting"

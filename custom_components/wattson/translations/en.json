@@ -26,7 +26,7 @@
           "auto": "Automatic (AI)",
           "force_charge": "Force charge",
           "force_charge_solar": "Solar charge only",
-          "force_discharge": "Force discharge / sell",
+          "force_discharge": "Force discharge to house",
           "force_hold": "Hold (no charge/discharge)"
         }
       },

@@ -121,7 +121,10 @@ class WattsonBatteryOverrideSelect(CoordinatorEntity, _BaseSelect):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {"remaining_minutes": self._coordinator.battery_override_remaining_minutes}
+        return {
+            "remaining_minutes": self._coordinator.battery_override_remaining_minutes,
+            **self._coordinator.battery_override_execution,
+        }
 
     async def async_select_option(self, option: str) -> None:
         if option in BATTERY_OVERRIDE_OPTIONS:
@@ -146,7 +149,10 @@ class WattsonEVOverrideSelect(CoordinatorEntity, _BaseSelect):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {"remaining_minutes": self._coordinator.ev_override_remaining_minutes}
+        return {
+            "remaining_minutes": self._coordinator.ev_override_remaining_minutes,
+            **self._coordinator.ev_override_execution,
+        }
 
     async def async_select_option(self, option: str) -> None:
         if option in EV_OVERRIDE_OPTIONS:

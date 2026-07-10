@@ -304,12 +304,18 @@ def build_site_state(
     if invert_battery_power_sign:
         battery_power = -battery_power
 
-    easee_online = _read_bool(hass, mapping.easee_online_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
-    easee_status = _read_string(hass, mapping.easee_status_entity, missing=missing, stale=stale, stale_seconds=stale_seconds)
-    easee_power = _read_float(hass, mapping.easee_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
+    # Easee has its own fault domain. Its telemetry may be unavailable while the
+    # Deye path is healthy, so retain the faults for diagnostics without adding
+    # them to the battery controller's required-data lists.
+    ev_missing: list[str] = []
+    ev_issues: list[str] = []
+    ev_stale: list[str] = []
+    easee_online = _read_bool(hass, mapping.easee_online_entity, missing=ev_missing, issues=ev_issues, stale=ev_stale, stale_seconds=stale_seconds)
+    easee_status = _read_string(hass, mapping.easee_status_entity, missing=ev_missing, stale=ev_stale, stale_seconds=stale_seconds)
+    easee_power = _read_float(hass, mapping.easee_power_entity, missing=ev_missing, issues=ev_issues, stale=ev_stale, stale_seconds=stale_seconds)
     easee_power = _normalize_power_to_watts(hass, mapping.easee_power_entity, easee_power)
-    easee_session = _read_float(hass, mapping.easee_session_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
-    easee_phase_mode = _read_string(hass, mapping.easee_phase_mode_entity, missing=missing, stale=stale, stale_seconds=stale_seconds)
+    easee_session = _read_float(hass, mapping.easee_session_entity, missing=ev_missing, issues=ev_issues, stale=ev_stale, stale_seconds=stale_seconds)
+    easee_phase_mode = _read_string(hass, mapping.easee_phase_mode_entity, missing=ev_missing, stale=ev_stale, stale_seconds=stale_seconds)
 
     load_includes_ev = False
     load_power = raw_load_power
@@ -391,10 +397,13 @@ def build_site_state(
         current_buy_price=buy_price,
         current_sell_price=sell_price,
         forecast_today_kwh=forecast_today,
-        stale_entities=sorted(set(stale)),
+        stale_entities=sorted(set(stale + ev_stale)),
         stale_required_entities=sorted(set(stale_required)),
         missing_entities=sorted(set(required_missing)),
-        issues=issues,
+        issues=issues + ev_issues,
+        ev_stale_entities=sorted(set(ev_stale)),
+        ev_missing_entities=sorted(set(ev_missing)),
+        ev_issues=ev_issues,
         price_slots=price_slots,
         solar_slots=solar_slots,
     )

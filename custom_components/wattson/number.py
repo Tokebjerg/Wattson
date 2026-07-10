@@ -90,6 +90,10 @@ class WattsonEvTargetSocNumber(NumberEntity):
     def native_value(self) -> float:
         return float(self._coordinator.ev_target_soc)
 
+    @property
+    def native_min_value(self) -> float:
+        return max(10.0, float(self._coordinator.ev_min_soc))
+
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_ev_target_soc(float(value))
         self.async_write_ha_state()
@@ -123,6 +127,10 @@ class WattsonEvMinSocNumber(NumberEntity):
     @property
     def native_value(self) -> float:
         return float(self._coordinator.ev_min_soc)
+
+    @property
+    def native_max_value(self) -> float:
+        return float(self._coordinator.ev_target_soc)
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_ev_min_soc(float(value))
@@ -193,6 +201,10 @@ class WattsonBatteryMinSocNumber(_BaseSocNumber):
     def native_value(self) -> float:
         return float(self._coordinator.battery_min_soc)
 
+    @property
+    def native_max_value(self) -> float:
+        return max(0.0, float(self._coordinator.battery_max_soc) - 1.0)
+
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_battery_min_soc(float(value))
         self.async_write_ha_state()
@@ -207,6 +219,10 @@ class WattsonBatteryMaxSocNumber(_BaseSocNumber):
     @property
     def native_value(self) -> float:
         return float(self._coordinator.battery_max_soc)
+
+    @property
+    def native_min_value(self) -> float:
+        return min(100.0, float(self._coordinator.battery_min_soc) + 1.0)
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_battery_max_soc(float(value))
