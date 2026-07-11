@@ -277,6 +277,23 @@ def _controlled_ev_surplus(
     )
 
 
+def _ev_staleness_blocks_control(
+    stale_entities: list[str],
+    mapping: EntityMapping | None,
+) -> bool:
+    """Only stale EV telemetry used in power allocation may block writes.
+
+    Easee status and phase entities commonly keep the same HA timestamp for an
+    entire session.  Treating those unchanged values as a fault disabled the
+    current controller while the charger's live power sensor was still healthy.
+    """
+    return bool(
+        mapping
+        and mapping.easee_power_entity
+        and mapping.easee_power_entity in stale_entities
+    )
+
+
 def _clamp_battery_min_soc(value: float, max_soc: float) -> float:
     return max(0.0, min(float(value), float(max_soc) - 1.0))
 
@@ -2263,7 +2280,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             or easee_status in {"", "disconnected", "unknown", "unavailable"}
             or self.site_state.ev_issues
             or self.site_state.ev_missing_entities
-            or self.site_state.ev_stale_entities
+            or _ev_staleness_blocks_control(
+                self.site_state.ev_stale_entities,
+                self.mapping,
+            )
         ):
             # EV is an independent fault domain: skip only Easee writes. Healthy
             # battery control continues and the manual override exposes "blocked".

@@ -2495,6 +2495,27 @@ def test_coordinator_ev_harness():
                    len(co._easee.refresh_calls) == 0,
                    str(co._easee.refresh_calls)))
 
+    # Live 2026-07-11: Easee's status/phase entities kept their timestamp while
+    # power telemetry remained fresh. Those unchanged informational values must
+    # not disable solar-current regulation; stale power telemetry still must.
+    co = make_co()
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(
+        co.site_state,
+        ev_stale_entities=["sensor.easee_status", "sensor.easee_phase_mode"],
+    )
+    informational_stale = asyncio.run(co._async_apply_ev(ev(8), at(0)))
+    co = make_co()
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(
+        co.site_state,
+        ev_stale_entities=["sensor.easee_power"],
+    )
+    power_stale = asyncio.run(co._async_apply_ev(ev(8), at(0)))
+    checks.append(("harness staleness: unchanged status/phase permits control; stale power blocks it",
+                   bool(informational_stale) and power_stale == [],
+                   f"informational={informational_stale}, power={power_stale}"))
+
     # (b) Asymmetric re-tune: ramp-ups still wait 90 s; reductions apply immediately.
     co = make_co()
     for i in range(13):
