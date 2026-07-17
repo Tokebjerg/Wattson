@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.24.62"
+INTEGRATION_VERSION = "0.24.63"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -325,6 +325,9 @@ EV_SUPPORT_BATTERY_DRAW_W = 500.0
 # Easee reported charger_wait / charger_disabled after a 0 A dynamic limit).
 # Stops the instant the car charges.
 EV_RESUME_RETRY_SECONDS = 60
+# A stale 0 kW reading is normal while Easee is waiting.  Resume such a session
+# at the charger's minimum offer so fresh power telemetry can take over safely.
+EV_STALE_POWER_BOOTSTRAP_A = 6
 EV_CONNECTED_IDLE_STATUSES = {
     "awaiting_start",
     "ready_to_charge",

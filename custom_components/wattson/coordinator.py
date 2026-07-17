@@ -22,6 +22,7 @@ from .const import (
     EV_SOAK_START_A,
     EV_SOAK_STEP_A,
     EV_SOAK_STEP_SECONDS,
+    EV_STALE_POWER_BOOTSTRAP_A,
     EV_WAITING_TO_START_STATUSES,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
@@ -280,17 +281,51 @@ def _controlled_ev_surplus(
 def _ev_staleness_blocks_control(
     stale_entities: list[str],
     mapping: EntityMapping | None,
+    *,
+    easee_status: str,
+    ev_plan: EvPlan,
 ) -> bool:
-    """Only stale EV telemetry used in power allocation may block writes.
+    """Block stale power telemetry except for a safe waiting-state bootstrap.
 
     Easee status and phase entities commonly keep the same HA timestamp for an
-    entire session.  Treating those unchanged values as a fault disabled the
-    current controller while the charger's live power sensor was still healthy.
+    entire session.  Its power entity also stays unchanged at 0 kW while paused,
+    which used to deadlock resume: stale power blocked the write that would make
+    power non-zero and fresh again.  A connected waiting charger may therefore
+    receive a minimum-current resume offer; active-session regulation still
+    requires fresh power telemetry.
     """
-    return bool(
+    power_stale = bool(
         mapping
         and mapping.easee_power_entity
         and mapping.easee_power_entity in stale_entities
+    )
+    if not power_stale:
+        return False
+    has_offer = bool(
+        ev_plan.desired_amps is not None
+        and ev_plan.desired_amps >= EV_STALE_POWER_BOOTSTRAP_A
+        and ev_plan.desired_circuit_currents is not None
+        and any(current >= EV_STALE_POWER_BOOTSTRAP_A for current in ev_plan.desired_circuit_currents)
+    )
+    bootstrap_allowed = bool(
+        easee_status in EV_WAITING_TO_START_STATUSES
+        and ev_plan.desired_enabled is True
+        and ev_plan.desired_action == "resume"
+        and has_offer
+    )
+    return not bootstrap_allowed
+
+
+def _ev_stale_power_bootstrap_plan(ev_plan: EvPlan) -> EvPlan:
+    """Clamp a stale-power resume to Easee's minimum current offer."""
+    currents = tuple(
+        EV_STALE_POWER_BOOTSTRAP_A if current > 0 else 0
+        for current in ev_plan.desired_circuit_currents
+    )
+    return replace(
+        ev_plan,
+        desired_amps=EV_STALE_POWER_BOOTSTRAP_A,
+        desired_circuit_currents=currents,
     )
 
 
@@ -417,6 +452,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_current_change_at: datetime | None = None
         self._last_ev_resume_retry_at: datetime | None = None
         self._last_ev_circuit_refresh_at: datetime | None = None
+        self._ev_control_blocked_reason: str | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -2273,23 +2309,40 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         expose Easee's higher offline current limit.
         """
         if not self.ev_control_enabled:
+            self._ev_control_blocked_reason = "ev_control_disabled"
             return []
         easee_status = (self.site_state.easee_status or "").strip().lower()
-        if (
-            self.site_state.easee_online is False
-            or easee_status in {"", "disconnected", "unknown", "unavailable"}
-            or self.site_state.ev_issues
-            or self.site_state.ev_missing_entities
-            or _ev_staleness_blocks_control(
-                self.site_state.ev_stale_entities,
-                self.mapping,
-            )
-        ):
+        ev = plan.ev
+        stale_power_blocks = _ev_staleness_blocks_control(
+            self.site_state.ev_stale_entities,
+            self.mapping,
+            easee_status=easee_status,
+            ev_plan=ev,
+        )
+        blocked_reason = None
+        if self.site_state.easee_online is False:
+            blocked_reason = "easee_offline"
+        elif easee_status in {"", "disconnected", "unknown", "unavailable"}:
+            blocked_reason = "easee_status_unavailable"
+        elif self.site_state.ev_issues:
+            blocked_reason = "ev_telemetry_issue"
+        elif self.site_state.ev_missing_entities:
+            blocked_reason = "ev_telemetry_missing"
+        elif stale_power_blocks:
+            blocked_reason = "ev_power_stale"
+        self._ev_control_blocked_reason = blocked_reason
+        if blocked_reason:
             # EV is an independent fault domain: skip only Easee writes. Healthy
             # battery control continues and the manual override exposes "blocked".
             self._last_ev_fp = None
             return []
-        ev = plan.ev
+        power_stale = bool(
+            self.mapping
+            and self.mapping.easee_power_entity
+            and self.mapping.easee_power_entity in self.site_state.ev_stale_entities
+        )
+        if power_stale:
+            ev = _ev_stale_power_bootstrap_plan(ev)
         # Structural changes (mode / enable / phase / start-stop) always apply.
         structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
         structural_changed = structural != self._last_ev_fp
@@ -2352,7 +2405,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 self._last_ev_write_at = now
                 self._last_ev_circuit_refresh_at = now
             return acts
-        acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, plan.ev)
+        acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, ev)
         if acts:
             self._last_ev_write_at = now
             if ev.desired_circuit_currents is not None:

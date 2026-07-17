@@ -2497,7 +2497,8 @@ def test_coordinator_ev_harness():
 
     # Live 2026-07-11: Easee's status/phase entities kept their timestamp while
     # power telemetry remained fresh. Those unchanged informational values must
-    # not disable solar-current regulation; stale power telemetry still must.
+    # not disable solar-current regulation; stale power during an active session
+    # still must.
     co = make_co()
     co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
     co.site_state = replace(
@@ -2515,6 +2516,34 @@ def test_coordinator_ev_harness():
     checks.append(("harness staleness: unchanged status/phase permits control; stale power blocks it",
                    bool(informational_stale) and power_stale == [],
                    f"informational={informational_stale}, power={power_stale}"))
+
+    # Live 2026-07-17: Easee waits at 0 kW, so its power state naturally keeps an
+    # old timestamp. The stale-power guard must not deadlock the resume that would
+    # make it fresh again. Bootstrap at 6 A, then let the normal 90-second upward
+    # retune apply the full offer once power telemetry is fresh.
+    co = make_co(status="awaiting_start")
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(co.site_state, easee_power_w=0.0,
+                            ev_stale_entities=["sensor.easee_power"])
+    stale_bootstrap = asyncio.run(co._async_apply_ev(ev(16), at(0)))
+    bootstrap_call = co._easee.calls[-1] if co._easee.calls else None
+    co.site_state = replace(co.site_state, easee_status="charging", easee_power_w=4200.0,
+                            ev_stale_entities=[])
+    fresh_retune = asyncio.run(co._async_apply_ev(ev(16), at(90)))
+    checks.append(("harness stale-zero bootstrap: waiting charger resumes at 6A, then fresh telemetry retunes",
+                   bool(stale_bootstrap) and bootstrap_call == ("resume", 6, (6, 6, 6))
+                   and bool(fresh_retune) and co._easee.calls[-1] == ("resume", 16, (16, 16, 16)),
+                   f"bootstrap={bootstrap_call}, calls={co._easee.calls}"))
+
+    co = make_co(status="awaiting_start")
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(co.site_state, easee_power_w=0.0,
+                            ev_stale_entities=["sensor.easee_power"])
+    stale_pause = asyncio.run(co._async_apply_ev(ev(10, action="pause", enabled=False), at(0)))
+    checks.append(("harness stale-zero bootstrap is resume-only; pause-shaped plan cannot open it",
+                   stale_pause == [] and co._easee.calls == []
+                   and co._ev_control_blocked_reason == "ev_power_stale",
+                   f"actions={stale_pause}, blocked={co._ev_control_blocked_reason}"))
 
     # (b) Asymmetric re-tune: ramp-ups still wait 90 s; reductions apply immediately.
     co = make_co()
