@@ -2372,16 +2372,6 @@ def build_ev_plan(
         # hours block below. The explicit toggle forces "charge until full" even
         # when a SOC reading exists (when it is for a different, non-connected car).
         car_soc = state.ev_soc_pct
-        # Minimum-SOC floor: below it, charge NOW at max amps regardless of price
-        # ("never stranded"). Checked before any price optimization.
-        if car_soc is not None and ev_min_soc > 0 and car_soc < ev_min_soc:
-            return EvPlan(
-                mode=ev_mode,
-                reason=f"Car {car_soc:.0f}% below minimum {ev_min_soc:.0f}% — charging now regardless of price",
-                desired_enabled=True,
-                desired_amps=int(ev_max_amps),
-                desired_action="resume",
-            )
         # The scheduled start/end WINDOW deliberately does not apply here (it
         # belongs to scheduled_periods): cheapest-mode is governed by the optional
         # "ready by" deadline alone. Compute the deadline + horizon FIRST — both the
@@ -2400,6 +2390,50 @@ def build_ev_plan(
             for slot in remaining_price_slots(state.price_slots, state.timestamp)
             if deadline is None or slot.start < deadline
         ]
+
+        # Minimum-SOC is an emergency fallback, not a reason to discard a valid
+        # ready-by plan.  If the remaining pre-deadline time can recover the
+        # minimum, keep price optimization active and include enough selected
+        # hours to cross the floor.  Without a deadline/price plan, or when too
+        # little charging time remains, preserve the immediate never-stranded
+        # behaviour.
+        minimum_recovery_hours = 0
+        minimum_recovery_feasible = False
+        if car_soc is not None and ev_min_soc > 0 and car_soc < ev_min_soc:
+            minimum_recovery_hours = max(1, math.ceil(
+                (ev_min_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+            ))
+            available_charge_hours = sum(
+                max(
+                    0.0,
+                    (
+                        min(slot.start + timedelta(hours=1), deadline)
+                        - max(slot.start, state.timestamp)
+                    ).total_seconds() / 3600.0,
+                )
+                for slot in horizon_slots
+            ) if deadline is not None else 0.0
+            required_charge_hours = (
+                (ev_min_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+            )
+            minimum_recovery_feasible = bool(
+                deadline is not None
+                and horizon_slots
+                and available_charge_hours + 1e-9 >= required_charge_hours
+            )
+            if not minimum_recovery_feasible:
+                return EvPlan(
+                    mode=ev_mode,
+                    reason=(
+                        f"Car {car_soc:.0f}% below minimum {ev_min_soc:.0f}% and no feasible "
+                        "ready-by plan — charging now regardless of price"
+                    ),
+                    desired_enabled=True,
+                    desired_amps=int(ev_max_amps),
+                    desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+                    desired_phase_mode="auto_phase",
+                    desired_action="resume",
+                )
 
         # How many of the cheapest hours to charge:
         #  - "Charge until full" (the toggle, OR no usable car SOC while a deadline
@@ -2435,6 +2469,10 @@ def build_ev_plan(
             wanted_hours = len(horizon_slots)
             target_note = " — charging until full (no car SOC)"
 
+        if minimum_recovery_feasible:
+            wanted_hours = max(wanted_hours, minimum_recovery_hours)
+            target_note += f"; minimum {ev_min_soc:.0f}% covered by deadline"
+
         if horizon_slots:
             wanted = wanted_hours
             cheapest = sorted(horizon_slots, key=lambda s: s.total_import_price)[:wanted]
@@ -2447,6 +2485,8 @@ def build_ev_plan(
                     reason=f"Within the {wanted} cheapest allowed hours{until}{target_note} ({current.total_import_price:.2f})",
                     desired_enabled=True,
                     desired_amps=int(ev_max_amps),
+                    desired_circuit_currents=(int(ev_max_amps), int(ev_max_amps), int(ev_max_amps)),
+                    desired_phase_mode="auto_phase",
                     desired_action="resume",
                 )
             # Solar opportunism: outside the chosen cheapest grid hours, a solar
@@ -2527,6 +2567,7 @@ def ev_cheapest_charge_hours(
     ev_ready_hour: int = -1,
     ev_target_soc: float = 0.0,
     ev_charge_speed_pct_h: float = 15.0,
+    ev_min_soc: float = 0.0,
     ev_charge_until_complete: bool = False,
 ) -> dict | None:
     """Per-hour view of the scheduled-cheapest plan, for the dashboard.
@@ -2568,6 +2609,12 @@ def ev_cheapest_charge_hours(
     elif car_soc is None and ev_target_soc > 0 and deadline is not None:
         wanted = len(horizon)
         note = f"no car SOC — charging until full before {int(ev_ready_hour):02d}:00"
+    if car_soc is not None and ev_min_soc > 0 and car_soc < ev_min_soc and deadline is not None:
+        minimum_recovery_hours = max(1, math.ceil(
+            (ev_min_soc - car_soc) / max(1.0, float(ev_charge_speed_pct_h))
+        ))
+        wanted = max(wanted, minimum_recovery_hours)
+        note += f"; minimum {ev_min_soc:.0f}% covered by deadline"
     cheapest = sorted(horizon, key=lambda s: s.total_import_price)[:wanted]
     cheapest_starts = {s.start for s in cheapest}
     return {
@@ -2598,6 +2645,7 @@ def projected_ev_load_by_start(
     ev_ready_hour: int = -1,
     ev_target_soc: float = 0.0,
     ev_charge_speed_pct_h: float = 15.0,
+    ev_min_soc: float = 0.0,
     ev_charge_until_complete: bool = False,
 ) -> dict[datetime, float]:
     """Forecast hourly EV energy so the battery SOC curve includes the car.
@@ -2650,6 +2698,7 @@ def projected_ev_load_by_start(
             ev_ready_hour=ev_ready_hour,
             ev_target_soc=ev_target_soc,
             ev_charge_speed_pct_h=ev_charge_speed_pct_h,
+            ev_min_soc=ev_min_soc,
             ev_charge_until_complete=ev_charge_until_complete,
         )
         selected = {

@@ -1182,6 +1182,7 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
             ev_ready_hour=coord.ev_ready_hour,
             ev_target_soc=coord.ev_target_soc,
             ev_charge_speed_pct_h=float(entry_value(self._entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
+            ev_min_soc=coord.ev_min_soc,
             ev_charge_until_complete=coord.ev_charge_until_complete,
         )
 

@@ -1510,6 +1510,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_ready_hour=self.ev_ready_hour,
             ev_target_soc=self.ev_target_soc,
             ev_charge_speed_pct_h=ev_charge_speed_pct_h,
+            ev_min_soc=self.ev_min_soc,
             ev_charge_until_complete=self.ev_charge_until_complete,
         )
         _ev_battery_protected = self.ev_mode != EV_MODE_SOLAR_ONLY

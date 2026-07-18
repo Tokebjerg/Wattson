@@ -1825,8 +1825,8 @@ def test_phase_gaps():
     checks = []
     TZ = timezone(timedelta(hours=2))
 
-    def at(h):
-        return datetime(2026, 6, 10, h, 0, tzinfo=TZ)
+    def at(h, m=0):
+        return datetime(2026, 6, 10, h, m, tzinfo=TZ)
 
     # ---- #10 EV "klar-til-tid" deadline ------------------------------------ #
     # Hours 3,4 are cheapest BEFORE a 05:00 deadline; hours 10,11 are globally
@@ -2006,14 +2006,14 @@ def test_phase_gaps():
                    f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
-    def sched_min(now_h, soc, min_soc=35.0, windows=""):
-        st = ev_state(at(now_h))
+    def sched_min(now_h, soc, min_soc=35.0, windows="", ready_hour=-1, minute=0):
+        st = ev_state(at(now_h, minute))
         if soc is not None:
             st = replace_state(st, ev_soc_pct=soc)
         return planner.build_ev_plan(
             st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
             ev_solar_min_surplus_w=1400, ev_windows=windows, ev_required_hours=2,
-            ev_ready_hour=-1, solar_surplus_override=0.0,
+            ev_ready_hour=ready_hour, solar_surplus_override=0.0,
             ev_target_soc=80.0, ev_min_soc=min_soc)
 
     p_m1 = sched_min(7, 20.0)  # hour 7 = the DAY'S MOST EXPENSIVE (0.62)
@@ -2026,6 +2026,107 @@ def test_phase_gaps():
     p_m3 = sched_min(7, None)
     checks.append(("min-SOC: no car-SOC sensor -> floor cannot apply (graceful)",
                    p_m3.desired_action == "pause", p_m3.desired_action))
+    p_m4 = sched_min(0, 20.0, ready_hour=5)
+    checks.append(("min-SOC + feasible deadline: waits for selected cheap hours instead of charging now",
+                   p_m4.desired_action == "pause" and "minimum 35% covered" not in p_m4.reason,
+                   f"{p_m4.desired_action}/{p_m4.reason[:70]}"))
+    p_m5 = sched_min(3, 20.0, ready_hour=5)
+    checks.append(("min-SOC + feasible deadline: selected cheap hour resumes with a complete Easee offer",
+                   p_m5.desired_action == "resume"
+                   and p_m5.desired_circuit_currents == (16, 16, 16)
+                   and p_m5.desired_phase_mode == "auto_phase",
+                   f"{p_m5.desired_action}/{p_m5.desired_circuit_currents}/{p_m5.desired_phase_mode}"))
+    p_m6 = sched_min(4, 20.0, ready_hour=5, minute=45)
+    checks.append(("min-SOC + infeasible deadline: last 15 minutes trigger emergency charging",
+                   p_m6.desired_action == "resume" and "no feasible ready-by plan" in p_m6.reason,
+                   f"{p_m6.desired_action}/{p_m6.reason[:70]}"))
+
+    # Live regression, 2026-07-18: car 25%, floor 30%, target 100%, deadline
+    # tomorrow 16:00. The dashboard correctly picked tomorrow 10-14, but the old
+    # minimum-floor shortcut resumed immediately, which activated EV battery
+    # protection and pinned Deye discharge to 0 A while the charger drew 0 W.
+    live_now = datetime(2026, 7, 18, 20, 40, tzinfo=TZ)
+    live_slots = []
+    slot_start = live_now.replace(minute=0)
+    for offset in range(20):
+        start = slot_start + timedelta(hours=offset)
+        price = 0.35 if start.date() > live_now.date() and 10 <= start.hour <= 14 else 1.20 + offset * 0.01
+        live_slots.append(models.PriceSlot(
+            start=start, spot_price=price, tariff=0.0,
+            total_import_price=price, export_value=0.25,
+        ))
+    live_state = replace_state(
+        ev_state(live_now),
+        easee_status="awaiting_start",
+        easee_power_w=0.0,
+        ev_soc_pct=25.0,
+        battery_soc_pct=99.0,
+        price_slots=live_slots,
+    )
+    live_ev = planner.build_ev_plan(
+        live_state,
+        ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
+        ev_max_amps=16,
+        ev_solar_min_surplus_w=1400.0,
+        ev_windows="",
+        ev_required_hours=4,
+        ev_ready_hour=16,
+        solar_surplus_override=0.0,
+        ev_target_soc=100.0,
+        ev_charge_speed_pct_h=15.0,
+        ev_min_soc=30.0,
+    )
+    live_battery = models.BatteryPlan(
+        strategy="DISCHARGE_TO_LOAD",
+        reason="cover house",
+        desired_discharge_current_a=70.0,
+    )
+    live_after_protect = planner.apply_ev_battery_protect(
+        live_battery,
+        ev_charging=live_ev.desired_enabled is True and live_ev.desired_action == "resume",
+        ev_covers_dips=False,
+    )
+    live_overview = planner.ev_cheapest_charge_hours(
+        live_state,
+        ev_required_hours=4,
+        ev_ready_hour=16,
+        ev_target_soc=100.0,
+        ev_charge_speed_pct_h=15.0,
+        ev_min_soc=30.0,
+    )
+    selected_live_hours = [
+        datetime.fromisoformat(hour["hour"]).hour
+        for hour in live_overview["hours"]
+        if hour["charge"]
+    ]
+    checks.append(("live regression: waiting now keeps house-battery discharge open",
+                   live_ev.desired_action == "pause"
+                   and live_after_protect.desired_discharge_current_a == 70.0,
+                   f"{live_ev.desired_action}/{live_after_protect.desired_discharge_current_a}A"))
+    checks.append(("live regression: tomorrow plan remains five cheapest hours 10-14 before 16:00",
+                   selected_live_hours == [10, 11, 12, 13, 14]
+                   and live_overview["wanted_hours"] == 5,
+                   f"wanted={live_overview['wanted_hours']}, hours={selected_live_hours}"))
+    tomorrow_ten = replace_state(live_state, timestamp=datetime(2026, 7, 19, 10, 0, tzinfo=TZ))
+    tomorrow_ev = planner.build_ev_plan(
+        tomorrow_ten,
+        ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
+        ev_max_amps=16,
+        ev_solar_min_surplus_w=1400.0,
+        ev_windows="",
+        ev_required_hours=4,
+        ev_ready_hour=16,
+        solar_surplus_override=0.0,
+        ev_target_soc=100.0,
+        ev_charge_speed_pct_h=15.0,
+        ev_min_soc=30.0,
+    )
+    checks.append(("live regression: tomorrow 10:00 starts at 16A/3-phase and can bootstrap stale 0W telemetry",
+                   tomorrow_ev.desired_action == "resume"
+                   and tomorrow_ev.desired_amps == 16
+                   and tomorrow_ev.desired_circuit_currents == (16, 16, 16)
+                   and tomorrow_ev.desired_phase_mode == "auto_phase",
+                   f"{tomorrow_ev.desired_action}/{tomorrow_ev.desired_amps}/{tomorrow_ev.desired_circuit_currents}"))
     # The scheduled WINDOW must be IGNORED in cheapest mode: a restrictive window
     # ("13:00-14:00") must not stop charging in the globally cheapest hour (10).
     p_w = sched_min(10, 50.0, windows="13:00-14:00")

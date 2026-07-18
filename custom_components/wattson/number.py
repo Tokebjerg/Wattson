@@ -100,9 +100,9 @@ class WattsonEvTargetSocNumber(NumberEntity):
 
 
 class WattsonEvMinSocNumber(NumberEntity):
-    """Minimum car SOC (%): below this, scheduled_cheapest charges IMMEDIATELY at
-    max amps regardless of price (never-stranded floor). 0 = off. Requires the
-    car-SOC sensor; the other EV modes never use it."""
+    """Minimum car SOC (%): recovered in a feasible cheapest-hours deadline plan,
+    otherwise charged immediately as a never-stranded floor. 0 = off. Requires
+    the car-SOC sensor; the other EV modes never use it."""
 
     _attr_has_entity_name = True
     _attr_mode = NumberMode.BOX
