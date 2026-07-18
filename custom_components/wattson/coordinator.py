@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -122,6 +123,7 @@ from .const import (
     DEFAULT_STALE_SECONDS,
     DOMAIN,
     EV_MODE_SOLAR_ONLY,
+    EV_MODE_SCHEDULED_CHEAPEST,
     EV_MODES,
     BATTERY_MODES,
     BATTERY_OVERRIDE_AUTO,
@@ -155,6 +157,11 @@ from .const import (
 )
 from .control import EaseeController, KlatremisController
 from .deye_contract import floor_sell_safe
+from .ev_recovery import (
+    MINIMUM_RECOVERY_PERSIST_STEP_KWH,
+    EvMinimumRecovery,
+    advance_minimum_recovery,
+)
 from .telemetry import TelemetryMixin
 from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
@@ -513,6 +520,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.ev_charge_until_complete = bool(entry_value(entry, CONF_EV_CHARGE_UNTIL_COMPLETE, DEFAULT_EV_CHARGE_UNTIL_COMPLETE))
         self.ev_solar_battery_priority = bool(entry_value(entry, CONF_EV_SOLAR_BATTERY_PRIORITY, DEFAULT_EV_SOLAR_BATTERY_PRIORITY))
         self.ev_solar_battery_threshold = float(entry_value(entry, CONF_EV_SOLAR_BATTERY_THRESHOLD, DEFAULT_EV_SOLAR_BATTERY_THRESHOLD))
+        self._ev_minimum_recovery_store = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}.ev_minimum_recovery"
+        )
+        self._ev_minimum_recovery: EvMinimumRecovery | None = None
+        self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
         self._repairs_state: dict[str, list] = {}
         # #6 heartbeat: the last successful tick + the gap before it, so a stall or
@@ -529,10 +541,20 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # _sell_ceiling_active), dwell timers, contention windows, surplus/load
         # sample buffers, the anomaly-fired set + digest day (both re-cleared/re-sent
         # via the issue registry / a fresh 07:00 pass). PERSISTED state (must survive a
-        # restart) lives in config-entry options or RestoreSensor: overrides (+expiry),
-        # savings/cycle/curtailment/grid-charge totals, the solar-bias history. ----
+        # restart) lives in config-entry options, HA Store, or RestoreSensor: overrides
+        # (+expiry), EV minimum recovery, savings/cycle/curtailment/grid-charge totals,
+        # and the solar-bias history. ----
 
     async def async_startup(self) -> None:
+        try:
+            saved = await self._ev_minimum_recovery_store.async_load()
+            self._ev_minimum_recovery = EvMinimumRecovery.from_storage_dict(saved)
+            if self._ev_minimum_recovery is not None:
+                self._ev_minimum_recovery_last_saved_kwh = (
+                    self._ev_minimum_recovery.delivered_kwh
+                )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson could not restore EV minimum recovery: %s", err)
         await self._async_update_load_profile()
 
     async def _async_update_load_profile(self) -> None:
@@ -637,6 +659,100 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # day-7 cliff. Floored at 0.4 so morning-shoulder protection still
         # contributes early; only ever LOWERS the reserve (safe direction).
         return base * max(0.4, getattr(profile, "confidence", 1.0))
+
+    async def _async_update_ev_minimum_recovery(
+        self,
+        *,
+        ev_runtime: str,
+        ev_max_amps: int,
+        ev_charge_speed_pct_h: float,
+    ) -> None:
+        """Meter immediate minimum-SOC charging independently of car API cadence."""
+        if self.site_state is None:
+            return
+        previous = self._ev_minimum_recovery
+        current = advance_minimum_recovery(
+            previous,
+            now=dt_util.utcnow(),
+            connected=ev_runtime != "disconnected",
+            minimum_mode_enabled=self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST,
+            soc_pct=self.site_state.ev_soc_pct,
+            minimum_soc_pct=self.ev_min_soc,
+            charge_speed_pct_h=ev_charge_speed_pct_h,
+            max_amps=ev_max_amps,
+            power_w=self.site_state.easee_power_w,
+            session_kwh=self.site_state.easee_session_kwh,
+        )
+        self._ev_minimum_recovery = current
+
+        transition = (
+            (previous is None) != (current is None)
+            or (
+                previous is not None
+                and current is not None
+                and (
+                    previous.complete != current.complete
+                    or abs(previous.anchor_soc_pct - current.anchor_soc_pct) >= 0.01
+                    or abs(previous.target_soc_pct - current.target_soc_pct) >= 0.01
+                    or abs(previous.required_kwh - current.required_kwh) >= 0.01
+                )
+            )
+        )
+        progress_due = bool(
+            current is not None
+            and abs(
+                current.delivered_kwh
+                - self._ev_minimum_recovery_last_saved_kwh
+            ) >= MINIMUM_RECOVERY_PERSIST_STEP_KWH
+        )
+        if not transition and not progress_due:
+            return
+        try:
+            if current is None:
+                await self._ev_minimum_recovery_store.async_remove()
+                self._ev_minimum_recovery_last_saved_kwh = 0.0
+            else:
+                await self._ev_minimum_recovery_store.async_save(
+                    current.as_storage_dict()
+                )
+                self._ev_minimum_recovery_last_saved_kwh = current.delivered_kwh
+        except Exception as err:  # noqa: BLE001
+            # Persistence may fail without making the live stop calculation unsafe.
+            _LOGGER.warning("Wattson could not persist EV minimum recovery: %s", err)
+
+    @property
+    def ev_minimum_recovery_complete(self) -> bool:
+        recovery = self._ev_minimum_recovery
+        soc = self.site_state.ev_soc_pct if self.site_state is not None else None
+        return bool(
+            recovery is not None
+            and recovery.complete
+            and soc is not None
+            and soc < self.ev_min_soc
+            and abs(soc - recovery.anchor_soc_pct) < 0.5
+            and abs(self.ev_min_soc - recovery.target_soc_pct) < 0.01
+        )
+
+    @property
+    def ev_minimum_recovery_status(self) -> dict[str, Any]:
+        recovery = self._ev_minimum_recovery
+        if recovery is None:
+            return {"state": "idle"}
+        return {
+            "state": "complete" if recovery.complete else "charging",
+            "anchor_soc_pct": round(recovery.anchor_soc_pct, 2),
+            "target_soc_pct": round(recovery.target_soc_pct, 2),
+            "estimated_soc_pct": round(recovery.estimated_soc_pct, 2),
+            "required_kwh": round(recovery.required_kwh, 3),
+            "delivered_kwh": round(recovery.delivered_kwh, 3),
+            "remaining_kwh": round(recovery.remaining_kwh, 3),
+            "started_at": recovery.started_at.isoformat(),
+            "completed_at": (
+                recovery.completed_at.isoformat()
+                if recovery.completed_at is not None else None
+            ),
+            "latched_for_stale_soc": self.ev_minimum_recovery_complete,
+        }
 
     def _restore_override_state(self, entry) -> None:
         """Resume persisted manual control windows that have not yet expired."""
@@ -1499,6 +1615,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         ))
         _ev_runtime = ev_runtime_state(self.site_state)
         _ev_connected = _ev_runtime != "disconnected"
+        await self._async_update_ev_minimum_recovery(
+            ev_runtime=_ev_runtime,
+            ev_max_amps=ev_max_amps,
+            ev_charge_speed_pct_h=ev_charge_speed_pct_h,
+        )
+        _ev_minimum_recovery_complete = self.ev_minimum_recovery_complete
         _ev_load_by_start = projected_ev_load_by_start(
             self.site_state,
             ev_mode=self.ev_mode,
@@ -1512,6 +1634,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_charge_speed_pct_h=ev_charge_speed_pct_h,
             ev_min_soc=self.ev_min_soc,
             ev_charge_until_complete=self.ev_charge_until_complete,
+            ev_minimum_recovery_complete=_ev_minimum_recovery_complete,
         )
         _ev_battery_protected = self.ev_mode != EV_MODE_SOLAR_ONLY
 
@@ -1760,7 +1883,25 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_charge_speed_pct_h=ev_charge_speed_pct_h,
             ev_min_soc=self.ev_min_soc,
             ev_charge_until_complete=self.ev_charge_until_complete,
+            ev_minimum_recovery_complete=_ev_minimum_recovery_complete,
         )
+
+        _minimum_recovery = self._ev_minimum_recovery
+        if (
+            self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
+            and _minimum_recovery is not None
+            and not _minimum_recovery.complete
+            and ev_plan.desired_action == "resume"
+        ):
+            ev_plan = replace(
+                ev_plan,
+                reason=(
+                    f"Car {_minimum_recovery.anchor_soc_pct:.0f}% below minimum "
+                    f"{_minimum_recovery.target_soc_pct:.0f}% — metered recovery "
+                    f"{_minimum_recovery.delivered_kwh:.2f}/"
+                    f"{_minimum_recovery.required_kwh:.2f} kWh, charging regardless of price"
+                ),
+            )
 
         # Phase E: a manual EV override is an explicit user action and wins over
         # the AI plan (and suppresses the solar-only auto-adjustments below).

@@ -101,6 +101,7 @@ _install_ha_stubs()
 const, models, horizon, learning, mapping, planner, control, telemetry = _load_wattson()
 safety = importlib.import_module("wattson.safety")
 deye_contract = importlib.import_module("wattson.deye_contract")
+ev_recovery = importlib.import_module("wattson.ev_recovery")
 State = sys.modules["homeassistant.core"].State
 
 
@@ -2006,7 +2007,8 @@ def test_phase_gaps():
                    f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
-    def sched_min(now_h, soc, min_soc=35.0, windows="", ready_hour=-1, minute=0):
+    def sched_min(now_h, soc, min_soc=35.0, windows="", ready_hour=-1, minute=0,
+                  recovery_complete=False):
         st = ev_state(at(now_h, minute))
         if soc is not None:
             st = replace_state(st, ev_soc_pct=soc)
@@ -2014,7 +2016,8 @@ def test_phase_gaps():
             st, ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST, ev_max_amps=16,
             ev_solar_min_surplus_w=1400, ev_windows=windows, ev_required_hours=2,
             ev_ready_hour=ready_hour, solar_surplus_override=0.0,
-            ev_target_soc=80.0, ev_min_soc=min_soc)
+            ev_target_soc=80.0, ev_min_soc=min_soc,
+            ev_minimum_recovery_complete=recovery_complete)
 
     p_m1 = sched_min(7, 20.0)  # hour 7 = the DAY'S MOST EXPENSIVE (0.62)
     checks.append(("min-SOC: below floor -> charges NOW at max amps even in the dearest hour",
@@ -2027,24 +2030,27 @@ def test_phase_gaps():
     checks.append(("min-SOC: no car-SOC sensor -> floor cannot apply (graceful)",
                    p_m3.desired_action == "pause", p_m3.desired_action))
     p_m4 = sched_min(0, 20.0, ready_hour=5)
-    checks.append(("min-SOC + feasible deadline: waits for selected cheap hours instead of charging now",
-                   p_m4.desired_action == "pause" and "minimum 35% covered" not in p_m4.reason,
+    checks.append(("min-SOC + feasible deadline: hard floor still charges immediately",
+                   p_m4.desired_action == "resume" and "regardless of price" in p_m4.reason,
                    f"{p_m4.desired_action}/{p_m4.reason[:70]}"))
     p_m5 = sched_min(3, 20.0, ready_hour=5)
-    checks.append(("min-SOC + feasible deadline: selected cheap hour resumes with a complete Easee offer",
+    checks.append(("min-SOC recovery always resumes with a complete Easee offer",
                    p_m5.desired_action == "resume"
                    and p_m5.desired_circuit_currents == (16, 16, 16)
                    and p_m5.desired_phase_mode == "auto_phase",
                    f"{p_m5.desired_action}/{p_m5.desired_circuit_currents}/{p_m5.desired_phase_mode}"))
     p_m6 = sched_min(4, 20.0, ready_hour=5, minute=45)
-    checks.append(("min-SOC + infeasible deadline: last 15 minutes trigger emergency charging",
-                   p_m6.desired_action == "resume" and "no feasible ready-by plan" in p_m6.reason,
+    checks.append(("min-SOC near deadline: same immediate metered recovery rule applies",
+                   p_m6.desired_action == "resume" and "metered recovery" in p_m6.reason,
                    f"{p_m6.desired_action}/{p_m6.reason[:70]}"))
+    p_m7 = sched_min(0, 20.0, ready_hour=5, recovery_complete=True)
+    checks.append(("min-SOC stale value: metered completion releases immediate charging latch",
+                   p_m7.desired_action == "pause" and "already recovered" in p_m7.reason,
+                   f"{p_m7.desired_action}/{p_m7.reason[:80]}"))
 
     # Live regression, 2026-07-18: car 25%, floor 30%, target 100%, deadline
-    # tomorrow 16:00. The dashboard correctly picked tomorrow 10-14, but the old
-    # minimum-floor shortcut resumed immediately, which activated EV battery
-    # protection and pinned Deye discharge to 0 A while the charger drew 0 W.
+    # tomorrow 16:00. The hard floor must charge immediately until metered energy
+    # reaches 30%, then the stale 25% value is latched and tomorrow 10-14 remains.
     live_now = datetime(2026, 7, 18, 20, 40, tzinfo=TZ)
     live_slots = []
     slot_start = live_now.replace(minute=0)
@@ -2086,6 +2092,28 @@ def test_phase_gaps():
         ev_charging=live_ev.desired_enabled is True and live_ev.desired_action == "resume",
         ev_covers_dips=False,
     )
+    live_recovered_ev = planner.build_ev_plan(
+        live_state,
+        ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
+        ev_max_amps=16,
+        ev_solar_min_surplus_w=1400.0,
+        ev_windows="",
+        ev_required_hours=4,
+        ev_ready_hour=16,
+        solar_surplus_override=0.0,
+        ev_target_soc=100.0,
+        ev_charge_speed_pct_h=15.0,
+        ev_min_soc=30.0,
+        ev_minimum_recovery_complete=True,
+    )
+    live_recovered_battery = planner.apply_ev_battery_protect(
+        live_battery,
+        ev_charging=(
+            live_recovered_ev.desired_enabled is True
+            and live_recovered_ev.desired_action == "resume"
+        ),
+        ev_covers_dips=False,
+    )
     live_overview = planner.ev_cheapest_charge_hours(
         live_state,
         ev_required_hours=4,
@@ -2099,10 +2127,14 @@ def test_phase_gaps():
         for hour in live_overview["hours"]
         if hour["charge"]
     ]
-    checks.append(("live regression: waiting now keeps house-battery discharge open",
-                   live_ev.desired_action == "pause"
-                   and live_after_protect.desired_discharge_current_a == 70.0,
+    checks.append(("live minimum recovery: starts now and protects the house battery",
+                   live_ev.desired_action == "resume"
+                   and live_after_protect.desired_discharge_current_a == 0.0,
                    f"{live_ev.desired_action}/{live_after_protect.desired_discharge_current_a}A"))
+    checks.append(("live minimum recovery: metered completion pauses and reopens house battery",
+                   live_recovered_ev.desired_action == "pause"
+                   and live_recovered_battery.desired_discharge_current_a == 70.0,
+                   f"{live_recovered_ev.desired_action}/{live_recovered_battery.desired_discharge_current_a}A"))
     checks.append(("live regression: tomorrow plan remains five cheapest hours 10-14 before 16:00",
                    selected_live_hours == [10, 11, 12, 13, 14]
                    and live_overview["wanted_hours"] == 5,
@@ -2120,6 +2152,7 @@ def test_phase_gaps():
         ev_target_soc=100.0,
         ev_charge_speed_pct_h=15.0,
         ev_min_soc=30.0,
+        ev_minimum_recovery_complete=True,
     )
     checks.append(("live regression: tomorrow 10:00 starts at 16A/3-phase and can bootstrap stale 0W telemetry",
                    tomorrow_ev.desired_action == "resume"
@@ -2486,6 +2519,26 @@ def _coordinator_module():
         sys.modules["homeassistant.helpers"] = helpers
         sys.modules["homeassistant.helpers.update_coordinator"] = uc
         sys.modules["homeassistant"].helpers = helpers
+    if "homeassistant.helpers.storage" not in sys.modules:
+        helpers = sys.modules["homeassistant.helpers"]
+
+        class Store:
+            def __init__(self, *args, **kwargs):
+                self.data = None
+
+            async def async_load(self):
+                return self.data
+
+            async def async_save(self, data):
+                self.data = data
+
+            async def async_remove(self):
+                self.data = None
+
+        storage = types.ModuleType("homeassistant.helpers.storage")
+        storage.Store = Store
+        helpers.storage = storage
+        sys.modules["homeassistant.helpers.storage"] = storage
     return importlib.import_module("wattson.coordinator")
 
 
@@ -4805,6 +4858,93 @@ def test_value_sensor_baseline_sync():
     return checks
 
 
+def test_ev_minimum_recovery():
+    """Hard EV floor uses metered energy and survives stale SOC/restarts."""
+    checks = []
+    base = datetime(2026, 7, 18, 20, 0, tzinfo=timezone.utc)
+    required = ev_recovery.minimum_recovery_required_kwh(25.0, 30.0, 15.0, 16)
+    checks.append(("25->30% at 15%/h and 16A requires 3.68 kWh AC",
+                   abs(required - 3.68) < 1e-9, str(required)))
+
+    recovery = ev_recovery.advance_minimum_recovery(
+        None, now=base, connected=True, minimum_mode_enabled=True,
+        soc_pct=25.0, minimum_soc_pct=30.0, charge_speed_pct_h=15.0,
+        max_amps=16, power_w=0.0, session_kwh=10.0,
+    )
+    checks.append(("below-minimum observation starts an immediate recovery meter",
+                   recovery is not None and not recovery.complete
+                   and abs(recovery.required_kwh - 3.68) < 1e-9,
+                   str(recovery)))
+
+    idle = ev_recovery.advance_minimum_recovery(
+        recovery, now=base + timedelta(hours=1), connected=True,
+        minimum_mode_enabled=True, soc_pct=25.0, minimum_soc_pct=30.0,
+        charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
+        session_kwh=10.0,
+    )
+    checks.append(("wall-clock time without measured charger power counts no progress",
+                   idle is not None and idle.delivered_kwh == 0.0,
+                   str(idle.delivered_kwh if idle else None)))
+
+    metered = recovery
+    for tick in range(1, 121):
+        metered = ev_recovery.advance_minimum_recovery(
+            metered, now=base + timedelta(seconds=tick * 10), connected=True,
+            minimum_mode_enabled=True, soc_pct=25.0, minimum_soc_pct=30.0,
+            charge_speed_pct_h=15.0, max_amps=16, power_w=11040.0,
+            session_kwh=10.0,
+        )
+    checks.append(("20 minutes of actual 11.04 kW charging completes 25->30% recovery",
+                   metered is not None and metered.complete
+                   and abs(metered.delivered_kwh - 3.68) < 1e-6,
+                   f"{metered.delivered_kwh if metered else None}"))
+
+    stale_latched = ev_recovery.advance_minimum_recovery(
+        metered, now=base + timedelta(hours=2), connected=True,
+        minimum_mode_enabled=True, soc_pct=25.0, minimum_soc_pct=30.0,
+        charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
+        session_kwh=13.68,
+    )
+    checks.append(("same stale 25% value remains latched after metered completion",
+                   stale_latched is not None and stale_latched.complete,
+                   str(stale_latched.complete if stale_latched else None)))
+
+    restored = ev_recovery.EvMinimumRecovery.from_storage_dict(
+        recovery.as_storage_dict()
+    )
+    session_caught_up = ev_recovery.advance_minimum_recovery(
+        restored, now=base + timedelta(minutes=20), connected=True,
+        minimum_mode_enabled=True, soc_pct=25.0, minimum_soc_pct=30.0,
+        charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
+        session_kwh=13.68,
+    )
+    checks.append(("Easee session delta completes recovery after an HA restart",
+                   session_caught_up is not None and session_caught_up.complete,
+                   str(session_caught_up.delivered_kwh if session_caught_up else None)))
+
+    refreshed_low = ev_recovery.advance_minimum_recovery(
+        stale_latched, now=base + timedelta(hours=3), connected=True,
+        minimum_mode_enabled=True, soc_pct=26.0, minimum_soc_pct=30.0,
+        charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
+        session_kwh=13.68,
+    )
+    checks.append(("changed below-floor SOC starts only the remaining top-up",
+                   refreshed_low is not None and not refreshed_low.complete
+                   and refreshed_low.anchor_soc_pct == 26.0
+                   and abs(refreshed_low.required_kwh - 2.944) < 1e-9,
+                   str(refreshed_low.required_kwh if refreshed_low else None)))
+
+    disconnected = ev_recovery.advance_minimum_recovery(
+        stale_latched, now=base + timedelta(hours=4), connected=False,
+        minimum_mode_enabled=True, soc_pct=25.0, minimum_soc_pct=30.0,
+        charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
+        session_kwh=0.0,
+    )
+    checks.append(("disconnect clears the stale-SOC latch for the next trip/session",
+                   disconnected is None, str(disconnected)))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -4864,6 +5004,7 @@ def main():
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("ROLLING PLAN · EV LOAD / P10 / AUDIT", test_rolling_planner_upgrade),
+                         ("EV MINIMUM SOC · METERED RECOVERY", test_ev_minimum_recovery),
                          ("VALUE SENSOR BASELINE SYNC", test_value_sensor_baseline_sync),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),
                          ("SOLAR-AWARE CHARGING", test_solar_aware),

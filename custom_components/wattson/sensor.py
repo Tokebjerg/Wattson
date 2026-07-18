@@ -299,6 +299,9 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "ev_override": getattr(self.coordinator, "ev_override_execution", {}),
                 "ev_fast_backoff_active": getattr(self.coordinator, "_ev_support_backoff_active", False),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
+                "ev_minimum_recovery": getattr(
+                    self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
+                ),
                 "physical_writes_today": getattr(self.coordinator, "physical_write_counts", {}),
                 # #6 heartbeat: gap before the last tick (a big value = a stall/restart
                 # trace). #3 data-source health: which planning feeds are live.
@@ -1184,6 +1187,7 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
             ev_charge_speed_pct_h=float(entry_value(self._entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
             ev_min_soc=coord.ev_min_soc,
             ev_charge_until_complete=coord.ev_charge_until_complete,
+            ev_minimum_recovery_complete=coord.ev_minimum_recovery_complete,
         )
 
     @property
