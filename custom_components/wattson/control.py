@@ -278,12 +278,18 @@ class EaseeController:
             return "auto_phase"
         return lowered
 
-    async def _set_switch(self, entity_id: str | None, enabled: bool) -> list[str]:
+    async def _set_switch(
+        self,
+        entity_id: str | None,
+        enabled: bool,
+        *,
+        force: bool = False,
+    ) -> list[str]:
         if not entity_id:
             return []
         current = self.hass.states.get(entity_id)
         target_state = "on" if enabled else "off"
-        if current is not None and current.state == target_state:
+        if not force and current is not None and current.state == target_state:
             return []
         service = "turn_on" if enabled else "turn_off"
         await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
@@ -342,7 +348,15 @@ class EaseeController:
         self._count_write("easee.phase_mode")
         return [f"easee.phase_mode={phase_mode}"]
 
-    async def apply_ev_plan(self, mapping: EntityMapping, state: SiteState, plan: EvPlan) -> list[str]:
+    async def apply_ev_plan(
+        self,
+        mapping: EntityMapping,
+        state: SiteState,
+        plan: EvPlan,
+        *,
+        force_enable: bool = False,
+        override_schedule: bool = False,
+    ) -> list[str]:
         actions: list[str] = []
 
         async def apply_current_offer() -> None:
@@ -366,7 +380,16 @@ class EaseeController:
                             actions.extend(changed)
 
         if plan.desired_enabled is not None and mapping.easee_enable_switch:
-            actions.extend(await self._set_switch(mapping.easee_enable_switch, plan.desired_enabled))
+            actions.extend(
+                await self._set_switch(
+                    mapping.easee_enable_switch,
+                    plan.desired_enabled,
+                    force=force_enable and plan.desired_enabled,
+                )
+            )
+
+        if override_schedule:
+            actions.extend(await self._action(mapping.easee_device_id, "override_schedule"))
 
         # For resume, publish the actual current offer before the start command.
         # Easee can stay in charger_wait/charger_disabled if resume lands while

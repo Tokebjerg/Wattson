@@ -1328,6 +1328,39 @@ def test_c_smartcharge():
     checks.append(("apply: resume writes non-zero limits before action_command",
                    -1 not in (circuit_i, limit_i, resume_i) and circuit_i < resume_i and limit_i < resume_i,
                    str(resume_order)))
+    recovery_hass = MutHass()
+
+    class EnabledStates:
+        def get(self, eid):
+            if eid == mp.easee_enable_switch:
+                return State("on")
+            return None
+
+    recovery_hass.states = EnabledStates()
+    recovery_actions = asyncio.run(control.EaseeController(recovery_hass).apply_ev_plan(
+        mp, ev_state(at(13), status="awaiting_start", phase="auto"),
+        models.EvPlan(
+            mode="scheduled_cheapest", reason="", desired_enabled=True,
+            desired_amps=16, desired_circuit_currents=(16, 16, 16),
+            desired_action="resume", desired_phase_mode="auto_phase",
+        ),
+        force_enable=True,
+        override_schedule=True,
+    ))
+    recovery_calls = recovery_hass.services.calls
+    forced_enable_i = next((i for i, x in enumerate(recovery_calls)
+                            if x[0:2] == ("switch", "turn_on")), -1)
+    override_i = next((i for i, x in enumerate(recovery_calls)
+                       if x[0:2] == ("easee", "action_command")
+                       and x[2].get("action_command") == "override_schedule"), -1)
+    recovery_resume_i = next((i for i, x in enumerate(recovery_calls)
+                              if x[0:2] == ("easee", "action_command")
+                              and x[2].get("action_command") == "resume"), -1)
+    checks.append(("apply: start recovery forces enable and overrides schedule before resume",
+                   -1 not in (forced_enable_i, override_i, recovery_resume_i)
+                   and forced_enable_i < override_i < recovery_resume_i
+                   and any("override_schedule" in action for action in recovery_actions),
+                   str(recovery_calls)))
     ttl_hass = MutHass()
     ttl_controller = control.EaseeController(ttl_hass)
     ttl_actions = asyncio.run(ttl_controller.refresh_circuit_limit(mp, (9, 9, 9)))
@@ -2578,9 +2611,13 @@ def test_coordinator_ev_harness():
         def __init__(self):
             self.calls = []
             self.refresh_calls = []
+            self.start_recoveries = []
 
-        async def apply_ev_plan(self, mapping, state, ev):
+        async def apply_ev_plan(
+            self, mapping, state, ev, *, force_enable=False, override_schedule=False
+        ):
             self.calls.append((ev.desired_action, ev.desired_amps, ev.desired_circuit_currents))
+            self.start_recoveries.append((force_enable, override_schedule))
             return [f"easee:{ev.desired_action}:{ev.desired_amps}A"]
 
         async def refresh_circuit_limit(self, mapping, currents):
@@ -2600,6 +2637,13 @@ def test_coordinator_ev_harness():
         co._last_ev_resume_retry_at = None
         co._last_ev_circuit_refresh_at = None
         co._last_ev_write_at = None
+        co._ev_control_blocked_reason = None
+        co._ev_start_wait_since = None
+        co._last_ev_start_recovery_at = None
+        co._ev_start_recovery_attempts = 0
+        co._ev_start_status = "idle"
+        co.ev_mode = const.EV_MODE_SOLAR_ONLY
+        co._ev_minimum_recovery = None
         co.site_state = models.SiteState(
             timestamp=datetime(2026, 6, 30, 10, 0, tzinfo=timezone.utc),
             pv_power_w=4000.0, load_power_w=800.0, load_includes_ev=True,
@@ -2688,6 +2732,55 @@ def test_coordinator_ev_harness():
                    bool(stale_bootstrap) and bootstrap_call == ("resume", 6, (6, 6, 6))
                    and bool(fresh_retune) and co._easee.calls[-1] == ("resume", 16, (16, 16, 16)),
                    f"bootstrap={bootstrap_call}, calls={co._easee.calls}"))
+
+    # Live 2026-07-22: the hard 30% floor correctly requested 0.74 kWh, but the
+    # stale 0 W bootstrap held the offer at 6 A forever and accepted service calls
+    # were mistaken for a physical start. Minimum recovery must start at the full
+    # configured offer, then force enable + override any Easee schedule if no power
+    # has appeared after the verification window.
+    co = make_co(status="awaiting_start")
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(co.site_state, easee_power_w=0.0,
+                            ev_stale_entities=["sensor.easee_power"])
+    co.ev_mode = const.EV_MODE_SCHEDULED_CHEAPEST
+    co._ev_minimum_recovery = types.SimpleNamespace(complete=False)
+    minimum_start = asyncio.run(co._async_apply_ev(ev(16), at(0)))
+    minimum_initial_call = co._easee.calls[-1]
+    asyncio.run(co._async_apply_ev(ev(16), at(const.EV_START_VERIFY_SECONDS)))
+    recovery_call = co._easee.calls[-1]
+    recovery_flags = co._easee.start_recoveries[-1]
+    checks.append(("harness minimum recovery: stale 0W gets full offer and verified recovery",
+                   bool(minimum_start)
+                   and minimum_initial_call == ("resume", 16, (16, 16, 16))
+                   and recovery_call == ("resume", 16, (16, 16, 16))
+                   and recovery_flags == (True, True)
+                   and co._ev_start_status == "recovering"
+                   and co._ev_control_blocked_reason == "easee_start_recovery",
+                   f"initial={minimum_initial_call}, recovery={recovery_call}, "
+                   f"flags={recovery_flags}, state={co._ev_start_status}"))
+
+    asyncio.run(co._async_apply_ev(
+        ev(16),
+        at(const.EV_START_VERIFY_SECONDS + const.EV_START_RECOVERY_RETRY_SECONDS),
+    ))
+    checks.append(("harness minimum recovery: repeated non-convergence is surfaced as failed",
+                   co._ev_start_status == "start_failed"
+                   and co._ev_start_recovery_attempts == const.EV_START_FAILED_ATTEMPTS
+                   and co._ev_control_blocked_reason == "easee_start_failed",
+                   f"state={co._ev_start_status}, attempts={co._ev_start_recovery_attempts}, "
+                   f"blocked={co._ev_control_blocked_reason}"))
+
+    co.site_state = replace(co.site_state, easee_status="charging", easee_power_w=4200.0,
+                            ev_stale_entities=[])
+    asyncio.run(co._async_apply_ev(
+        ev(16),
+        at(const.EV_START_VERIFY_SECONDS + const.EV_START_RECOVERY_RETRY_SECONDS + 10),
+    ))
+    checks.append(("harness minimum recovery: physical charging clears start watchdog",
+                   co._ev_start_status == "charging"
+                   and co._ev_start_wait_since is None
+                   and co._ev_start_recovery_attempts == 0,
+                   str(co.ev_start_status)))
 
     co = make_co(status="awaiting_start")
     co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")

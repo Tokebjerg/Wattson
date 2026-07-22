@@ -24,6 +24,10 @@ from .const import (
     EV_SOAK_STEP_A,
     EV_SOAK_STEP_SECONDS,
     EV_STALE_POWER_BOOTSTRAP_A,
+    EV_START_CONFIRMED_POWER_W,
+    EV_START_FAILED_ATTEMPTS,
+    EV_START_RECOVERY_RETRY_SECONDS,
+    EV_START_VERIFY_SECONDS,
     EV_WAITING_TO_START_STATUSES,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
@@ -460,6 +464,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_resume_retry_at: datetime | None = None
         self._last_ev_circuit_refresh_at: datetime | None = None
         self._ev_control_blocked_reason: str | None = None
+        self._ev_start_wait_since: datetime | None = None
+        self._last_ev_start_recovery_at: datetime | None = None
+        self._ev_start_recovery_attempts: int = 0
+        self._ev_start_status: str = "idle"
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -738,8 +746,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         recovery = self._ev_minimum_recovery
         if recovery is None:
             return {"state": "idle"}
+        if recovery.complete:
+            recovery_state = "complete"
+        elif self._ev_start_status in {"pending_start", "recovering", "start_failed"}:
+            recovery_state = self._ev_start_status
+        else:
+            recovery_state = "charging"
         return {
-            "state": "complete" if recovery.complete else "charging",
+            "state": recovery_state,
             "anchor_soc_pct": round(recovery.anchor_soc_pct, 2),
             "target_soc_pct": round(recovery.target_soc_pct, 2),
             "estimated_soc_pct": round(recovery.estimated_soc_pct, 2),
@@ -752,6 +766,25 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if recovery.completed_at is not None else None
             ),
             "latched_for_stale_soc": self.ev_minimum_recovery_complete,
+        }
+
+    @property
+    def ev_start_status(self) -> dict[str, Any]:
+        now = dt_util.utcnow()
+        wait_seconds = (
+            max(0.0, (now - self._ev_start_wait_since).total_seconds())
+            if self._ev_start_wait_since is not None
+            else 0.0
+        )
+        return {
+            "state": self._ev_start_status,
+            "wait_seconds": round(wait_seconds),
+            "recovery_attempts": self._ev_start_recovery_attempts,
+            "last_recovery_at": (
+                self._last_ev_start_recovery_at.isoformat()
+                if self._last_ev_start_recovery_at is not None
+                else None
+            ),
         }
 
     def _restore_override_state(self, entry) -> None:
@@ -2454,7 +2487,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_control_blocked_reason = "ev_control_disabled"
             return []
         easee_status = (self.site_state.easee_status or "").strip().lower()
-        ev = plan.ev
+        requested_ev = plan.ev
+        ev = requested_ev
         stale_power_blocks = _ev_staleness_blocks_control(
             self.site_state.ev_stale_entities,
             self.mapping,
@@ -2483,7 +2517,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and self.mapping.easee_power_entity
             and self.mapping.easee_power_entity in self.site_state.ev_stale_entities
         )
-        if power_stale:
+        minimum_recovery_active = bool(
+            self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
+            and self._ev_minimum_recovery is not None
+            and not self._ev_minimum_recovery.complete
+        )
+        # The hard minimum is explicitly allowed to use grid power and requests a
+        # fixed, installation-safe max offer.  Clamping it to 6 A because an idle
+        # 0 W sensor has not changed can deadlock cars that need a stronger pilot
+        # signal to wake up.
+        if power_stale and not minimum_recovery_active:
             ev = _ev_stale_power_bootstrap_plan(ev)
         # Structural changes (mode / enable / phase / start-stop) always apply.
         structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
@@ -2515,6 +2558,51 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # it never competes with the in-session anti-oscillation gating.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
         not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES
+        physically_charging = bool(
+            easee_status == "charging"
+            or (self.site_state.easee_power_w or 0.0) >= EV_START_CONFIRMED_POWER_W
+        )
+        if physically_charging:
+            self._ev_start_wait_since = None
+            self._last_ev_start_recovery_at = None
+            self._ev_start_recovery_attempts = 0
+            self._ev_start_status = "charging"
+        elif wants_charging and not_yet_charging:
+            if self._ev_start_wait_since is None:
+                self._ev_start_wait_since = now
+            if self._ev_start_recovery_attempts >= EV_START_FAILED_ATTEMPTS:
+                self._ev_start_status = "start_failed"
+                self._ev_control_blocked_reason = "easee_start_failed"
+            elif self._ev_start_recovery_attempts:
+                self._ev_start_status = "recovering"
+                self._ev_control_blocked_reason = "easee_start_recovery"
+            else:
+                self._ev_start_status = "pending_start"
+        else:
+            self._ev_start_wait_since = None
+            self._last_ev_start_recovery_at = None
+            self._ev_start_recovery_attempts = 0
+            self._ev_start_status = "idle"
+
+        start_wait_seconds = (
+            (now - self._ev_start_wait_since).total_seconds()
+            if self._ev_start_wait_since is not None
+            else 0.0
+        )
+        start_recovery_due = bool(
+            wants_charging
+            and not_yet_charging
+            and start_wait_seconds >= EV_START_VERIFY_SECONDS
+            and write_allowed(
+                self._last_ev_start_recovery_at,
+                EV_START_RECOVERY_RETRY_SECONDS,
+                now,
+            )
+        )
+        if start_recovery_due:
+            # A recovery attempt must use the requested offer, not the stale-power
+            # 6 A bootstrap that failed to establish a physical session.
+            ev = requested_ev
         nudge_stuck = (
             wants_charging
             and not_yet_charging
@@ -2532,7 +2620,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 now,
             )
         )
-        full_apply = structural_changed or current_change_wanted or nudge_stuck
+        full_apply = structural_changed or current_change_wanted or nudge_stuck or start_recovery_due
         if not full_apply and not circuit_refresh_due:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
@@ -2547,13 +2635,28 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 self._last_ev_write_at = now
                 self._last_ev_circuit_refresh_at = now
             return acts
-        acts = await self._easee.apply_ev_plan(self.mapping, self.site_state, ev)
+        acts = await self._easee.apply_ev_plan(
+            self.mapping,
+            self.site_state,
+            ev,
+            force_enable=start_recovery_due,
+            override_schedule=start_recovery_due and minimum_recovery_active,
+        )
         if acts:
             self._last_ev_write_at = now
             if ev.desired_circuit_currents is not None:
                 self._last_ev_circuit_refresh_at = now
         if nudge_stuck:
             self._last_ev_resume_retry_at = now
+        if start_recovery_due:
+            self._last_ev_start_recovery_at = now
+            self._ev_start_recovery_attempts += 1
+            if self._ev_start_recovery_attempts >= EV_START_FAILED_ATTEMPTS:
+                self._ev_start_status = "start_failed"
+                self._ev_control_blocked_reason = "easee_start_failed"
+            else:
+                self._ev_start_status = "recovering"
+                self._ev_control_blocked_reason = "easee_start_recovery"
         self._last_ev_fp = structural
         if not within_deadband:
             self._last_ev_amps = ev.desired_amps

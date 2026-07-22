@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.24.65"
+INTEGRATION_VERSION = "0.24.66"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -328,6 +328,14 @@ EV_RESUME_RETRY_SECONDS = 60
 # A stale 0 kW reading is normal while Easee is waiting.  Resume such a session
 # at the charger's minimum offer so fresh power telemetry can take over safely.
 EV_STALE_POWER_BOOTSTRAP_A = 6
+# A service call completing only proves that Home Assistant accepted the write;
+# it does not prove that the charger started.  Verify physical convergence and
+# recover a stuck start by re-enabling the charger and overriding its own
+# schedule.  Recovery is deliberately slow and only runs while power is zero.
+EV_START_VERIFY_SECONDS = 90
+EV_START_RECOVERY_RETRY_SECONDS = 180
+EV_START_FAILED_ATTEMPTS = 2
+EV_START_CONFIRMED_POWER_W = 500.0
 EV_CONNECTED_IDLE_STATUSES = {
     "awaiting_start",
     "ready_to_charge",

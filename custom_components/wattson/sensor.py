@@ -299,6 +299,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "ev_override": getattr(self.coordinator, "ev_override_execution", {}),
                 "ev_fast_backoff_active": getattr(self.coordinator, "_ev_support_backoff_active", False),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
+                "ev_start": getattr(self.coordinator, "ev_start_status", {"state": "idle"}),
                 "ev_minimum_recovery": getattr(
                     self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
                 ),
