@@ -1534,24 +1534,42 @@ def test_f_savings():
             forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
         )
 
+    def importstate(now, grid_import_w):
+        return models.SiteState(
+            timestamp=now, pv_power_w=0.0, load_power_w=grid_import_w, load_includes_ev=False,
+            grid_power_w=grid_import_w, grid_import_power_w=grid_import_w, grid_export_power_w=0.0,
+            battery_soc_pct=80.0, battery_power_w=0.0, inverter_online=True, inverter_status="normal",
+            easee_online=True, easee_status="disconnected", easee_power_w=0.0, easee_session_kwh=0.0,
+            easee_phase_mode="auto", current_buy_price=0.1, current_sell_price=0.1,
+            forecast_today_kwh=0.0, price_slots=slots, solar_slots=[],
+        )
+
     try:
         dtmod.utcnow = lambda: current.astimezone(timezone.utc)
         dtmod.now = lambda: current
         coord.site_state = estate(current, 6000.0)
         coord._accumulate_export_revenue()  # primes last_tick; no revenue yet
         coord._accumulate_import_savings()
+        coord.site_state = importstate(current, 2000.0)
+        coord._accumulate_grid_import()  # primes last_tick; no import yet
         current = at(12, 2)
         coord.site_state = estate(current, 6000.0)
         coord._accumulate_export_revenue()
         coord._accumulate_import_savings()
+        coord.site_state = importstate(current, 2000.0)
+        coord._accumulate_grid_import()
         current = at(13, 0)
         coord.site_state = estate(current, 3000.0)
         coord._accumulate_export_revenue()  # hour gap is skipped by the gap cap
         coord._accumulate_import_savings()
+        coord.site_state = importstate(current, 3000.0)
+        coord._accumulate_grid_import()  # hour gap is skipped by the gap cap
         current = at(13, 2)
         coord.site_state = estate(current, 3000.0)
         coord._accumulate_export_revenue()
         coord._accumulate_import_savings()
+        coord.site_state = importstate(current, 3000.0)
+        coord._accumulate_grid_import()
         # Simulate the first deploy of a new yearly sensor: day/week/month
         # restored, but year is still at 0. The accumulator should floor the
         # inclusive yearly bucket to the current shorter period before adding
@@ -1568,6 +1586,7 @@ def test_f_savings():
         coord.site_state = estate(current, 0.0)
         coord._accumulate_export_revenue()
         coord._accumulate_import_savings()
+        coord._accumulate_grid_import()
         ev_solar_plan = types.SimpleNamespace(ev=types.SimpleNamespace(mode=const.EV_MODE_SOLAR_ONLY))
         current = at(14, 0)
         coord.site_state = evstate(current, 7000.0, 1000.0)
@@ -1613,6 +1632,21 @@ def test_f_savings():
                    )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_year_kr, coord.import_savings_total_kr))))
     checks.append(("import savings telemetry tracks self-supplied kWh beside DKK",
                    abs(coord.import_savings_kwh_today - (2.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
+    # 2 kW for 2 min @ 2.0 = +0.1333 kr, then 3 kW for 2 min @ -0.5
+    # = -0.05 kr. The hour-long gap between them must not be counted.
+    expected_import_kwh = (2.0 + 3.0) * (2.0 / 60.0)
+    expected_import_cost = 2.0 * (2.0 / 60.0) * 2.0 + 3.0 * (2.0 / 60.0) * -0.5
+    checks.append(("grid import telemetry uses measured import and signed all-in slot price",
+                   abs(coord.grid_import_kwh_today - expected_import_kwh) < 1e-6
+                   and abs(coord.grid_import_cost_today_kr - expected_import_cost) < 1e-6,
+                   str((coord.grid_import_kwh_today, coord.grid_import_cost_today_kr))))
+    checks.append(("grid import telemetry books synchronized day/week/month/year/total buckets",
+                   all(abs(getattr(coord, f"grid_import_kwh_{p}") - expected_import_kwh) < 1e-6
+                           and abs(getattr(coord, f"grid_import_cost_{p}_kr") - expected_import_cost) < 1e-6
+                           for p in ("today", "week", "month", "year", "total")),
+                   str(tuple((getattr(coord, f"grid_import_kwh_{p}"),
+                              getattr(coord, f"grid_import_cost_{p}_kr"))
+                             for p in ("today", "week", "month", "year", "total")))))
     expected_net_value = expected_import_savings + 0.12
     checks.append(("net value headline is import savings + export revenue",
                    abs(expected_net_value - (coord.import_savings_today_kr + coord.export_revenue_today_kr)) < 1e-6,
@@ -4895,6 +4929,8 @@ def test_value_sensor_baseline_sync():
         setattr(d, f"import_savings_kwh_{period}", 5.67)
         setattr(d, f"export_revenue_{period}_kr", 8.90)
         setattr(d, f"export_revenue_kwh_{period}", 1.23)
+        setattr(d, f"grid_import_kwh_{period}", 9.87)
+        setattr(d, f"grid_import_cost_{period}_kr", 6.54)
         for attr_template in telemetry.EV_SOLAR_VALUE_ATTRS.values():
             setattr(d, attr_template.format(period=period), 4.56)
     d.ev_solar_grid_backed_kwh = 1.0
@@ -4918,6 +4954,11 @@ def test_value_sensor_baseline_sync():
                        and getattr(d, f"export_revenue_kwh_{p}") == 0.0
                        for p in ("today", "week", "month", "year", "total")),
                    "export"))
+    checks.append(("grid import energy and cost periods reset together",
+                   all(getattr(d, f"grid_import_kwh_{p}") == 0.0
+                       and getattr(d, f"grid_import_cost_{p}_kr") == 0.0
+                       for p in ("today", "week", "month", "year", "total")),
+                   "grid import"))
     checks.append(("EV solar savings periods reset",
                    all(getattr(d, attr_template.format(period=p)) == 0.0
                        for p in ("today", "week", "month", "year", "total")
@@ -4926,20 +4967,25 @@ def test_value_sensor_baseline_sync():
     checks.append(("period markers align to now",
                    d._import_savings_day == today
                    and d._export_revenue_day == today
+                   and d._grid_import_day == today
                    and d._evsh_day == today
                    and d._import_savings_week == iso_week
                    and d._export_revenue_week == iso_week
+                   and d._grid_import_week == iso_week
                    and d._ev_solar_savings_week == iso_week
                    and d._import_savings_month == month
                    and d._export_revenue_month == month
+                   and d._grid_import_month == month
                    and d._ev_solar_savings_month == month
                    and d._import_savings_year == today.year
                    and d._export_revenue_year == today.year
+                   and d._grid_import_year == today.year
                    and d._ev_solar_savings_year == today.year,
                    "markers"))
     checks.append(("last ticks share one baseline instant",
                    d._import_savings_last_tick is d._export_revenue_last_tick
-                   and d._export_revenue_last_tick is d._evsh_last_tick,
+                   and d._export_revenue_last_tick is d._grid_import_last_tick
+                   and d._grid_import_last_tick is d._evsh_last_tick,
                    "same object"))
     checks.append(("EV shadow side counters reset",
                    d.ev_solar_grid_backed_kwh == 0.0

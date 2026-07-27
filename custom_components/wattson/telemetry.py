@@ -44,6 +44,7 @@ from .planner import effective_solar_surplus_w, value_increment_kr
 
 
 EV_SOLAR_VALUE_PERIODS = ("today", "week", "month", "year", "total")
+GRID_IMPORT_PERIODS = ("today", "week", "month", "year", "total")
 EV_SOLAR_VALUE_ATTRS = {
     "savings": "ev_solar_savings_{period}_kr",
     "gross": "ev_solar_gross_savings_{period}_kr",
@@ -98,6 +99,16 @@ class TelemetryMixin:
         self._export_revenue_month = None
         self._export_revenue_year = None
         self._export_revenue_last_tick: datetime | None = None
+        # Actual grid import and its all-in cost. Energy and money share one
+        # tick and the same period markers, so their figures cannot drift apart.
+        for period in GRID_IMPORT_PERIODS:
+            setattr(self, f"grid_import_kwh_{period}", 0.0)
+            setattr(self, f"grid_import_cost_{period}_kr", 0.0)
+        self._grid_import_day = None
+        self._grid_import_week = None
+        self._grid_import_month = None
+        self._grid_import_year = None
+        self._grid_import_last_tick: datetime | None = None
         # Counterfactual (#5): what today WOULD have cost without the battery
         # (deficit imports, surplus exports) vs what it actually costs.
         self.baseline_cost_today_kr: float = 0.0
@@ -106,13 +117,8 @@ class TelemetryMixin:
         self.savings_vs_no_battery_today_kr: float = 0.0
         self._cf_day = None
         self._cf_last_tick: datetime | None = None
-        # H2: the honest counterfactual over the long horizons. The existing
-        # weekly/monthly/yearly Savings meters track value_total (vs buying
-        # EVERYTHING from grid — credits the bare PV array, 4-8x overstated), so
-        # they cannot answer "did the battery+plan earn their keep?". These mirror
-        # savings_vs_no_battery into week/month/year/lifetime buckets so the
-        # long-horizon headline is the honest number too. value_total is kept as a
-        # separate PV+battery KPI; existing meters are NOT re-pointed (history).
+        # H2: the honest counterfactual over long horizons. This answers whether
+        # the battery and plan earn their keep without crediting the bare PV array.
         self.savings_vs_no_battery_total_kr: float = 0.0
         self.savings_vs_no_battery_week_kr: float = 0.0
         self.savings_vs_no_battery_month_kr: float = 0.0
@@ -226,11 +232,11 @@ class TelemetryMixin:
         return import_price, export_price
 
     def _sync_value_sensor_baseline(self) -> None:
-        """Start the four value sensor families from the same instant.
+        """Start the transparent value sensor families from the same instant.
 
-        This intentionally covers only the new transparent KPI families:
+        This intentionally covers only the transparent KPI families:
         import_savings, export_revenue, net_value (derived from the first two),
-        and ev_solar_savings. Legacy ``value_*`` / ``savings_*`` counters keep
+        ev_solar_savings, and grid_import. Legacy ``value_*`` counters keep
         their historical continuity.
         """
         now = dt_util.utcnow()
@@ -243,6 +249,8 @@ class TelemetryMixin:
             setattr(self, f"import_savings_kwh_{period}", 0.0)
             setattr(self, f"export_revenue_{period}_kr", 0.0)
             setattr(self, f"export_revenue_kwh_{period}", 0.0)
+            setattr(self, f"grid_import_kwh_{period}", 0.0)
+            setattr(self, f"grid_import_cost_{period}_kr", 0.0)
             self._reset_ev_solar_value_period(period)
 
         self._import_savings_day = today
@@ -256,6 +264,12 @@ class TelemetryMixin:
         self._export_revenue_month = month
         self._export_revenue_year = today.year
         self._export_revenue_last_tick = now
+
+        self._grid_import_day = today
+        self._grid_import_week = iso_week
+        self._grid_import_month = month
+        self._grid_import_year = today.year
+        self._grid_import_last_tick = now
 
         self._evsh_day = today
         self._ev_solar_savings_week = iso_week
@@ -382,6 +396,65 @@ class TelemetryMixin:
         self.import_savings_kwh_month += saved_kwh
         self.import_savings_kwh_year += saved_kwh
         self.import_savings_kwh_total += saved_kwh
+
+    # ------------------------------------------------------------------ #
+    # Actual grid import and all-in cost
+    # ------------------------------------------------------------------ #
+    def _accumulate_grid_import(self) -> None:
+        """Accumulate measured grid import and its all-in buy cost.
+
+        The buy price is slot-first, exactly like Wattson's planner. Negative
+        prices remain signed: being paid to consume reduces the cost sensor.
+        """
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        today = dt_util.now().date()
+        if self._grid_import_day != today:
+            self._grid_import_day = today
+            self.grid_import_kwh_today = 0.0
+            self.grid_import_cost_today_kr = 0.0
+        iso_week = today.isocalendar()[:2]
+        if self._grid_import_week != iso_week:
+            self._grid_import_week = iso_week
+            self.grid_import_kwh_week = 0.0
+            self.grid_import_cost_week_kr = 0.0
+        month = (today.year, today.month)
+        if self._grid_import_month != month:
+            self._grid_import_month = month
+            self.grid_import_kwh_month = 0.0
+            self.grid_import_cost_month_kr = 0.0
+        if self._grid_import_year != today.year:
+            self._grid_import_year = today.year
+            self.grid_import_kwh_year = 0.0
+            self.grid_import_cost_year_kr = 0.0
+
+        last = self._grid_import_last_tick
+        self._grid_import_last_tick = now
+        if last is None:
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
+            return
+        import_price, _ = self._tick_prices()
+        if import_price is None:
+            return
+        imported_kwh = max(0.0, state.grid_import_power_w) / 1000.0 * dt_hours
+        if imported_kwh <= 0.0:
+            return
+        cost = imported_kwh * import_price
+        for period in GRID_IMPORT_PERIODS:
+            setattr(
+                self,
+                f"grid_import_kwh_{period}",
+                getattr(self, f"grid_import_kwh_{period}") + imported_kwh,
+            )
+            setattr(
+                self,
+                f"grid_import_cost_{period}_kr",
+                getattr(self, f"grid_import_cost_{period}_kr") + cost,
+            )
 
     # ------------------------------------------------------------------ #
     # Actual export revenue
