@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.24.67"
+INTEGRATION_VERSION = "0.25.0"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -31,6 +31,8 @@ CONF_INVERT_BATTERY_POWER_SIGN = "invert_battery_power_sign"
 CONF_BUY_PRICE_ENTITY = "buy_price_entity"
 CONF_SELL_PRICE_ENTITY = "sell_price_entity"
 CONF_FORECAST_TODAY_ENTITY = "forecast_today_entity"
+CONF_OUTDOOR_TEMPERATURE_ENTITY = "outdoor_temperature_entity"
+DEFAULT_OUTDOOR_TEMPERATURE_ENTITY = "sensor.udendors_temperatur_fra_weather"
 CONF_EV_WINDOWS = "ev_windows"
 CONF_EV_MAX_AMPS = "ev_max_amps"
 CONF_EV_SOLAR_MIN_SURPLUS_W = "ev_solar_min_surplus_w"
@@ -460,6 +462,15 @@ BATTERY_MIN_CHARGE_TEMP_C = 2.0
 # this pack+inverter. A stored kWh only offsets ~this much grid import, so buying to
 # arbitrage is only worth it when the price spread also covers the conversion loss.
 BATTERY_ROUND_TRIP_EFFICIENCY = 0.90
+# Learned battery model safeguards. Runtime estimates only take control after
+# several clean observations and are blended with the configured values.
+BATTERY_MODEL_MIN_OBSERVATIONS = 3
+BATTERY_MODEL_FULL_OBSERVATIONS = 6
+BATTERY_MODEL_CAPACITY_MIN_FACTOR = 0.75
+BATTERY_MODEL_CAPACITY_MAX_FACTOR = 1.10
+BATTERY_MODEL_GRID_RATE_MIN_KWH = 0.40
+BATTERY_MODEL_GRID_RATE_MAX_KWH = 5.0
+BATTERY_MODEL_EWMA_ALPHA = 0.25
 
 SERVICE_REPLAN = "replan"
 SERVICE_PAUSE = "pause"

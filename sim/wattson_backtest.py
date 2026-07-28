@@ -34,13 +34,18 @@ planner = ws.planner
 
 # --- site / battery assumptions (match the live DK1 Deye + 10 kWh system) -------- #
 CAPACITY_KWH = 10.0
-MIN_SOC = 20.0          # %
-MAX_SOC = 95.0          # %
+MIN_SOC = 15.0          # % (live default)
+MAX_SOC = 100.0         # % (live default)
 BATTERY_MODE = "blue"   # the live profile (decision reasons show "[blue]")
 START_SOC = 50.0        # % at 00:00 (neutral start; the day is long enough to wash out)
 NOMINAL_V = 51.0        # LV battery pack voltage, for A -> kW
 MAX_CURRENT_A = 70.0    # configured safety ceiling
-RATE_KWH = MAX_CURRENT_A * NOMINAL_V / 1000.0   # ~3.57 kWh per hour charge/discharge
+CHARGE_RATE_KWH = MAX_CURRENT_A * NOMINAL_V / 1000.0
+DISCHARGE_RATE_KWH = CHARGE_RATE_KWH
+# Deye grid charging is firmware-throttled far below the PV/DC charge ceiling.
+GRID_CHARGE_RATE_KWH = 1.15
+# Backwards-compatible analyzer alias: it uses this only as the discharge cap.
+RATE_KWH = DISCHARGE_RATE_KWH
 
 # EDS tariff structure (kr/kWh) — replicates horizon.build_price_slots so the planner
 # sees the same total import price it would live. Hourly grid tariff + flat additions.
@@ -93,22 +98,25 @@ def step_with_plan(plan, pv_kwh, load_kwh, soc_kwh, floor_kwh):
         target_kwh = max_kwh
         if plan.charge_target_soc_pct is not None:
             target_kwh = min(max_kwh, plan.charge_target_soc_pct / 100.0 * CAPACITY_KWH)
-        charge = clamp(target_kwh - soc_kwh, 0.0, RATE_KWH)
+        charge = clamp(target_kwh - soc_kwh, 0.0, GRID_CHARGE_RATE_KWH)
         soc_kwh += charge
-        net = load_kwh + charge - pv_kwh
+        # The plan's charge delta is stored battery energy. More energy must be
+        # bought at the meter because the AC->battery path is not lossless.
+        bought_for_battery = charge / max(0.01, planner.BATTERY_ROUND_TRIP_EFFICIENCY)
+        net = load_kwh + bought_for_battery - pv_kwh
         if net >= 0:
             grid_imp = net
         else:
             grid_exp = (-net if sell else 0.0)  # zero-export -> curtail
     elif strat in ("DISCHARGE_TO_LOAD", "OVERRIDE_DISCHARGE") and not dis_blocked:
         if surplus >= 0:  # solar surplus while in discharge mode -> charge (Load first)
-            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, RATE_KWH)
+            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, CHARGE_RATE_KWH)
             soc_kwh += charge
             leftover = surplus - charge
             grid_exp = leftover if sell else 0.0
         else:
             deficit = -surplus
-            dis = clamp(min(soc_kwh - floor_kwh, deficit), 0.0, RATE_KWH)
+            dis = clamp(min(soc_kwh - floor_kwh, deficit), 0.0, DISCHARGE_RATE_KWH)
             soc_kwh -= dis
             grid_imp = deficit - dis
     elif strat == "SELL_SOLAR_PEAK":
@@ -116,21 +124,21 @@ def step_with_plan(plan, pv_kwh, load_kwh, soc_kwh, floor_kwh):
         # FULL charge rate, and "Load first" fills the battery BEFORE export — the
         # old trickle-while-selling is physically impossible on this firmware.
         if surplus >= 0:
-            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, RATE_KWH)
+            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, CHARGE_RATE_KWH)
             soc_kwh += charge
             grid_exp = surplus - charge  # sell the rest
         elif not dis_blocked:
             # v0.24.2: discharge is open in sell hours (CT clamp prevents battery
             # export structurally) — a cloud-dip deficit is covered from the pack.
             deficit = -surplus
-            dis = clamp(min(soc_kwh - floor_kwh, deficit), 0.0, RATE_KWH)
+            dis = clamp(min(soc_kwh - floor_kwh, deficit), 0.0, DISCHARGE_RATE_KWH)
             soc_kwh -= dis
             grid_imp = deficit - dis
         else:
             grid_imp = -surplus  # discharge blocked -> grid covers
     else:  # SOLAR_SELF_CONSUMPTION / IDLE / BLOCK_NEGATIVE_EXPORT / HOLD / PROTECT
         if surplus >= 0:
-            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, RATE_KWH)
+            charge = clamp(min(max_kwh - soc_kwh, surplus), 0.0, CHARGE_RATE_KWH)
             soc_kwh += charge
             leftover = surplus - charge
             grid_exp = leftover if sell else 0.0
@@ -204,6 +212,8 @@ def run_wattson_planned(day, spot, sell, pv, load):
     dp = planner.build_day_plan(
         state_at(0, START_SOC), battery_mode=BATTERY_MODE, min_soc=MIN_SOC, max_soc=MAX_SOC,
         capacity_kwh=CAPACITY_KWH, load_hourly_w=load_hourly,
+        charge_current_a=MAX_CURRENT_A, discharge_current_a=MAX_CURRENT_A,
+        grid_charge_rate_kwh=GRID_CHARGE_RATE_KWH,
     )
     soc_kwh = START_SOC / 100.0 * CAPACITY_KWH
     rows, cost = [], 0.0
@@ -262,12 +272,12 @@ def run_dumb_battery(spot, sell, pv, load):
     for h in range(24):
         surplus = pv[h] - load[h]
         if surplus >= 0:
-            charge = clamp(min(max_kwh - soc, surplus), 0.0, RATE_KWH)
+            charge = clamp(min(max_kwh - soc, surplus), 0.0, CHARGE_RATE_KWH)
             soc += charge
             cost -= (surplus - charge) * (sell[h] if sell else spot[h])  # export leftover
         else:
             deficit = -surplus
-            dis = clamp(min(soc - floor_kwh, deficit), 0.0, RATE_KWH)
+            dis = clamp(min(soc - floor_kwh, deficit), 0.0, DISCHARGE_RATE_KWH)
             soc -= dis
             cost += (deficit - dis) * total_import(spot[h], h)
     return cost
@@ -304,11 +314,22 @@ def run_oracle(spot, sell, pv, load, *, no_battery_export: bool = False):
             best = INF
             for s2 in usable:
                 d = s2 - s  # battery delta (+charge/-discharge)
-                if d > RATE_KWH + 1e-9 or d < -RATE_KWH - 1e-9:
+                if d > CHARGE_RATE_KWH + 1e-9 or d < -DISCHARGE_RATE_KWH - 1e-9:
                     continue
                 if no_battery_export and d < 0 and -d > deficit + 1e-9:
                     continue  # discharge beyond the house deficit = battery export
-                net = load[h] - pv[h] + d
+                if d > 0:
+                    solar_surplus = max(0.0, pv[h] - load[h])
+                    pv_charge = min(d, solar_surplus)
+                    grid_charge = d - pv_charge
+                    if grid_charge > GRID_CHARGE_RATE_KWH + 1e-9:
+                        continue
+                    net = (
+                        load[h] - pv[h] + pv_charge
+                        + grid_charge / max(0.01, planner.BATTERY_ROUND_TRIP_EFFICIENCY)
+                    )
+                else:
+                    net = load[h] - pv[h] + d
                 if net >= 0:
                     c = net * imp_p
                 else:

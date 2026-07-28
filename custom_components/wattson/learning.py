@@ -23,6 +23,7 @@ LEARNING_HALF_LIFE_DAYS = 10.0
 def build_load_profile(
     samples: Iterable[tuple[datetime, float | None]],
     *,
+    temperature_samples: Iterable[tuple[datetime, float | None]] | None = None,
     full_days: int = LEARNING_FULL_DAYS,
     half_life_days: float = LEARNING_HALF_LIFE_DAYS,
 ) -> LoadProfile | None:
@@ -57,7 +58,7 @@ def build_load_profile(
         day_buckets.setdefault(timestamp.hour, []).append((watts, weight))
         days.add(timestamp.date())
 
-    def _typical(b: dict[int, list[tuple[float, float]]]) -> dict[int, float]:
+    def _quantile(b: dict[int, list[tuple[float, float]]], quantile: float) -> dict[int, float]:
         # F3: weighted MEDIAN per hour, not mean. A single contaminated sample
         # (an Easee-statistics gap leaks the full ~12 kW EV draw into the house
         # bucket; a one-off spike) drags a recency-weighted mean up ~70% for that
@@ -70,24 +71,113 @@ def build_load_profile(
             if total_w <= 0:
                 continue
             ordered = sorted(pairs, key=lambda p: p[0])
-            half, cum, med = total_w / 2.0, 0.0, ordered[-1][0]
+            threshold, cum, selected = total_w * quantile, 0.0, ordered[-1][0]
             for value, weight in ordered:
                 cum += weight
-                if cum >= half:
-                    med = value
+                if cum >= threshold:
+                    selected = value
                     break
-            out[hour] = med
+            out[hour] = selected
         return out
+
+    hourly_w = _quantile(buckets, 0.5)
+    weekday_w = _quantile(weekday_buckets, 0.5)
+    weekend_w = _quantile(weekend_buckets, 0.5)
+
+    # Temperature correction is deliberately conservative and optional. First
+    # remove the normal hour-of-day shape, then regress the residual demand on
+    # degrees colder than the median observed temperature. This avoids teaching
+    # the model that every 18:00 cooking peak was caused by cold weather.
+    temp_by_hour: dict[datetime, float] = {}
+    for timestamp, value in temperature_samples or []:
+        if value is None:
+            continue
+        try:
+            temp_by_hour[timestamp.replace(minute=0, second=0, microsecond=0)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    paired: list[tuple[float, float]] = []
+    for timestamp, watts in parsed:
+        temp = temp_by_hour.get(timestamp.replace(minute=0, second=0, microsecond=0))
+        baseline = hourly_w.get(timestamp.hour)
+        if temp is not None and baseline is not None:
+            paired.append((temp, watts - baseline))
+    temp_reference: float | None = None
+    temp_slope = 0.0
+    if len(paired) >= 48:
+        ordered_t = sorted(t for t, _ in paired)
+        temp_reference = ordered_t[len(ordered_t) // 2]
+        xys = [(max(0.0, temp_reference - temp), residual) for temp, residual in paired]
+        denominator = sum(x * x for x, _ in xys)
+        if denominator > 1.0 and max(ordered_t) - min(ordered_t) >= 4.0:
+            # Negative/noisy slopes are unsafe and ignored. The upper bound keeps
+            # one heater event from predicting implausible multi-kW corrections.
+            temp_slope = max(0.0, min(500.0, sum(x * y for x, y in xys) / denominator))
 
     days_observed = len(days)
     confidence = min(1.0, days_observed / full_days) if full_days > 0 else 0.0
     return LoadProfile(
-        hourly_w=_typical(buckets),
-        weekday_hourly_w=_typical(weekday_buckets),
-        weekend_hourly_w=_typical(weekend_buckets),
+        hourly_w=hourly_w,
+        weekday_hourly_w=weekday_w,
+        weekend_hourly_w=weekend_w,
+        hourly_p90_w=_quantile(buckets, 0.9),
+        weekday_p90_w=_quantile(weekday_buckets, 0.9),
+        weekend_p90_w=_quantile(weekend_buckets, 0.9),
         days_observed=days_observed,
         confidence=round(confidence, 3),
+        temperature_reference_c=round(temp_reference, 2) if temp_reference is not None else None,
+        temperature_slope_w_per_c=round(temp_slope, 2),
+        temperature_samples=len(paired),
     )
+
+
+def forecast_load_w(
+    profile: LoadProfile | None,
+    start: datetime,
+    *,
+    outdoor_temperature_c: float | None = None,
+    conservative: bool = False,
+) -> float:
+    """Date-aware P50/P90 house-load forecast for one timestamp.
+
+    ``conservative=False`` is the economic median. ``True`` uses the learned P90
+    band for reserve and deadline feasibility. A current outdoor temperature can
+    add cold-weather demand; missing temperature leaves the learned profile intact.
+    """
+    if profile is None:
+        return 0.0
+    table = profile.conservative_hourly_for(start) if conservative else profile.hourly_for(start)
+    watts = max(0.0, float(table.get(start.hour, profile.hourly_w.get(start.hour, 0.0))))
+    if (
+        outdoor_temperature_c is not None
+        and profile.temperature_reference_c is not None
+        and profile.temperature_slope_w_per_c > 0.0
+    ):
+        cold_degrees = max(0.0, profile.temperature_reference_c - float(outdoor_temperature_c))
+        watts += cold_degrees * profile.temperature_slope_w_per_c
+    # Weather correction cannot make one bucket more than 2.5x its learned
+    # uncorrected demand. This bounds bad temperature sensors/history.
+    base = max(1.0, float(table.get(start.hour, watts)))
+    return min(watts, base * 2.5)
+
+
+def build_load_forecast(
+    profile: LoadProfile | None,
+    starts: Iterable[datetime],
+    *,
+    outdoor_temperature_c: float | None = None,
+    conservative: bool = False,
+) -> dict[datetime, float]:
+    """Build an absolute timestamp -> W horizon (weekday/weekend safe)."""
+    return {
+        start: forecast_load_w(
+            profile,
+            start,
+            outdoor_temperature_c=outdoor_temperature_c,
+            conservative=conservative,
+        )
+        for start in starts
+    }
 
 
 def solar_bias_factor(

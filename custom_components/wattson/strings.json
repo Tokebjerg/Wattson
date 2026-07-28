@@ -107,6 +107,7 @@
           "buy_price_entity": "Købpris sensor",
           "sell_price_entity": "Salgspris sensor",
           "forecast_today_entity": "Forecast i dag",
+          "outdoor_temperature_entity": "Udendørs temperatur",
           "cheap_price_threshold": "Billig pris tærskel",
           "expensive_price_threshold": "Dyr pris tærskel"
         }
@@ -206,7 +207,8 @@
           "easee_online_entity": "Charger online",
           "buy_price_entity": "Købpris sensor",
           "sell_price_entity": "Salgspris sensor",
-          "forecast_today_entity": "Forecast i dag"
+          "forecast_today_entity": "Forecast i dag",
+          "outdoor_temperature_entity": "Udendørs temperatur"
         }
       }
     }

@@ -25,6 +25,7 @@ from .const import (
     CONF_ENERGY_PRIORITY_SELECT,
     CONF_EXPORT_LIMIT_NUMBER,
     CONF_FORECAST_TODAY_ENTITY,
+    CONF_OUTDOOR_TEMPERATURE_ENTITY,
     CONF_GRID_CHARGE_SWITCH,
     CONF_GRID_POWER_ENTITY,
     CONF_INVERTER_ONLINE_ENTITY,
@@ -38,6 +39,7 @@ from .const import (
     CONF_TOU_ENABLE_SWITCH,
     CONF_TOU_TIME_POINT_PREFIX,
     DEFAULT_EV_SOC_ENTITY,
+    DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
     DEFAULT_TOU_TIME_POINT_PREFIX,
     TOU_TIME_POINT_COUNT,
     KNOWN_DEFAULTS,
@@ -99,6 +101,10 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
         forecast_today_entity=config.get(CONF_FORECAST_TODAY_ENTITY),
         tou_capacity_numbers=_tou_registers(config, "number", "capacity"),
         tou_charge_enable_switches=_tou_registers(config, "switch", "charge_enable"),
+        outdoor_temperature_entity=config.get(
+            CONF_OUTDOOR_TEMPERATURE_ENTITY,
+            DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
+        ) or None,
     )
 
 
@@ -300,6 +306,16 @@ def build_site_state(
         battery_temp = _read_float(hass, _temp_eid, missing=[], issues=[], stale=[], stale_seconds=stale_seconds * 20)
         if battery_temp is not None and not (-40.0 <= battery_temp <= 90.0):
             battery_temp = None  # implausible reading -> ignore
+    outdoor_temp = _read_float(
+        hass,
+        mapping.outdoor_temperature_entity,
+        missing=[],
+        issues=[],
+        stale=[],
+        stale_seconds=stale_seconds * 20,
+    )
+    if outdoor_temp is not None and not (-50.0 <= outdoor_temp <= 60.0):
+        outdoor_temp = None
     inverter_online = _read_bool(hass, mapping.inverter_online_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds)
     inverter_status = _read_string(hass, mapping.inverter_status_entity, missing=missing, stale=stale, stale_seconds=stale_seconds) or "unknown"
 
@@ -390,6 +406,7 @@ def build_site_state(
         battery_soc_pct=battery_soc,
         battery_power_w=battery_power,
         battery_temperature_c=battery_temp,
+        outdoor_temperature_c=outdoor_temp,
         inverter_online=bool(inverter_online),
         inverter_status=inverter_status,
         easee_online=easee_online,

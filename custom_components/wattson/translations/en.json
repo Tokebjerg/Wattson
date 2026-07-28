@@ -107,6 +107,7 @@
           "buy_price_entity": "Import price sensor",
           "sell_price_entity": "Export price sensor",
           "forecast_today_entity": "Today's forecast",
+          "outdoor_temperature_entity": "Outdoor temperature",
           "cheap_price_threshold": "Cheap price threshold",
           "expensive_price_threshold": "Expensive price threshold"
         }
@@ -206,7 +207,8 @@
           "easee_online_entity": "Charger online",
           "buy_price_entity": "Import price sensor",
           "sell_price_entity": "Export price sensor",
-          "forecast_today_entity": "Today's forecast"
+          "forecast_today_entity": "Today's forecast",
+          "outdoor_temperature_entity": "Outdoor temperature"
         }
       }
     }

@@ -41,6 +41,9 @@ class EntityMapping:
     # active slot always reflects current intent). Empty = feature inactive.
     tou_capacity_numbers: tuple[str, ...] = ()
     tou_charge_enable_switches: tuple[str, ...] = ()
+    # Optional outdoor temperature used to weather-normalise the learned house
+    # load. Missing/unavailable keeps the existing history-only forecast.
+    outdoor_temperature_entity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,10 +65,10 @@ class Capabilities:
 class LoadProfile:
     """Phase D: learned house-load profile by hour-of-day (local time).
 
-    ``hourly_w`` maps hour 0-23 to the mean house load in W observed at that
+    ``hourly_w`` maps hour 0-23 to the median house load in W observed at that
     hour over the learning window (across ALL days); ``confidence`` ramps 0->1 as
     more days are observed (full after ~4 weeks, like SunMate's 3-4 week ramp).
-    ``weekday_hourly_w`` / ``weekend_hourly_w`` hold the same per-hour means split
+    ``weekday_hourly_w`` / ``weekend_hourly_w`` hold the same medians split
     by day type, so planning a Saturday uses the weekend pattern.
     """
 
@@ -74,6 +77,16 @@ class LoadProfile:
     confidence: float
     weekday_hourly_w: dict[int, float] = field(default_factory=dict)
     weekend_hourly_w: dict[int, float] = field(default_factory=dict)
+    # Conservative per-hour demand bands. The planner uses the median maps above
+    # for economics and these weighted P90 maps for reserve/feasibility.
+    hourly_p90_w: dict[int, float] = field(default_factory=dict)
+    weekday_p90_w: dict[int, float] = field(default_factory=dict)
+    weekend_p90_w: dict[int, float] = field(default_factory=dict)
+    # Robust cold-load model: extra house demand per degree below the reference
+    # temperature. Zero samples/slope means weather correction is inactive.
+    temperature_reference_c: float | None = None
+    temperature_slope_w_per_c: float = 0.0
+    temperature_samples: int = 0
 
     def hourly_for(self, day: "datetime | date | None") -> dict[int, float]:
         """Per-hour load map for the given day, falling back to the all-days mean.
@@ -87,6 +100,13 @@ class LoadProfile:
         weekday = day.weekday()
         bucket = self.weekend_hourly_w if weekday >= 5 else self.weekday_hourly_w
         return bucket or self.hourly_w
+
+    def conservative_hourly_for(self, day: "datetime | date | None") -> dict[int, float]:
+        """P90 map for ``day``, falling back conservatively to the median map."""
+        if day is None:
+            return self.hourly_p90_w or self.hourly_w
+        bucket = self.weekend_p90_w if day.weekday() >= 5 else self.weekday_p90_w
+        return bucket or self.hourly_p90_w or self.hourly_for(day)
 
 
 @dataclass(frozen=True)
@@ -182,6 +202,7 @@ class SiteState:
     # ingested in trin A1 and used by the 24h planner in trin A2.
     price_slots: list[PriceSlot] = field(default_factory=list)
     solar_slots: list[SolarSlot] = field(default_factory=list)
+    outdoor_temperature_c: float | None = None
 
     @property
     def solar_surplus_w(self) -> float:
@@ -325,3 +346,12 @@ class ControlPlan:
     decision_code: str = ""
     replan_reason: str | None = None
     ev_runtime_state: str = "disconnected"
+    # Winter/long-peak diagnostics. These describe physical coverage, not a new
+    # control mode: how much expensive-period load the current plan can cover.
+    peak_required_kwh: float = 0.0
+    peak_covered_kwh: float = 0.0
+    peak_uncovered_kwh: float = 0.0
+    peak_target_soc_pct: float | None = None
+    peak_exhaustion_at: str | None = None
+    effective_capacity_kwh: float | None = None
+    effective_grid_charge_rate_kwh: float | None = None

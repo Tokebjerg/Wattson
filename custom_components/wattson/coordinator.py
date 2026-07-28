@@ -159,6 +159,13 @@ from .const import (
     NAME,
     UPDATE_INTERVAL,
 )
+from .battery_model import (
+    BatteryModelState,
+    effective_capacity_kwh,
+    effective_grid_rate_kwh,
+    observe_capacity,
+    observe_grid_rate,
+)
 from .control import EaseeController, KlatremisController
 from .deye_contract import floor_sell_safe
 from .ev_recovery import (
@@ -171,7 +178,12 @@ from .safety import write_allowed
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import BatteryPlan, Capabilities, ControlPlan, EntityMapping, EvPlan, SiteState, SolarSlot
 from .horizon import current_price_slot
-from .learning import build_load_profile, predicted_load_kwh, solar_bias_factor
+from .learning import (
+    build_load_forecast,
+    build_load_profile,
+    forecast_load_w,
+    solar_bias_factor,
+)
 from .models import LoadProfile
 from .planner import (
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
@@ -531,6 +543,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_minimum_recovery_store = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.ev_minimum_recovery"
         )
+        self._battery_model_store = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}.battery_model"
+        )
+        self._battery_model = BatteryModelState()
+        self._battery_model_last_tick: datetime | None = None
+        self._battery_model_capacity_day = None
+        self._battery_model_grid_hours = 0.0
+        self._battery_model_grid_kwh = 0.0
         self._ev_minimum_recovery: EvMinimumRecovery | None = None
         self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
@@ -554,6 +574,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # and the solar-bias history. ----
 
     async def async_startup(self) -> None:
+        try:
+            self._battery_model = BatteryModelState.from_dict(
+                await self._battery_model_store.async_load()
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson could not restore battery model: %s", err)
         try:
             saved = await self._ev_minimum_recovery_store.async_load()
             self._ev_minimum_recovery = EvMinimumRecovery.from_storage_dict(saved)
@@ -591,7 +617,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if (self.site_state is not None and self.site_state.load_includes_ev)
                 else None
             )
-            wanted = {load_entity} | ({ev_entity} if ev_entity else set())
+            temp_entity = mapping.outdoor_temperature_entity
+            wanted = (
+                {load_entity}
+                | ({ev_entity} if ev_entity else set())
+                | ({temp_entity} if temp_entity else set())
+            )
             stats = await get_instance(self.hass).async_add_executor_job(
                 statistics_during_period, self.hass, start, end, wanted, "hour", None, {"mean"}
             )
@@ -615,6 +646,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     ev_by_hour[ts] = float(mean) * 1000.0  # kW -> W
                 except (TypeError, ValueError):
                     continue
+            temperature_samples: list[tuple[datetime, float | None]] = []
+            for row in (stats.get(temp_entity, []) if (stats and temp_entity) else []):
+                ts = _row_ts(row)
+                mean = row.get("mean")
+                if ts is not None:
+                    temperature_samples.append((dt_util.as_local(ts), mean))
             samples: list[tuple[datetime, float | None]] = []
             for row in rows:
                 ts = _row_ts(row)
@@ -638,7 +675,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     except (TypeError, ValueError):
                         pass
                 samples.append((dt_util.as_local(ts), mean))
-            profile = build_load_profile(samples)
+            profile = build_load_profile(
+                samples,
+                temperature_samples=temperature_samples,
+            )
             if profile is not None:
                 self.load_profile = profile
             self._profile_built_at = dt_util.utcnow()
@@ -651,15 +691,24 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         profile = self.load_profile
         if profile is None or profile.days_observed < LEARNING_MIN_DAYS:
             return 0.0
-        capacity_kwh = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        capacity_kwh = self.effective_battery_capacity_kwh
         if capacity_kwh <= 0:
             return 0.0
         # F2: size the reserve from the SAME weekday/weekend hourly profile the
         # planner uses (hourly_for(today)), not the all-days mean — the two halves
         # otherwise disagree about the very same day's load.
-        reserve_kwh = predicted_load_kwh(
-            profile, dt_util.now().hour, LEARNING_RESERVE_HOURS,
-            hourly=profile.hourly_for(dt_util.now().date()),
+        now = dt_util.now().replace(minute=0, second=0, microsecond=0)
+        reserve_kwh = sum(
+            forecast_load_w(
+                profile,
+                now + timedelta(hours=offset),
+                outdoor_temperature_c=(
+                    self.site_state.outdoor_temperature_c if self.site_state else None
+                ),
+                conservative=True,
+            )
+            / 1000.0
+            for offset in range(LEARNING_RESERVE_HOURS)
         )
         base = min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
         # Apply the learning confidence ramp (0->1 over the learning window) the
@@ -667,6 +716,94 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # day-7 cliff. Floored at 0.4 so morning-shoulder protection still
         # contributes early; only ever LOWERS the reserve (safe direction).
         return base * max(0.4, getattr(profile, "confidence", 1.0))
+
+    @property
+    def effective_battery_capacity_kwh(self) -> float:
+        configured = float(entry_value(
+            self.config_entry,
+            CONF_BATTERY_CAPACITY_KWH,
+            DEFAULT_BATTERY_CAPACITY_KWH,
+        ))
+        return effective_capacity_kwh(self._battery_model, configured)
+
+    @property
+    def effective_grid_charge_rate_kwh(self) -> float:
+        configured = float(entry_value(
+            self.config_entry,
+            CONF_GRID_CHARGE_RATE_KWH,
+            SCHEDULE_GRID_CHARGE_RATE_KWH,
+        ))
+        return effective_grid_rate_kwh(self._battery_model, configured)
+
+    async def _async_update_battery_model(self) -> None:
+        """Learn effective capacity/rate from clean physical segments."""
+        state = self.site_state
+        if state is None:
+            return
+        now = dt_util.utcnow()
+        previous = self._battery_model
+
+        # At most one capacity observation per day, and only after a real >=15 pp
+        # discharge span accumulated in telemetry.
+        today = dt_util.now().date()
+        if self._battery_model_capacity_day != today and self._cap_soc_drop >= 15.0:
+            observed = self._cap_dis_wh / 1000.0 / (self._cap_soc_drop / 100.0)
+            configured = float(entry_value(
+                self.config_entry,
+                CONF_BATTERY_CAPACITY_KWH,
+                DEFAULT_BATTERY_CAPACITY_KWH,
+            ))
+            updated = observe_capacity(
+                self._battery_model,
+                observed,
+                configured_kwh=configured,
+                updated_at=now.isoformat(),
+            )
+            if updated != self._battery_model:
+                self._battery_model = updated
+                self._battery_model_capacity_day = today
+
+        # The previous tick's committed plan identifies grid charging. Restrict
+        # samples to the pack's broad linear SOC band and cap gaps like telemetry.
+        dt_hours = 0.0
+        if self._battery_model_last_tick is not None:
+            dt_hours = (now - self._battery_model_last_tick).total_seconds() / 3600.0
+        self._battery_model_last_tick = now
+        previous_plan = getattr(self, "control_plan", None)
+        grid_commanded = bool(
+            previous_plan is not None
+            and getattr(previous_plan.battery, "desired_grid_charge", False)
+        )
+        valid_tick = 0.0 < dt_hours <= VALUE_MAX_TICK_SECONDS / 3600.0
+        charging = bool(
+            grid_commanded
+            and valid_tick
+            and 10.0 <= state.battery_soc_pct <= 98.0
+            and state.battery_power_w < -100.0
+            and state.grid_import_power_w > 100.0
+        )
+        if charging:
+            charge_kw = min(-state.battery_power_w, state.grid_import_power_w) / 1000.0
+            self._battery_model_grid_hours += dt_hours
+            self._battery_model_grid_kwh += charge_kw * dt_hours
+        elif self._battery_model_grid_hours > 0.0:
+            if self._battery_model_grid_hours >= 0.25 and self._battery_model_grid_kwh >= 0.2:
+                configured_rate = float(entry_value(
+                    self.config_entry,
+                    CONF_GRID_CHARGE_RATE_KWH,
+                    SCHEDULE_GRID_CHARGE_RATE_KWH,
+                ))
+                self._battery_model = observe_grid_rate(
+                    self._battery_model,
+                    self._battery_model_grid_kwh / self._battery_model_grid_hours,
+                    configured_kwh_h=configured_rate,
+                    updated_at=now.isoformat(),
+                )
+            self._battery_model_grid_hours = 0.0
+            self._battery_model_grid_kwh = 0.0
+
+        if self._battery_model != previous:
+            await self._battery_model_store.async_save(self._battery_model.as_dict())
 
     async def _async_update_ev_minimum_recovery(
         self,
@@ -1606,6 +1743,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._accumulate_export_revenue()
         self._accumulate_counterfactual()
         self._accumulate_battery_health()
+        await self._async_update_battery_model()
         # Learn the solar bias from the RAW forecast, then apply the correction
         # so the planner/schedule see bias-corrected production.
         self._accumulate_solar_bias()
@@ -1621,15 +1759,30 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         profile_age = dt_util.utcnow() - self._profile_built_at if self._profile_built_at else None
         if profile_age is None or profile_age >= timedelta(seconds=LEARNING_REBUILD_SECONDS):
             await self._async_update_load_profile()
-        learned_reserve_pct = self._learned_reserve_pct()
         solar_charge_priority = float(entry_value(self.config_entry, CONF_SOLAR_CHARGE_PRIORITY_SOC, DEFAULT_SOLAR_CHARGE_PRIORITY_SOC))
 
         _min_soc = float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC))
         _max_soc = float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC))
-        _capacity = float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH))
+        _capacity = self.effective_battery_capacity_kwh
         _allow_grid_charge = bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE))
         _allow_neg_export = bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT))
-        _load_hourly = self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None
+        _forecast_starts = sorted({
+            *(slot.start for slot in self.site_state.price_slots),
+            *(slot.start for slot in self.site_state.solar_slots),
+        })
+        _load_hourly = build_load_forecast(
+            self.load_profile,
+            _forecast_starts,
+            outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            conservative=False,
+        ) if self.load_profile else None
+        _reserve_load = build_load_forecast(
+            self.load_profile,
+            _forecast_starts,
+            outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            conservative=True,
+        ) if self.load_profile else None
+        learned_reserve_pct = self._learned_reserve_pct()
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
         ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_solar_min_surplus_w = float(entry_value(
@@ -1683,7 +1836,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         learned_reserve_pct = solar_aware_reserve_pct(
             learned_reserve_pct,
             solar_slots=self.site_state.solar_slots,
-            load_hourly_w=_load_hourly,
+            load_hourly_w=_reserve_load or _load_hourly,
             now=self.site_state.timestamp,
             usable_pct=max(0.0, _max_soc - _min_soc),
             capacity_kwh=_capacity,
@@ -1694,9 +1847,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Rolling plan: rebuild every 15 minutes and immediately on a new solar
         # forecast, EV connect/disconnect, material SOC drift, horizon, or config.
         _now_local = self.site_state.timestamp
-        _grid_charge_rate = float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH))
+        _grid_charge_rate = self.effective_grid_charge_rate_kwh
+        _cold_grid_charge_blocked = bool(
+            self.site_state.battery_temperature_c is not None
+            and self.site_state.battery_temperature_c < BATTERY_MIN_CHARGE_TEMP_C
+        )
         _plan_fp = (
-            self.battery_mode, _min_soc, _max_soc, _capacity, _allow_grid_charge,
+            self.battery_mode, _min_soc, _max_soc, _capacity,
+            _allow_grid_charge, _cold_grid_charge_blocked,
             round(learned_reserve_pct / 5.0), _grid_charge_rate,
             round(self._forecast_confidence, 2),
             round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
@@ -1773,6 +1931,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 max_soc=_max_soc,
                 capacity_kwh=_capacity,
                 load_hourly_w=_load_hourly,
+                reserve_load_by_start_w=_reserve_load,
                 learned_reserve_pct=learned_reserve_pct,
                 solar_charge_priority_soc=solar_charge_priority,
                 charge_current_a=self.battery_charge_current,
@@ -1782,6 +1941,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 forecast_confidence=self._forecast_confidence,
                 ev_load_by_start=_ev_load_by_start,
                 ev_battery_protected=_ev_battery_protected,
+                allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
             )
             if _new_day_plan is not None:
                 self._day_plan = _new_day_plan
@@ -1823,7 +1983,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # Legacy reactive fallback (no price horizon): unchanged behaviour.
             peak_reserve = peak_reserve_pct(
                 self.site_state.price_slots, self.site_state.timestamp, self.site_state.solar_slots,
-                _load_hourly, capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
+                _reserve_load or _load_hourly,
+                capacity_kwh=_capacity, min_soc=_min_soc, max_soc=_max_soc,
                 margin=self.reserve_hold_margin,
                 discharge_rate_kwh=battery_rate_kwh(self.battery_discharge_current),
                 ev_load_by_start=_ev_load_by_start,
@@ -2377,8 +2538,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             safe_reasons=safe_reasons,
             negative_price_active=negative_price_active,
             battery_mode=self.battery_mode,
-            load_hourly_w=self.load_profile.hourly_for(dt_util.now().date()) if self.load_profile else None,
-            capacity_kwh=float(entry_value(self.config_entry, CONF_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)),
+            load_hourly_w=_load_hourly,
+            capacity_kwh=_capacity,
             min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
             max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
             learned_reserve_pct=learned_reserve_pct,
@@ -2386,7 +2547,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             charge_current_a=self.battery_charge_current,
             discharge_current_a=self.battery_discharge_current,
             battery_care_soc=self.battery_care_soc,
-            grid_charge_rate_kwh=float(entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH)),
+            grid_charge_rate_kwh=_grid_charge_rate,
             ev_load_by_start=_ev_load_by_start,
             ev_battery_protected=_ev_battery_protected,
             schedule_override=(
@@ -2397,6 +2558,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if self._day_plan else None
             ),
             replan_reason=self._last_replan_reason,
+            allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
         )
 
         if not self.shadow_mode and not self.control_plan.safe_mode:

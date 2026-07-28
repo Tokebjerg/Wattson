@@ -102,6 +102,7 @@ const, models, horizon, learning, mapping, planner, control, telemetry = _load_w
 safety = importlib.import_module("wattson.safety")
 deye_contract = importlib.import_module("wattson.deye_contract")
 ev_recovery = importlib.import_module("wattson.ev_recovery")
+battery_model = importlib.import_module("wattson.battery_model")
 State = sys.modules["homeassistant.core"].State
 
 
@@ -3805,8 +3806,10 @@ def test_day_plan():
     base_floor = 20.0
     pre_peak_max = max(by_hour[h].tou_floor_pct for h in range(14, 18))
     checks.append((f"pre-peak afternoon holds a reserve floor > base (got {pre_peak_max:.0f}%)", pre_peak_max > base_floor + 5, f"{pre_peak_max}"))
-    checks.append(("reserve RELEASED at the expensive peak slots (floor = base)",
-                   all(abs(by_hour[h].tou_floor_pct - base_floor) < 0.6 for h in (18, 19, 20)),
+    checks.append(("peak TOU floor follows the optimizer end-SOC (multi-peak rationing)",
+                   all(abs(by_hour[h].tou_floor_pct - max(
+                       base_floor, by_hour[h].projected_soc_pct or base_floor
+                   )) < 0.6 for h in (18, 19, 20)),
                    f"{[by_hour[h].tou_floor_pct for h in (18, 19, 20)]}"))
     sell_slots = [s for s in dp.slots if s.intent == "SELL_SURPLUS"]
     checks.append(("sell-surplus slots carry the sell-safe charge rate (never trickle with sell on)",
@@ -4466,8 +4469,8 @@ def test_reserve_release_overnight_floor():
     rel_floors, rel_min = overnight_floor_and_soc(0.0)
     checks.append((f"held reserve (35%) bakes a high overnight floor (>=45%) -> pack holds ({held_floors})",
                    all(f >= 45 for f in held_floors), str(held_floors)))
-    checks.append((f"released reserve (0%) lets the overnight floor drop to the hard min (15%) ({rel_floors})",
-                   rel_floors == {15}, str(rel_floors)))
+    checks.append((f"released reserve (0%) steps the optimizer floor down to hard min (15%) ({rel_floors})",
+                   min(rel_floors) == 15 and any(f < 45 for f in rel_floors), str(rel_floors)))
     checks.append((f"released reserve discharges overnight to COVER THE HOUSE (min SOC {rel_min}% << held {held_min}%)",
                    rel_min < held_min - 20, f"{rel_min} vs {held_min}"))
     return checks
@@ -5084,6 +5087,106 @@ def test_ev_minimum_recovery():
     return checks
 
 
+def test_winter_planning_upgrade():
+    """v0.25: dated/P90 load, bounded battery learning and peak diagnostics."""
+    checks = []
+    tz = timezone(timedelta(hours=1))
+    friday = datetime(2026, 1, 9, 18, tzinfo=tz)
+    saturday = friday + timedelta(days=1)
+    profile = models.LoadProfile(
+        hourly_w={18: 700.0}, days_observed=28, confidence=1.0,
+        weekday_hourly_w={18: 500.0}, weekend_hourly_w={18: 1000.0},
+        hourly_p90_w={18: 1200.0}, weekday_p90_w={18: 800.0},
+        weekend_p90_w={18: 1600.0}, temperature_reference_c=10.0,
+        temperature_slope_w_per_c=100.0, temperature_samples=200,
+    )
+    dated = learning.build_load_forecast(profile, [friday, saturday])
+    conservative = learning.build_load_forecast(
+        profile, [friday], outdoor_temperature_c=0.0, conservative=True,
+    )
+    checks.append(("dated load: Friday uses weekday and Saturday uses weekend",
+                   dated[friday] == 500.0 and dated[saturday] == 1000.0, str(dated)))
+    checks.append(("P90 reserve forecast exceeds P50 economics",
+                   conservative[friday] > dated[friday], str(conservative[friday])))
+    checks.append(("cold correction adds learned temperature demand",
+                   conservative[friday] == 1800.0, str(conservative[friday])))
+    checks.append(("planner load lookup accepts absolute datetime and legacy hour maps",
+                   planner.load_forecast_w(dated, saturday) == 1000.0
+                   and planner.load_forecast_w({18: 700.0}, saturday) == 700.0,
+                   "compat"))
+
+    model = battery_model.BatteryModelState()
+    for n in range(3):
+        model = battery_model.observe_capacity(
+            model, 9.4, configured_kwh=10.0, updated_at=str(n),
+        )
+        model = battery_model.observe_grid_rate(
+            model, 1.0, configured_kwh_h=1.15, updated_at=str(n),
+        )
+    eff_cap = battery_model.effective_capacity_kwh(model, 10.0)
+    eff_rate = battery_model.effective_grid_rate_kwh(model, 1.15)
+    rejected = battery_model.observe_capacity(model, 3.0, configured_kwh=10.0)
+    checks.append(("battery model waits for clean observations then blends capacity",
+                   9.4 < eff_cap < 10.0, str(eff_cap)))
+    checks.append(("battery model blends learned grid-charge rate",
+                   1.0 < eff_rate < 1.15, str(eff_rate)))
+    checks.append(("battery model rejects implausible capacity observation",
+                   rejected == model, str(rejected)))
+    restored = battery_model.BatteryModelState.from_dict(model.as_dict())
+    checks.append(("battery model survives restart serialization", restored == model, str(restored)))
+
+    now = datetime(2026, 1, 10, 0, tzinfo=tz)
+    slots = []
+    solar = []
+    load_by_start = {}
+    for h in range(24):
+        start = now + timedelta(hours=h)
+        price = 0.5 if h < 6 else (2.5 if 17 <= h <= 21 else 1.0)
+        slots.append(models.PriceSlot(start, price, 0.0, price, 0.4))
+        solar.append(models.SolarSlot(start, 0.0, 0.0, 0.0))
+        load_by_start[start] = 1800.0 if 17 <= h <= 21 else 700.0
+    state = models.SiteState(
+        timestamp=now, pv_power_w=0, load_power_w=700, load_includes_ev=False,
+        grid_power_w=0, grid_import_power_w=0, grid_export_power_w=0,
+        battery_soc_pct=15, battery_power_w=0, inverter_online=True,
+        inverter_status="normal", easee_online=True, easee_status="disconnected",
+        easee_power_w=0, easee_session_kwh=0, easee_phase_mode="auto",
+        current_buy_price=0.5, current_sell_price=0.4, forecast_today_kwh=0,
+        price_slots=slots, solar_slots=solar, battery_temperature_c=-2.0,
+    )
+    warm = planner.build_day_plan(
+        state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10, load_hourly_w=load_by_start,
+        reserve_load_by_start_w={k: v * 1.2 for k, v in load_by_start.items()},
+        grid_charge_rate_kwh=1.15, allow_grid_charge=True,
+    )
+    cold = planner.build_day_plan(
+        state, battery_mode="blue", min_soc=15, max_soc=100,
+        capacity_kwh=10, load_hourly_w=load_by_start,
+        reserve_load_by_start_w={k: v * 1.2 for k, v in load_by_start.items()},
+        grid_charge_rate_kwh=1.15, allow_grid_charge=False,
+    )
+    checks.append(("warm winter plan schedules grid charging before peak",
+                   warm is not None and any(s.grid_charge for s in warm.slots), "warm"))
+    checks.append(("cold-aware day plan assumes no blocked grid charge",
+                   cold is not None and not any(s.grid_charge for s in cold.slots), "cold"))
+
+    control_plan = planner.build_control_plan(
+        state,
+        battery_plan=models.BatteryPlan(strategy="IDLE", reason="test"),
+        ev_plan=models.EvPlan(mode="idle", reason="test"),
+        safe_reasons=[], negative_price_active=False, battery_mode="blue",
+        load_hourly_w=load_by_start, capacity_kwh=10, min_soc=15, max_soc=100,
+        grid_charge_rate_kwh=1.15,
+    )
+    checks.append(("peak diagnostic exposes required and uncovered expensive energy",
+                   control_plan.peak_required_kwh > 0
+                   and control_plan.peak_uncovered_kwh >= 0
+                   and control_plan.effective_capacity_kwh == 10,
+                   f"{control_plan.peak_required_kwh}/{control_plan.peak_uncovered_kwh}"))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -5143,6 +5246,7 @@ def main():
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
                          ("ROLLING PLAN · EV LOAD / P10 / AUDIT", test_rolling_planner_upgrade),
+                         ("WINTER PLAN · DATED LOAD / BATTERY MODEL / PEAK", test_winter_planning_upgrade),
                          ("EV MINIMUM SOC · METERED RECOVERY", test_ev_minimum_recovery),
                          ("VALUE SENSOR BASELINE SYNC", test_value_sensor_baseline_sync),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

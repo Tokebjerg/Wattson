@@ -24,9 +24,11 @@ from .const import (
     DEFAULT_EV_REQUIRED_HOURS,
     CONF_EV_CHARGE_SPEED_PCT_H,
     DEFAULT_EV_CHARGE_SPEED_PCT_H,
+    CONF_BATTERY_CAPACITY_KWH,
+    DEFAULT_BATTERY_CAPACITY_KWH,
     EV_MODE_SCHEDULED_CHEAPEST,
 )
-from .learning import predicted_today_kwh
+from .learning import forecast_load_w
 from .models import ControlPlan, SiteState
 from .planner import ev_cheapest_charge_hours
 
@@ -55,6 +57,31 @@ def _plan_action_label(coordinator: Any) -> Any:
         return None
     action = plan.schedule[0].action
     return ACTION_LABELS.get(action, action)
+
+
+def _daily_load_forecast(coordinator: Any, *, conservative: bool = False) -> dict[str, float]:
+    profile = getattr(coordinator, "load_profile", None)
+    if profile is None:
+        return {}
+    day = dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    temperature = (
+        coordinator.site_state.outdoor_temperature_c
+        if coordinator.site_state is not None else None
+    )
+    return {
+        str(hour): round(forecast_load_w(
+            profile,
+            day.replace(hour=hour),
+            outdoor_temperature_c=temperature,
+            conservative=conservative,
+        ))
+        for hour in range(24)
+    }
+
+
+def _predicted_load_today_kwh(coordinator: Any) -> float | None:
+    hourly = _daily_load_forecast(coordinator)
+    return round(sum(hourly.values()) / 1000.0, 2) if hourly else None
 
 
 SENSORS: tuple[WattsonSensorDescription, ...] = (
@@ -150,14 +177,62 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         name="Predicted Load Today",
         icon="mdi:home-lightning-bolt-outline",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        value_fn=lambda c: round(predicted_today_kwh(getattr(c, "load_profile", None)), 2) if getattr(c, "load_profile", None) else None,
+        value_fn=_predicted_load_today_kwh,
         attrs_fn=lambda c: {
             "days_observed": c.load_profile.days_observed,
             "confidence": c.load_profile.confidence,
             "hourly_w": {str(h): round(c.load_profile.hourly_w.get(h, 0.0)) for h in range(24)},
+            "hourly_p90_w": {str(h): round(c.load_profile.hourly_p90_w.get(h, 0.0)) for h in range(24)},
+            "forecast_hourly_w": _daily_load_forecast(c),
+            "forecast_p90_hourly_w": _daily_load_forecast(c, conservative=True),
+            "outdoor_temperature_c": (
+                c.site_state.outdoor_temperature_c if c.site_state else None
+            ),
+            "temperature_reference_c": c.load_profile.temperature_reference_c,
+            "temperature_slope_w_per_c": c.load_profile.temperature_slope_w_per_c,
+            "temperature_samples": c.load_profile.temperature_samples,
         }
         if getattr(c, "load_profile", None)
         else None,
+    ),
+    WattsonSensorDescription(
+        key="battery_model",
+        name="Battery Model",
+        icon="mdi:battery-sync-outline",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        value_fn=lambda c: round(c.effective_battery_capacity_kwh, 2),
+        attrs_fn=lambda c: {
+            "configured_capacity_kwh": round(float(entry_value(
+                c.config_entry,
+                CONF_BATTERY_CAPACITY_KWH,
+                DEFAULT_BATTERY_CAPACITY_KWH,
+            )), 2),
+            "learned_capacity_kwh": c._battery_model.effective_capacity_kwh,
+            "capacity_observations": c._battery_model.capacity_observations,
+            "effective_grid_charge_rate_kwh": round(c.effective_grid_charge_rate_kwh, 3),
+            "learned_grid_charge_rate_kwh": c._battery_model.grid_charge_rate_kwh,
+            "grid_rate_observations": c._battery_model.grid_rate_observations,
+            "updated_at": c._battery_model.updated_at,
+        },
+    ),
+    WattsonSensorDescription(
+        key="peak_uncovered_energy",
+        name="Peak Uncovered Energy",
+        icon="mdi:transmission-tower-alert",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        value_fn=lambda c: round(c.control_plan.peak_uncovered_kwh, 2) if c.control_plan else None,
+        attrs_fn=lambda c: {
+            "required_kwh": c.control_plan.peak_required_kwh,
+            "covered_kwh": c.control_plan.peak_covered_kwh,
+            "target_soc_pct": c.control_plan.peak_target_soc_pct,
+            "expected_exhaustion_at": c.control_plan.peak_exhaustion_at,
+            "effective_capacity_kwh": c.control_plan.effective_capacity_kwh,
+            "effective_grid_charge_rate_kwh": c.control_plan.effective_grid_charge_rate_kwh,
+        } if c.control_plan else None,
     ),
     WattsonSensorDescription(
         key="solar_forecast_bias",

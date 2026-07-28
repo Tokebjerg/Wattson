@@ -723,12 +723,15 @@ class TelemetryMixin:
         if capacity_kwh > 0:
             self.battery_cycles_today += discharge_kwh / capacity_kwh
         soc = state.battery_soc_pct
-        # #7: effective-capacity estimate — sum delivered energy against the SOC% it
-        # cost, but ONLY on genuine discharge ticks (>100 W out, SOC actually falling)
-        # so charge/idle/PV-blend never pollute it. estimated = Wh ÷ (ΔSOC/100).
-        if state.battery_power_w > 100.0 and self._cap_last_soc is not None and soc < self._cap_last_soc:
+        # #7: effective-capacity estimate. Count ALL energy delivered during a
+        # genuine discharge, including the many ticks where an integer/slow SOC
+        # sensor has not moved yet. Count SOC only when it actually falls. The old
+        # combined condition retained one tick of energy per percentage point and
+        # therefore produced implausibly small capacity observations.
+        if state.battery_power_w > 100.0:
             self._cap_dis_wh += discharge_kwh * 1000.0
-            self._cap_soc_drop += (self._cap_last_soc - soc)
+            if self._cap_last_soc is not None and soc < self._cap_last_soc:
+                self._cap_soc_drop += (self._cap_last_soc - soc)
         self._cap_last_soc = soc
         minutes = dt_hours * 60.0
         if soc >= 95.0:

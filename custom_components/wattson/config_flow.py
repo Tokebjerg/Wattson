@@ -69,6 +69,7 @@ from .const import (
     CONF_EXPENSIVE_PRICE_THRESHOLD,
     CONF_EXPORT_LIMIT_NUMBER,
     CONF_FORECAST_TODAY_ENTITY,
+    CONF_OUTDOOR_TEMPERATURE_ENTITY,
     CONF_GRID_CHARGE_SWITCH,
     CONF_GRID_POWER_ENTITY,
     CONF_INVERTER_ONLINE_ENTITY,
@@ -105,6 +106,7 @@ from .const import (
     DEFAULT_INVERT_GRID_POWER_SIGN,
     DEFAULT_SHADOW_MODE,
     DEFAULT_STALE_SECONDS,
+    DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
     DOMAIN,
     EV_MODES,
 )
@@ -213,6 +215,10 @@ def _step_price_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(CONF_BUY_PRICE_ENTITY, default=defaults.get(CONF_BUY_PRICE_ENTITY, "")): _entity("sensor"),
             vol.Optional(CONF_SELL_PRICE_ENTITY, default=defaults.get(CONF_SELL_PRICE_ENTITY, "")): _entity("sensor"),
             vol.Optional(CONF_FORECAST_TODAY_ENTITY, default=defaults.get(CONF_FORECAST_TODAY_ENTITY, "")): _entity("sensor"),
+            vol.Optional(
+                CONF_OUTDOOR_TEMPERATURE_ENTITY,
+                default=defaults.get(CONF_OUTDOOR_TEMPERATURE_ENTITY, DEFAULT_OUTDOOR_TEMPERATURE_ENTITY),
+            ): _entity("sensor"),
             vol.Required(
                 CONF_CHEAP_PRICE_THRESHOLD,
                 default=defaults.get(CONF_CHEAP_PRICE_THRESHOLD, DEFAULT_CHEAP_PRICE_THRESHOLD),
@@ -315,6 +321,10 @@ def _options_mapping_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(CONF_BUY_PRICE_ENTITY, default=defaults.get(CONF_BUY_PRICE_ENTITY, "")): _entity("sensor"),
             vol.Optional(CONF_SELL_PRICE_ENTITY, default=defaults.get(CONF_SELL_PRICE_ENTITY, "")): _entity("sensor"),
             vol.Optional(CONF_FORECAST_TODAY_ENTITY, default=defaults.get(CONF_FORECAST_TODAY_ENTITY, "")): _entity("sensor"),
+            vol.Optional(
+                CONF_OUTDOOR_TEMPERATURE_ENTITY,
+                default=defaults.get(CONF_OUTDOOR_TEMPERATURE_ENTITY, DEFAULT_OUTDOOR_TEMPERATURE_ENTITY),
+            ): _entity("sensor"),
         }
     )
 
@@ -496,6 +506,11 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_BUY_PRICE_ENTITY: entry_value(self.config_entry, CONF_BUY_PRICE_ENTITY, ""),
             CONF_SELL_PRICE_ENTITY: entry_value(self.config_entry, CONF_SELL_PRICE_ENTITY, ""),
             CONF_FORECAST_TODAY_ENTITY: entry_value(self.config_entry, CONF_FORECAST_TODAY_ENTITY, ""),
+            CONF_OUTDOOR_TEMPERATURE_ENTITY: entry_value(
+                self.config_entry,
+                CONF_OUTDOOR_TEMPERATURE_ENTITY,
+                DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
+            ),
         }
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
