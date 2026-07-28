@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta
+from functools import partial
 import logging
 from typing import Any
 
@@ -652,6 +653,36 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 mean = row.get("mean")
                 if ts is not None:
                     temperature_samples.append((dt_util.as_local(ts), mean))
+            # Template/weather-derived temperature sensors often have Recorder
+            # history but no long-term-statistics metadata. Fall back to raw state
+            # history so weather learning is not silently disabled for those
+            # perfectly valid sensors.
+            if temp_entity and not temperature_samples:
+                from homeassistant.components.recorder.history import get_significant_states
+
+                history = await get_instance(self.hass).async_add_executor_job(
+                    partial(
+                        get_significant_states,
+                        self.hass,
+                        start,
+                        end,
+                        entity_ids=[temp_entity],
+                        include_start_time_state=True,
+                        significant_changes_only=True,
+                        minimal_response=False,
+                        no_attributes=True,
+                    )
+                )
+                for historic_state in history.get(temp_entity, []):
+                    ts = getattr(historic_state, "last_updated", None)
+                    value = getattr(historic_state, "state", None)
+                    if isinstance(historic_state, dict):
+                        ts = historic_state.get("last_updated")
+                        value = historic_state.get("state")
+                    if isinstance(ts, str):
+                        ts = dt_util.parse_datetime(ts)
+                    if isinstance(ts, datetime):
+                        temperature_samples.append((dt_util.as_local(ts), value))
             samples: list[tuple[datetime, float | None]] = []
             for row in rows:
                 ts = _row_ts(row)
