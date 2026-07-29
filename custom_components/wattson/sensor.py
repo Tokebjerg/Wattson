@@ -27,6 +27,7 @@ from .const import (
     CONF_BATTERY_CAPACITY_KWH,
     DEFAULT_BATTERY_CAPACITY_KWH,
     EV_MODE_SCHEDULED_CHEAPEST,
+    EV_SOLAR_GRID_BUDGET_KWH,
 )
 from .learning import forecast_load_w
 from .models import ControlPlan, SiteState
@@ -283,6 +284,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "load_estimate_kwh": task.load_estimate_kwh,
                     "ev_load_estimate_kwh": task.ev_load_estimate_kwh,
                     "projected_soc_pct": task.projected_soc_pct,
+                    "tou_floor_pct": task.tou_floor_pct,
                 }
                 for task in c.control_plan.schedule
             ]
@@ -372,6 +374,19 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "battery_override": getattr(self.coordinator, "battery_override_execution", {}),
                 "ev_override": getattr(self.coordinator, "ev_override_execution", {}),
                 "ev_fast_backoff_active": getattr(self.coordinator, "_ev_support_backoff_active", False),
+                "ev_solar_grid_budget_kwh": round(
+                    getattr(self.coordinator, "_ev_solar_grid_budget_kwh", 0.0), 3
+                ),
+                "ev_solar_grid_budget_exhausted": (
+                    getattr(self.coordinator, "_ev_solar_grid_budget_kwh", 0.0)
+                    >= EV_SOLAR_GRID_BUDGET_KWH
+                ),
+                "self_consumption_watchdog_active": getattr(
+                    self.coordinator, "_self_consumption_watchdog_active", False
+                ),
+                "physical_tou_floor_pct": (
+                    control_plan.battery.desired_tou_capacity_pct if control_plan else None
+                ),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
                 "ev_start": getattr(self.coordinator, "ev_start_status", {"state": "idle"}),
                 "ev_minimum_recovery": getattr(

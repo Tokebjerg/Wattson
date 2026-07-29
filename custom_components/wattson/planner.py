@@ -762,14 +762,23 @@ def tou_setpoint(
       - grid-charging / force-charge -> the charge target (max_soc) + enable;
       - force-discharge -> min_soc (drain fully);
       - protect -> max SOC as a hard floor with grid charge disabled;
-      - degraded/safety (HOLD/BLOCK_NEGATIVE_EXPORT) -> (None, None), leave
-        TOU untouched.
-    ``soc_pct`` is accepted for interface stability but no longer gates the floor.
+      - hold -> current SOC (explicitly hold, never inherit an older slot);
+      - block negative export -> the calculated discharge floor, so export is
+        blocked without disabling self-consumption.
+    ``soc_pct`` supplies the explicit hold target.
     """
     if plan.strategy == "PROTECT":
         return (_snap_tou_capacity(float(max_soc), up=True), False)
-    if plan.strategy in ("HOLD", "BLOCK_NEGATIVE_EXPORT"):
-        return (None, None)
+    if plan.strategy == "HOLD":
+        return (
+            min(
+                _snap_tou_capacity(float(min(max_soc, max(min_soc, soc_pct))), up=True),
+                float(max_soc),
+            ),
+            False,
+        )
+    if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
+        return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
     if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
         # Battery care: a plan may cap its own grid-charge target below max_soc
         # (LFP calendar aging at 100 %); absorb/force-charge plans leave it None.
@@ -964,7 +973,14 @@ def build_day_plan(
         # the pack even while the displayed SOC curve stayed flat. Enforce the
         # optimizer's end-of-slot SOC for deficit-shaped actions; solar/export
         # actions stay open so the battery can continue covering cloud dips.
-        if task.action in ("IDLE", "DISCHARGE") and task.projected_soc_pct is not None:
+        forecast_deficit = (
+            (task.load_estimate_kwh or 0.0) > (task.pv_estimate_kwh or 0.0) + 0.01
+        )
+        if (
+            task.projected_soc_pct is not None
+            and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
+            and (task.action in ("IDLE", "DISCHARGE") or forecast_deficit)
+        ):
             # The DP projection already contains the P50 peak reservation. Add
             # only the P90-P50 uncertainty tail, and only when no planned refill
             # occurs before that later peak. This avoids the old double reserve
@@ -1018,24 +1034,32 @@ def build_day_plan(
             # up to the export limit), OFF at non-positive prices. Harmless during
             # deficits (there is no surplus to sell).
             intent, sell, grid_charge, charge_a = "SELF_CONSUME", sell_ok, False, None
+        committed_floor = min(
+            _snap_tou_capacity(float(min(floor, max_soc)), up=True),
+            float(max_soc),
+        )
         committed_projected = task.projected_soc_pct
         if (
-            task.action in ("IDLE", "DISCHARGE")
-            and committed_projected is not None
+            committed_projected is not None
+            and committed_projected < committed_prev_soc
         ):
             committed_projected = min(
                 committed_prev_soc,
-                max(float(committed_projected), min(float(floor), max_soc)),
+                max(float(committed_projected), committed_floor),
             )
         if committed_projected is not None:
             committed_prev_soc = float(committed_projected)
-        committed_tasks.append(replace(task, projected_soc_pct=committed_projected))
+        committed_tasks.append(replace(
+            task,
+            projected_soc_pct=committed_projected,
+            tou_floor_pct=committed_floor,
+        ))
         plan_slots.append(SlotPlan(
             start=task.start,
             intent=intent,
             sell=sell,
             grid_charge=grid_charge,
-            tou_floor_pct=round(min(floor, max_soc), 1),
+            tou_floor_pct=committed_floor,
             charge_current_a=charge_a,
             total_import_price=task.total_import_price,
             export_value=export_value,
@@ -2736,8 +2760,9 @@ def projected_ev_load_by_start(
 ) -> dict[datetime, float]:
     """Forecast hourly EV energy so the battery SOC curve includes the car.
 
-    Solar-only uses median Solcast surplus. Other modes use their scheduled
-    charging hours; their unmet EV load is marked battery-protected by the caller.
+    Solar-only commits only conservative Solcast P10 surplus. Other modes use
+    their scheduled charging hours; their unmet EV load is marked
+    battery-protected by the caller.
     """
     if ev_runtime_state(state) == "disconnected" or not state.price_slots:
         return {}
@@ -2770,7 +2795,11 @@ def projected_ev_load_by_start(
         projected: dict[datetime, float] = {}
         for slot in slots:
             solar = solar_by_start.get(slot.start)
-            solar_kwh = solar.pv_estimate_kwh if solar else 0.0
+            solar_kwh = (
+                solar.pv_estimate10_kwh
+                if solar and solar.pv_estimate10_kwh is not None
+                else (solar.pv_estimate_kwh * 0.6 if solar else 0.0)
+            )
             house_kwh = load_forecast_w(load_hourly_w, slot.start) / 1000.0
             surplus_kwh = max(0.0, solar_kwh - house_kwh)
             if surplus_kwh * 1000.0 >= ev_solar_min_surplus_w:

@@ -145,16 +145,20 @@ from .const import (
     BATTERY_MODE_DWELL_SECONDS,
     DEFAULT_EXPORT_LIMIT_W,
     EV_WRITE_COOLDOWN_SECONDS,
-    EV_RESUME_RETRY_SECONDS,
     EV_CIRCUIT_LIMIT_REFRESH_SECONDS,
     EV_SUPPORT_BACKOFF_HOLD_SECONDS,
     EV_SUPPORT_GRID_IMPORT_W,
     EV_SUPPORT_BATTERY_DRAW_W,
+    EV_SOLAR_STOP_DEFICIT_SECONDS,
+    EV_SOLAR_RESTART_SURPLUS_SECONDS,
+    EV_SOLAR_GRID_BUDGET_KWH,
     EV_ACTIVE_HOLD_SECONDS,
     EV_CURRENT_DEADBAND_A,
     EV_CURRENT_RETUNE_SECONDS,
     PLAN_REPLAN_INTERVAL_SECONDS,
     PLAN_SOC_DEVIATION_PCT,
+    SELF_CONSUMPTION_WATCHDOG_SECONDS,
+    SELF_CONSUMPTION_WATCHDOG_SURPLUS_W,
     MASTER_LOCK_BACKOFF_SECONDS,
     LEGACY_BATTERY_MODE_MAP,
     NAME,
@@ -272,6 +276,64 @@ def _rolling_replan_reason(
     if interval_elapsed:
         return "rolling_15m"
     return None
+
+
+def _price_horizon_changed(
+    previous: tuple[Any, ...] | None,
+    current: tuple[Any, ...],
+) -> bool:
+    """Return whether the semantic price horizon changed.
+
+    The committed plan is intentionally capped at 24 hours while price ingestion
+    may expose 48 hours.  Comparing their end timestamps made every coordinator
+    tick look like a newly-grown horizon.  The normalized price fingerprint is
+    the complete contract: identical tuples must never trigger a replan.
+    """
+    return previous is not None and previous != current
+
+
+def _ev_solar_session_action(
+    *,
+    base_wants_charge: bool,
+    physically_charging: bool,
+    deficit_elapsed_seconds: float | None,
+    surplus_elapsed_seconds: float | None,
+    grid_budget_exhausted: bool,
+) -> str:
+    """Solar-only session hysteresis: fast current reductions, slow start/stop."""
+    if grid_budget_exhausted:
+        return "pause"
+    if physically_charging:
+        if base_wants_charge:
+            return "resume"
+        if (
+            deficit_elapsed_seconds is None
+            or deficit_elapsed_seconds < EV_SOLAR_STOP_DEFICIT_SECONDS
+        ):
+            return "hold"
+        return "pause"
+    if not base_wants_charge:
+        return "pause"
+    if (
+        surplus_elapsed_seconds is not None
+        and surplus_elapsed_seconds >= EV_SOLAR_RESTART_SURPLUS_SECONDS
+    ):
+        return "resume"
+    return "wait"
+
+
+def _conservative_current_solar_w(state: SiteState) -> float:
+    """Bias-corrected P10 power for the current hour, with a safe fallback."""
+    now = state.timestamp
+    for slot in state.solar_slots:
+        if slot.start <= now < slot.start + timedelta(hours=1):
+            estimate = (
+                slot.pv_estimate10_kwh
+                if slot.pv_estimate10_kwh is not None
+                else slot.pv_estimate_kwh * 0.6
+            )
+            return max(0.0, estimate * 1000.0)
+    return 0.0
 
 
 def _ev_offer_is_lower(
@@ -474,7 +536,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_amps: int | None = None
         self._last_ev_currents: tuple[int, int, int] | None = None
         self._last_ev_current_change_at: datetime | None = None
-        self._last_ev_resume_retry_at: datetime | None = None
         self._last_ev_circuit_refresh_at: datetime | None = None
         self._ev_control_blocked_reason: str | None = None
         self._ev_start_wait_since: datetime | None = None
@@ -506,7 +567,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.contended_entities: list[str] = []
         self.master_lock_enabled = bool(entry_value(entry, CONF_MASTER_LOCK_ENABLED, DEFAULT_MASTER_LOCK_ENABLED))
         self._default_export_limit_w: float | None = None
-        self._ev_solar_hold_until: datetime | None = None
+        self._ev_solar_surplus_since: datetime | None = None
+        self._ev_solar_deficit_since: datetime | None = None
+        self._ev_solar_grid_budget_hour: datetime | None = None
+        self._ev_solar_grid_budget_kwh: float = 0.0
+        self._ev_solar_grid_budget_last_tick: datetime | None = None
+        self._self_consumption_watchdog_since: datetime | None = None
+        self._self_consumption_watchdog_active: bool = False
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -565,7 +632,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._prev_tick_gap_s: float = 0.0
         # ---- #4 restart-audit: state below _restore_override_state is INTENTIONALLY
         # volatile (re-derives within seconds/minutes, so persisting it adds risk for
-        # no gain): EV sticky holds (_ev_active_until, _ev_solar_hold_until), the
+        # no gain): EV sticky holds (_ev_active_until and solar session timers), the
         # near-full + sell-ceiling hysteresis latches (_ev_full_buffer_active,
         # _sell_ceiling_active), dwell timers, contention windows, surplus/load
         # sample buffers, the anomaly-fired set + digest day (both re-cleared/re-sent
@@ -1328,6 +1395,160 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_soak_import_since = None  # settle after any step
         return self._ev_soak_amps
 
+    def _update_ev_solar_grid_budget(self, now: datetime) -> bool:
+        """Integrate grid-backed solar-EV energy and enforce an hourly cap."""
+        local_hour = dt_util.as_local(now).replace(minute=0, second=0, microsecond=0)
+        if self._ev_solar_grid_budget_hour != local_hour:
+            self._ev_solar_grid_budget_hour = local_hour
+            self._ev_solar_grid_budget_kwh = 0.0
+            self._ev_solar_grid_budget_last_tick = now
+        last = self._ev_solar_grid_budget_last_tick
+        self._ev_solar_grid_budget_last_tick = now
+        if last is None:
+            return False
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0.0 or dt_hours > VALUE_MAX_TICK_SECONDS / 3600.0:
+            return self._ev_solar_grid_budget_kwh >= EV_SOLAR_GRID_BUDGET_KWH
+        if (
+            self.ev_mode == EV_MODE_SOLAR_ONLY
+            and (self.site_state.easee_power_w or 0.0) >= 500.0
+        ):
+            grid_backed_w = min(
+                max(0.0, self.site_state.easee_power_w or 0.0),
+                max(0.0, self.site_state.grid_import_power_w or 0.0),
+            )
+            self._ev_solar_grid_budget_kwh += grid_backed_w * dt_hours / 1000.0
+        return self._ev_solar_grid_budget_kwh >= EV_SOLAR_GRID_BUDGET_KWH
+
+    def _apply_ev_solar_session_hysteresis(
+        self,
+        ev_plan: EvPlan,
+        *,
+        now: datetime,
+        runtime_state: str,
+        grid_budget_exhausted: bool,
+    ) -> EvPlan:
+        """Keep cloud dips, stop sustained support, and require stable restart sun."""
+        if self.ev_mode != EV_MODE_SOLAR_ONLY or runtime_state == "disconnected":
+            self._ev_solar_surplus_since = None
+            self._ev_solar_deficit_since = None
+            return ev_plan
+
+        base_wants_charge = bool(
+            ev_plan.desired_enabled is True and ev_plan.desired_action == "resume"
+        )
+        physically_charging = bool(
+            runtime_state == "charging"
+            or (self.site_state.easee_power_w or 0.0) >= 500.0
+        )
+        if base_wants_charge:
+            self._ev_solar_deficit_since = None
+            if self._ev_solar_surplus_since is None:
+                self._ev_solar_surplus_since = now
+        else:
+            self._ev_solar_surplus_since = None
+            if physically_charging and self._ev_solar_deficit_since is None:
+                self._ev_solar_deficit_since = now
+
+        deficit_elapsed = (
+            (now - self._ev_solar_deficit_since).total_seconds()
+            if self._ev_solar_deficit_since is not None
+            else None
+        )
+        surplus_elapsed = (
+            (now - self._ev_solar_surplus_since).total_seconds()
+            if self._ev_solar_surplus_since is not None
+            else None
+        )
+        action = _ev_solar_session_action(
+            base_wants_charge=base_wants_charge,
+            physically_charging=physically_charging,
+            deficit_elapsed_seconds=deficit_elapsed,
+            surplus_elapsed_seconds=surplus_elapsed,
+            grid_budget_exhausted=grid_budget_exhausted,
+        )
+        if action == "resume":
+            return ev_plan
+        if action == "hold":
+            if self._last_ev_amps is None:
+                return replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | Holder session gennem kort soldyk",
+                    desired_enabled=None,
+                    desired_amps=None,
+                    desired_circuit_currents=None,
+                    desired_phase_mode=None,
+                    desired_action=None,
+                )
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | Holder session gennem kort soldyk",
+                desired_enabled=True,
+                desired_amps=self._last_ev_amps,
+                desired_circuit_currents=self._last_ev_currents,
+                desired_phase_mode="auto_phase",
+                desired_action="resume",
+            )
+        if grid_budget_exhausted:
+            reason = (
+                f"Ren sol netbudget {self._ev_solar_grid_budget_kwh:.2f}/"
+                f"{EV_SOLAR_GRID_BUDGET_KWH:.2f} kWh brugt; pauser til næste time"
+            )
+        elif action == "wait":
+            reason = (
+                f"{ev_plan.reason} | Afventer "
+                f"{EV_SOLAR_RESTART_SURPLUS_SECONDS // 60} min stabilt soloverskud"
+            )
+        else:
+            reason = (
+                f"{ev_plan.reason} | Vedvarende underskud i "
+                f"{EV_SOLAR_STOP_DEFICIT_SECONDS // 60} min; pauser ren-sol-ladning"
+            )
+        return replace(
+            ev_plan,
+            reason=reason,
+            desired_enabled=None,
+            desired_amps=None,
+            desired_circuit_currents=None,
+            desired_phase_mode=None,
+            desired_action="pause",
+        )
+
+    def _update_self_consumption_watchdog(
+        self,
+        battery_plan: BatteryPlan,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Latch recovery from full-pack curtailment until the export block ends."""
+        conservative_pv_w = _conservative_current_solar_w(self.site_state)
+        sunny_enough = conservative_pv_w >= (
+            max(0.0, self.site_state.load_power_w)
+            + SELF_CONSUMPTION_WATCHDOG_SURPLUS_W
+        )
+        export_blocked = battery_plan.strategy == "BLOCK_NEGATIVE_EXPORT"
+        if not export_blocked or not sunny_enough:
+            self._self_consumption_watchdog_since = None
+            self._self_consumption_watchdog_active = False
+            return False
+        if self._self_consumption_watchdog_active:
+            return True
+        stalled = bool(
+            self.site_state.grid_import_power_w >= 300.0
+            and abs(self.site_state.battery_power_w or 0.0) < 200.0
+        )
+        if not stalled:
+            self._self_consumption_watchdog_since = None
+            return False
+        if self._self_consumption_watchdog_since is None:
+            self._self_consumption_watchdog_since = now
+            return False
+        if (
+            now - self._self_consumption_watchdog_since
+        ).total_seconds() >= SELF_CONSUMPTION_WATCHDOG_SECONDS:
+            self._self_consumption_watchdog_active = True
+        return self._self_consumption_watchdog_active
+
     def _reset_control_fingerprints(self) -> None:
         """Force the next active tick to re-assert both physical plans."""
         self._last_ev_fp = None
@@ -1854,7 +2075,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_charge_until_complete=self.ev_charge_until_complete,
             ev_minimum_recovery_complete=_ev_minimum_recovery_complete,
         )
-        _ev_battery_protected = self.ev_mode != EV_MODE_SOLAR_ONLY
+        # Forward planning never budgets stored house-battery energy for the EV.
+        # Solar-only may use the pack for short runtime dips, but its committed EV
+        # load is P10 solar allocation; non-solar modes remain grid-protected.
+        _ev_battery_protected = True
 
         # Solar-aware reserve release (v0.24.14): when enough high-confidence
         # forecast solar is coming to refill the whole usable band, drop the learned
@@ -1906,7 +2130,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             for slot in self.site_state.solar_slots
             if slot.start >= _now_local.replace(minute=0, second=0, microsecond=0)
         )
-        _latest_price_start = max((s.start for s in self.site_state.price_slots), default=None)
         _price_fp = tuple(
             (
                 slot.start.isoformat(),
@@ -1924,17 +2147,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if _expected_soc is not None
             else None
         )
-        _horizon_grew = bool(
-            (
-                self._last_price_horizon_fp is not None
-                and self._last_price_horizon_fp != _price_fp
-            )
-            or (
-                self._day_plan is not None
-                and _latest_price_start is not None
-                and self._day_plan.slots
-                and self._day_plan.slots[-1].start < _latest_price_start
-            )
+        _horizon_grew = _price_horizon_changed(
+            self._last_price_horizon_fp,
+            _price_fp,
         )
         _replan_reason = _rolling_replan_reason(
             pending_reason=self._pending_replan_reason,
@@ -2137,6 +2352,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if forced_ev is not None:
                 ev_plan = forced_ev
 
+        _ev_grid_budget_exhausted = self._update_ev_solar_grid_budget(dt_util.utcnow())
+        if not ev_override_active:
+            ev_plan = self._apply_ev_solar_session_hysteresis(
+                ev_plan,
+                now=dt_util.utcnow(),
+                runtime_state=_ev_runtime,
+                grid_budget_exhausted=_ev_grid_budget_exhausted,
+            )
+
         # Save last tick's soak state BEFORE resetting, so the engage-edge check below
         # (init amps only on the FIRST tick the gate opens) survives the per-tick reset.
         # Resetting the live flag every tick is what makes it False whenever the gate is
@@ -2146,11 +2370,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
             ev_is_connected = _ev_runtime != "disconnected"
-            ev_is_charging = _ev_runtime == "charging"
-            _battery_first_gate_active = bool(
-                effective_battery_threshold
-                and self.site_state.battery_soc_pct < effective_battery_threshold
-            )
 
             # EV curtailment-soak (v0.24.41): when export is blocked/<=0 AND the battery is
             # full/near-full, the inverter CURTAILS PV, so the measured surplus that normally
@@ -2194,42 +2413,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     desired_phase_mode="auto_phase",
                     desired_action="resume",
                 )
-            if (
-                ev_plan.desired_action == "resume"
-                and ev_plan.desired_enabled is True
-                and not getattr(ev_plan, "battery_first_spillover", False)
-            ):
-                # Hold a solar-driven EV session through short PV dips to avoid rapid pause/resume flapping.
-                self._ev_solar_hold_until = now + timedelta(minutes=3)
-            elif (
-                ev_plan.desired_action == "pause"
-                and ev_is_charging
-                and self._ev_solar_hold_until is not None
-                and now < self._ev_solar_hold_until
-                and not _battery_first_gate_active
-                and not self._ev_support_backoff_active
-            ):
-                # Re-assert the LAST-SENT values: the structural fingerprint and
-                # the currents stay identical, so the apply layer writes NOTHING
-                # during the dip (the old None-fields approach changed the
-                # fingerprint and triggered a write on every passing cloud).
-                ev_plan = replace(
-                    ev_plan,
-                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
-                    desired_enabled=True,
-                    desired_amps=self._last_ev_amps,
-                    desired_circuit_currents=self._last_ev_currents,
-                    desired_phase_mode="auto_phase",
-                    desired_action="resume",
-                ) if self._last_ev_amps is not None else replace(
-                    ev_plan,
-                    reason=f"{ev_plan.reason} | Holding EV session through brief solar dip",
-                    desired_enabled=None,
-                    desired_amps=None,
-                    desired_phase_mode=None,
-                    desired_action=None,
-                )
-
             # Sticky: keep EV-solar priority through brief charger dips so the
             # battery strategy doesn't flip every few seconds and churn the
             # inverter settings.
@@ -2533,13 +2716,29 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # The TOU floor follows the CURRENT PLAN SLOT (incl. its peak reserve), so the
         # inverter itself holds the reserve pre-peak and releases it at the peak. The
         # legacy fallback derives the same floor reactively.
+        base_discharge_floor = min_soc + max(
+            profile_for(self.battery_mode).reserve_soc_offset,
+            learned_reserve_pct,
+        )
         if _slot is not None:
             discharge_floor = max(
-                min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct),
+                base_discharge_floor,
                 _slot.tou_floor_pct,
             )
         else:
             discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
+        if self._update_self_consumption_watchdog(
+            battery_plan,
+            now=dt_util.utcnow(),
+        ):
+            discharge_floor = base_discharge_floor
+            battery_plan = replace(
+                battery_plan,
+                reason=(
+                    f"{battery_plan.reason} | selvforbrugs-vagt: konservativ sol kan "
+                    "dække huset, frigiver fastlåst TOU-reserve"
+                ),
+            )
         # EV-BATTERY PROTECT (v0.24.46, user rule 2026-07-06): the house battery must NEVER
         # be discharged to charge the car — except solar_only, which covers dips. The per-mode
         # EV_SOLAR_PRIORITY block only runs for solar_only, so full_speed / scheduled / a
@@ -2743,13 +2942,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev.desired_circuit_currents,
         )
         current_change_wanted = (not within_deadband) and (offer_is_lower or retune_due)
-        # Stuck-car nudge: the plan WANTS the car charging but the charger is still
-        # awaiting_start / ready_to_charge / paused — the single resume that the
-        # structural change sent didn't wake it. The deadband/retune gates only
-        # fire on CHANGES, so without this the car would sit at 0 kW forever.
-        # Re-assert the whole plan (resume + enable + currents) on a slow cadence
-        # until it actually draws; the moment status is "charging" this stops, so
-        # it never competes with the in-session anti-oscillation gating.
+        # Start convergence is stateful: one initial structural command, then a
+        # verified recovery after the response timeout. This avoids a second,
+        # independent nudge loop resending the same tuple during transitions.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
         not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES
         physically_charging = bool(
@@ -2786,6 +2981,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         start_recovery_due = bool(
             wants_charging
             and not_yet_charging
+            and self._ev_start_recovery_attempts < EV_START_FAILED_ATTEMPTS
             and start_wait_seconds >= EV_START_VERIFY_SECONDS
             and write_allowed(
                 self._last_ev_start_recovery_at,
@@ -2797,11 +2993,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # A recovery attempt must use the requested offer, not the stale-power
             # 6 A bootstrap that failed to establish a physical session.
             ev = requested_ev
-        nudge_stuck = (
-            wants_charging
-            and not_yet_charging
-            and write_allowed(self._last_ev_resume_retry_at, EV_RESUME_RETRY_SECONDS, now)
-        )
+        # The initial structural write is followed by the verified start-recovery
+        # state machine.  A second independent 60-second nudge used to resend the
+        # same charger/circuit tuple throughout Easee's transition states.
         circuit_refresh_due = (
             wants_charging
             and bool(self.site_state.easee_online)
@@ -2814,7 +3008,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 now,
             )
         )
-        full_apply = structural_changed or current_change_wanted or nudge_stuck or start_recovery_due
+        full_apply = structural_changed or current_change_wanted or start_recovery_due
         if not full_apply and not circuit_refresh_due:
             return []
         if not write_allowed(self._last_ev_write_at, EV_WRITE_COOLDOWN_SECONDS, now):
@@ -2840,8 +3034,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._last_ev_write_at = now
             if ev.desired_circuit_currents is not None:
                 self._last_ev_circuit_refresh_at = now
-        if nudge_stuck:
-            self._last_ev_resume_retry_at = now
         if start_recovery_due:
             self._last_ev_start_recovery_at = now
             self._ev_start_recovery_attempts += 1

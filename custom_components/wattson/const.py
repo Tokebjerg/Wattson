@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.25.2"
+INTEGRATION_VERSION = "0.25.3"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -306,8 +306,8 @@ EV_CURRENT_RETUNE_SECONDS = 90
 # Easee's circuit dynamic limit is temporary. Renew it well before the
 # integration's TTL expires, otherwise Easee falls back to its offline circuit
 # limit while Wattson's plan is stable and the car can draw from the battery.
-EV_CIRCUIT_LIMIT_TTL_MINUTES = 2
-EV_CIRCUIT_LIMIT_REFRESH_SECONDS = 60
+EV_CIRCUIT_LIMIT_TTL_MINUTES = 10
+EV_CIRCUIT_LIMIT_REFRESH_SECONDS = 8 * 60
 # Rolling planner cadence and event thresholds.
 PLAN_REPLAN_INTERVAL_SECONDS = 15 * 60
 PLAN_SOC_DEVIATION_PCT = 7.5
@@ -317,16 +317,14 @@ PLAN_SOC_DEVIATION_PCT = 7.5
 EV_SUPPORT_BACKOFF_HOLD_SECONDS = 45
 EV_SUPPORT_GRID_IMPORT_W = 400.0
 EV_SUPPORT_BATTERY_DRAW_W = 500.0
-# When the plan WANTS the car charging but the charger is still awaiting_start /
-# ready_to_charge / charger_wait / paused (the car never actually started — a
-# single resume didn't wake it, or it was offered current capped by a stale
-# circuit/charger limit), re-assert the full plan this often until it is
-# genuinely drawing power. The deadband/retune gating only fires on changes, so
-# without this nudge a stuck car sits waiting forever (observed 2026-06-13:
-# ~50 min at 0 kW on a negative-price morning after a mode switch; 2026-07-08:
-# Easee reported charger_wait / charger_disabled after a 0 A dynamic limit).
-# Stops the instant the car charges.
-EV_RESUME_RETRY_SECONDS = 60
+# Solar-only sessions reduce their offer quickly, but only stop after a sustained
+# deficit.  Starting is deliberately slower so broken cloud does not create an
+# Easee pause/resume loop.
+EV_SOLAR_STOP_DEFICIT_SECONDS = 3 * 60
+EV_SOLAR_RESTART_SURPLUS_SECONDS = 3 * 60
+# A tiny amount of grid support can occur while meters and the charger settle.
+# Beyond this per-clock-hour budget, "Ren sol" pauses for the rest of the hour.
+EV_SOLAR_GRID_BUDGET_KWH = 0.15
 # A stale 0 kW reading is normal while Easee is waiting.  Resume such a session
 # at the charger's minimum offer so fresh power telemetry can take over safely.
 EV_STALE_POWER_BOOTSTRAP_A = 6
@@ -377,6 +375,13 @@ EV_SOAK_IMPORT_HOLD_SECONDS = 45     # overshoot must persist this long before b
 # cannot hammer the hardware.
 INVERTER_WRITE_COOLDOWN_SECONDS = 30
 EV_WRITE_COOLDOWN_SECONDS = 10
+
+# Full-pack self-consumption watchdog.  If export is blocked, conservative solar
+# can cover the house, but the inverter imports while the battery sits idle, the
+# current TOU reserve is released after this debounce instead of pinning a stale
+# 100 % floor and curtailing the PV strings.
+SELF_CONSUMPTION_WATCHDOG_SECONDS = 30
+SELF_CONSUMPTION_WATCHDOG_SURPLUS_W = 500.0
 
 # Anti-hunt: the battery inverter mode (solar_sell + limit-control + energy-priority
 # + discharge current + grid-charge) may change at most once per this many seconds.

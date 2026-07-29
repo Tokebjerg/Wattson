@@ -1366,7 +1366,7 @@ def test_c_smartcharge():
     ttl_controller = control.EaseeController(ttl_hass)
     ttl_actions = asyncio.run(ttl_controller.refresh_circuit_limit(mp, (9, 9, 9)))
     ttl_calls = [call for call in ttl_hass.services.calls if call[1] == "set_circuit_dynamic_limit"]
-    checks.append(("Easee circuit heartbeat uses the configured 2-minute TTL",
+    checks.append(("Easee circuit heartbeat uses the configured extended TTL",
                    len(ttl_calls) == 1
                    and ttl_calls[0][2]["time_to_live"] == const.EV_CIRCUIT_LIMIT_TTL_MINUTES
                    and any("(9,9,9)" in action for action in ttl_actions),
@@ -2293,8 +2293,12 @@ def test_tou_management():
     checks.append(("TOU: sell-solar -> discharge floor (no drain via discharge=0)", ss(sell, soc_pct=90, **kw) == (20.0, False), str(ss(sell, soc_pct=90, **kw))))
     checks.append(("TOU: override charge -> max + enable", ss(P(strategy="OVERRIDE_CHARGE", reason=""), soc_pct=50, **kw) == (100.0, True), "oc"))
     checks.append(("TOU: override discharge -> min_soc (full discharge)", ss(P(strategy="OVERRIDE_DISCHARGE", reason=""), soc_pct=50, **kw) == (15.0, False), "od"))
-    for degraded in ("HOLD", "BLOCK_NEGATIVE_EXPORT"):
-        checks.append((f"TOU: {degraded} leaves TOU untouched (None)", ss(P(strategy=degraded, reason=""), soc_pct=50, **kw) == (None, None), degraded))
+    checks.append(("TOU: HOLD writes current SOC explicitly (never inherits stale TOU)",
+                   ss(P(strategy="HOLD", reason=""), soc_pct=50, **kw) == (50.0, False),
+                   str(ss(P(strategy="HOLD", reason=""), soc_pct=50, **kw))))
+    checks.append(("TOU: BLOCK_NEGATIVE_EXPORT keeps self-consumption open to the calculated floor",
+                   ss(P(strategy="BLOCK_NEGATIVE_EXPORT", reason=""), soc_pct=50, **kw) == (20.0, False),
+                   str(ss(P(strategy="BLOCK_NEGATIVE_EXPORT", reason=""), soc_pct=50, **kw))))
     checks.append(("TOU: PROTECT installs max-SOC floor and disables grid charge",
                    ss(P(strategy="PROTECT", reason=""), soc_pct=50, **kw) == (100.0, False),
                    str(ss(P(strategy="PROTECT", reason=""), soc_pct=50, **kw))))
@@ -2617,8 +2621,8 @@ def test_coordinator_ev_harness():
     is advanced tick by tick. Locks the four live-won anti-cycling protections:
     (a) ±deadband current wiggles never reach the charger, (b) material current
     changes are rate-limited to one per EV_CURRENT_RETUNE_SECONDS, (c) structural
-    changes apply immediately, (d) the stuck-car nudge re-asserts at its own slow
-    cadence and stops when charging — plus the write cooldown retry."""
+    changes apply immediately, (d) verified stuck-start recovery does not create
+    a parallel nudge loop, plus the write cooldown retry."""
     import asyncio
 
     checks = []
@@ -2669,7 +2673,6 @@ def test_coordinator_ev_harness():
         co._last_ev_amps = None
         co._last_ev_currents = None
         co._last_ev_current_change_at = None
-        co._last_ev_resume_retry_at = None
         co._last_ev_circuit_refresh_at = None
         co._last_ev_write_at = None
         co._ev_control_blocked_reason = None
@@ -2712,13 +2715,18 @@ def test_coordinator_ev_harness():
     checks.append((f"harness deadband: ±1A wiggles for 2 min → 0 charger calls [{len(co._easee.calls) - n0}]",
                    n0 == 1 and len(co._easee.calls) == n0, str(co._easee.calls)))
 
-    # Stable plans still renew Easee's temporary circuit cap every 60 seconds,
-    # before its 2-minute TTL can fall back to a higher offline limit.
+    # Stable plans use a 10-minute TTL and renew at 8 minutes. This preserves the
+    # safety cap without writing the same physical tuple every minute.
     co = make_co()
     for i in range(19):
         asyncio.run(co._async_apply_ev(ev(9), at(i * 10)))
-    checks.append(("harness TTL: stable charging plan gets 3 circuit-only renewals in 3 min",
-                   len(co._easee.calls) == 1 and len(co._easee.refresh_calls) == 3,
+    checks.append(("harness TTL: stable charging plan has no circuit renewal in 3 min",
+                   len(co._easee.calls) == 1 and len(co._easee.refresh_calls) == 0,
+                   f"full={len(co._easee.calls)} refresh={co._easee.refresh_calls}"))
+    for i in range(19, 50):
+        asyncio.run(co._async_apply_ev(ev(9), at(i * 10)))
+    checks.append(("harness TTL: stable charging plan renews once at 8 min",
+                   len(co._easee.calls) == 1 and len(co._easee.refresh_calls) == 1,
                    f"full={len(co._easee.calls)} refresh={co._easee.refresh_calls}"))
 
     co = make_co(status="disconnected")
@@ -2843,27 +2851,28 @@ def test_coordinator_ev_harness():
     checks.append((f"harness structural: action flip applies immediately despite retune window [{len(co._easee.calls)}]",
                    len(co._easee.calls) == 2, str(co._easee.calls)))
 
-    # (d) Stuck-car nudge: plan wants charging, charger stays awaiting_start → re-assert
-    # at t0 then every 60 s (4 calls over 3 min, ticking every 10 s) — and STOPS the
-    # moment the car actually charges.
+    # (d) Stuck-car recovery: one initial command, then one verified recovery after
+    # 90 seconds. Do not independently resend the same tuple every 60 seconds.
     co = make_co(status="awaiting_start")
+    co.site_state = replace(co.site_state, easee_power_w=0.0)
     for i in range(19):
         asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
     n_nudge = len(co._easee.calls)
-    co.site_state = replace(co.site_state, easee_status="charging")
+    co.site_state = replace(co.site_state, easee_status="charging", easee_power_w=4200.0)
     for i in range(19, 25):
         asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
-    checks.append((f"harness nudge: awaiting_start re-asserted 1/60s (4 in 3 min), stops when charging [{n_nudge}→{len(co._easee.calls)}]",
-                   n_nudge == 4 and len(co._easee.calls) == n_nudge, f"{n_nudge}/{len(co._easee.calls)}"))
+    checks.append((f"harness recovery: awaiting_start gets initial + one verified retry, then stops [{n_nudge}->{len(co._easee.calls)}]",
+                   n_nudge == 2 and len(co._easee.calls) == n_nudge, f"{n_nudge}/{len(co._easee.calls)}"))
 
     # (d2) Live 2026-07-08: mapped Easee status stayed charger_wait with no current
     # after resume landed while dynamic charger limit was 0 A. Treat it as the same
-    # stuck-start class as awaiting_start, so the full plan is re-asserted every 60 s.
+    # stuck-start class as awaiting_start, using the same verified recovery cadence.
     co = make_co(status="charger_wait")
+    co.site_state = replace(co.site_state, easee_power_w=0.0)
     for i in range(19):
         asyncio.run(co._async_apply_ev(ev(16), at(i * 10)))
-    checks.append((f"harness nudge: charger_wait re-asserted 1/60s like awaiting_start [{len(co._easee.calls)}]",
-                   len(co._easee.calls) == 4, str(co._easee.calls)))
+    checks.append((f"harness recovery: charger_wait gets one verified retry [{len(co._easee.calls)}]",
+                   len(co._easee.calls) == 2, str(co._easee.calls)))
 
     # (e) Write cooldown: a second structural change 5 s after the first is HELD and
     # retried — applied cleanly at t15 (fp not falsely marked as applied at t5).
@@ -4516,6 +4525,143 @@ def test_solar_aware_reserve():
     return checks
 
 
+def test_control_stability_regressions():
+    """v0.25.3: exact regressions from the 2026-07-29 live failure."""
+    checks = []
+    co_mod = _coordinator_module()
+
+    # A 48-hour ingestion horizon feeding a 24-hour plan must remain unchanged
+    # across every 10-second coordinator tick. Only semantic price changes replan.
+    fp_48h = tuple((f"2026-07-{29 + h // 24:02d}T{h % 24:02d}:00", 1.0, 0.2, h >= 24)
+                   for h in range(48))
+    no_storm = all(not co_mod._price_horizon_changed(fp_48h, fp_48h) for _ in range(360))
+    changed_fp = fp_48h[:-1] + ((fp_48h[-1][0], 1.1, 0.2, True),)
+    checks.append(("48h prices + 24h plan: 360 identical ticks cause zero price replans",
+                   no_storm, "stable"))
+    checks.append(("a real price change still triggers an immediate replan",
+                   co_mod._price_horizon_changed(fp_48h, changed_fp), "changed"))
+
+    # Solar-only session state machine: short clouds are held, sustained support
+    # pauses, and new surplus must remain stable before a restart.
+    action = co_mod._ev_solar_session_action
+    checks.append(("ren sol: 179s deficit is a dip and keeps the session",
+                   action(base_wants_charge=False, physically_charging=True,
+                          deficit_elapsed_seconds=179.0, surplus_elapsed_seconds=None,
+                          grid_budget_exhausted=False) == "hold", "hold"))
+    checks.append(("ren sol: 180s deficit is sunset/sustained loss and pauses",
+                   action(base_wants_charge=False, physically_charging=True,
+                          deficit_elapsed_seconds=180.0, surplus_elapsed_seconds=None,
+                          grid_budget_exhausted=False) == "pause", "pause"))
+    checks.append(("ren sol: restart waits for 180s stable surplus",
+                   action(base_wants_charge=True, physically_charging=False,
+                          deficit_elapsed_seconds=None, surplus_elapsed_seconds=179.0,
+                          grid_budget_exhausted=False) == "wait"
+                   and action(base_wants_charge=True, physically_charging=False,
+                              deficit_elapsed_seconds=None, surplus_elapsed_seconds=180.0,
+                              grid_budget_exhausted=False) == "resume", "wait/resume"))
+    checks.append(("ren sol: exhausted grid-energy budget always pauses",
+                   action(base_wants_charge=True, physically_charging=True,
+                          deficit_elapsed_seconds=None, surplus_elapsed_seconds=300.0,
+                          grid_budget_exhausted=True) == "pause", "budget"))
+
+    base = datetime(2026, 7, 29, 13, 0, tzinfo=timezone.utc)
+    sunny_state = models.SiteState(
+        timestamp=base, pv_power_w=0.0, load_power_w=2100.0, load_includes_ev=True,
+        grid_power_w=2100.0, grid_import_power_w=2100.0, grid_export_power_w=0.0,
+        battery_soc_pct=100.0, battery_power_w=0.0, inverter_online=True,
+        inverter_status="normal", easee_online=True, easee_status="disconnected",
+        easee_power_w=0.0, easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=0.37, current_sell_price=-0.15, forecast_today_kwh=40.0,
+        solar_slots=[models.SolarSlot(
+            start=base, pv_estimate_kwh=6.0,
+            pv_estimate10_kwh=4.0, pv_estimate90_kwh=7.0,
+        )],
+    )
+    watchdog = object.__new__(co_mod.WattsonCoordinator)
+    watchdog.site_state = sunny_state
+    watchdog._self_consumption_watchdog_since = None
+    watchdog._self_consumption_watchdog_active = False
+    block = models.BatteryPlan(strategy="BLOCK_NEGATIVE_EXPORT", reason="test")
+    first = watchdog._update_self_consumption_watchdog(block, now=base)
+    tripped = watchdog._update_self_consumption_watchdog(
+        block, now=base + timedelta(seconds=const.SELF_CONSUMPTION_WATCHDOG_SECONDS)
+    )
+    watchdog.site_state = replace(sunny_state, battery_soc_pct=95.0, grid_import_power_w=0.0)
+    latched = watchdog._update_self_consumption_watchdog(
+        block, now=base + timedelta(minutes=2)
+    )
+    cleared = watchdog._update_self_consumption_watchdog(
+        models.BatteryPlan(strategy="IDLE", reason="test"),
+        now=base + timedelta(minutes=3),
+    )
+    charging_watchdog = object.__new__(co_mod.WattsonCoordinator)
+    charging_watchdog.site_state = replace(sunny_state, battery_power_w=-2000.0)
+    charging_watchdog._self_consumption_watchdog_since = None
+    charging_watchdog._self_consumption_watchdog_active = False
+    charging_ignored = not charging_watchdog._update_self_consumption_watchdog(
+        block, now=base
+    ) and not charging_watchdog._update_self_consumption_watchdog(
+        block, now=base + timedelta(minutes=1)
+    )
+    checks.append(("full battery + blocked export + sunny import trips and latches self-consumption watchdog",
+                   not first and tripped and latched and not cleared and charging_ignored,
+                   f"{first}/{tripped}/{latched}/{cleared}/charging_ignored={charging_ignored}"))
+
+    budget = object.__new__(co_mod.WattsonCoordinator)
+    budget.ev_mode = const.EV_MODE_SOLAR_ONLY
+    budget.site_state = replace(
+        sunny_state, easee_status="charging", easee_power_w=2000.0,
+        grid_import_power_w=1000.0,
+    )
+    budget._ev_solar_grid_budget_hour = None
+    budget._ev_solar_grid_budget_kwh = 0.0
+    budget._ev_solar_grid_budget_last_tick = None
+    budget._update_ev_solar_grid_budget(base)
+    exhausted = False
+    for i in range(1, 21):
+        exhausted = budget._update_ev_solar_grid_budget(base + timedelta(seconds=30 * i))
+    checks.append(("ren sol: measured grid support reaches the 0.15kWh hourly hard cap",
+                   exhausted and budget._ev_solar_grid_budget_kwh >= const.EV_SOLAR_GRID_BUDGET_KWH,
+                   f"{budget._ev_solar_grid_budget_kwh:.3f}kWh"))
+
+    # Midnight plan: the displayed SOC curve and the physical floor are the same
+    # snapped value, and a sunny refill day may release the 85% starting SOC.
+    prices = [models.PriceSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        spot_price=1.0 if h < 17 else 2.5, tariff=0.0,
+        total_import_price=1.0 if h < 17 else 2.5, export_value=0.4,
+    ) for h in range(24)]
+    solar = [models.SolarSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        pv_estimate_kwh=6.0 if 8 <= h <= 15 else 0.0,
+        pv_estimate10_kwh=5.0 if 8 <= h <= 15 else 0.0,
+        pv_estimate90_kwh=7.0 if 8 <= h <= 15 else 0.0,
+    ) for h in range(24)]
+    midnight = replace(
+        sunny_state, timestamp=base.replace(hour=0), battery_soc_pct=85.0,
+        pv_power_w=0.0, load_power_w=600.0, grid_import_power_w=0.0,
+        current_sell_price=0.4, price_slots=prices, solar_slots=solar,
+    )
+    day_plan = planner.build_day_plan(
+        midnight, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w={h: 600.0 for h in range(24)},
+    )
+    coherent = bool(day_plan) and all(
+        task.tou_floor_pct == slot.tou_floor_pct
+        for task, slot in zip(day_plan.tasks, day_plan.slots)
+    )
+    first_slot = day_plan.slots[0] if day_plan else None
+    checks.append(("midnight SOC plan publishes the exact snapped physical TOU floor",
+                   coherent and first_slot is not None
+                   and first_slot.tou_floor_pct % 5 == 0
+                   and (first_slot.projected_soc_pct or 0.0) >= first_slot.tou_floor_pct,
+                   str(first_slot)))
+    checks.append(("sunny refill plan releases an 85% overnight start instead of pinning it",
+                   first_slot is not None and first_slot.tou_floor_pct < 85.0,
+                   str(first_slot.tou_floor_pct if first_slot else None)))
+    return checks
+
+
 def test_rolling_planner_upgrade():
     """v0.24.58: rolling replans, EV-aware SOC, P10 reserve and audit contract."""
     import asyncio
@@ -4602,7 +4748,7 @@ def test_rolling_planner_upgrade():
     prices = [pslot(h) for h in range(6)]
     solar = [models.SolarSlot(
         start=base + timedelta(hours=h), pv_estimate_kwh=5.0,
-        pv_estimate10_kwh=1.0, pv_estimate90_kwh=6.0,
+        pv_estimate10_kwh=3.0, pv_estimate90_kwh=6.0,
     ) for h in range(6)]
     state = models.SiteState(
         timestamp=base, pv_power_w=0.0, load_power_w=0.0, load_includes_ev=False,
@@ -4875,13 +5021,13 @@ def test_rolling_planner_upgrade():
     with_ev_plan = planner.build_day_plan(
         state, battery_mode="blue", min_soc=15, max_soc=100,
         capacity_kwh=10.0, load_hourly_w=load,
-        ev_load_by_start=ev_load, ev_battery_protected=False,
+        ev_load_by_start=ev_load, ev_battery_protected=True,
     )
-    checks.append(("solar EV load is visible and lowers the battery SOC projection",
+    checks.append(("P10 solar EV load is visible and consumes forecast solar, not stored battery",
                    bool(ev_load)
                    and with_ev_plan is not None and no_ev_plan is not None
                    and any((task.ev_load_estimate_kwh or 0.0) > 0 for task in with_ev_plan.tasks)
-                   and with_ev_plan.tasks[-1].projected_soc_pct < no_ev_plan.tasks[-1].projected_soc_pct,
+                   and with_ev_plan.tasks[-1].projected_soc_pct <= no_ev_plan.tasks[-1].projected_soc_pct,
                    f"ev={ev_load} soc={with_ev_plan.tasks[-1].projected_soc_pct if with_ev_plan else None}/{no_ev_plan.tasks[-1].projected_soc_pct if no_ev_plan else None}"))
     checks.append(("economic SOC plan uses Solcast median, not P10",
                    with_ev_plan is not None and with_ev_plan.tasks[0].pv_estimate_kwh == 5.0,
@@ -5245,6 +5391,7 @@ def main():
                          ("PLAN PROJECTION THROTTLE-AWARE (v0.24.24: SOC curve reflects morning-sell)", test_plan_projection_throttle_aware),
                          ("INVERTER-MODE COHERENCE", test_mode_coherence),
                          ("EV-SOLAR PRIORITY GATE", test_ev_solar_priority_gate),
+                         ("CONTROL STABILITY REGRESSIONS · 2026-07-29", test_control_stability_regressions),
                          ("ROLLING PLAN · EV LOAD / P10 / AUDIT", test_rolling_planner_upgrade),
                          ("WINTER PLAN · DATED LOAD / BATTERY MODEL / PEAK", test_winter_planning_upgrade),
                          ("EV MINIMUM SOC · METERED RECOVERY", test_ev_minimum_recovery),

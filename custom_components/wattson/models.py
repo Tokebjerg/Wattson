@@ -259,6 +259,9 @@ class PlanTask:
     ev_load_estimate_kwh: float | None = None
     projected_soc_pct: float | None = None
     reason: str = ""
+    # Physical Deye discharge floor committed for this hour.  Keeping it on the
+    # public task makes the dashboard SOC curve auditable against the inverter.
+    tou_floor_pct: float | None = None
 
 
 @dataclass(frozen=True)
