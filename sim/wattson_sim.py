@@ -4659,6 +4659,51 @@ def test_control_stability_regressions():
     checks.append(("sunny refill plan releases an 85% overnight start instead of pinning it",
                    first_slot is not None and first_slot.tou_floor_pct < 85.0,
                    str(first_slot.tou_floor_pct if first_slot else None)))
+
+    # Exact 2026-07-30 failure shape: a full pack, overnight house deficit,
+    # conservative peak-load tail and abundant P10 solar before the evening
+    # peak. The optimizer labels that sun EXPORT because the uncorrected path
+    # starts full. The physical forecast must still release the overnight floor.
+    dated_median = {
+        base.replace(hour=0) + timedelta(hours=h): 600.0 for h in range(24)
+    }
+    dated_p90 = {
+        base.replace(hour=0) + timedelta(hours=h): (2400.0 if h >= 17 else 600.0)
+        for h in range(24)
+    }
+    full_midnight = replace(midnight, battery_soc_pct=100.0)
+    sunny_uncertainty_plan = planner.build_day_plan(
+        full_midnight, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=dated_median,
+        reserve_load_by_start_w=dated_p90,
+    )
+    sunny_first = sunny_uncertainty_plan.tasks[0] if sunny_uncertainty_plan else None
+    checks.append(("P10 refill credits the P90 load tail even when sunny hours are labelled EXPORT",
+                   sunny_first is not None
+                   and sunny_first.action == "DISCHARGE"
+                   and (sunny_first.projected_soc_pct or 100.0) < 100.0
+                   and (sunny_first.tou_floor_pct or 100.0) < 100.0
+                   and any(task.action == "EXPORT"
+                           for task in sunny_uncertainty_plan.tasks[8:16]),
+                   str(sunny_first)))
+
+    low_solar = [replace(slot, pv_estimate_kwh=0.0,
+                         pv_estimate10_kwh=0.0, pv_estimate90_kwh=0.0)
+                 for slot in solar]
+    cloudy_uncertainty_plan = planner.build_day_plan(
+        replace(full_midnight, solar_slots=low_solar, forecast_today_kwh=0.0),
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=dated_median,
+        reserve_load_by_start_w=dated_p90,
+    )
+    cloudy_task = cloudy_uncertainty_plan.tasks[0] if cloudy_uncertainty_plan else None
+    cloudy_slot = cloudy_uncertainty_plan.slots[0] if cloudy_uncertainty_plan else None
+    checks.append(("without conservative refill the peak reserve stays, and the plan says IDLE rather than false DISCHARGE",
+                   cloudy_task is not None and cloudy_slot is not None
+                   and cloudy_task.action == "IDLE"
+                   and cloudy_slot.reason == "IDLE"
+                   and cloudy_slot.tou_floor_pct == 100.0,
+                   f"{cloudy_task}/{cloudy_slot}"))
     return checks
 
 

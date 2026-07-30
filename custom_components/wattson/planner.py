@@ -136,6 +136,10 @@ SOLAR_RESERVE_HORIZON_H = 24
 # refilling free from the day's sun. 2.0x = ~17 kWh still refills a 10 kWh pack 2x over, and
 # winter/low-solar days (surplus a few kWh) stay far below it, so they keep the full reserve.
 PEAK_RESERVE_RELEASE_MARGIN = 2.0
+# A P10-solar/P90-load refill forecast is already deliberately conservative.
+# Keep a small extra margin before that refill may offset the P90-P50 peak-load
+# tail, so a knife-edge forecast cannot release the physical TOU reserve.
+UNCERTAINTY_REFILL_MARGIN = 1.10
 # Forecast-confidence (#5): both reserve releases lean on the solar FORECAST. The penalty
 # (raise the release threshold when recent forecasts were optimistic) is DISABLED (K=0,
 # v0.24.45): with min(recent_ratios) two cloudy days dropped confidence to ~0.68 and lifted
@@ -357,6 +361,39 @@ def forecast_refills_band(
         surplus_kwh += max(0.0, conservative_solar - load_kwh - ev_kwh)
     penalty = 1.0 + FORECAST_CONFIDENCE_PENALTY_K * (1.0 - max(0.0, min(1.0, confidence)))
     return surplus_kwh >= band_kwh * margin * penalty
+
+
+def conservative_refill_surplus_kwh(
+    solar_slots,
+    reserve_load_by_start_w,
+    after_start: datetime,
+    through_start: datetime,
+    *,
+    ev_load_by_start: dict[datetime, float] | None = None,
+) -> float:
+    """Conservative solar energy available to refill before a later peak.
+
+    This deliberately follows the physical forecast rather than optimizer action
+    labels.  A full battery makes sunny hours appear as ``EXPORT`` instead of
+    ``SOLAR_CHARGE``; using that label as proof that no refill exists caused the
+    TOU floor to pin a full battery while the house imported overnight.
+    """
+    ev_load_by_start = ev_load_by_start or {}
+    total = 0.0
+    for slot in solar_slots:
+        if slot.start <= after_start or slot.start > through_start:
+            continue
+        conservative_solar = (
+            slot.pv_estimate10_kwh
+            if slot.pv_estimate10_kwh is not None
+            else max(0.0, slot.pv_estimate_kwh) * 0.6
+        )
+        reserve_load_kwh = load_forecast_w(
+            reserve_load_by_start_w, slot.start
+        ) / 1000.0
+        ev_kwh = max(0.0, ev_load_by_start.get(slot.start, 0.0))
+        total += max(0.0, conservative_solar - reserve_load_kwh - ev_kwh)
+    return total
 
 
 def solar_aware_reserve_pct(
@@ -946,6 +983,7 @@ def build_day_plan(
     committed_tasks: list[PlanTask] = []
     committed_prev_soc = state.battery_soc_pct
     for task_index, task in enumerate(tasks):
+        committed_start_soc = committed_prev_soc
         price_slot = slots_by_start.get(task.start)
         export_value = price_slot.export_value if price_slot else None
         sell_ok = (export_value or 0) > 0
@@ -982,9 +1020,11 @@ def build_day_plan(
             and (task.action in ("IDLE", "DISCHARGE") or forecast_deficit)
         ):
             # The DP projection already contains the P50 peak reservation. Add
-            # only the P90-P50 uncertainty tail, and only when no planned refill
-            # occurs before that later peak. This avoids the old double reserve
-            # (DP planned morning discharge + peak_reserve pinned 100%).
+            # only the P90-P50 uncertainty tail after crediting a conservative
+            # P10-solar/P90-load refill before the later peak. The refill must be
+            # derived from ENERGY, not action labels: when the pack starts full,
+            # the optimizer labels sunny refill hours EXPORT, which previously
+            # made the reserve pin the pack at 100% and buy the house load.
             uncertainty_kwh = 0.0
             if reserve_load_by_start_w:
                 future_peaks = [
@@ -993,19 +1033,33 @@ def build_day_plan(
                 ]
                 if future_peaks:
                     last_peak = future_peaks[-1].start
-                    planned_refill = any(
+                    uncertainty_kwh = sum(
+                        max(
+                            0.0,
+                            load_forecast_w(reserve_load_by_start_w, candidate.start)
+                            - load_forecast_w(load_hourly_w, candidate.start),
+                        ) / 1000.0
+                        for candidate in future_peaks
+                    )
+                    planned_grid_refill = any(
                         candidate.start <= last_peak
-                        and candidate.action in ("GRID_CHARGE", "SOLAR_CHARGE")
+                        and candidate.action == "GRID_CHARGE"
                         for candidate in tasks[task_index + 1:]
                     )
-                    if not planned_refill:
-                        uncertainty_kwh = sum(
-                            max(
-                                0.0,
-                                load_forecast_w(reserve_load_by_start_w, candidate.start)
-                                - load_forecast_w(load_hourly_w, candidate.start),
-                            ) / 1000.0
-                            for candidate in future_peaks
+                    if planned_grid_refill:
+                        uncertainty_kwh = 0.0
+                    elif uncertainty_kwh > 0.0:
+                        refill_kwh = conservative_refill_surplus_kwh(
+                            state.solar_slots,
+                            reserve_load_by_start_w,
+                            task.start,
+                            last_peak,
+                            ev_load_by_start=ev_load_by_start,
+                        )
+                        uncertainty_kwh = max(
+                            0.0,
+                            uncertainty_kwh
+                            - refill_kwh / UNCERTAINTY_REFILL_MARGIN,
                         )
             uncertainty_pct = uncertainty_kwh / max(0.1, capacity_kwh) * 100.0
             floor = max(base_floor, float(task.projected_soc_pct) + uncertainty_pct)
@@ -1049,8 +1103,16 @@ def build_day_plan(
             )
         if committed_projected is not None:
             committed_prev_soc = float(committed_projected)
+        committed_action = task.action
+        if (
+            task.action == "DISCHARGE"
+            and committed_projected is not None
+            and float(committed_projected) >= committed_start_soc - 0.1
+        ):
+            committed_action = "IDLE"
         committed_tasks.append(replace(
             task,
+            action=committed_action,
             projected_soc_pct=committed_projected,
             tou_floor_pct=committed_floor,
         ))
@@ -1065,7 +1127,7 @@ def build_day_plan(
             export_value=export_value,
             projected_soc_pct=committed_projected,
             ev_load_estimate_kwh=task.ev_load_estimate_kwh,
-            reason=task.action,
+            reason=committed_action,
         ))
     return DayPlan(
         built_at=state.timestamp,
