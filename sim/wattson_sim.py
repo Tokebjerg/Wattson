@@ -4708,6 +4708,27 @@ def test_control_stability_regressions():
                    and capacity_first.tou_floor_pct == 95.0,
                    str(capacity_first)))
 
+    # Live learned P90 daytime buckets can contain rare 4-8 kW spikes. They
+    # belong in the separate peak uncertainty tail, not as a second worst-case
+    # subtraction from every P10 solar hour.
+    contaminated_p90 = {
+        start: (8000.0 if 8 <= start.hour <= 16 else value)
+        for start, value in dated_p90.items()
+    }
+    no_double_tail_plan = planner.build_day_plan(
+        full_midnight,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=dated_median,
+        reserve_load_by_start_w=contaminated_p90,
+    )
+    no_double_tail_first = no_double_tail_plan.tasks[0] if no_double_tail_plan else None
+    checks.append(("P10 refill subtracts P50 load while P90 remains a separate peak tail",
+                   no_double_tail_first is not None
+                   and no_double_tail_first.action == "DISCHARGE"
+                   and no_double_tail_first.projected_soc_pct == 95.0
+                   and no_double_tail_first.tou_floor_pct == 95.0,
+                   str(no_double_tail_first)))
+
     low_solar = [replace(slot, pv_estimate_kwh=0.0,
                          pv_estimate10_kwh=0.0, pv_estimate90_kwh=0.0)
                  for slot in solar]

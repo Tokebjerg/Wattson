@@ -365,7 +365,7 @@ def forecast_refills_band(
 
 def conservative_refill_surplus_kwh(
     solar_slots,
-    reserve_load_by_start_w,
+    expected_load_by_start_w,
     after_start: datetime,
     through_start: datetime,
     *,
@@ -376,7 +376,10 @@ def conservative_refill_surplus_kwh(
     This deliberately follows the physical forecast rather than optimizer action
     labels.  A full battery makes sunny hours appear as ``EXPORT`` instead of
     ``SOLAR_CHARGE``; using that label as proof that no refill exists caused the
-    TOU floor to pin a full battery while the house imported overnight.
+    TOU floor to pin a full battery while the house imported overnight. Solcast
+    P10 makes the supply side conservative; expected P50 house load is subtracted
+    here because the separate P90-P50 tail is already held at the expensive
+    window. Using P90 in both places double-counts the same demand uncertainty.
     """
     ev_load_by_start = ev_load_by_start or {}
     total = 0.0
@@ -388,11 +391,11 @@ def conservative_refill_surplus_kwh(
             if slot.pv_estimate10_kwh is not None
             else max(0.0, slot.pv_estimate_kwh) * 0.6
         )
-        reserve_load_kwh = load_forecast_w(
-            reserve_load_by_start_w, slot.start
+        expected_load_kwh = load_forecast_w(
+            expected_load_by_start_w, slot.start
         ) / 1000.0
         ev_kwh = max(0.0, ev_load_by_start.get(slot.start, 0.0))
-        total += max(0.0, conservative_solar - reserve_load_kwh - ev_kwh)
+        total += max(0.0, conservative_solar - expected_load_kwh - ev_kwh)
     return total
 
 
@@ -1067,7 +1070,7 @@ def build_day_plan(
                     elif uncertainty_kwh > 0.0:
                         refill_kwh = conservative_refill_surplus_kwh(
                             state.solar_slots,
-                            reserve_load_by_start_w,
+                            load_hourly_w or reserve_load_by_start_w,
                             task.start,
                             last_peak,
                             ev_load_by_start=ev_load_by_start,
