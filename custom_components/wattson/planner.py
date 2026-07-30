@@ -1033,13 +1033,29 @@ def build_day_plan(
                 ]
                 if future_peaks:
                     last_peak = future_peaks[-1].start
-                    uncertainty_kwh = sum(
+                    raw_uncertainty_kwh = sum(
                         max(
                             0.0,
                             load_forecast_w(reserve_load_by_start_w, candidate.start)
                             - load_forecast_w(load_hourly_w, candidate.start),
                         ) / 1000.0
                         for candidate in future_peaks
+                    )
+                    # Only the headroom above the optimizer's P50 end-SOC can
+                    # become an additional physical reserve. Summing hourly P90
+                    # tails can exceed the whole pack; requiring solar to offset
+                    # that impossible amount pinned a 95% plan at 100% even when
+                    # a conservative 0.6 kWh refill could restore the only 0.5
+                    # kWh actually held back.
+                    uncertainty_room_kwh = max(
+                        0.0,
+                        (float(max_soc) - float(task.projected_soc_pct))
+                        / 100.0
+                        * max(0.0, capacity_kwh),
+                    )
+                    uncertainty_kwh = min(
+                        raw_uncertainty_kwh,
+                        uncertainty_room_kwh,
                     )
                     planned_grid_refill = any(
                         candidate.start <= last_peak

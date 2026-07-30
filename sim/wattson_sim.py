@@ -4687,6 +4687,27 @@ def test_control_stability_regressions():
                            for task in sunny_uncertainty_plan.tasks[8:16]),
                    str(sunny_first)))
 
+    # The aggregate hourly P90 tail can be far larger than the pack. Refill
+    # credit must be compared with the extra energy that can actually be held
+    # above this task's P50 end-SOC, not the impossible raw multi-hour sum.
+    modest_p10 = [
+        replace(slot, pv_estimate10_kwh=(1.3 if slot.start.hour == 8 else 0.0))
+        for slot in solar
+    ]
+    capacity_limited_plan = planner.build_day_plan(
+        replace(full_midnight, solar_slots=modest_p10),
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=dated_median,
+        reserve_load_by_start_w=dated_p90,
+    )
+    capacity_first = capacity_limited_plan.tasks[0] if capacity_limited_plan else None
+    checks.append(("refill offsets only the physically possible P90 reserve, not the unbounded hourly-tail sum",
+                   capacity_first is not None
+                   and capacity_first.action == "DISCHARGE"
+                   and capacity_first.projected_soc_pct == 95.0
+                   and capacity_first.tou_floor_pct == 95.0,
+                   str(capacity_first)))
+
     low_solar = [replace(slot, pv_estimate_kwh=0.0,
                          pv_estimate10_kwh=0.0, pv_estimate90_kwh=0.0)
                  for slot in solar]
