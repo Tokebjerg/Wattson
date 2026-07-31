@@ -392,6 +392,9 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "ev_transport_recovery": getattr(
                     self.coordinator, "ev_transport_recovery_status", {"state": "idle"}
                 ),
+                "ev_phase_transition": getattr(
+                    self.coordinator, "ev_phase_transition_status", {"state": "idle"}
+                ),
                 "ev_minimum_recovery": getattr(
                     self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
                 ),

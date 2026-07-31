@@ -2583,7 +2583,7 @@ def build_ev_plan(
             return None
         return (cur.start in {s.start for s in cheapest}, cur.total_import_price)
 
-    def _solar_currents(surplus_w: float, ev_session_active: bool, current_ev_power_w: float):
+    def _solar_currents(surplus_w: float):
         """Amps + per-phase circuit currents for a given solar surplus (shared by
         solar-only and the cheapest-mode solar opportunism)."""
         three_phase_min_w = 6 * 3 * 235
@@ -2594,20 +2594,12 @@ def build_ev_plan(
         )
         if use_three_phase:
             per_phase_amps = max(6, min(int(math.floor(surplus_w / (3 * 235))), int(ev_max_amps)))
-            expected_three_phase_w = per_phase_amps * 3 * 230
-            # Some cars do not ramp up on automatic multi-phase charging even when
-            # told to; fall back to single-phase where the car responds predictably.
-            if (
-                ev_session_active
-                and current_ev_power_w >= 500.0
-                and current_phase_normalized == "3_phase"
-                and current_ev_power_w < (expected_three_phase_w * 0.65)
-            ):
-                use_three_phase = False
-            else:
-                # Easee's charger dynamic limit is amps PER PHASE, just like the
-                # circuit tuple. Summing the three phases over-offers the charger.
-                return per_phase_amps, (per_phase_amps, per_phase_amps, per_phase_amps)
+            # Easee's charger dynamic limit is amps PER PHASE, just like the
+            # circuit tuple. Summing the three phases over-offers the charger.
+            # Transition verification belongs in the stateful coordinator: using
+            # the old one-phase power here made the planner instantly write P2/P3
+            # back to zero before the car had time to renegotiate.
+            return per_phase_amps, (per_phase_amps, per_phase_amps, per_phase_amps)
         per_phase_amps = max(6, min(int(math.floor(surplus_w / 235)), int(ev_max_amps)))
         return per_phase_amps, (per_phase_amps, 0, 0)
 
@@ -2629,7 +2621,6 @@ def build_ev_plan(
         )
 
     if ev_mode == EV_MODE_SOLAR_ONLY:
-        current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
         ev_session_active = runtime_state == "charging"
 
         # Phase C: use the smoothed (2-minute averaged) surplus when supplied by the
@@ -2647,7 +2638,7 @@ def build_ev_plan(
         solar_available = surplus_w >= required_surplus_w and not battery_gated
 
         if solar_available:
-            amps, circuit = _solar_currents(surplus_w, ev_session_active, current_ev_power_w)
+            amps, circuit = _solar_currents(surplus_w)
             return EvPlan(
                 mode=ev_mode,
                 reason=f"Solar surplus {surplus_w:.0f}W supports EV charging",
@@ -2669,7 +2660,7 @@ def build_ev_plan(
                 and spillover_w >= min_single_phase_w
             )
             if spillover_available:
-                amps, circuit = _solar_currents(spillover_w, ev_session_active, current_ev_power_w)
+                amps, circuit = _solar_currents(spillover_w)
                 return EvPlan(
                     mode=ev_mode,
                     reason=(
@@ -2824,7 +2815,6 @@ def build_ev_plan(
             # SURPLUS is cheaper than any import hour (its cost is only the lost
             # export value), so charge on it instead of pausing. Same surplus
             # threshold + house-battery-first gate as solar-only mode.
-            current_ev_power_w = max(0.0, state.easee_power_w or 0.0)
             ev_session_active = runtime_state == "charging"
             surplus_w = (
                 solar_surplus_override
@@ -2834,7 +2824,7 @@ def build_ev_plan(
             required_surplus_w = max(500.0, ev_solar_min_surplus_w * 0.6) if ev_session_active else ev_solar_min_surplus_w
             battery_gated = bool(ev_solar_battery_threshold and state.battery_soc_pct < ev_solar_battery_threshold)
             if surplus_w >= required_surplus_w and not battery_gated:
-                amps, circuit = _solar_currents(surplus_w, ev_session_active, current_ev_power_w)
+                amps, circuit = _solar_currents(surplus_w)
                 return EvPlan(
                     mode=ev_mode,
                     reason=f"Solar surplus {surplus_w:.0f}W charges the car for free between the cheapest grid hours",

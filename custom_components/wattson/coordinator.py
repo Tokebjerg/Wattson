@@ -29,6 +29,11 @@ from .const import (
     EV_START_FAILED_ATTEMPTS,
     EV_START_RECOVERY_RETRY_SECONDS,
     EV_START_VERIFY_SECONDS,
+    EV_PHASE_TRANSITION_COOLDOWN_SECONDS,
+    EV_PHASE_TRANSITION_MAX_ATTEMPTS,
+    EV_PHASE_TRANSITION_PAUSE_SECONDS,
+    EV_PHASE_TRANSITION_POWER_RATIO,
+    EV_PHASE_TRANSITION_VERIFY_SECONDS,
     EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS,
     EV_TRANSPORT_RELOAD_GRACE_SECONDS,
     EV_WAITING_TO_START_STATUSES,
@@ -563,6 +568,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_transport_reload_grace_until: datetime | None = None
         self._ev_transport_reload_count: int = 0
         self._ev_transport_recovery_status: str = "idle"
+        self._ev_phase_transition_state: str = "idle"
+        self._ev_phase_transition_started_at: datetime | None = None
+        self._ev_phase_transition_pause_at: datetime | None = None
+        self._ev_phase_transition_failures: int = 0
+        self._ev_phase_transition_cooldown_until: datetime | None = None
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -1067,6 +1077,26 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "cooldown_remaining_seconds": cooldown_remaining,
         }
 
+    @property
+    def ev_phase_transition_status(self) -> dict[str, Any]:
+        """Expose verified solar 1-to-3-phase transitions for diagnosis."""
+        now = dt_util.utcnow()
+        cooldown_remaining = (
+            max(0, round((self._ev_phase_transition_cooldown_until - now).total_seconds()))
+            if self._ev_phase_transition_cooldown_until is not None
+            else 0
+        )
+        return {
+            "state": self._ev_phase_transition_state,
+            "failed_attempts": self._ev_phase_transition_failures,
+            "started_at": (
+                self._ev_phase_transition_started_at.isoformat()
+                if self._ev_phase_transition_started_at is not None
+                else None
+            ),
+            "cooldown_remaining_seconds": cooldown_remaining,
+        }
+
     def _restore_override_state(self, entry) -> None:
         """Resume persisted manual control windows that have not yet expired."""
         now = dt_util.utcnow()
@@ -1439,6 +1469,180 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_soak_last_step_at = now
             self._ev_soak_import_since = None  # settle after any step
         return self._ev_soak_amps
+
+    def _ev_one_phase_fallback_plan(
+        self,
+        ev_plan: EvPlan,
+        *,
+        ev_max_amps: int,
+        reason: str,
+    ) -> EvPlan:
+        """Keep the same solar power budget while safely falling back to one phase."""
+        currents = ev_plan.desired_circuit_currents or (0, 0, 0)
+        one_phase_amps = max(6, min(int(ev_max_amps), sum(max(0, int(a)) for a in currents)))
+        return replace(
+            ev_plan,
+            reason=f"{ev_plan.reason} | {reason}",
+            desired_enabled=True,
+            desired_amps=one_phase_amps,
+            desired_circuit_currents=(one_phase_amps, 0, 0),
+            desired_phase_mode="auto_phase",
+            desired_action="resume",
+        )
+
+    def _apply_ev_phase_transition(
+        self,
+        ev_plan: EvPlan,
+        *,
+        now: datetime,
+        ev_max_amps: int,
+    ) -> EvPlan:
+        """Verify solar 1-to-3-phase changes before allowing a fallback.
+
+        The old planner compared a new three-phase target with the power from the
+        still-running one-phase session and immediately wrote P2/P3 back to zero.
+        Hold the offer for a full response window, retry once through a controlled
+        pause/resume, and only then use a cooldown-protected one-phase fallback.
+        """
+        wants_charge = bool(
+            ev_plan.desired_enabled is True
+            and ev_plan.desired_action == "resume"
+            and ev_plan.desired_circuit_currents is not None
+        )
+        if ev_plan.mode != EV_MODE_SOLAR_ONLY:
+            self._ev_phase_transition_state = "idle"
+            self._ev_phase_transition_started_at = None
+            self._ev_phase_transition_pause_at = None
+            self._ev_phase_transition_failures = 0
+            self._ev_phase_transition_cooldown_until = None
+            return ev_plan
+        if not wants_charge:
+            self._ev_phase_transition_state = "idle"
+            self._ev_phase_transition_started_at = None
+            self._ev_phase_transition_pause_at = None
+            if (
+                self._ev_phase_transition_cooldown_until is not None
+                and now >= self._ev_phase_transition_cooldown_until
+            ):
+                self._ev_phase_transition_cooldown_until = None
+                self._ev_phase_transition_failures = 0
+            return ev_plan
+
+        currents = ev_plan.desired_circuit_currents or (0, 0, 0)
+        wants_three_phase = currents[1] > 0 and currents[2] > 0
+        cooldown_active = bool(
+            self._ev_phase_transition_cooldown_until is not None
+            and now < self._ev_phase_transition_cooldown_until
+        )
+        if not wants_three_phase:
+            self._ev_phase_transition_started_at = None
+            self._ev_phase_transition_pause_at = None
+            self._ev_phase_transition_state = (
+                "fallback_cooldown" if cooldown_active else "single_phase"
+            )
+            if not cooldown_active:
+                self._ev_phase_transition_failures = 0
+                self._ev_phase_transition_cooldown_until = None
+            return ev_plan
+        if cooldown_active:
+            self._ev_phase_transition_state = "fallback_cooldown"
+            return self._ev_one_phase_fallback_plan(
+                ev_plan,
+                ev_max_amps=ev_max_amps,
+                reason="three-phase retry cooldown; using verified one-phase fallback",
+            )
+        if self._ev_phase_transition_cooldown_until is not None:
+            self._ev_phase_transition_cooldown_until = None
+            self._ev_phase_transition_failures = 0
+
+        desired_amps = max(1, int(ev_plan.desired_amps or min(currents)))
+        expected_three_phase_w = desired_amps * 3 * 230.0
+        measured_power_w = max(0.0, self.site_state.easee_power_w or 0.0)
+        power_stale = bool(
+            self.mapping
+            and self.mapping.easee_power_entity
+            and self.mapping.easee_power_entity in self.site_state.ev_stale_entities
+        )
+        three_phase_confirmed = bool(
+            not power_stale
+            and measured_power_w
+            >= expected_three_phase_w * EV_PHASE_TRANSITION_POWER_RATIO
+        )
+        if three_phase_confirmed:
+            self._ev_phase_transition_state = "three_phase"
+            self._ev_phase_transition_started_at = None
+            self._ev_phase_transition_pause_at = None
+            self._ev_phase_transition_failures = 0
+            return ev_plan
+        if self._ev_phase_transition_state == "three_phase":
+            # Once physically proved, ordinary solar/current transients must not
+            # start a new pause cycle. A real one-phase plan or disconnect resets it.
+            return ev_plan
+
+        if self._ev_phase_transition_state == "restart_pause":
+            pause_at = self._ev_phase_transition_pause_at or now
+            if (now - pause_at).total_seconds() < EV_PHASE_TRANSITION_PAUSE_SECONDS:
+                return replace(
+                    ev_plan,
+                    reason=f"{ev_plan.reason} | controlled pause before three-phase retry",
+                    desired_enabled=None,
+                    desired_action="pause",
+                )
+            self._ev_phase_transition_state = "retrying_three_phase"
+            self._ev_phase_transition_started_at = now
+            self._ev_phase_transition_pause_at = None
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | retrying verified three-phase transition",
+            )
+
+        if self._ev_phase_transition_state not in {
+            "requesting_three_phase",
+            "retrying_three_phase",
+        }:
+            self._ev_phase_transition_state = "requesting_three_phase"
+            self._ev_phase_transition_started_at = now
+            self._ev_phase_transition_failures = 0
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | requesting verified three-phase transition",
+            )
+
+        started_at = self._ev_phase_transition_started_at or now
+        if power_stale:
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | holding three-phase offer for fresh power telemetry",
+            )
+        if (now - started_at).total_seconds() < EV_PHASE_TRANSITION_VERIFY_SECONDS:
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | verifying three-phase response",
+            )
+
+        self._ev_phase_transition_failures += 1
+        if self._ev_phase_transition_failures < EV_PHASE_TRANSITION_MAX_ATTEMPTS:
+            self._ev_phase_transition_state = "restart_pause"
+            self._ev_phase_transition_started_at = None
+            self._ev_phase_transition_pause_at = now
+            return replace(
+                ev_plan,
+                reason=f"{ev_plan.reason} | first three-phase response failed; controlled retry",
+                desired_enabled=None,
+                desired_action="pause",
+            )
+
+        self._ev_phase_transition_state = "fallback_cooldown"
+        self._ev_phase_transition_started_at = None
+        self._ev_phase_transition_pause_at = None
+        self._ev_phase_transition_cooldown_until = now + timedelta(
+            seconds=EV_PHASE_TRANSITION_COOLDOWN_SECONDS
+        )
+        return self._ev_one_phase_fallback_plan(
+            ev_plan,
+            ev_max_amps=ev_max_amps,
+            reason="two verified three-phase attempts failed; temporary one-phase fallback",
+        )
 
     def _update_ev_solar_grid_budget(self, now: datetime) -> bool:
         """Integrate grid-backed solar-EV energy and enforce an hourly cap."""
@@ -2440,6 +2644,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # not met OR this block isn't entered (non-solar-only / manual override).
         _soak_was_active = self._ev_curtailment_soak_active
         self._ev_curtailment_soak_active = False
+        if ev_override_active or self.ev_mode != EV_MODE_SOLAR_ONLY:
+            ev_plan = self._apply_ev_phase_transition(
+                ev_plan,
+                now=dt_util.utcnow(),
+                ev_max_amps=ev_max_amps,
+            )
         if not ev_override_active and self.ev_mode == EV_MODE_SOLAR_ONLY:
             now = dt_util.utcnow()
             ev_is_connected = _ev_runtime != "disconnected"
@@ -2486,6 +2696,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     desired_phase_mode="auto_phase",
                     desired_action="resume",
                 )
+            ev_plan = self._apply_ev_phase_transition(
+                ev_plan,
+                now=now,
+                ev_max_amps=ev_max_amps,
+            )
             # Sticky: keep EV-solar priority through brief charger dips so the
             # battery strategy doesn't flip every few seconds and churn the
             # inverter settings.

@@ -451,16 +451,17 @@ SCENARIOS = [
          and pl.ev.desired_circuit_currents[1] > 0,
          "expect resume on 3 phases (phase B current > 0)")),
 
-    ("EV solar: 3-phase requested but car won't ramp -> fall back to 1-phase",
-     # Big surplus, charger in 3-phase, but the car only draws 3 kW (< 65% of the
-     # 3-phase target). The safeguard should steer back to single phase.
+    ("EV solar: old one-phase power cannot cancel a new 3-phase request",
+     # Big surplus, but the still-running session only draws one-phase power.
+     # The stateful coordinator now owns verification; the stateless planner must
+     # keep P2/P3 open long enough for Easee/the car to renegotiate.
      entities(pv1=4000, pv2=3500, grid=-5000, soc=80, bat=0,
               buy=1.0, sell=0.4, ev_status="charging", ev_power=3000, ev_phase="3_phase"),
      Settings(ev_mode=const.EV_MODE_SOLAR_ONLY),
      chk(lambda st, pl: pl.ev.desired_action == "resume"
          and pl.ev.desired_circuit_currents is not None
-         and pl.ev.desired_circuit_currents[1] == 0,
-         "expect single-phase fallback (phase B current == 0)")),
+         and pl.ev.desired_circuit_currents[1] > 0,
+         "expect three-phase request to survive until coordinator verification")),
 
     ("EV solar: modest surplus -> resume, single phase",
      entities(pv1=1200, pv2=800, grid=-1700, soc=80, bat=0,
@@ -2696,6 +2697,11 @@ def test_coordinator_ev_harness():
         co._ev_transport_reload_grace_until = None
         co._ev_transport_reload_count = 0
         co._ev_transport_recovery_status = "idle"
+        co._ev_phase_transition_state = "idle"
+        co._ev_phase_transition_started_at = None
+        co._ev_phase_transition_pause_at = None
+        co._ev_phase_transition_failures = 0
+        co._ev_phase_transition_cooldown_until = None
         co.ev_mode = const.EV_MODE_SOLAR_ONLY
         co._ev_minimum_recovery = None
         co.site_state = models.SiteState(
@@ -2720,6 +2726,159 @@ def test_coordinator_ev_harness():
 
     def at(s):
         return t0 + timedelta(seconds=s)
+
+    # Live 2026-07-31: 9.49 kW PV, 6.79 kW whole-site load including a
+    # 3.65 kW one-phase EV session left ~6.35 kW physically available to the
+    # car. The stateless fallback immediately wrote (16,0,0), permanently
+    # limiting the car to 3.7 kW. Hold (9,9,9), retry once, and verify power.
+    co = make_co()
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(co.site_state, easee_power_w=3650.0)
+    three_phase_9a = ev(9).ev
+    first_request = co._apply_ev_phase_transition(
+        three_phase_9a, now=at(0), ev_max_amps=16
+    )
+    asyncio.run(
+        co._async_apply_ev(types.SimpleNamespace(ev=first_request), at(0))
+    )
+    held_request = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS - 1),
+        ev_max_amps=16,
+    )
+    first_failure = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS),
+        ev_max_amps=16,
+    )
+    asyncio.run(
+        co._async_apply_ev(
+            types.SimpleNamespace(ev=first_failure),
+            at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS),
+        )
+    )
+    co.site_state = replace(co.site_state, easee_status="awaiting_start", easee_power_w=0.0)
+    retry = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(
+            const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+            + const.EV_PHASE_TRANSITION_PAUSE_SECONDS
+        ),
+        ev_max_amps=16,
+    )
+    asyncio.run(
+        co._async_apply_ev(
+            types.SimpleNamespace(ev=retry),
+            at(
+                const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+                + const.EV_PHASE_TRANSITION_PAUSE_SECONDS
+            ),
+        )
+    )
+    co.site_state = replace(co.site_state, easee_status="charging", easee_power_w=6200.0)
+    confirmed = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(
+            const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+            + const.EV_PHASE_TRANSITION_PAUSE_SECONDS
+            + 30
+        ),
+        ev_max_amps=16,
+    )
+    checks.append(("harness 1->3 phase: hold offer, controlled retry, then measured confirmation",
+                   first_request.desired_circuit_currents == (9, 9, 9)
+                   and held_request.desired_circuit_currents == (9, 9, 9)
+                   and first_failure.desired_action == "pause"
+                   and first_failure.desired_enabled is None
+                   and retry.desired_action == "resume"
+                   and retry.desired_circuit_currents == (9, 9, 9)
+                   and confirmed.desired_circuit_currents == (9, 9, 9)
+                   and co._easee.calls[:3] == [
+                       ("resume", 9, (9, 9, 9)),
+                       ("pause", 9, (9, 9, 9)),
+                       ("resume", 9, (9, 9, 9)),
+                   ]
+                   and co._ev_phase_transition_state == "three_phase"
+                   and co._ev_phase_transition_failures == 0,
+                   f"first={first_request}, failure={first_failure}, retry={retry}, "
+                   f"confirmed={confirmed}, state={co.ev_phase_transition_status}"))
+
+    co = make_co()
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(co.site_state, easee_power_w=2100.0)
+    co._apply_ev_phase_transition(three_phase_9a, now=at(0), ev_max_amps=16)
+    co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS),
+        ev_max_amps=16,
+    )
+    co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(
+            const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+            + const.EV_PHASE_TRANSITION_PAUSE_SECONDS
+        ),
+        ev_max_amps=16,
+    )
+    second_failure_at = (
+        const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+        + const.EV_PHASE_TRANSITION_PAUSE_SECONDS
+        + const.EV_PHASE_TRANSITION_VERIFY_SECONDS
+    )
+    fallback = co._apply_ev_phase_transition(
+        three_phase_9a, now=at(second_failure_at), ev_max_amps=16
+    )
+    cooldown_hold = co._apply_ev_phase_transition(
+        three_phase_9a, now=at(second_failure_at + 10), ev_max_amps=16
+    )
+    retry_after_cooldown = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(second_failure_at + const.EV_PHASE_TRANSITION_COOLDOWN_SECONDS + 1),
+        ev_max_amps=16,
+    )
+    checks.append(("harness 1->3 phase: two failures fall back once with cooldown",
+                   fallback.desired_circuit_currents == (16, 0, 0)
+                   and cooldown_hold.desired_circuit_currents == (16, 0, 0)
+                   and retry_after_cooldown.desired_circuit_currents == (9, 9, 9)
+                   and co._ev_phase_transition_state == "requesting_three_phase"
+                   and co._ev_phase_transition_failures == 0,
+                   f"fallback={fallback.desired_circuit_currents}, "
+                   f"cooldown={cooldown_hold.desired_circuit_currents}, "
+                   f"retry={retry_after_cooldown.desired_circuit_currents}, "
+                   f"state={co.ev_phase_transition_status}"))
+
+    co = make_co()
+    co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")
+    co.site_state = replace(
+        co.site_state,
+        easee_power_w=2100.0,
+        ev_stale_entities=["sensor.easee_power"],
+    )
+    co._apply_ev_phase_transition(three_phase_9a, now=at(0), ev_max_amps=16)
+    stale_hold = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS + 300),
+        ev_max_amps=16,
+    )
+    checks.append(("harness 1->3 phase: stale power never counts as a failed attempt",
+                   stale_hold.desired_action == "resume"
+                   and stale_hold.desired_circuit_currents == (9, 9, 9)
+                   and co._ev_phase_transition_failures == 0
+                   and co._ev_phase_transition_state == "requesting_three_phase",
+                   f"plan={stale_hold}, state={co.ev_phase_transition_status}"))
+
+    non_solar = replace(three_phase_9a, mode=const.EV_MODE_FULL_SPEED)
+    reset_plan = co._apply_ev_phase_transition(
+        non_solar,
+        now=at(const.EV_PHASE_TRANSITION_VERIFY_SECONDS + 310),
+        ev_max_amps=16,
+    )
+    checks.append(("harness 1->3 phase: leaving solar-only resets transition state",
+                   reset_plan == non_solar
+                   and co._ev_phase_transition_state == "idle"
+                   and co._ev_phase_transition_started_at is None
+                   and co._ev_phase_transition_cooldown_until is None,
+                   str(co.ev_phase_transition_status)))
 
     # (a) Deadband: after the initial apply, ±1 A solar wiggles for 2 min cause no
     # full-plan/current renegotiations. Circuit TTL heartbeats are tracked separately.

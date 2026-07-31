@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.25.8"
+INTEGRATION_VERSION = "0.25.9"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -277,6 +277,15 @@ EV_MODES = [
 # Phase C anti-flap parameters.
 EV_PHASE_LOCK_MINUTES = 15        # min between 1<->3 phase switches
 EV_SURPLUS_AVERAGE_SECONDS = 120  # rolling window for smoothing the solar surplus
+# A running one-phase session needs time to renegotiate after a three-phase
+# circuit offer. Verify measured power instead of immediately interpreting the
+# old one-phase draw as a failed transition. One controlled pause/resume gets a
+# second chance; repeated failure falls back with a long anti-flap cooldown.
+EV_PHASE_TRANSITION_VERIFY_SECONDS = 90
+EV_PHASE_TRANSITION_PAUSE_SECONDS = 20
+EV_PHASE_TRANSITION_MAX_ATTEMPTS = 2
+EV_PHASE_TRANSITION_COOLDOWN_SECONDS = 15 * 60
+EV_PHASE_TRANSITION_POWER_RATIO = 0.90
 
 # Only hand PV to the car (stop charging the house battery + allow export) when
 # the charger actually draws at least this much. A charger that is merely enabled
