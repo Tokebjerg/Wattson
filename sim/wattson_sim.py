@@ -2663,10 +2663,22 @@ def test_coordinator_ev_harness():
             self.refresh_calls.append(currents)
             return [f"easee:refresh:{currents}"]
 
+    class _Services:
+        def __init__(self):
+            self.calls = []
+
+        async def async_call(self, domain, service, data, blocking=False):
+            self.calls.append((domain, service, data, blocking))
+
+    class _Hass:
+        def __init__(self):
+            self.services = _Services()
+
     def make_co(status="charging"):
         co = object.__new__(co_mod.WattsonCoordinator)
         co.ev_control_enabled = True
         co.config_entry = _Entry()
+        co.hass = _Hass()
         co.mapping = None
         co._easee = _Easee()
         co._last_ev_fp = None
@@ -2680,6 +2692,10 @@ def test_coordinator_ev_harness():
         co._last_ev_start_recovery_at = None
         co._ev_start_recovery_attempts = 0
         co._ev_start_status = "idle"
+        co._last_ev_transport_reload_at = None
+        co._ev_transport_reload_grace_until = None
+        co._ev_transport_reload_count = 0
+        co._ev_transport_recovery_status = "idle"
         co.ev_mode = const.EV_MODE_SOLAR_ONLY
         co._ev_minimum_recovery = None
         co.site_state = models.SiteState(
@@ -2824,6 +2840,76 @@ def test_coordinator_ev_harness():
                    and co._ev_start_wait_since is None
                    and co._ev_start_recovery_attempts == 0,
                    str(co.ev_start_status)))
+
+    # Live 2026-07-31: Easee accepted service calls into a stalled transport queue
+    # for nine minutes while its online heartbeat was stale. A verified non-start
+    # plus that stale heartbeat reloads only the Easee config entry, re-arms the
+    # full offer and preserves already-stable solar through the brief reload.
+    co = make_co(status="awaiting_start")
+    co.mapping = types.SimpleNamespace(
+        easee_power_entity="sensor.easee_power",
+        easee_online_entity="binary_sensor.easee_online",
+        easee_status_entity="sensor.easee_status",
+        easee_enable_switch="switch.easee_enabled",
+    )
+    co.site_state = replace(
+        co.site_state,
+        easee_power_w=0.0,
+        ev_stale_entities=["sensor.easee_power", "binary_sensor.easee_online"],
+    )
+    asyncio.run(co._async_apply_ev(ev(16), at(0)))
+    transport_recovery = asyncio.run(
+        co._async_apply_ev(ev(16), at(const.EV_START_VERIFY_SECONDS))
+    )
+    reload_calls = [
+        call for call in co.hass.services.calls
+        if call[:2] == ("homeassistant", "reload_config_entry")
+    ]
+    checks.append(("harness stale Easee transport: verified non-start reloads config entry once",
+                   len(reload_calls) == 1
+                   and reload_calls[0][2] == {"entity_id": "sensor.easee_status"}
+                   and co._ev_start_status == "transport_recovering"
+                   and co._ev_start_recovery_attempts == 0
+                   and co._last_ev_fp is None
+                   and co._ev_transport_reload_count == 1
+                   and "config entry reloaded" in " ".join(transport_recovery),
+                   f"calls={reload_calls}, state={co.ev_transport_recovery_status}"))
+
+    cooldown_recovery = asyncio.run(
+        co._async_recover_easee_transport(
+            at(const.EV_START_VERIFY_SECONDS + const.EV_START_RECOVERY_RETRY_SECONDS)
+        )
+    )
+    reload_calls = [
+        call for call in co.hass.services.calls
+        if call[:2] == ("homeassistant", "reload_config_entry")
+    ]
+    checks.append(("harness stale Easee transport: reload cooldown prevents loops",
+                   len(reload_calls) == 1
+                   and cooldown_recovery == []
+                   and co._ev_transport_recovery_status == "cooldown",
+                   f"calls={reload_calls}, state={co.ev_transport_recovery_status}"))
+
+    stable_since = at(-const.EV_SOLAR_RESTART_SURPLUS_SECONDS)
+    co._ev_solar_surplus_since = stable_since
+    co._ev_solar_deficit_since = None
+    unavailable_plan = models.EvPlan(mode=const.EV_MODE_SOLAR_ONLY, reason="unavailable")
+    co._apply_ev_solar_session_hysteresis(
+        unavailable_plan,
+        now=at(const.EV_START_VERIFY_SECONDS + 10),
+        runtime_state="disconnected",
+        grid_budget_exhausted=False,
+    )
+    preserved = co._ev_solar_surplus_since == stable_since
+    co._apply_ev_solar_session_hysteresis(
+        unavailable_plan,
+        now=at(const.EV_START_VERIFY_SECONDS + const.EV_TRANSPORT_RELOAD_GRACE_SECONDS + 1),
+        runtime_state="disconnected",
+        grid_budget_exhausted=False,
+    )
+    checks.append(("harness Easee reload: stable solar survives grace but not a real disconnect",
+                   preserved and co._ev_solar_surplus_since is None,
+                   f"preserved={preserved}, final={co._ev_solar_surplus_since}"))
 
     co = make_co(status="awaiting_start")
     co.mapping = types.SimpleNamespace(easee_power_entity="sensor.easee_power")

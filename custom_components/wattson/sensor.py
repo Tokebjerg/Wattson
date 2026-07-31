@@ -389,6 +389,9 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 ),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
                 "ev_start": getattr(self.coordinator, "ev_start_status", {"state": "idle"}),
+                "ev_transport_recovery": getattr(
+                    self.coordinator, "ev_transport_recovery_status", {"state": "idle"}
+                ),
                 "ev_minimum_recovery": getattr(
                     self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
                 ),

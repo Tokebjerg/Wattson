@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.25.7"
+INTEGRATION_VERSION = "0.25.8"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -336,6 +336,12 @@ EV_START_VERIFY_SECONDS = 90
 EV_START_RECOVERY_RETRY_SECONDS = 180
 EV_START_FAILED_ATTEMPTS = 2
 EV_START_CONFIRMED_POWER_W = 500.0
+# The Easee integration can keep accepting cloud service calls while its command
+# transport is stalled.  A stale online heartbeat plus a verified non-start is a
+# strong signal to reload that config entry.  Keep a long cooldown so a physical
+# car-side refusal can never create a reload loop.
+EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS = 30 * 60
+EV_TRANSPORT_RELOAD_GRACE_SECONDS = 90
 EV_CONNECTED_IDLE_STATUSES = {
     "awaiting_start",
     "ready_to_charge",

@@ -29,6 +29,8 @@ from .const import (
     EV_START_FAILED_ATTEMPTS,
     EV_START_RECOVERY_RETRY_SECONDS,
     EV_START_VERIFY_SECONDS,
+    EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS,
+    EV_TRANSPORT_RELOAD_GRACE_SECONDS,
     EV_WAITING_TO_START_STATUSES,
     CONF_ALLOW_GRID_CHARGE,
     CONF_ALLOW_NEGATIVE_EXPORT,
@@ -557,6 +559,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_start_recovery_at: datetime | None = None
         self._ev_start_recovery_attempts: int = 0
         self._ev_start_status: str = "idle"
+        self._last_ev_transport_reload_at: datetime | None = None
+        self._ev_transport_reload_grace_until: datetime | None = None
+        self._ev_transport_reload_count: int = 0
+        self._ev_transport_recovery_status: str = "idle"
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -1037,6 +1043,30 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ),
         }
 
+    @property
+    def ev_transport_recovery_status(self) -> dict[str, Any]:
+        """Expose automatic Easee transport recovery for live diagnosis."""
+        now = dt_util.utcnow()
+        cooldown_remaining = 0
+        if self._last_ev_transport_reload_at is not None:
+            cooldown_remaining = max(
+                0,
+                round(
+                    EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS
+                    - (now - self._last_ev_transport_reload_at).total_seconds()
+                ),
+            )
+        return {
+            "state": self._ev_transport_recovery_status,
+            "reloads": self._ev_transport_reload_count,
+            "last_reload_at": (
+                self._last_ev_transport_reload_at.isoformat()
+                if self._last_ev_transport_reload_at is not None
+                else None
+            ),
+            "cooldown_remaining_seconds": cooldown_remaining,
+        }
+
     def _restore_override_state(self, entry) -> None:
         """Resume persisted manual control windows that have not yet expired."""
         now = dt_util.utcnow()
@@ -1444,9 +1474,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         grid_budget_exhausted: bool,
     ) -> EvPlan:
         """Keep cloud dips, stop sustained support, and require stable restart sun."""
-        if self.ev_mode != EV_MODE_SOLAR_ONLY or runtime_state == "disconnected":
+        if self.ev_mode != EV_MODE_SOLAR_ONLY:
             self._ev_solar_surplus_since = None
             self._ev_solar_deficit_since = None
+            return ev_plan
+        if runtime_state == "disconnected":
+            # A controlled Easee config-entry reload makes its entities briefly
+            # unavailable. Preserve already-proven solar surplus through that
+            # short recovery window so transport repair cannot impose a fresh
+            # three-minute solar wait after the charger comes back.
+            in_reload_grace = bool(
+                self._ev_transport_reload_grace_until is not None
+                and now < self._ev_transport_reload_grace_until
+            )
+            if not in_reload_grace:
+                self._ev_solar_surplus_since = None
+                self._ev_solar_deficit_since = None
             return ev_plan
 
         base_wants_charge = bool(
@@ -2899,6 +2942,69 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.battery_contended = self._battery_contended_until is not None
         return actions
 
+    def _easee_transport_is_stale(self) -> bool:
+        """Return whether Easee claims online but its heartbeat has stopped."""
+        if self.mapping is None or self.site_state is None:
+            return False
+        online_entity = getattr(self.mapping, "easee_online_entity", None)
+        return bool(
+            self.site_state.easee_online is True
+            and online_entity
+            and online_entity in self.site_state.ev_stale_entities
+        )
+
+    async def _async_recover_easee_transport(self, now: datetime) -> list[str]:
+        """Reload a stalled Easee config entry and re-arm EV convergence."""
+        if self.mapping is None:
+            return []
+        target_entity = (
+            getattr(self.mapping, "easee_status_entity", None)
+            or getattr(self.mapping, "easee_online_entity", None)
+            or getattr(self.mapping, "easee_enable_switch", None)
+        )
+        if not target_entity:
+            return []
+        if not write_allowed(
+            self._last_ev_transport_reload_at,
+            EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS,
+            now,
+        ):
+            self._ev_transport_recovery_status = "cooldown"
+            return []
+
+        try:
+            await self.hass.services.async_call(
+                "homeassistant",
+                "reload_config_entry",
+                {"entity_id": target_entity},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            self._ev_transport_recovery_status = "reload_failed"
+            _LOGGER.warning("Wattson could not reload stalled Easee transport: %s", err)
+            return []
+
+        self._last_ev_transport_reload_at = now
+        self._ev_transport_reload_grace_until = now + timedelta(
+            seconds=EV_TRANSPORT_RELOAD_GRACE_SECONDS
+        )
+        self._ev_transport_reload_count += 1
+        self._ev_transport_recovery_status = "reloading"
+        self._ev_control_blocked_reason = "easee_transport_recovery"
+        self._ev_start_status = "transport_recovering"
+        self._ev_start_wait_since = now
+        self._last_ev_start_recovery_at = now
+        self._ev_start_recovery_attempts = 0
+        # The Easee controller cache has been replaced. Re-publish the complete
+        # offer after its entities return instead of trusting pre-reload state.
+        self._last_ev_fp = None
+        self._last_ev_amps = None
+        self._last_ev_currents = None
+        self._last_ev_current_change_at = None
+        self._last_ev_circuit_refresh_at = None
+        self._last_ev_write_at = None
+        return ["easee config entry reloaded after stale start transport"]
+
     async def _async_apply_ev(self, plan: ControlPlan, now: datetime) -> list[str]:
         """Apply EV changes and keep Easee's temporary circuit limit alive.
 
@@ -2986,6 +3092,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._last_ev_start_recovery_at = None
             self._ev_start_recovery_attempts = 0
             self._ev_start_status = "charging"
+            if self._ev_transport_recovery_status == "reloading":
+                self._ev_transport_recovery_status = "recovered"
+                self._ev_transport_reload_grace_until = None
         elif wants_charging and not_yet_charging:
             if self._ev_start_wait_since is None:
                 self._ev_start_wait_since = now
@@ -3023,6 +3132,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # A recovery attempt must use the requested offer, not the stale-power
             # 6 A bootstrap that failed to establish a physical session.
             ev = requested_ev
+        transport_reload_candidate = bool(
+            start_recovery_due and self._easee_transport_is_stale()
+        )
         # The initial structural write is followed by the verified start-recovery
         # state machine.  A second independent 60-second nudge used to resend the
         # same charger/circuit tuple throughout Easee's transition states.
@@ -3078,6 +3190,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._last_ev_amps = ev.desired_amps
             self._last_ev_currents = ev.desired_circuit_currents
             self._last_ev_current_change_at = now
+        if transport_reload_candidate:
+            acts.extend(await self._async_recover_easee_transport(now))
         return acts
 
     def _grid_power_sign_should_be_inverted(self) -> bool:
