@@ -4536,8 +4536,14 @@ def test_control_stability_regressions():
                    for h in range(48))
     no_storm = all(not co_mod._price_horizon_changed(fp_48h, fp_48h) for _ in range(360))
     changed_fp = fp_48h[:-1] + ((fp_48h[-1][0], 1.1, 0.2, True),)
+    rolled_fp = fp_48h[1:]
+    grown_fp = fp_48h + (("2026-07-31T00:00", 1.0, 0.2, True),)
     checks.append(("48h prices + 24h plan: 360 identical ticks cause zero price replans",
                    no_storm, "stable"))
+    checks.append(("hour rollover removes only the elapsed price prefix without a false horizon replan",
+                   not co_mod._price_horizon_changed(fp_48h, rolled_fp), "rolled"))
+    checks.append(("a genuinely longer future price horizon still triggers an immediate replan",
+                   co_mod._price_horizon_changed(fp_48h, grown_fp), "grown"))
     checks.append(("a real price change still triggers an immediate replan",
                    co_mod._price_horizon_changed(fp_48h, changed_fp), "changed"))
 
@@ -4725,8 +4731,8 @@ def test_control_stability_regressions():
     checks.append(("P10 refill subtracts P50 load while P90 remains a separate peak tail",
                    no_double_tail_first is not None
                    and no_double_tail_first.action == "DISCHARGE"
-                   and no_double_tail_first.projected_soc_pct == 95.0
-                   and no_double_tail_first.tou_floor_pct == 95.0,
+                   and no_double_tail_first.projected_soc_pct == 94.0
+                   and no_double_tail_first.tou_floor_pct == 90.0,
                    str(no_double_tail_first)))
 
     low_solar = [replace(slot, pv_estimate_kwh=0.0,
@@ -4746,6 +4752,114 @@ def test_control_stability_regressions():
                    and cloudy_slot.reason == "IDLE"
                    and cloudy_slot.tou_floor_pct == 100.0,
                    f"{cloudy_task}/{cloudy_slot}"))
+
+    # Exact 2026-07-31 failure class: a full pack bought 0.45-0.48 kWh/h while
+    # rolling replans held 95%, then 90%, despite a large P10 refill later that
+    # day. The conservative refill must create a continuous overnight release
+    # path, and a routine 15-minute replan may lower but never raise commitments.
+    night_prices = [1.88, 1.83, 1.76, 1.74, 1.75, 1.83, 2.01, 1.96]
+    live_prices = [models.PriceSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        spot_price=(night_prices[h] if h < len(night_prices) else (1.2 if h < 18 else 2.3)),
+        tariff=0.0,
+        total_import_price=(night_prices[h] if h < len(night_prices) else (1.2 if h < 18 else 2.3)),
+        export_value=0.8,
+    ) for h in range(24)]
+    live_p50 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.03, 0.25, 1.15,
+                2.4, 3.6, 4.4, 5.0, 5.1, 5.0, 4.7, 4.0, 3.0, 1.9,
+                1.2, 0.5, 0.1, 0.0, 0.0, 0.0]
+    live_p10 = [value * 0.42 for value in live_p50]
+    live_solar = [models.SolarSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        pv_estimate_kwh=live_p50[h],
+        pv_estimate10_kwh=live_p10[h],
+        pv_estimate90_kwh=live_p50[h] * 1.25,
+    ) for h in range(24)]
+    live_load = {
+        base.replace(hour=0) + timedelta(hours=h):
+        ([497, 338, 405, 339, 383, 340, 406, 434, 443, 731, 806, 870,
+          1088, 702, 694, 678, 705, 679, 967, 704, 689, 525, 728, 599][h])
+        for h in range(24)
+    }
+    live_p90_load = {
+        start: max(value, 1600.0 if start.hour >= 17 else value * 1.35)
+        for start, value in live_load.items()
+    }
+    live_midnight = replace(
+        full_midnight,
+        timestamp=base.replace(hour=0),
+        price_slots=live_prices,
+        solar_slots=live_solar,
+    )
+    live_plan = planner.build_day_plan(
+        live_midnight, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=live_load,
+        reserve_load_by_start_w=live_p90_load,
+    )
+    live_night = list(live_plan.tasks[:7]) if live_plan else []
+    no_stranded_hour = True
+    projected_start = 100.0
+    for task in live_night:
+        deficit = max(0.0, (task.load_estimate_kwh or 0.0) - (task.pv_estimate_kwh or 0.0))
+        available = max(0.0, projected_start - (task.tou_floor_pct or projected_start)) / 100.0 * 10.0
+        no_stranded_hour = no_stranded_hour and available + 0.01 >= deficit
+        projected_start = task.projected_soc_pct or projected_start
+    checks.append(("2026-07-31 sunny night has a continuous discharge path instead of 95/90% grid holds",
+                   len(live_night) == 7
+                   and all(task.action == "DISCHARGE" for task in live_night)
+                   and all(live_night[i].tou_floor_pct <= live_night[i - 1].tou_floor_pct
+                           for i in range(1, len(live_night)))
+                   and no_stranded_hour,
+                   str([(t.action, t.projected_soc_pct, t.tou_floor_pct) for t in live_night])))
+
+    quarter_state = replace(
+        live_midnight,
+        timestamp=base.replace(hour=0, minute=15),
+        battery_soc_pct=live_plan.tasks[0].projected_soc_pct if live_plan else 95.0,
+    )
+    quarter_fresh = planner.build_day_plan(
+        quarter_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=live_load,
+        reserve_load_by_start_w=live_p90_load,
+    )
+    quarter_committed = planner.preserve_routine_discharge_commitments(
+        live_plan, quarter_fresh
+    ) if live_plan and quarter_fresh else None
+    old_floors = {slot.start: slot.tou_floor_pct for slot in live_plan.slots} if live_plan else {}
+    quarter_deficits = {
+        task.start: (task.load_estimate_kwh or 0.0) - (task.pv_estimate_kwh or 0.0)
+        for task in quarter_committed.tasks
+    } if quarter_committed else {}
+    commitment_holds = bool(quarter_committed) and all(
+        slot.tou_floor_pct <= old_floors.get(slot.start, slot.tou_floor_pct)
+        for slot in quarter_committed.slots
+        if slot.start in old_floors
+        and quarter_deficits.get(slot.start, 0.0) > 0.01
+    )
+    checks.append(("routine rolling replan cannot postpone an already promised discharge floor",
+                   commitment_holds,
+                   str([(s.start.hour, s.tou_floor_pct) for s in (quarter_committed.slots[:7] if quarter_committed else [])])))
+
+    hour_state = replace(
+        live_midnight,
+        timestamp=base.replace(hour=1),
+        battery_soc_pct=live_plan.tasks[0].projected_soc_pct if live_plan else 95.0,
+    )
+    hour_fresh = planner.build_day_plan(
+        hour_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=live_load,
+        reserve_load_by_start_w=live_p90_load,
+    )
+    hour_committed = planner.preserve_routine_discharge_commitments(
+        live_plan, hour_fresh
+    ) if live_plan and hour_fresh else None
+    promised_hour_one = old_floors.get(base.replace(hour=1))
+    checks.append(("hour rollover keeps the previously promised 01:00 floor instead of resetting it upward",
+                   hour_committed is not None
+                   and promised_hour_one is not None
+                   and hour_committed.slots[0].start == base.replace(hour=1)
+                   and hour_committed.slots[0].tou_floor_pct <= promised_hour_one,
+                   str(hour_committed.slots[0] if hour_committed else None)))
     return checks
 
 

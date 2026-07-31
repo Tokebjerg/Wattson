@@ -203,6 +203,7 @@ from .planner import (
     apply_cold_guard,
     apply_ev_battery_protect,
     apply_sell_throttle,
+    preserve_routine_discharge_commitments,
     near_full_buffer_active,
     SCHEDULE_GRID_CHARGE_RATE_KWH,
     peak_reserve_pct,
@@ -289,7 +290,21 @@ def _price_horizon_changed(
     tick look like a newly-grown horizon.  The normalized price fingerprint is
     the complete contract: identical tuples must never trigger a replan.
     """
-    return previous is not None and previous != current
+    if previous is None:
+        return False
+    if previous == current:
+        return False
+
+    previous_by_start = {row[0]: row[1:] for row in previous}
+    current_by_start = {row[0]: row[1:] for row in current}
+    common = previous_by_start.keys() & current_by_start.keys()
+    if any(previous_by_start[start] != current_by_start[start] for start in common):
+        return True
+
+    # Removing elapsed prefix slots at an hour boundary is normal horizon
+    # progression, not a price update. A genuinely new future slot still grows
+    # the horizon and must trigger an immediate replan.
+    return any(start not in previous_by_start for start in current_by_start)
 
 
 def _ev_solar_session_action(
@@ -2103,6 +2118,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # forecast, EV connect/disconnect, material SOC drift, horizon, or config.
         _now_local = self.site_state.timestamp
         _grid_charge_rate = self.effective_grid_charge_rate_kwh
+        _load_fp = tuple(
+            (
+                start.isoformat(),
+                round(float((_load_hourly or {}).get(start, 0.0)) / 100.0),
+                round(float((_reserve_load or {}).get(start, 0.0)) / 100.0),
+            )
+            for start in _forecast_starts
+        )
         _cold_grid_charge_blocked = bool(
             self.site_state.battery_temperature_c is not None
             and self.site_state.battery_temperature_c < BATTERY_MIN_CHARGE_TEMP_C
@@ -2111,6 +2134,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.battery_mode, _min_soc, _max_soc, _capacity,
             _allow_grid_charge, _cold_grid_charge_blocked,
             round(learned_reserve_pct / 5.0), _grid_charge_rate,
+            _load_fp,
             round(self._forecast_confidence, 2),
             round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
             round(self.battery_discharge_current, 1), round(self.battery_care_soc, 1),
@@ -2170,6 +2194,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ),
         )
         if _replan_reason is not None and self.site_state.price_slots:
+            _previous_day_plan = self._day_plan
             _new_day_plan = build_day_plan(
                 self.site_state,
                 battery_mode=self.battery_mode,
@@ -2190,6 +2215,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
             )
             if _new_day_plan is not None:
+                if _replan_reason == "rolling_15m":
+                    _new_day_plan = preserve_routine_discharge_commitments(
+                        _previous_day_plan,
+                        _new_day_plan,
+                    )
                 self._day_plan = _new_day_plan
                 self._day_plan_fp = _plan_fp
                 self._last_replan_at = _now_local
