@@ -2297,6 +2297,15 @@ def test_tou_management():
     checks.append(("TOU: HOLD writes current SOC explicitly (never inherits stale TOU)",
                    ss(P(strategy="HOLD", reason=""), soc_pct=50, **kw) == (50.0, False),
                    str(ss(P(strategy="HOLD", reason=""), soc_pct=50, **kw))))
+    semantic_hold = P(
+        strategy="BLOCK_NEGATIVE_EXPORT",
+        reason="EV battery protect",
+        desired_solar_sell=False,
+        desired_discharge_current_a=0.0,
+    )
+    checks.append(("TOU: semantic discharge=0 becomes a current-SOC hold floor (physical register stays 70A)",
+                   ss(semantic_hold, soc_pct=53, **kw) == (55.0, False),
+                   str(ss(semantic_hold, soc_pct=53, **kw))))
     checks.append(("TOU: BLOCK_NEGATIVE_EXPORT keeps self-consumption open to the calculated floor",
                    ss(P(strategy="BLOCK_NEGATIVE_EXPORT", reason=""), soc_pct=50, **kw) == (20.0, False),
                    str(ss(P(strategy="BLOCK_NEGATIVE_EXPORT", reason=""), soc_pct=50, **kw))))
@@ -2371,12 +2380,30 @@ def test_tou_management():
     qctrl = control.KlatremisController(_Hass(qstates, qsvc))
     fplan = P(strategy="DISCHARGE_TO_LOAD", reason="", desired_tou_capacity_pct=50.6, desired_tou_charge_enable=False)
     asyncio.run(qctrl.apply_battery_plan(mp, fplan, datetime(2026, 6, 9, 22, 0, tzinfo=timezone(timedelta(hours=2)))))
-    n1 = sum(1 for c in qsvc.calls if c[0] == "number")
+    n1 = sum(1 for c in qsvc.calls if c[0] == "number" and c[2]["entity_id"] in mp.tou_capacity_numbers)
     qsvc.calls.clear()
     asyncio.run(qctrl.apply_battery_plan(mp, fplan, datetime(2026, 6, 9, 22, 1, tzinfo=timezone(timedelta(hours=2)))))
-    n2 = sum(1 for c in qsvc.calls if c[0] == "number")
+    n2 = sum(1 for c in qsvc.calls if c[0] == "number" and c[2]["entity_id"] in mp.tou_capacity_numbers)
     checks.append((f"TOU converges: fractional 50.6 vs 5%-quantized read-back re-writes 0 on tick 2 (was 6/tick = the limit cycle) [{n1}->{n2}]",
                    n1 == 6 and n2 == 0, f"{n1}->{n2}"))
+
+    # Defense in depth: even a future/legacy plan that still carries semantic 0 A
+    # must never issue a physical 0 A write to the Deye discharge-limit register.
+    guard_states = _States({mp.battery_discharge_current_number: "0"})
+    guard_services = _Services(guard_states)
+    guard_ctrl = control.KlatremisController(_Hass(guard_states, guard_services))
+    guard_plan = P(strategy="HOLD", reason="legacy", desired_discharge_current_a=0.0)
+    asyncio.run(guard_ctrl.apply_battery_plan(
+        mp, guard_plan, datetime(2026, 8, 1, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+    ))
+    guard_writes = [
+        call[2]["value"] for call in guard_services.calls
+        if call[0] == "number" and call[2]["entity_id"] == mp.battery_discharge_current_number
+    ]
+    checks.append(("physical invariant: legacy discharge=0 plan writes exactly 70A, never 0A",
+                   guard_states.get(mp.battery_discharge_current_number).state == "70.0"
+                   and guard_writes == [70.0],
+                   str(guard_writes)))
 
     # #4 (mock-fidelity audit, v0.24.36): the step-aware convergence skip must hold for ANY
     # native register step, not just the TOU's 5%. A live audit of the writable Deye registers
@@ -4435,13 +4462,16 @@ def test_sell_throttle():
     checks.append(("floor_sell_safe OPENS a closed discharge while selling (sell+discharge=0 stall)",
                    deye_contract.floor_sell_safe(sell_dis0).desired_discharge_current_a == DSAFE,
                    str(deye_contract.floor_sell_safe(sell_dis0).desired_discharge_current_a)))
-    # sell OFF + discharge 0 is legitimate intent (EV-solar below full = no drain
-    # into car, grid-charge, hold) -> must stay 0.
+    # sell OFF + discharge 0 remains legitimate PLANNER intent (EV protection,
+    # grid-charge, hold); the final physical invariant opens it to 70 after TOU.
     nosell_dis0 = models.BatteryPlan(
         strategy="EV_SOLAR_PRIORITY", reason="ev", desired_solar_sell=False,
         desired_discharge_current_a=0.0)
-    checks.append(("sell OFF + discharge 0 stays 0 (legit no-drain/grid-charge intent)",
+    checks.append(("sell OFF + discharge 0 stays semantic before the final physical guard",
                    deye_contract.floor_sell_safe(nosell_dis0).desired_discharge_current_a == 0.0, "nosell-dis0"))
+    checks.append(("final discharge-register guard opens every plan to the hard 70A invariant",
+                   deye_contract.force_discharge_register_open(nosell_dis0).desired_discharge_current_a == DSAFE,
+                   str(deye_contract.force_discharge_register_open(nosell_dis0).desired_discharge_current_a)))
     # discharge None while selling -> untouched (coordinator fills the configured ceiling).
     sell_disN = models.BatteryPlan(
         strategy="SELL_SOLAR_PEAK", reason="sell", desired_solar_sell=True,

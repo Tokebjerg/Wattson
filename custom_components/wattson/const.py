@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.25.10"
+INTEGRATION_VERSION = "0.25.11"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -188,10 +188,11 @@ CONF_RESERVE_HOLD_MARGIN = "reserve_hold_margin"      # peak-reserve hold spread
 CONF_EV_FULL_RELEASE_MARGIN_PCT = "ev_full_release_margin_pct"  # Ren sol: SOC band below max where the pack still covers the car (H4)
 CONF_GRID_CHARGE_RATE_KWH = "grid_charge_rate_kwh"    # measured grid-charge rate (kWh/h) for the cheap-hour projection (H4/E1)
 # Battery charge/discharge-current limits (A). 70 A is a HARD SAFETY CEILING for
-# this battery — the number entities cannot be set above it. Both default to the
-# ceiling. Discharge is a LIMIT (battery delivers only what the house needs, but
-# must be > 0 or the house falls back to grid); charge must be high enough to
-# absorb the solar surplus or PV is curtailed when export is blocked.
+# this battery. The physical maximum-discharge register is also a HARD CONSTANT:
+# it stays at 70 A in every strategy. Discharge blocking is expressed with Deye's
+# TOU SOC floor instead of closing this register; live evidence repeatedly showed
+# that 0 A can strand the house on grid and destabilise the PV path. Charge must be
+# high enough to absorb the solar surplus or PV is curtailed when export is blocked.
 # "Sell-at-peak" deliberately trickles charge at TRICKLE_CHARGE_A.
 BATTERY_CURRENT_SAFETY_MAX = 70.0
 DEFAULT_BATTERY_DISCHARGE_CURRENT_A = 70.0

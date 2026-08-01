@@ -8,6 +8,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    BATTERY_DISCHARGE_CURRENT_MAX,
     CONTENTION_WINDOW_SECONDS,
     CONTENTION_WRITE_THRESHOLD,
     EV_CIRCUIT_LIMIT_TTL_MINUTES,
@@ -188,7 +189,14 @@ class KlatremisController:
         await do(mapping.export_limit_number, plan.desired_export_limit_w, self._set_number(mapping.export_limit_number, plan.desired_export_limit_w))
         await do(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a, self._set_number(mapping.battery_grid_charge_current_number, plan.desired_charge_current_a))
         await do(mapping.battery_charge_current_number, plan.desired_max_charge_current_a, self._set_number(mapping.battery_charge_current_number, plan.desired_max_charge_current_a))
-        await do(mapping.battery_discharge_current_number, plan.desired_discharge_current_a, self._set_number(mapping.battery_discharge_current_number, plan.desired_discharge_current_a))
+        # Final physical backstop: this register is an installation invariant,
+        # never a mode switch. Hold/protect intent is carried by the TOU SOC floor.
+        discharge_limit = float(BATTERY_DISCHARGE_CURRENT_MAX)
+        await do(
+            mapping.battery_discharge_current_number,
+            discharge_limit,
+            self._set_number(mapping.battery_discharge_current_number, discharge_limit),
+        )
         # Deye TOU management: keep all time-points identical to the plan's intent,
         # so the (unknown) active slot always carries Wattson's discharge floor /
         # charge target instead of a stale manual value that silently blocks it.

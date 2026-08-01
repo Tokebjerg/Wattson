@@ -489,7 +489,9 @@ def apply_ev_battery_protect(plan, *, ev_charging: bool, ev_covers_dips: bool):
     The house battery must not be discharged into the car unless the caller has
     explicitly allowed solar-only dip coverage (``ev_covers_dips``). Battery-first
     spillover passes ``ev_covers_dips=False`` even though the EV mode is solar_only:
-    that path may use measured export, but not stored battery energy.
+    that path may use measured export, but not stored battery energy. The 0 A below
+    is planner intent only: ``tou_setpoint`` turns it into a current-SOC hold floor,
+    then the coordinator and physical adapter restore the hard 70 A register.
     """
     if not ev_charging or ev_covers_dips:
         return plan
@@ -822,8 +824,6 @@ def tou_setpoint(
             ),
             False,
         )
-    if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
-        return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
     if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
         # Battery care: a plan may cap its own grid-charge target below max_soc
         # (LFP calendar aging at 100 %); absorb/force-charge plans leave it None.
@@ -832,6 +832,24 @@ def tou_setpoint(
         return (_snap_tou_capacity(float(min(max_soc, target)), up=False), True)
     if plan.strategy == "OVERRIDE_DISCHARGE":
         return (_snap_tou_capacity(float(min_soc), up=True), False)
+    # A semantic 0 A means "do not let the battery discharge in this plan". The
+    # physical max-discharge register is a hard 70 A constant (v0.25.11), so carry
+    # the same intent through Deye's native TOU floor instead. This covers full-
+    # speed/scheduled EV protection, HOLD_FULL and solar-charge/hold overrides.
+    if (
+        getattr(plan, "desired_discharge_current_a", None) == 0.0
+        and not getattr(plan, "desired_solar_sell", False)
+        and plan.strategy != "SELL_SOLAR_PEAK"
+    ):
+        return (
+            min(
+                _snap_tou_capacity(float(min(max_soc, max(min_soc, soc_pct))), up=True),
+                float(max_soc),
+            ),
+            False,
+        )
+    if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
+        return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
     # Every other state covers the house down to the discharge floor. Round the floor UP
     # to the step (never let the inverter discharge below the intended reserve), clamped
     # to max_soc, so the setpoint is a clean 5-multiple that converges (no limit cycle).

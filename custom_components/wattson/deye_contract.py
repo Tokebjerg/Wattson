@@ -67,9 +67,17 @@ BATTERY -> GRID (the no-export rule)
   and under the constant modes it only caused harm: the sell-slot deficit
   demotion flipped the discharge register 0<->70 on every cloud (36
   writes/hour observed 2026-06-12 morning), and a full pack sat idle while
-  the house IMPORTED through cloud dips. Discharge 0 A remains only where it
-  expresses real intent: grid-charge hours, force-charge/hold overrides, and
-  EV-solar priority (don't drain the house battery into the car).
+  the house IMPORTED through cloud dips.
+
+DISCHARGE REGISTER IS ALWAYS OPEN (user hard rule, v0.25.11)
+  number.*_maximum_battery_discharge_current stays at exactly 70 A in EVERY
+  strategy. A plan may still carry semantic discharge=0 while its TOU setpoint
+  is calculated: that means "hold SOC" and is translated to the current-SOC
+  TOU floor. Immediately afterwards the final plan and the physical write layer
+  both force the register back to 70 A. This preserves grid-charge, protect,
+  manual-hold and non-solar-EV battery protection without ever closing the
+  inverter's discharge buffer. The write-layer backstop is deliberate defense
+  in depth: future planner paths cannot reintroduce a physical 0 A write.
 
 EV CURTAILMENT-SOAK IS REGISTER-NEUTRAL (v0.24.41)
   When the inverter curtails PV at a full pack + blocked/negative export, the
@@ -144,3 +152,16 @@ def floor_sell_safe(plan):
     ):
         updates["desired_discharge_current_a"] = float(SELL_SAFE_DISCHARGE_A)
     return replace(plan, **updates) if updates else plan
+
+
+def force_discharge_register_open(plan):
+    """Return ``plan`` with the physical discharge-limit invariant applied.
+
+    Call this only after ``tou_setpoint`` has consumed any semantic 0 A intent;
+    Deye's TOU SOC floor carries the hold/protect behaviour while this register
+    remains the constant, installation-safe 70 A ceiling.
+    """
+    target = float(BATTERY_DISCHARGE_CURRENT_MAX)
+    if getattr(plan, "desired_discharge_current_a", None) == target:
+        return plan
+    return replace(plan, desired_discharge_current_a=target)

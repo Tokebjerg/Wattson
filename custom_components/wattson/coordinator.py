@@ -179,7 +179,7 @@ from .battery_model import (
     observe_grid_rate,
 )
 from .control import EaseeController, KlatremisController
-from .deye_contract import floor_sell_safe
+from .deye_contract import floor_sell_safe, force_discharge_register_open
 from .ev_recovery import (
     MINIMUM_RECOVERY_PERSIST_STEP_KWH,
     EvMinimumRecovery,
@@ -2069,10 +2069,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     @property
     def battery_discharge_current(self) -> float:
-        return float(entry_value(self.config_entry, CONF_BATTERY_DISCHARGE_CURRENT_A, DEFAULT_BATTERY_DISCHARGE_CURRENT_A))
+        # Installation invariant: the physical maximum-discharge register is
+        # never used as a mode switch. TOU SOC floors express hold/protect intent.
+        return float(DEFAULT_BATTERY_DISCHARGE_CURRENT_A)
 
     async def async_set_battery_discharge_current(self, value: float) -> None:
-        update_entry_options(self.hass, self.config_entry, **{CONF_BATTERY_DISCHARGE_CURRENT_A: float(value)})
+        # Keep the legacy number entity compatible, but reject attempts to lower
+        # the hard 70 A register invariant.
+        update_entry_options(
+            self.hass,
+            self.config_entry,
+            **{CONF_BATTERY_DISCHARGE_CURRENT_A: float(DEFAULT_BATTERY_DISCHARGE_CURRENT_A)},
+        )
         await self.async_request_refresh()
 
     @property
@@ -3047,7 +3055,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             battery_plan, soc_pct=self.site_state.battery_soc_pct,
             min_soc=min_soc, discharge_floor=discharge_floor, max_soc=max_soc,
         )
-        battery_plan = replace(battery_plan, desired_tou_capacity_pct=tou_cap, desired_tou_charge_enable=tou_charge)
+        battery_plan = replace(
+            force_discharge_register_open(battery_plan),
+            desired_tou_capacity_pct=tou_cap,
+            desired_tou_charge_enable=tou_charge,
+        )
 
         self.control_plan = build_control_plan(
             self.site_state,
