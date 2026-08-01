@@ -4938,6 +4938,107 @@ def test_control_stability_regressions():
                            for task in sunny_uncertainty_plan.tasks[8:16]),
                    str(sunny_first)))
 
+    # Exact 2026-08-01 daytime failure shape: the hourly P50 plan says EXPORT,
+    # while a live load spike makes PV insufficient. The evening reserve still
+    # targets 100%, but abundant future P10 solar can refill any dip energy before
+    # the peak. The physical floor must therefore sit below the current 57% SOC so
+    # the Deye covers the house instead of importing.
+    daytime_prices = [models.PriceSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        spot_price=(2.3 if 17 <= h <= 21 else (0.4 if 12 <= h <= 15 else 1.5)),
+        tariff=0.0,
+        total_import_price=(2.3 if 17 <= h <= 21 else (0.4 if 12 <= h <= 15 else 1.5)),
+        export_value=0.75,
+    ) for h in range(24)]
+    daytime_solar = [models.SolarSlot(
+        start=base.replace(hour=0) + timedelta(hours=h),
+        pv_estimate_kwh=(
+            [2.7, 4.2, 5.3, 6.2, 6.8, 6.9, 6.4, 5.4][h - 9]
+            if 9 <= h <= 16 else 0.0
+        ),
+        pv_estimate10_kwh=(
+            [2.0, 3.2, 4.0, 4.8, 5.2, 5.3, 4.8, 4.0][h - 9]
+            if 9 <= h <= 16 else 0.0
+        ),
+        pv_estimate90_kwh=(
+            [3.2, 5.0, 6.3, 7.3, 7.8, 7.9, 7.4, 6.2][h - 9]
+            if 9 <= h <= 16 else 0.0
+        ),
+    ) for h in range(24)]
+    daytime_load = {
+        base.replace(hour=0) + timedelta(hours=h): (1400.0 if 17 <= h <= 21 else 650.0)
+        for h in range(24)
+    }
+    daytime_p90_load = {
+        start: (3600.0 if 17 <= start.hour <= 21 else value)
+        for start, value in daytime_load.items()
+    }
+    daytime_state = replace(
+        full_midnight,
+        timestamp=base.replace(hour=9),
+        battery_soc_pct=57.0,
+        pv_power_w=2750.0,
+        load_power_w=3450.0,
+        grid_power_w=700.0,
+        grid_import_power_w=700.0,
+        grid_export_power_w=0.0,
+        current_buy_price=1.5,
+        current_sell_price=0.75,
+        forecast_today_kwh=61.2,
+        price_slots=daytime_prices,
+        solar_slots=daytime_solar,
+    )
+    daytime_plan = planner.build_day_plan(
+        daytime_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=daytime_load,
+        reserve_load_by_start_w=daytime_p90_load,
+    )
+    daytime_slot = daytime_plan.slots[0] if daytime_plan else None
+    daytime_task = daytime_plan.tasks[0] if daytime_plan else None
+    daytime_execution = planner.execute_slot(
+        daytime_slot, daytime_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        allow_grid_charge=True, allow_negative_export=False,
+        export_limit_default_w=6000.0,
+    )[0] if daytime_slot else None
+    checks.append(("2026-08-01 sunny EXPORT slot releases a refill-safe floor below live SOC",
+                   daytime_task is not None
+                   and daytime_slot is not None
+                   and daytime_task.action == "EXPORT"
+                   and daytime_slot.tou_floor_pct < daytime_state.battery_soc_pct
+                   and daytime_execution is not None
+                   and daytime_execution.strategy == "DISCHARGE_TO_LOAD",
+                   f"{daytime_task}/{daytime_slot}/{daytime_execution}"))
+
+    # The release is proportional, not all-or-nothing: 2.2kWh P10 surplus with
+    # the 1.10 margin restores exactly 20 percentage points of a 10kWh pack.
+    partial_p10 = [replace(
+        slot,
+        pv_estimate10_kwh=(2.85 if slot.start.hour == 10 else 0.0),
+    ) for slot in daytime_solar]
+    partial_plan = planner.build_day_plan(
+        replace(daytime_state, battery_soc_pct=85.0, solar_slots=partial_p10),
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=daytime_load,
+        reserve_load_by_start_w=daytime_p90_load,
+    )
+    partial_slot = partial_plan.slots[0] if partial_plan else None
+    checks.append(("partial P10 refill opens only the energy it can restore before the peak",
+                   partial_slot is not None and partial_slot.tou_floor_pct == 80.0,
+                   str(partial_slot)))
+
+    no_p10 = [replace(slot, pv_estimate10_kwh=0.0) for slot in daytime_solar]
+    no_refill_plan = planner.build_day_plan(
+        replace(daytime_state, battery_soc_pct=85.0, solar_slots=no_p10),
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=daytime_load,
+        reserve_load_by_start_w=daytime_p90_load,
+    )
+    no_refill_slot = no_refill_plan.slots[0] if no_refill_plan else None
+    checks.append(("zero P10 refill keeps the full winter-style peak reserve",
+                   no_refill_slot is not None and no_refill_slot.tou_floor_pct == 100.0,
+                   str(no_refill_slot)))
+
     # The aggregate hourly P90 tail can be far larger than the pack. Refill
     # credit must be compared with the extra energy that can actually be held
     # above this task's P50 end-SOC, not the impossible raw multi-hour sum.

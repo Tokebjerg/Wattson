@@ -1044,10 +1044,20 @@ def build_day_plan(
             / UNCERTAINTY_REFILL_MARGIN
             / max(0.1, capacity_kwh)
             * 100.0
-        ) if strong_refill else 0.0
-        refill_safe_floor = (
+        )
+        strong_refill_floor = (
             max(base_floor, max_soc - refill_release_pct)
             if strong_refill else base_floor
+        )
+        # A forecast-surplus slot can still encounter a live house deficit when
+        # consumption spikes or PV dips below its hourly estimate. Keep enough of
+        # the reserve to reach the later peak, but release exactly the amount that
+        # conservative P10 surplus can restore before then. This is deliberately
+        # partial: a marginal refill opens only a 5%-quantized envelope, while no
+        # refill leaves the full winter/low-solar reserve untouched.
+        live_dip_floor = max(
+            base_floor,
+            reserve_floor - refill_release_pct,
         )
         # The optimizer may ration a finite pack across several expensive hours:
         # an early peak slot can deliberately IDLE (or discharge only part-way)
@@ -1075,11 +1085,11 @@ def build_day_plan(
             and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
             and task.total_import_price >= 0.0
             and strong_refill
-            and committed_start_soc > refill_safe_floor + 0.1
+            and committed_start_soc > strong_refill_floor + 0.1
         )
         if refill_backed_self_consumption:
             available_kwh = (
-                max(0.0, committed_start_soc - refill_safe_floor)
+                max(0.0, committed_start_soc - strong_refill_floor)
                 / 100.0
                 * capacity_kwh
             )
@@ -1092,8 +1102,13 @@ def build_day_plan(
                 self_consumption_end,
             )
 
-        floor = reserve_floor
-        physical_reserve_floor = reserve_floor
+        live_dip_release = bool(
+            not forecast_deficit
+            and task.action != "GRID_CHARGE"
+            and conservative_refill_kwh > 0.0
+        )
+        floor = live_dip_floor if live_dip_release else reserve_floor
+        physical_reserve_floor = floor
         if (
             committed_projected is not None
             and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
@@ -1150,7 +1165,7 @@ def build_day_plan(
             # The optimizer projection already contains its P50 economic reserve;
             # peak_reserve_pct is the fallback for non-projected paths and must
             # not be added a second time here.
-            physical_reserve_floor = refill_safe_floor if strong_refill else base_floor
+            physical_reserve_floor = strong_refill_floor if strong_refill else base_floor
             floor = max(
                 physical_reserve_floor,
                 float(committed_projected) + uncertainty_pct,
