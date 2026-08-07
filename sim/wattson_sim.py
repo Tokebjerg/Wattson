@@ -18,8 +18,9 @@ import sys
 import types
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-REPO_ROOT = "/Users/emiltokebjerg/Documents/Playground"
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
 WATTSON_DIR = f"{REPO_ROOT}/custom_components/wattson"
 
 
@@ -5068,6 +5069,125 @@ def test_control_stability_regressions():
                    and any(task.action == "EXPORT"
                            for task in sunny_uncertainty_plan.tasks[8:16]),
                    str(sunny_first)))
+
+    # Exact 2026-08-07 price-inversion failure: both economic schedulers want
+    # to cover the 20:00 deficit at 2.39 kr/kWh, but the old P90 overlay treated
+    # 21:00 as a future "peak" merely because it was in the horizon's top-N —
+    # even though it was cheaper at 2.17.  It lifted the physical floor to 100%,
+    # relabelled the current discharge IDLE and bought the house load from grid.
+    inversion_now = base.replace(hour=20)
+    inversion_price_values = [
+        2.39, 2.17, 2.02, 1.90, 1.76, 1.70, 1.66, 1.65,
+        1.63, 1.66, 1.72, 1.64, 1.43, 0.94, 0.39, 0.37,
+        0.36, 0.35, 0.36, 0.36, 0.37, 1.18, 1.85, 2.11,
+    ]
+    inversion_prices = [models.PriceSlot(
+        start=inversion_now + timedelta(hours=i),
+        spot_price=price, tariff=0.0,
+        total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate(inversion_price_values)]
+    inversion_pv = [
+        0.118, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.01, 0.145, 1.069, 2.590, 4.062, 5.153, 5.842,
+        6.112, 6.092, 5.657, 4.872, 3.981, 3.079, 1.982, 0.723,
+    ]
+    inversion_load_kwh = [
+        0.918, 0.641, 0.601, 0.568, 0.445, 0.407, 0.453, 0.459,
+        0.378, 0.454, 0.413, 0.501, 1.582, 2.392, 2.305, 3.016,
+        0.861, 1.131, 3.581, 2.385, 1.454, 1.316, 1.222, 2.186,
+    ]
+    inversion_solar = [models.SolarSlot(
+        start=slot.start, pv_estimate_kwh=inversion_pv[i],
+        pv_estimate10_kwh=inversion_pv[i] * 0.55,
+        pv_estimate90_kwh=inversion_pv[i] * 1.20,
+    ) for i, slot in enumerate(inversion_prices)]
+    inversion_load = {
+        slot.start: inversion_load_kwh[i] * 1000.0
+        for i, slot in enumerate(inversion_prices)
+    }
+    inversion_p90 = {
+        slot.start: max(inversion_load[slot.start] * 1.35, 1600.0)
+        for slot in inversion_prices
+    }
+    inversion_state = replace(
+        full_midnight,
+        timestamp=inversion_now,
+        battery_soc_pct=100.0,
+        pv_power_w=0.0,
+        load_power_w=700.0,
+        grid_power_w=700.0,
+        grid_import_power_w=700.0,
+        grid_export_power_w=0.0,
+        current_buy_price=2.39,
+        current_sell_price=0.4,
+        forecast_today_kwh=0.0,
+        price_slots=inversion_prices,
+        solar_slots=inversion_solar,
+    )
+    inversion_plan = planner.build_day_plan(
+        inversion_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=inversion_load,
+        reserve_load_by_start_w=inversion_p90,
+    )
+    inversion_task = inversion_plan.tasks[0] if inversion_plan else None
+    inversion_slot = inversion_plan.slots[0] if inversion_plan else None
+    inversion_execution = planner.execute_slot(
+        inversion_slot, inversion_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        allow_grid_charge=True, allow_negative_export=False,
+        export_limit_default_w=6000.0,
+    )[0] if inversion_slot else None
+    inversion_available_kwh = (
+        (100.0 - inversion_slot.tou_floor_pct) / 100.0 * 10.0
+        if inversion_slot else 0.0
+    )
+    checks.append(("2026-08-07: 2.39 now -> 2.17 later discharges now instead of holding 100%",
+                   inversion_task is not None
+                   and inversion_slot is not None
+                   and inversion_task.action == "DISCHARGE"
+                   and inversion_slot.tou_floor_pct <= 90.0
+                   and inversion_available_kwh >= 0.70
+                   and inversion_execution is not None
+                   and inversion_execution.strategy == "DISCHARGE_TO_LOAD"
+                   and inversion_execution.desired_grid_charge is False,
+                   f"{inversion_task}/{inversion_slot}/{inversion_execution}"))
+
+    # Safety mirror: when the current slot really IS cheaper and the pack has
+    # only enough usable energy for the later peak, the same filter must retain
+    # the reserve.  This prevents the correction becoming a generic
+    # "import => lower floor" rule that would regress winter economics.
+    dearer_later_prices = [models.PriceSlot(
+        start=inversion_now + timedelta(hours=i),
+        spot_price=price, tariff=0.0,
+        total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.40, 2.39, 2.17, 1.60])]
+    dearer_load = {
+        slot.start: (2000.0 if i == 1 else 700.0)
+        for i, slot in enumerate(dearer_later_prices)
+    }
+    dearer_state = replace(
+        inversion_state,
+        battery_soc_pct=30.0,
+        current_buy_price=1.40,
+        price_slots=dearer_later_prices,
+        solar_slots=[replace(solar, start=dearer_later_prices[i].start)
+                     for i, solar in enumerate(inversion_solar[:4])],
+    )
+    dearer_plan = planner.build_day_plan(
+        dearer_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=dearer_load,
+        reserve_load_by_start_w=dearer_load,
+    )
+    dearer_current = dearer_plan.tasks[0] if dearer_plan else None
+    dearer_peak = dearer_plan.tasks[1] if dearer_plan and len(dearer_plan.tasks) > 1 else None
+    checks.append(("cheap current hour still holds scarce energy for a genuinely dearer later peak",
+                   dearer_current is not None
+                   and dearer_peak is not None
+                   and dearer_current.action in ("IDLE", "GRID_CHARGE")
+                   and (dearer_current.tou_floor_pct or 0.0) >= 30.0
+                   and dearer_peak.action == "DISCHARGE"
+                   and (dearer_peak.projected_soc_pct or 0.0) >= 15.0,
+                   f"{dearer_current}/{dearer_peak}"))
 
     # Exact 2026-08-01 daytime failure shape: the hourly P50 plan says EXPORT,
     # while a live load spike makes PV insufficient. The evening reserve still

@@ -1057,9 +1057,18 @@ def build_day_plan(
         # the reserve itself, not only against the separate P90 uncertainty tail.
         # This gives a sunny night a conservative discharge envelope while a
         # cloudy/winter night keeps the full reserve unchanged.
+        # ``view.expensive_starts`` is a top-N ranking over the remaining
+        # horizon, not proof that a later slot is dearer than THIS slot.  The
+        # P90 uncertainty overlay must never cancel discharge now in order to
+        # reserve energy for a cheaper later hour (the live 2026-08-07 failure:
+        # 2.39 kr/kWh now was pinned at 100%, then released at 2.17 kr/kWh).
+        # Use the same economic peak definition as ``peak_reserve_pct``: only a
+        # markedly dearer later slot may justify holding extra uncertainty.
         future_peaks = [
             candidate for candidate in tasks[task_index + 1:]
             if candidate.start in view.expensive_starts
+            and candidate.total_import_price
+            > task.total_import_price + RESERVE_HOLD_MARGIN
         ]
         conservative_refill_kwh = 0.0
         if future_peaks:
@@ -1126,9 +1135,33 @@ def build_day_plan(
             and strong_refill
             and committed_start_soc > strong_refill_floor + 0.1
         )
-        if refill_backed_self_consumption:
+        # Price-aware release: when no materially dearer protected deficit remains,
+        # do not import now merely to save the same stored kWh for a later hour
+        # that is cheaper beyond the configured hold margin. Cover this slot's P50
+        # house deficit down to the base reserve even if the discretized optimizer
+        # happened to ration only part of it. This is deliberately NOT a live
+        # "import => release" guard:
+        # a real dearer future peak keeps ``future_peaks`` non-empty and therefore
+        # retains the conservative reserve unchanged.
+        price_dominant_self_consumption = bool(
+            forecast_deficit
+            and task.action == "DISCHARGE"
+            and task.total_import_price >= 0.0
+            and not future_peaks
+            and committed_start_soc > base_floor + 0.1
+        )
+        protected_self_consumption = bool(
+            refill_backed_self_consumption
+            or price_dominant_self_consumption
+        )
+        if protected_self_consumption:
+            self_consumption_floor = (
+                strong_refill_floor
+                if refill_backed_self_consumption
+                else base_floor
+            )
             available_kwh = (
-                max(0.0, committed_start_soc - strong_refill_floor)
+                max(0.0, committed_start_soc - self_consumption_floor)
                 / 100.0
                 * capacity_kwh
             )
@@ -1239,12 +1272,26 @@ def build_day_plan(
             and committed_projected is not None
             and float(committed_projected) < committed_start_soc - 0.1
         )
-        if release_intent and refill_backed_self_consumption:
+        trajectory_snap_down_safe = bool(
+            release_intent
+            and (
+                refill_backed_self_consumption
+                or (
+                    view.current is not None
+                    and task.start == view.current.start
+                    and task.action == "DISCHARGE"
+                    and not future_peaks
+                    and uncertainty_pct <= 0.1
+                )
+            )
+        )
+        if trajectory_snap_down_safe:
             # The optimizer works in 2.5%-SOC buckets while the Deye accepts only
             # 5%. Rounding a discharge trajectory upward turns every other planned
-            # discharge into a hard hold. Round the trajectory down, but never the
-            # true reserve floor, so execution can cover the forecast house load
-            # without weakening the conservative reserve.
+            # discharge into a hard hold. Round the trajectory down when either a
+            # conservative refill backs it OR no P90 uncertainty is being held.
+            # The true reserve floor is still rounded UP, so the hard minimum and
+            # every genuinely dearer future peak remain protected.
             committed_floor = max(
                 _snap_tou_capacity(float(min(physical_reserve_floor, max_soc)), up=True),
                 _snap_tou_capacity(float(min(floor, max_soc)), up=False),
