@@ -200,7 +200,11 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         key="battery_model",
         name="Battery Model",
         icon="mdi:battery-sync-outline",
-        device_class=SensorDeviceClass.ENERGY,
+        # This is the pack's current learned capacity estimate, not a cumulative
+        # energy meter. ENERGY_STORAGE + MEASUREMENT is the statistics-safe HA
+        # contract for an instantaneous stored-capacity value.
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         value_fn=lambda c: round(c.effective_battery_capacity_kwh, 2),
         attrs_fn=lambda c: {
@@ -1518,11 +1522,14 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
 class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
     """#8/#5 (observe-only): grid-backed EV energy while charging in "Ren sol" today,
     plus the surplus-signal regression comparison as attributes. Revives the P4 sensor's
-    unique_id so the orphaned entity comes back to life. Daily; resets on restart."""
+    unique_id so the orphaned entity comes back to life. The energy state uses
+    the restored calendar-day telemetry; shadow averages remain restart-local."""
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:car-electric-outline"
     _attr_native_unit_of_measurement = "kWh"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
     def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -1537,7 +1544,11 @@ class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        return round(self.coordinator.ev_solar_grid_backed_kwh, 2)
+        return round(float(getattr(
+            self.coordinator,
+            "ev_solar_grid_backed_kwh_today",
+            self.coordinator.ev_solar_grid_backed_kwh,
+        ) or 0.0), 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1550,13 +1561,18 @@ class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):
             if (used is not None and shadow is not None and shadow > 50.0)
             else None
         )
-        ev_kwh = c.ev_solar_ev_kwh
+        ev_kwh = float(getattr(c, "ev_solar_ev_kwh_today", c.ev_solar_ev_kwh) or 0.0)
+        grid_kwh = float(getattr(
+            c,
+            "ev_solar_grid_backed_kwh_today",
+            c.ev_solar_grid_backed_kwh,
+        ) or 0.0)
         return {
             "ev_kwh_solar_mode": round(ev_kwh, 2),
-            "grid_fraction_pct": round(c.ev_solar_grid_backed_kwh / ev_kwh * 100.0, 1) if ev_kwh > 0.05 else None,
+            "grid_fraction_pct": round(grid_kwh / ev_kwh * 100.0, 1) if ev_kwh > 0.05 else None,
             "surplus_used_avg_w": round(used) if used is not None else None,
             "surplus_shadow_avg_w": round(shadow) if shadow is not None else None,
             "overoffer_pct": over,
             "hours_observed": round(hours, 2),
-            "note": "Regressionsvagt: 'used' og 'shadow' bruger nu samme korrigerede soloverskud. Gabet skal forblive 0%; grid-andelen viser fortsat faktisk netstøttet EV-ladning i Ren sol.",
+            "note": "Regressionsvagt: 'used' og 'shadow' bruger samme korrigerede soloverskud. Hovedværdien er den gendannede dagsmåler for faktisk netstøttet EV-ladning i Ren sol; shadow-gennemsnit starter forfra ved genstart.",
         }
