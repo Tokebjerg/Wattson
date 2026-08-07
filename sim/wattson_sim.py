@@ -2858,20 +2858,44 @@ def test_coordinator_ev_harness():
     cooldown_hold = co._apply_ev_phase_transition(
         three_phase_9a, now=at(second_failure_at + 10), ev_max_amps=16
     )
-    retry_after_cooldown = co._apply_ev_phase_transition(
+    still_locked_later = co._apply_ev_phase_transition(
         three_phase_9a,
         now=at(second_failure_at + const.EV_PHASE_TRANSITION_COOLDOWN_SECONDS + 1),
         ev_max_amps=16,
     )
-    checks.append(("harness 1->3 phase: two failures fall back once with cooldown",
+    co.site_state = replace(
+        co.site_state,
+        easee_status="disconnected",
+        easee_power_w=0.0,
+        easee_session_kwh=0.0,
+    )
+    co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(second_failure_at + const.EV_PHASE_TRANSITION_COOLDOWN_SECONDS + 2),
+        ev_max_amps=16,
+    )
+    co.site_state = replace(
+        co.site_state,
+        easee_status="charging",
+        easee_power_w=2100.0,
+        easee_session_kwh=0.1,
+    )
+    next_session_retry = co._apply_ev_phase_transition(
+        three_phase_9a,
+        now=at(second_failure_at + const.EV_PHASE_TRANSITION_COOLDOWN_SECONDS + 3),
+        ev_max_amps=16,
+    )
+    checks.append(("harness 1->3 phase: two failures lock one phase for this session only",
                    fallback.desired_circuit_currents == (16, 0, 0)
                    and cooldown_hold.desired_circuit_currents == (16, 0, 0)
-                   and retry_after_cooldown.desired_circuit_currents == (9, 9, 9)
+                   and still_locked_later.desired_circuit_currents == (16, 0, 0)
+                   and next_session_retry.desired_circuit_currents == (9, 9, 9)
                    and co._ev_phase_transition_state == "requesting_three_phase"
                    and co._ev_phase_transition_failures == 0,
                    f"fallback={fallback.desired_circuit_currents}, "
                    f"cooldown={cooldown_hold.desired_circuit_currents}, "
-                   f"retry={retry_after_cooldown.desired_circuit_currents}, "
+                   f"locked_later={still_locked_later.desired_circuit_currents}, "
+                   f"next_session={next_session_retry.desired_circuit_currents}, "
                    f"state={co.ev_phase_transition_status}"))
 
     co = make_co()

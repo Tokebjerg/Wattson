@@ -2583,6 +2583,7 @@ def build_ev_plan(
     ev_min_soc: float = 0.0,
     ev_charge_until_complete: bool = False,
     ev_minimum_recovery_complete: bool = False,
+    ev_phase_capability: str | None = None,
 ) -> EvPlan:
     normalized_status = (state.easee_status or "").strip().lower()
     runtime_state = ev_runtime_state(state)
@@ -2591,8 +2592,16 @@ def build_ev_plan(
 
     current_phase_mode = (state.easee_phase_mode or "").lower()
     current_phase_normalized = (
-        "3_phase" if current_phase_mode in {"3_phase", "three_phase", "three", "auto_phase", "auto"} else "1_phase"
+        ev_phase_capability
+        if ev_phase_capability in {"single_phase", "three_phase"}
+        else (
+            "3_phase"
+            if current_phase_mode in {"3_phase", "three_phase", "three", "auto_phase", "auto"}
+            else "1_phase"
+        )
     )
+    if current_phase_normalized == "single_phase":
+        current_phase_normalized = "1_phase"
 
     def _ready_deadline() -> datetime | None:
         """Next occurrence of the 'ready by' hour, or None when no deadline is set."""
@@ -3009,6 +3018,7 @@ def projected_ev_load_by_start(
     ev_min_soc: float = 0.0,
     ev_charge_until_complete: bool = False,
     ev_minimum_recovery_complete: bool = False,
+    ev_phase_capability: str | None = None,
 ) -> dict[datetime, float]:
     """Forecast hourly EV energy so the battery SOC curve includes the car.
 
@@ -3022,7 +3032,12 @@ def projected_ev_load_by_start(
     if not slots:
         return {}
     phase_mode = (state.easee_phase_mode or "").lower()
-    phases = 1 if phase_mode in {"1_phase", "single", "one_phase", "one"} else 3
+    if ev_phase_capability == "three_phase":
+        phases = 3
+    elif ev_phase_capability in {"single_phase", "unknown"}:
+        phases = 1
+    else:
+        phases = 1 if phase_mode in {"1_phase", "single", "one_phase", "one"} else 3
     max_ev_kwh = max(0.0, int(ev_max_amps) * 230.0 * phases / 1000.0)
     if max_ev_kwh <= 0.0:
         return {}

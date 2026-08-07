@@ -395,9 +395,19 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "ev_phase_transition": getattr(
                     self.coordinator, "ev_phase_transition_status", {"state": "idle"}
                 ),
+                "ev_session": getattr(self.coordinator, "_ev_session", None).as_dict()
+                if getattr(self.coordinator, "_ev_session", None) is not None
+                else {},
                 "ev_minimum_recovery": getattr(
                     self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
                 ),
+                "execution": getattr(self.coordinator, "execution_status", {}),
+                "tick_metrics": getattr(self.coordinator, "tick_metrics", {}),
+                "recent_decisions": getattr(
+                    self.coordinator, "_decision_traces", None
+                ).as_list(limit=10)
+                if getattr(self.coordinator, "_decision_traces", None) is not None
+                else [],
                 "physical_writes_today": getattr(self.coordinator, "physical_write_counts", {}),
                 # #6 heartbeat: gap before the last tick (a big value = a stall/restart
                 # trace). #3 data-source health: which planning feeds are live.

@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.zip
 tmp/
+sim/study_results.json
 
 # Stray Claude scheduled-task lock written into the component cwd
 custom_components/wattson/.claude/

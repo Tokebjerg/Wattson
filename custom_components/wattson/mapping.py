@@ -238,6 +238,8 @@ def build_site_state(
     stale_seconds: int,
     invert_grid_power_sign: bool,
     invert_battery_power_sign: bool,
+    price_slots=None,
+    solar_slots=None,
 ) -> SiteState:
     missing: list[str] = []
     issues: list[str] = []
@@ -352,7 +354,17 @@ def build_site_state(
 
     # Car SOC (scheduled_cheapest target charging only): fully optional — absent or
     # stale never raises issues; the planner degrades to fixed required-hours.
-    ev_soc = _read_float(hass, mapping.ev_soc_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds * 20)
+    ev_soc_stale: list[str] = []
+    ev_soc = _read_float(
+        hass,
+        mapping.ev_soc_entity,
+        missing=[],
+        issues=[],
+        stale=ev_soc_stale,
+        stale_seconds=stale_seconds * 20,
+    )
+    if ev_soc_stale:
+        ev_soc = None
     if ev_soc is not None and not (0.0 <= ev_soc <= 100.0):
         ev_soc = None
     buy_price = _read_float(hass, mapping.buy_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
@@ -361,8 +373,10 @@ def build_site_state(
 
     # Phase A trin A1: ingest the hourly planning horizon. Defensive — returns
     # empty lists when the entities do not expose hourly attributes.
-    price_slots = build_price_slots(hass, mapping.buy_price_entity, mapping.sell_price_entity)
-    solar_slots = build_solar_slots(hass, mapping.forecast_today_entity)
+    if price_slots is None:
+        price_slots = build_price_slots(hass, mapping.buy_price_entity, mapping.sell_price_entity)
+    if solar_slots is None:
+        solar_slots = build_solar_slots(hass, mapping.forecast_today_entity)
 
     required_missing = [entity_id for entity_id in missing if entity_id in required_missing_entity_ids]
     if required_missing:

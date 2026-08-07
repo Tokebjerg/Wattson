@@ -25,6 +25,15 @@ import wattson_backtest as bt  # noqa: E402
 TZ = bt.TZ
 MIN_SOC = bt.MIN_SOC
 
+# Deliberately tolerant no-harm floors around the established 20-day baseline.
+# These catch a material economic regression while leaving room for better planning
+# to move individual days around as the optimizer evolves.
+MIN_MEAN_EFFICIENCY_PCT = 85.0
+MIN_WORST_PLAN_VS_REACTIVE_DKK = -1.0
+MAX_PLAN_WORSE_THAN_REACTIVE_RATIO = 0.50
+MAX_MISSED_DISCHARGE_DAY_RATIO = 0.55
+MAX_WORST_ORACLE_HEADROOM_DKK = 3.0
+
 
 def analyze(path):
     with open(path) as f:
@@ -148,14 +157,20 @@ def main(paths):
     # aggregate
     ok = [r for r in results if "error" not in r]
     if ok:
+        worse_than_reactive = [r for r in ok if r["plan_vs_reactive"] < -0.05]
+        missed_discharge = [r for r in ok if r["missed_discharge_hours"]]
         out["aggregate"] = {
             "n": len(ok),
             "n_errors": len(results) - len(ok),
             "total_headroom": round(sum(r["headroom_to_honest_oracle"] for r in ok), 2),
             "mean_efficiency_pct": round(sum(r["efficiency_pct"] for r in ok) / len(ok), 1),
-            "days_plan_worse_than_reactive": [r["date"] for r in ok if r["plan_vs_reactive"] < -0.05],
-            "days_with_missed_discharge": [r["date"] for r in ok if r["missed_discharge_hours"]],
+            "days_plan_worse_than_reactive": [r["date"] for r in worse_than_reactive],
+            "plan_worse_than_reactive_ratio": round(len(worse_than_reactive) / len(ok), 3),
+            "worst_plan_vs_reactive": round(min(r["plan_vs_reactive"] for r in ok), 2),
+            "days_with_missed_discharge": [r["date"] for r in missed_discharge],
+            "missed_discharge_day_ratio": round(len(missed_discharge) / len(ok), 3),
             "days_with_neg_export": [r["date"] for r in ok if r["neg_export_hours"]],
+            "worst_headroom": round(max(r["headroom_to_honest_oracle"] for r in ok), 2),
             "worst_headroom_days": sorted(ok, key=lambda r: r["headroom_to_honest_oracle"], reverse=True)[:6] and
                 [{"date": r["date"], "headroom": r["headroom_to_honest_oracle"], "regime": r.get("regime"), "sky": r.get("sky")}
                  for r in sorted(ok, key=lambda r: r["headroom_to_honest_oracle"], reverse=True)[:6]],
@@ -171,6 +186,8 @@ def main(paths):
         print(f"  total headroom to honest oracle: {a['total_headroom']:+.2f} kr  "
               f"(mean eff {a['mean_efficiency_pct']:.0f}%)")
         print(f"  errors: {a['n_errors']}  |  plan<reactive days: {a['days_plan_worse_than_reactive']}")
+        print(f"  worst plan-reactive: {a['worst_plan_vs_reactive']:+.2f} kr  |  "
+              f"ratio: {a['plan_worse_than_reactive_ratio']:.0%}")
         print(f"  missed-discharge days: {a['days_with_missed_discharge']}")
         print(f"  neg-export days: {a['days_with_neg_export']}")
         print(f"  worst headroom: " + ", ".join(f"{w['date']}({w['headroom']:+.2f})" for w in a['worst_headroom_days']))
@@ -181,12 +198,39 @@ def main(paths):
         agg = out.get("aggregate") or {}
         if agg.get("n_errors"):
             problems.append(f"{agg['n_errors']} day(s) errored")
-        if agg and agg.get("mean_efficiency_pct", 0.0) < 85.0:
-            problems.append(f"mean efficiency {agg.get('mean_efficiency_pct')}% < 85% floor")
+        if agg and agg.get("mean_efficiency_pct", 0.0) < MIN_MEAN_EFFICIENCY_PCT:
+            problems.append(
+                f"mean efficiency {agg.get('mean_efficiency_pct')}% < "
+                f"{MIN_MEAN_EFFICIENCY_PCT:.0f}% floor"
+            )
+        if agg and agg.get("worst_plan_vs_reactive", -999.0) < MIN_WORST_PLAN_VS_REACTIVE_DKK:
+            problems.append(
+                f"worst plan-reactive {agg.get('worst_plan_vs_reactive')} kr < "
+                f"{MIN_WORST_PLAN_VS_REACTIVE_DKK:.2f} kr floor"
+            )
+        if agg and agg.get("plan_worse_than_reactive_ratio", 1.0) > MAX_PLAN_WORSE_THAN_REACTIVE_RATIO:
+            problems.append(
+                f"plan worse than reactive on {agg.get('plan_worse_than_reactive_ratio', 0.0):.0%} "
+                f"> {MAX_PLAN_WORSE_THAN_REACTIVE_RATIO:.0%} ceiling"
+            )
+        if agg and agg.get("missed_discharge_day_ratio", 1.0) > MAX_MISSED_DISCHARGE_DAY_RATIO:
+            problems.append(
+                f"missed discharge on {agg.get('missed_discharge_day_ratio', 0.0):.0%} "
+                f"> {MAX_MISSED_DISCHARGE_DAY_RATIO:.0%} ceiling"
+            )
+        if agg and agg.get("worst_headroom", 999.0) > MAX_WORST_ORACLE_HEADROOM_DKK:
+            problems.append(
+                f"worst honest-oracle headroom {agg.get('worst_headroom')} kr > "
+                f"{MAX_WORST_ORACLE_HEADROOM_DKK:.2f} kr ceiling"
+            )
         if problems:
             print("CHECK FAILED: " + "; ".join(problems))
             return 1
-        print(f"CHECK OK: {len(ok)} days, 0 errors, mean eff {agg.get('mean_efficiency_pct')}% >= 85%")
+        print(
+            f"CHECK OK: {len(ok)} days, 0 errors, mean eff "
+            f"{agg.get('mean_efficiency_pct')}%, worst plan-reactive "
+            f"{agg.get('worst_plan_vs_reactive'):+.2f} kr"
+        )
     return 0
 
 

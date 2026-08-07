@@ -338,7 +338,8 @@ def _merge(defaults: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
 class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Wattson config flow."""
 
-    VERSION = 1
+    VERSION = 2
+    MINOR_VERSION = 0
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
