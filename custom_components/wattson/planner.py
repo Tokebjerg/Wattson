@@ -118,13 +118,11 @@ NEGATIVE_IMPORT_ABSORB_THRESHOLD = 0.0
 # margin is the safety buffer against an over-optimistic forecast.
 SELL_REFILL_MARGIN = 1.2
 
-# Solar-aware reserve release (v0.24.14): drop the LEARNED self-use reserve when the
-# forecast solar surplus over the next SOLAR_RESERVE_HORIZON_H hours can refill the
-# whole usable SOC band at least this many times over — high-confidence enough that
-# the pack refills from the sun regardless, so holding the reserve overnight/evening
-# is dead weight. Conservative margin + bias-corrected forecast; mirrors the
-# peak_reserve cheap-refill credit (A1). Lets the pack discharge the cheap
-# overnight/evening hours down to the hard min and refill free from tomorrow's sun.
+# Solar-aware reserve release: drop only the LEARNED self-use reserve when P10 solar
+# surplus over the next SOLAR_RESERVE_HORIZON_H hours can refill that released energy
+# this many times over. The old whole-usable-band threshold (~12.9 kWh on the live
+# pack) pinned a 15 pp learned reserve even when replacing it needed only ~1.5 kWh.
+# Peak/economic reserves keep their separate, stricter whole-band gates below.
 SOLAR_RESERVE_RELEASE_MARGIN = 1.5
 SOLAR_RESERVE_HORIZON_H = 24
 # Same idea applied to the EVENING-PEAK reserve (peak_reserve_pct), but with a stricter
@@ -333,6 +331,7 @@ def forecast_refills_band(
     margin: float,
     confidence: float = 1.0,
     ev_load_by_start: dict[datetime, float] | None = None,
+    require_p10: bool = False,
 ) -> bool:
     """True when the forecast solar SURPLUS over the next ``horizon_hours`` can refill
     the whole usable SOC band at least ``margin``x over — i.e. the coming sun is so
@@ -357,6 +356,8 @@ def forecast_refills_band(
         load_kwh = load_forecast_w(load_hourly_w, s.start, avg_load_w) / 1000.0
         # Reserve release uses Solcast's conservative P10 band. The economic
         # optimizer continues to use the median estimate.
+        if require_p10 and s.pv_estimate10_kwh is None:
+            continue
         conservative_solar = (
             s.pv_estimate10_kwh
             if s.pv_estimate10_kwh is not None
@@ -410,33 +411,53 @@ def solar_aware_reserve_pct(
     solar_slots,
     load_hourly_w,
     now,
-    usable_pct,
     capacity_kwh,
+    min_soc: float,
+    current_soc_pct: float | None,
     horizon_hours: int = SOLAR_RESERVE_HORIZON_H,
     margin: float = SOLAR_RESERVE_RELEASE_MARGIN,
     confidence: float = 1.0,
     ev_load_by_start: dict[datetime, float] | None = None,
+    forecast_usable: bool = True,
+    tou_step_pct: float = 5.0,
 ) -> float:
-    """Release (-> 0) the LEARNED self-use reserve when the forecast solar surplus
-    over the next ``horizon_hours`` can refill the whole usable SOC band at least
-    ``margin``x over — so the pack may run down to the hard min on the cheap
-    overnight/evening hours and refill for free from the coming sun, instead of
-    carrying the reserve dead to a near-certain solar refill.
+    """Return the effective LEARNED self-use reserve.
 
-    Conservative by construction: it needs the (already bias-corrected) forecast
-    surplus to clear the FULL usable band x margin, so a clearly-sunny tomorrow
-    releases while a marginal/low-solar day keeps the reserve and never strands the
-    pack. Only the LEARNED reserve is released here — a profile self-sufficiency
-    reserve (Grøn's reserve_soc_offset) is the caller's max() and stays untouched.
-    Mirrors peak_reserve_pct's cheap-refill credit (A1, v0.24.8)."""
+    Release it only when fresh, bias-corrected P10 surplus can refill the energy
+    actually released by ``margin``. Missing P10 or a degraded forecast fails closed.
+    If the forecast later deteriorates after SOC has already fallen below the normal
+    floor, re-arm only to the highest native TOU step already present in the battery;
+    the learned reserve may preserve energy, but must never create a grid catch-up.
+
+    A profile reserve (Grøn) and peak/economic reserves are separate max() terms and
+    therefore remain untouched. The hard ``min_soc`` is also applied downstream and
+    can never be released here.
+    """
     if learned_reserve_pct <= 0.0:
         return learned_reserve_pct
-    if forecast_refills_band(solar_slots, load_hourly_w, now, usable_pct=usable_pct,
-                             capacity_kwh=capacity_kwh, horizon_hours=horizon_hours,
-                             margin=margin, confidence=confidence,
-                             ev_load_by_start=ev_load_by_start):
+    if forecast_usable and forecast_refills_band(
+        solar_slots,
+        load_hourly_w,
+        now,
+        usable_pct=learned_reserve_pct,
+        capacity_kwh=capacity_kwh,
+        horizon_hours=horizon_hours,
+        margin=margin,
+        confidence=confidence,
+        ev_load_by_start=ev_load_by_start,
+        require_p10=True,
+    ):
         return 0.0
-    return learned_reserve_pct
+
+    # Deye rounds discharge floors up to its native 5 pp step. Cap the reserve to a
+    # step at/below actual SOC, so a forecast downgrade or HA restart never raises the
+    # physical floor above energy the pack already contains. As solar restores SOC the
+    # reserve re-arms monotonically in native steps until the learned target is whole.
+    if current_soc_pct is None or tou_step_pct <= 0.0:
+        return learned_reserve_pct
+    available_floor = math.floor(max(0.0, current_soc_pct) / tou_step_pct) * tou_step_pct
+    available_reserve = max(0.0, available_floor - max(0.0, min_soc))
+    return min(learned_reserve_pct, available_reserve)
 
 
 def near_full_buffer_active(

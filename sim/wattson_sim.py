@@ -4785,42 +4785,110 @@ def test_reserve_release_overnight_floor():
 
 
 def test_solar_aware_reserve():
-    """v0.24.14: release the LEARNED self-use reserve when forecast solar over the
-    next 24h can refill the whole usable band x SOLAR_RESERVE_RELEASE_MARGIN — so the
-    pack runs down to the hard min on cheap overnight/evening hours and refills free
-    from tomorrow's sun. Conservative: a marginal/low-solar day keeps the reserve,
-    and only solar inside the horizon (not past, not far-future) counts."""
+    """v0.26.1: release only the learned energy that P10 can safely replace."""
     checks = []
     SS = models.SolarSlot
     base = datetime(2026, 6, 18, 16, 0, tzinfo=timezone.utc)  # evening 'now'
     def at(h):
         return base + timedelta(hours=h)
     load = {h: 600.0 for h in range(24)}  # ~0.6 kWh/h
-    # usable band 85% x 10 kWh = 8.5 kWh; margin 1.5 -> release needs >= 12.75 kWh.
 
-    sunny = [SS(start=at(h), pv_estimate_kwh=2.5) for h in range(16, 25)]  # ~9h x 1.9 = 17 kWh
-    rel = planner.solar_aware_reserve_pct(15.0, solar_slots=sunny, load_hourly_w=load,
-                                          now=base, usable_pct=85.0, capacity_kwh=10.0)
-    checks.append(("sunny tomorrow (~17 kWh > 8.5x1.5) -> learned reserve released to 0", rel == 0.0, str(rel)))
+    def effective(slots, **kwargs):
+        return planner.solar_aware_reserve_pct(
+            15.0,
+            solar_slots=slots,
+            load_hourly_w=load,
+            now=base,
+            capacity_kwh=kwargs.pop("capacity_kwh", 10.0),
+            min_soc=15.0,
+            current_soc_pct=kwargs.pop("current_soc_pct", 42.0),
+            **kwargs,
+        )
 
-    cloudy = [SS(start=at(h), pv_estimate_kwh=1.1) for h in range(16, 25)]  # ~9h x 0.5 = 4.5 kWh
-    keep = planner.solar_aware_reserve_pct(15.0, solar_slots=cloudy, load_hourly_w=load,
-                                           now=base, usable_pct=85.0, capacity_kwh=10.0)
-    checks.append(("low-solar tomorrow (~4.5 kWh < threshold) -> reserve kept (no stranding)", keep == 15.0, str(keep)))
+    # 4.5 kWh P10 surplus is nowhere near the old full-band gate (12.75 kWh),
+    # but safely replaces a 1.5 kWh learned reserve with the 1.5x margin (2.25 kWh).
+    moderate = [
+        SS(start=at(h), pv_estimate_kwh=1.5, pv_estimate10_kwh=1.1)
+        for h in range(16, 25)
+    ]
+    old_full_band_gate = planner.forecast_refills_band(
+        moderate, load, base, usable_pct=85.0, capacity_kwh=10.0,
+        margin=planner.SOLAR_RESERVE_RELEASE_MARGIN, require_p10=True,
+    )
+    rel = effective(moderate)
+    checks.append(("moderate P10 refill releases the 15pp reserve, not the whole 85pp band",
+                   not old_full_band_gate and rel == 0.0,
+                   f"old_gate={old_full_band_gate}, effective={rel}"))
+
+    low = [
+        SS(start=at(h), pv_estimate_kwh=1.2, pv_estimate10_kwh=0.8)
+        for h in range(16, 25)
+    ]  # ~1.8 kWh P10 surplus < 2.25 kWh threshold
+    keep = effective(low)
+    checks.append(("low P10 refill keeps the learned reserve (no stranding)",
+                   keep == 15.0, str(keep)))
+
+    ev_load = {at(h): 0.3 for h in range(16, 25)}
+    checks.append(("planned EV energy is deducted before a learned reserve may release",
+                   effective(moderate, ev_load_by_start=ev_load) == 15.0,
+                   str(effective(moderate, ev_load_by_start=ev_load))))
+
+    missing_p10 = [SS(start=at(h), pv_estimate_kwh=2.5) for h in range(16, 25)]
+    checks.append(("missing P10 fails closed and keeps the learned reserve",
+                   effective(missing_p10) == 15.0, str(effective(missing_p10))))
+    checks.append(("degraded forecast fails closed even with abundant P10",
+                   effective(moderate, forecast_usable=False) == 15.0,
+                   str(effective(moderate, forecast_usable=False))))
+
+    # If a forecast downgrade/restart occurs after release, never raise the native
+    # Deye floor above SOC: at 27% re-arm only to a 25% floor; at 34%, to 30%.
+    rearm_27 = effective(low, current_soc_pct=27.0)
+    rearm_34 = effective(low, current_soc_pct=34.0)
+    checks.append(("forecast downgrade re-arms without grid catch-up (27% SOC -> 25% floor)",
+                   rearm_27 == 10.0, str(rearm_27)))
+    checks.append(("solar recovery re-arms the full learned reserve in native steps",
+                   rearm_34 == 15.0, str(rearm_34)))
+
+    # 2026-08-07 replay from the recorded live P10/load shape: 4.39 kWh positive
+    # hourly surplus. 15pp of the 10.148 kWh effective pack is 1.522 kWh and covers
+    # the observed 1.39 kWh import; the old 85pp gate still demands ~12.94 kWh.
+    live_p10 = [1.26, 1.47, 2.59, 2.09, 2.10, 2.35, 2.59, 2.27]
+    live_p90_load = [1.07, 1.01, 1.76, 1.71, 2.03, 1.74, 1.61, 1.39]
+    live_scale = [
+        SS(start=at(16 + i), pv_estimate_kwh=p10, pv_estimate10_kwh=p10)
+        for i, p10 in enumerate(live_p10)
+    ]
+    live_load = {at(16 + i): kwh * 1000.0 for i, kwh in enumerate(live_p90_load)}
+    old_live_gate = planner.forecast_refills_band(
+        live_scale, live_load, base, usable_pct=85.0, capacity_kwh=10.148,
+        margin=planner.SOLAR_RESERVE_RELEASE_MARGIN, require_p10=True,
+    )
+    live_effective = planner.solar_aware_reserve_pct(
+        15.0, solar_slots=live_scale, load_hourly_w=live_load, now=base,
+        capacity_kwh=10.148, min_soc=15.0, current_soc_pct=30.0,
+    )
+    released_kwh = 0.15 * 10.148
+    checks.append(("2026-08-07 replay scale: candidate releases where old full-band gate held",
+                   not old_live_gate and live_effective == 0.0,
+                   f"old_gate={old_live_gate}, effective={live_effective}"))
+    checks.append(("released live reserve can cover the measured 1.39 kWh avoidable import",
+                   released_kwh >= 1.39, f"{released_kwh:.3f} kWh"))
 
     checks.append(("no learned reserve to begin with -> unchanged",
-                   planner.solar_aware_reserve_pct(0.0, solar_slots=sunny, load_hourly_w=load,
-                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 0.0, "0"))
+                   planner.solar_aware_reserve_pct(
+                       0.0, solar_slots=moderate, load_hourly_w=load, now=base,
+                       capacity_kwh=10.0, min_soc=15.0, current_soc_pct=42.0,
+                   ) == 0.0, "0"))
 
-    far = [SS(start=at(h), pv_estimate_kwh=2.5) for h in range(30, 39)]  # beyond the 24h horizon
+    far = [SS(start=at(h), pv_estimate_kwh=2.5, pv_estimate10_kwh=2.0)
+           for h in range(30, 39)]  # beyond the 24h horizon
     checks.append(("solar beyond the 24h horizon ignored -> reserve kept",
-                   planner.solar_aware_reserve_pct(15.0, solar_slots=far, load_hourly_w=load,
-                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 15.0, "far"))
+                   effective(far) == 15.0, "far"))
 
-    past = [SS(start=at(-h), pv_estimate_kwh=5.0) for h in range(1, 10)]  # already happened
+    past = [SS(start=at(-h), pv_estimate_kwh=5.0, pv_estimate10_kwh=4.0)
+            for h in range(1, 10)]  # already happened
     checks.append(("past solar (before now) ignored -> reserve kept",
-                   planner.solar_aware_reserve_pct(15.0, solar_slots=past, load_hourly_w=load,
-                                                   now=base, usable_pct=85.0, capacity_kwh=10.0) == 15.0, "past"))
+                   effective(past) == 15.0, "past"))
     return checks
 
 
@@ -5584,8 +5652,9 @@ def test_rolling_planner_upgrade():
         solar_slots=[replace(slot, pv_estimate10_kwh=slot.pv_estimate_kwh) for slot in state.solar_slots],
         load_hourly_w=load,
         now=state.timestamp,
-        usable_pct=85.0,
         capacity_kwh=10.0,
+        min_soc=15.0,
+        current_soc_pct=state.battery_soc_pct,
         ev_load_by_start=full_idle_ev_load,
     )
     checks.append(("full idle EV no longer prevents sunny-day reserve release to min SOC",

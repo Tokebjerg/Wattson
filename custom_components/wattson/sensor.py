@@ -387,6 +387,15 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "physical_tou_floor_pct": (
                     control_plan.battery.desired_tou_capacity_pct if control_plan else None
                 ),
+                "learned_reserve_raw_pct": round(
+                    getattr(self.coordinator, "_raw_learned_reserve_pct", 0.0), 1
+                ),
+                "learned_reserve_effective_pct": round(
+                    getattr(self.coordinator, "_effective_learned_reserve_pct", 0.0), 1
+                ),
+                "learned_reserve_released_pct": round(
+                    getattr(self.coordinator, "_released_learned_reserve_pct", 0.0), 1
+                ),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
                 "ev_start": getattr(self.coordinator, "ev_start_status", {"state": "idle"}),
                 "ev_transport_recovery": getattr(

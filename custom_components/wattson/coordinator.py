@@ -2432,7 +2432,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
             conservative=True,
         ) if self.load_profile else None
-        learned_reserve_pct = self._learned_reserve_pct()
+        raw_learned_reserve_pct = self._learned_reserve_pct()
+        learned_reserve_pct = raw_learned_reserve_pct
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
         ev_max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
         ev_solar_min_surplus_w = float(entry_value(
@@ -2492,10 +2493,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             solar_slots=self.site_state.solar_slots,
             load_hourly_w=_reserve_load or _load_hourly,
             now=self.site_state.timestamp,
-            usable_pct=max(0.0, _max_soc - _min_soc),
             capacity_kwh=_capacity,
+            min_soc=_min_soc,
+            current_soc_pct=self.site_state.battery_soc_pct,
             confidence=self._forecast_confidence,
             ev_load_by_start=_ev_load_by_start,
+            forecast_usable=not getattr(self, "_solar_forecast_degraded", True),
+        )
+        self._raw_learned_reserve_pct = raw_learned_reserve_pct
+        self._effective_learned_reserve_pct = learned_reserve_pct
+        self._released_learned_reserve_pct = max(
+            0.0, raw_learned_reserve_pct - learned_reserve_pct
         )
 
         # Rolling plan: rebuild every 15 minutes and immediately on a new solar
