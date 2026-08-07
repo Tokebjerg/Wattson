@@ -4849,16 +4849,18 @@ def test_solar_aware_reserve():
     checks.append(("solar recovery re-arms the full learned reserve in native steps",
                    rearm_34 == 15.0, str(rearm_34)))
 
-    # 2026-08-07 replay from the recorded live P10/load shape: 4.39 kWh positive
-    # hourly surplus. 15pp of the 10.148 kWh effective pack is 1.522 kWh and covers
-    # the observed 1.39 kWh import; the old 85pp gate still demands ~12.94 kWh.
-    live_p10 = [1.26, 1.47, 2.59, 2.09, 2.10, 2.35, 2.59, 2.27]
-    live_p90_load = [1.07, 1.01, 1.76, 1.71, 2.03, 1.74, 1.61, 1.39]
+    # 2026-08-07 replay from the recorded live P10/P50 shape. 15pp of the
+    # 10.148 kWh effective pack is 1.522 kWh and covers the observed 1.39 kWh
+    # import; the old 85pp gate still demands ~12.94 kWh.
+    live_p10 = [2.086, 2.098, 2.345, 2.592, 2.272, 1.807, 1.367, 0.846]
+    live_p50_load = [1.365, 1.281, 1.290, 0.732, 0.926, 0.901, 0.881, 1.161]
+    live_p90_load = [5.634, 7.355, 3.720, 3.944, 2.672, 4.766, 4.321, 2.281]
     live_scale = [
         SS(start=at(16 + i), pv_estimate_kwh=p10, pv_estimate10_kwh=p10)
         for i, p10 in enumerate(live_p10)
     ]
-    live_load = {at(16 + i): kwh * 1000.0 for i, kwh in enumerate(live_p90_load)}
+    live_load = {at(16 + i): kwh * 1000.0 for i, kwh in enumerate(live_p50_load)}
+    live_load_p90 = {at(16 + i): kwh * 1000.0 for i, kwh in enumerate(live_p90_load)}
     old_live_gate = planner.forecast_refills_band(
         live_scale, live_load, base, usable_pct=85.0, capacity_kwh=10.148,
         margin=planner.SOLAR_RESERVE_RELEASE_MARGIN, require_p10=True,
@@ -4867,10 +4869,17 @@ def test_solar_aware_reserve():
         15.0, solar_slots=live_scale, load_hourly_w=live_load, now=base,
         capacity_kwh=10.148, min_soc=15.0, current_soc_pct=30.0,
     )
+    double_counted_effective = planner.solar_aware_reserve_pct(
+        15.0, solar_slots=live_scale, load_hourly_w=live_load_p90, now=base,
+        capacity_kwh=10.148, min_soc=15.0, current_soc_pct=30.0,
+    )
     released_kwh = 0.15 * 10.148
     checks.append(("2026-08-07 replay scale: candidate releases where old full-band gate held",
                    not old_live_gate and live_effective == 0.0,
                    f"old_gate={old_live_gate}, effective={live_effective}"))
+    checks.append(("P90 tail stays separate: P10-P50 releases while double-counted P10-P90 would hold",
+                   live_effective == 0.0 and double_counted_effective == 15.0,
+                   f"p50={live_effective}, p90={double_counted_effective}"))
     checks.append(("released live reserve can cover the measured 1.39 kWh avoidable import",
                    released_kwh >= 1.39, f"{released_kwh:.3f} kWh"))
 

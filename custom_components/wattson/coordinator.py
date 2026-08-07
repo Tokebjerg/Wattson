@@ -2491,7 +2491,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         learned_reserve_pct = solar_aware_reserve_pct(
             learned_reserve_pct,
             solar_slots=self.site_state.solar_slots,
-            load_hourly_w=_reserve_load or _load_hourly,
+            # P10 already makes the refill supply conservative. The separate peak
+            # reserve holds the P90-P50 demand tail; subtracting P90 here as well
+            # double-counts the same uncertainty and recreates the sunny-day hold.
+            load_hourly_w=_load_hourly,
             now=self.site_state.timestamp,
             capacity_kwh=_capacity,
             min_soc=_min_soc,
