@@ -171,9 +171,13 @@ from .trace import DecisionTraceBuffer
 from .safety import write_allowed
 from .mapping import build_entity_mapping
 from .models import BatteryPlan, Capabilities, ControlPlan, EntityMapping, EvPlan, SiteState, SolarSlot
-from .horizon import current_price_slot
+from .horizon import (
+    current_price_slot,
+    hourly_utc_instants,
+    unique_utc_instants,
+    utc_instant,
+)
 from .learning import (
-    build_load_forecast,
     build_load_profile,
     forecast_load_w,
 )
@@ -214,6 +218,27 @@ from .planner import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _canonical_load_forecast(
+    profile: LoadProfile | None,
+    instants: tuple[datetime, ...],
+    *,
+    outdoor_temperature_c: float | None,
+    conservative: bool,
+) -> dict[str, float] | None:
+    """Build a UTC-keyed forecast while evaluating learned buckets locally."""
+    if profile is None:
+        return None
+    return {
+        instant.isoformat(): forecast_load_w(
+            profile,
+            dt_util.as_local(instant),
+            outdoor_temperature_c=outdoor_temperature_c,
+            conservative=conservative,
+        )
+        for instant in instants
+    }
 
 
 def _ev_solar_effective_battery_threshold(
@@ -883,7 +908,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             _LOGGER.debug("Wattson could not build load profile (learning inactive): %s", err)
             self._profile_built_at = dt_util.utcnow()
 
-    def _learned_reserve_pct(self) -> float:
+    def _learned_reserve_pct(self, at: datetime | None = None) -> float:
         """SOC (%) to hold back for predicted self-use over the next reserve window."""
         profile = self.load_profile
         if profile is None or profile.days_observed < LEARNING_MIN_DAYS:
@@ -894,18 +919,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # F2: size the reserve from the SAME weekday/weekend hourly profile the
         # planner uses (hourly_for(today)), not the all-days mean — the two halves
         # otherwise disagree about the very same day's load.
-        now = dt_util.now().replace(minute=0, second=0, microsecond=0)
         reserve_kwh = sum(
             forecast_load_w(
                 profile,
-                now + timedelta(hours=offset),
+                # Add elapsed hours in UTC, then choose the learned bucket in
+                # Home Assistant's local timezone. Spring never invents 02:00;
+                # autumn counts both physical 02:00 hours.
+                dt_util.as_local(instant),
                 outdoor_temperature_c=(
                     self.site_state.outdoor_temperature_c if self.site_state else None
                 ),
                 conservative=True,
             )
             / 1000.0
-            for offset in range(LEARNING_RESERVE_HOURS)
+            for instant in hourly_utc_instants(
+                at or dt_util.now(), LEARNING_RESERVE_HOURS
+            )
         )
         base = min(LEARNING_RESERVE_MAX_PCT, reserve_kwh / capacity_kwh * 100.0)
         # Apply the learning confidence ramp (0->1 over the learning window) the
@@ -2416,22 +2445,28 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         _capacity = self.effective_battery_capacity_kwh
         _allow_grid_charge = bool(entry_value(self.config_entry, CONF_ALLOW_GRID_CHARGE, DEFAULT_ALLOW_GRID_CHARGE))
         _allow_neg_export = bool(entry_value(self.config_entry, CONF_ALLOW_NEGATIVE_EXPORT, DEFAULT_ALLOW_NEGATIVE_EXPORT))
-        _forecast_starts = sorted({
+        # Canonical physical instants preserve both 02:00 hours on the autumn
+        # DST fold. Python considers two local ZoneInfo datetimes with different
+        # ``fold`` values equal, so a local set/dict silently loses one of them.
+        _forecast_instants = unique_utc_instants((
             *(slot.start for slot in self.site_state.price_slots),
             *(slot.start for slot in self.site_state.solar_slots),
-        })
-        _load_hourly = build_load_forecast(
+        ))
+        # Keep lookup keys in canonical UTC. Providers are free to expose the
+        # same physical slot as UTC or local time; the planner canonicalises the
+        # lookup while the learned profile is still evaluated in local time.
+        _load_hourly = _canonical_load_forecast(
             self.load_profile,
-            _forecast_starts,
+            _forecast_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
             conservative=False,
-        ) if self.load_profile else None
-        _reserve_load = build_load_forecast(
+        )
+        _reserve_load = _canonical_load_forecast(
             self.load_profile,
-            _forecast_starts,
+            _forecast_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
             conservative=True,
-        ) if self.load_profile else None
+        )
         raw_learned_reserve_pct = self._learned_reserve_pct()
         learned_reserve_pct = raw_learned_reserve_pct
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
@@ -2495,7 +2530,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # reserve holds the P90-P50 demand tail; subtracting P90 here as well
             # double-counts the same uncertainty and recreates the sunny-day hold.
             load_hourly_w=_load_hourly,
-            now=self.site_state.timestamp,
+            now=utc_instant(self.site_state.timestamp),
             capacity_kwh=_capacity,
             min_soc=_min_soc,
             current_soc_pct=self.site_state.battery_soc_pct,
@@ -2509,17 +2544,54 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             0.0, raw_learned_reserve_pct - learned_reserve_pct
         )
 
+        # Project the learned reserve at every future slot instead of freezing
+        # today's effective floor across the whole 24-hour display.  Each point
+        # uses the correct weekday/weekend P90 load window and the existing P10
+        # refill gate.  Missing/degraded solar fails closed; build_day_plan also
+        # caps every projected reserve to SOC expected to exist at that slot.
+        _forecast_usable = not getattr(self, "_solar_forecast_degraded", True)
+        _current_hour = utc_instant(self.site_state.timestamp).replace(
+            minute=0, second=0, microsecond=0
+        )
+        _learned_reserve_by_start: dict[datetime, float] = {}
+        for instant in _forecast_instants:
+            local_start = dt_util.as_local(instant)
+            if instant <= _current_hour:
+                effective_future_reserve = learned_reserve_pct
+            else:
+                raw_future_reserve = self._learned_reserve_pct(local_start)
+                effective_future_reserve = solar_aware_reserve_pct(
+                    raw_future_reserve,
+                    solar_slots=self.site_state.solar_slots,
+                    load_hourly_w=_load_hourly,
+                    now=instant,
+                    capacity_kwh=_capacity,
+                    min_soc=_min_soc,
+                    current_soc_pct=None,
+                    confidence=self._forecast_confidence,
+                    ev_load_by_start=_ev_load_by_start,
+                    forecast_usable=_forecast_usable,
+                )
+            _learned_reserve_by_start[instant] = effective_future_reserve
+
         # Rolling plan: rebuild every 15 minutes and immediately on a new solar
         # forecast, EV connect/disconnect, material SOC drift, horizon, or config.
         _now_local = self.site_state.timestamp
         _grid_charge_rate = self.effective_grid_charge_rate_kwh
         _load_fp = tuple(
             (
-                start.isoformat(),
-                round(float((_load_hourly or {}).get(start, 0.0)) / 100.0),
-                round(float((_reserve_load or {}).get(start, 0.0)) / 100.0),
+                instant.isoformat(),
+                round(float((_load_hourly or {}).get(instant.isoformat(), 0.0)) / 100.0),
+                round(float((_reserve_load or {}).get(instant.isoformat(), 0.0)) / 100.0),
             )
-            for start in _forecast_starts
+            for instant in _forecast_instants
+        )
+        _learned_reserve_fp = tuple(
+            (
+                instant.isoformat(),
+                round(float(_learned_reserve_by_start.get(instant, 0.0)), 1),
+            )
+            for instant in _forecast_instants
         )
         _cold_grid_charge_blocked = bool(
             self.site_state.battery_temperature_c is not None
@@ -2528,7 +2600,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         _plan_fp = (
             self.battery_mode, _min_soc, _max_soc, _capacity,
             _allow_grid_charge, _cold_grid_charge_blocked,
-            round(learned_reserve_pct / 5.0), _grid_charge_rate,
+            round(learned_reserve_pct / 5.0), _learned_reserve_fp,
+            round(self.reserve_hold_margin, 2), _grid_charge_rate,
             _load_fp,
             round(self._forecast_confidence, 2),
             round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
@@ -2599,6 +2672,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 load_hourly_w=_load_hourly,
                 reserve_load_by_start_w=_reserve_load,
                 learned_reserve_pct=learned_reserve_pct,
+                learned_reserve_by_start_pct=_learned_reserve_by_start,
+                reserve_hold_margin=self.reserve_hold_margin,
                 solar_charge_priority_soc=solar_charge_priority,
                 charge_current_a=self.battery_charge_current,
                 discharge_current_a=self.battery_discharge_current,
@@ -3214,6 +3289,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             min_soc=float(entry_value(self.config_entry, CONF_BATTERY_MIN_SOC, DEFAULT_BATTERY_MIN_SOC)),
             max_soc=float(entry_value(self.config_entry, CONF_BATTERY_MAX_SOC, DEFAULT_BATTERY_MAX_SOC)),
             learned_reserve_pct=learned_reserve_pct,
+            reserve_hold_margin=self.reserve_hold_margin,
             solar_charge_priority_soc=solar_charge_priority,
             charge_current_a=self.battery_charge_current,
             discharge_current_a=self.battery_discharge_current,
