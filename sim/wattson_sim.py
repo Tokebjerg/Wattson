@@ -5387,13 +5387,13 @@ def test_control_stability_regressions():
                    and old_19.action == "IDLE"
                    and old_19.tou_floor_pct == 100.0,
                    str(old_19)))
-    checks.append(("2026-08-08 live: source-limited 0.26kr value releases 19:00 to cover the house",
+    checks.append(("2026-08-08 live: allocated 0.25kr value releases 19:00 to cover the house",
                    new_19 is not None
                    and new_19.action == "DISCHARGE"
                    and new_19.projected_soc_pct == 84.0
                    and new_19.tou_floor_pct == 80.0
                    and (100.0 - new_19.tou_floor_pct) / 100.0 * 9.903 >= 1.625
-                   and "upper gain 0.26 kr < 0.30 kr" in new_19.reason,
+                   and "upper gain 0.25 kr < 0.30 kr" in new_19.reason,
                    str(new_19)))
     checks.append(("2026-08-08 exact: materiality release leaves the true 20:00 peak trajectory intact",
                    new_20 is not None
@@ -5449,6 +5449,161 @@ def test_control_stability_regressions():
                    and p90_only_current.tou_floor_pct == 25.0,
                    str(p90_only_current)))
 
+    # The source may itself rank among the day's three dearest hours and still
+    # precede an even dearer destination. A rank-only release used to drain the
+    # pack to minimum here, leaving a later P10 solar miss uncovered.
+    p10_rank_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.5, 0.2, 2.0] + [0.1] * 21)]
+    p10_rank_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=(2.0 if i == 2 else 0.0),
+        pv_estimate10_kwh=0.0,
+    ) for i, slot in enumerate(p10_rank_prices)]
+    p10_rank_state = replace(
+        p90_only_state, timestamp=p10_rank_prices[0].start,
+        battery_soc_pct=25.0, current_buy_price=1.5,
+        price_slots=p10_rank_prices, solar_slots=p10_rank_solar,
+    )
+    p10_rank_load = {
+        slot.start: (1000.0 if i in (0, 2) else 0.0)
+        for i, slot in enumerate(p10_rank_prices)
+    }
+    p10_rank_plan = planner.build_day_plan(
+        p10_rank_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=p10_rank_load,
+        reserve_load_by_start_w=dict(p10_rank_load),
+        allow_grid_charge=False,
+    )
+    p10_rank_source = p10_rank_plan.tasks[0] if p10_rank_plan else None
+    p10_rank_bridge = p10_rank_plan.tasks[1] if p10_rank_plan else None
+    p10_rank_destination = p10_rank_plan.tasks[2] if p10_rank_plan else None
+    p10_rank_after = p10_rank_plan.tasks[3] if p10_rank_plan else None
+    checks.append(("top-3 source retains a material P10-only tail for an even dearer destination",
+                   p10_rank_source is not None
+                   and p10_rank_bridge is not None
+                   and p10_rank_destination is not None
+                   and p10_rank_after is not None
+                   and p10_rank_source.action == "IDLE"
+                   and p10_rank_source.projected_soc_pct == 25.0
+                   and p10_rank_source.tou_floor_pct == 25.0
+                   and p10_rank_bridge.projected_soc_pct == 25.0
+                   and p10_rank_bridge.tou_floor_pct == 25.0
+                   and p10_rank_destination.projected_soc_pct == 25.0
+                   and p10_rank_destination.tou_floor_pct == 15.0
+                   and p10_rank_after.projected_soc_pct == 25.0
+                   and p10_rank_after.tou_floor_pct == 15.0,
+                   str(p10_rank_plan.tasks[:4] if p10_rank_plan else None)))
+
+    partial_p90 = dict(p90_only_p50)
+    partial_p90[p90_only_prices[1].start] = 1600.0
+    # Isolate the P90-load band: P10 equals P50 here, so the expected 0.5 kWh
+    # allocation is not correctly superseded by a larger solar-uncertainty tail.
+    partial_state = replace(
+        p90_only_state,
+        solar_slots=[
+            p90_only_solar[0],
+            replace(p90_only_solar[1], pv_estimate10_kwh=1.1),
+        ],
+    )
+    partial_plan = planner.build_day_plan(
+        partial_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=p90_only_p50,
+        reserve_load_by_start_w=partial_p90,
+        forecast_confidence=0.7, allow_grid_charge=False,
+    )
+    partial_source = partial_plan.tasks[0] if partial_plan else None
+    checks.append(("partial 0.5kWh allocation carries exactly 5pp, not the whole source slot",
+                   partial_source is not None
+                   and partial_source.action == "DISCHARGE"
+                   and partial_source.projected_soc_pct == 20.0
+                   and partial_source.tou_floor_pct == 20.0,
+                   str(partial_source)))
+
+    # Solar in the destination hour is already part of that hour's P50/P90 net
+    # deficit. It cannot also be counted as refill *before* the destination;
+    # doing so double-counts the same forecast and strands the P90/P10 tail.
+    same_hour_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([0.5, 2.0])]
+    same_hour_solar = [
+        models.SolarSlot(start=same_hour_prices[0].start,
+                         pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0),
+        models.SolarSlot(start=same_hour_prices[1].start,
+                         pv_estimate_kwh=2.1, pv_estimate10_kwh=2.0),
+    ]
+    same_hour_state = replace(
+        p90_only_state, timestamp=same_hour_prices[0].start,
+        battery_soc_pct=25.0, current_buy_price=0.5,
+        price_slots=same_hour_prices, solar_slots=same_hour_solar,
+    )
+    same_hour_p50 = {slot.start: 1000.0 for slot in same_hour_prices}
+    same_hour_p90 = dict(same_hour_p50)
+    same_hour_p90[same_hour_prices[1].start] = 3000.0
+    same_hour_plan = planner.build_day_plan(
+        same_hour_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=same_hour_p50,
+        reserve_load_by_start_w=same_hour_p90, allow_grid_charge=False,
+    )
+    same_hour_source = same_hour_plan.tasks[0] if same_hour_plan else None
+    same_hour_destination = same_hour_plan.tasks[1] if same_hour_plan else None
+    checks.append(("destination-hour solar cannot double-count as pre-peak refill",
+                   same_hour_source is not None
+                   and same_hour_destination is not None
+                   and same_hour_source.action == "IDLE"
+                   and same_hour_source.projected_soc_pct == 25.0
+                   and same_hour_source.tou_floor_pct == 25.0
+                   and same_hour_destination.tou_floor_pct == 15.0
+                   and "P90 reserve released" not in same_hour_source.reason,
+                   str(same_hour_plan.tasks if same_hour_plan else None)))
+
+    # If the raw P50 path refills to 100% between source and destination, the
+    # source reserve is absorbed by saturation. It must not be resurrected as
+    # an extra floor after the refill; the destination still needs a 1kWh
+    # physical envelope for its P90 tail.
+    saturation_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([0.5, 0.4, 1.0])]
+    saturation_solar = [
+        models.SolarSlot(start=saturation_prices[0].start, pv_estimate_kwh=0.0,
+                         pv_estimate10_kwh=0.0),
+        models.SolarSlot(start=saturation_prices[1].start, pv_estimate_kwh=1.2,
+                         pv_estimate10_kwh=1.2),
+        models.SolarSlot(start=saturation_prices[2].start, pv_estimate_kwh=0.0,
+                         pv_estimate10_kwh=0.0),
+    ]
+    saturation_state = replace(
+        p90_only_state, timestamp=saturation_prices[0].start,
+        battery_soc_pct=100.0, current_buy_price=0.5,
+        price_slots=saturation_prices, solar_slots=saturation_solar,
+    )
+    saturation_p50 = {
+        saturation_prices[0].start: 1000.0,
+        saturation_prices[1].start: 0.0,
+        saturation_prices[2].start: 20.0,
+    }
+    saturation_p90 = dict(saturation_p50)
+    saturation_p90[saturation_prices[2].start] = 1020.0
+    saturation_plan = planner.build_day_plan(
+        saturation_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=saturation_p50,
+        reserve_load_by_start_w=saturation_p90, allow_grid_charge=False,
+    )
+    saturation_source = saturation_plan.tasks[0] if saturation_plan else None
+    saturation_refill = saturation_plan.tasks[1] if saturation_plan else None
+    saturation_peak = saturation_plan.tasks[2] if saturation_plan else None
+    checks.append(("intervening full refill cannot resurrect reserve or pin the destination floor",
+                   saturation_source is not None
+                   and saturation_refill is not None
+                   and saturation_peak is not None
+                   and saturation_source.tou_floor_pct < 100.0
+                   and saturation_refill.projected_soc_pct == 100.0
+                   and saturation_peak.tou_floor_pct <= 90.0,
+                   str(saturation_plan.tasks if saturation_plan else None)))
+
     # Materiality is matched across the coherent physical source/destination
     # episode. A large future tail may not inflate one small source hour, but a
     # real three-hour source budget of 3 kWh at 0.20 kr is worth 0.60 kr in total
@@ -5473,10 +5628,40 @@ def test_control_stability_regressions():
         reserve_load_by_start_w=episode_p90, allow_grid_charge=False,
     )
     episode_early = list(episode_plan.tasks[:3]) if episode_plan else []
+    episode_peak = episode_plan.tasks[3] if episode_plan else None
     checks.append(("aggregate P90 episode keeps a 0.60kr reserve without destination double-counting",
                    len(episode_early) == 3
-                   and all("P90 reserve released" not in task.reason for task in episode_early),
-                   str(episode_early)))
+                   and all(task.action == "IDLE" for task in episode_early)
+                   and all(task.projected_soc_pct == 100.0 for task in episode_early)
+                   and all(task.tou_floor_pct == 100.0 for task in episode_early)
+                   and all("P90 reserve released" not in task.reason for task in episode_early)
+                   and episode_peak is not None
+                   and episode_peak.action == "DISCHARGE"
+                   and episode_peak.projected_soc_pct == 70.0
+                   and episode_peak.tou_floor_pct == 70.0,
+                   f"sources={episode_early} peak={episode_peak}"))
+
+    # With only 2 kWh of destination capacity the deterministic latest-source
+    # tie-break must release the first kWh, then carry exactly 1 -> 2 kWh from
+    # the two later sources. It may neither reserve 3 kWh nor lose the first
+    # carried kWh in the final source slot.
+    two_kwh_episode_p90 = dict(episode_p50)
+    two_kwh_episode_p90[episode_prices[3].start] = 2100.0
+    two_kwh_episode_plan = planner.build_day_plan(
+        episode_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=episode_p50,
+        reserve_load_by_start_w=two_kwh_episode_p90, allow_grid_charge=False,
+    )
+    two_kwh_sources = list(two_kwh_episode_plan.tasks[:3]) if two_kwh_episode_plan else []
+    checks.append(("finite 2kWh tail uses the latest two sources and carries 1->2kWh",
+                   len(two_kwh_sources) == 3
+                   and [task.action for task in two_kwh_sources]
+                   == ["DISCHARGE", "IDLE", "IDLE"]
+                   and [task.projected_soc_pct for task in two_kwh_sources]
+                   == [90.0, 90.0, 90.0]
+                   and [task.tou_floor_pct for task in two_kwh_sources]
+                   == [90.0, 90.0, 90.0],
+                   str(two_kwh_sources)))
 
     # The opposite capacity bound matters just as much: three possible source
     # hours must not count the same 1 kWh destination tail three times. The
@@ -5491,11 +5676,380 @@ def test_control_stability_regressions():
     small_episode_early = list(small_episode_plan.tasks[:3]) if small_episode_plan else []
     checks.append(("aggregate P90 episode counts one 1kWh destination tail only once",
                    len(small_episode_early) == 3
-                   and all(
+                   and all("P90 reserve released" in task.reason for task in small_episode_early)
+                   and sum(
                        "upper gain 0.20 kr < 0.30 kr" in task.reason
                        for task in small_episode_early
-                   ),
+                   ) == 1,
                    str(small_episode_early)))
+
+    # A zero-flow eligible edge must not join two otherwise independent
+    # episodes. The first 0.4kWh component is worth 0.40kr and is retained; the
+    # later 1kWh component is worth only 0.20kr and must release. Unioning every
+    # eligible edge (rather than positive flow only) incorrectly promoted both.
+    split_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.0, 2.0, 1.0, 1.2])]
+    split_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=(0.2 if i in (1, 3) else 0.0),
+        pv_estimate10_kwh=0.0,
+    ) for i, slot in enumerate(split_prices)]
+    split_state = replace(
+        p90_only_state, timestamp=split_prices[0].start, battery_soc_pct=100.0,
+        current_buy_price=1.0, price_slots=split_prices, solar_slots=split_solar,
+    )
+    split_p50 = {
+        split_prices[0].start: 400.0,
+        split_prices[1].start: 100.0,
+        split_prices[2].start: 1000.0,
+        split_prices[3].start: 100.0,
+    }
+    split_p90 = dict(split_p50)
+    split_p90[split_prices[1].start] = 600.0
+    split_p90[split_prices[3].start] = 1200.0
+    split_plan = planner.build_day_plan(
+        split_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=split_p50,
+        reserve_load_by_start_w=split_p90, allow_grid_charge=False,
+    )
+    split_material = split_plan.tasks[0] if split_plan else None
+    split_small = split_plan.tasks[2] if split_plan else None
+    checks.append(("zero-flow edge cannot promote a disconnected subthreshold episode",
+                   split_material is not None
+                   and split_small is not None
+                   and "P90 reserve released" not in split_material.reason
+                   and "upper gain 0.20 kr < 0.30 kr" in split_small.reason
+                   and split_small.action == "DISCHARGE",
+                   f"material={split_material} small={split_small}"))
+
+    # Different source prices are not interchangeable. The later 0.50-kr source
+    # should carry the one-kWh reserve for 1.20, while the current 1.00-kr source
+    # is released (its own premium is only 0.20). A scalar episode verdict used
+    # to hold both and perversely import at 1.00 before discharging at 0.50.
+    allocated_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.4,
+    ) for i, price in enumerate([1.0, 0.5, 1.2])]
+    allocated_state = replace(
+        p90_only_state,
+        timestamp=allocated_prices[0].start,
+        battery_soc_pct=100.0,
+        current_buy_price=1.0,
+        price_slots=allocated_prices,
+        solar_slots=[models.SolarSlot(
+            start=slot.start,
+            pv_estimate_kwh=0.0,
+            pv_estimate10_kwh=0.0,
+        ) for slot in allocated_prices],
+    )
+    allocated_p50 = {
+        allocated_prices[0].start: 1000.0,
+        allocated_prices[1].start: 1000.0,
+        allocated_prices[2].start: 100.0,
+    }
+    allocated_p90 = dict(allocated_p50)
+    allocated_p90[allocated_prices[2].start] = 1100.0
+    allocated_plan = planner.build_day_plan(
+        allocated_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=allocated_p50,
+        reserve_load_by_start_w=allocated_p90, allow_grid_charge=False,
+    )
+    allocated_now = allocated_plan.tasks[0] if allocated_plan else None
+    allocated_cheap = allocated_plan.tasks[1] if allocated_plan else None
+    checks.append(("source allocation releases 1.00 now and reserves the cheaper 0.50 source for 1.20",
+                   allocated_now is not None
+                   and allocated_cheap is not None
+                   and allocated_now.action == "DISCHARGE"
+                   and allocated_now.tou_floor_pct < 100.0
+                   and "upper gain 0.00 kr < 0.30 kr" in allocated_now.reason
+                   and "P90 reserve released" not in allocated_cheap.reason,
+                   f"now={allocated_now} cheap={allocated_cheap}"))
+
+    # Mirror the price order: the cheap source is now first and remains
+    # outstanding through a dearer, unallocated source. Releasing the second
+    # source must not erase the first source's already accepted reserve.
+    carried_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.4,
+    ) for i, price in enumerate([0.5, 1.0, 1.2])]
+    carried_state = replace(
+        allocated_state,
+        timestamp=carried_prices[0].start,
+        current_buy_price=0.5,
+        price_slots=carried_prices,
+        solar_slots=[models.SolarSlot(
+            start=slot.start,
+            pv_estimate_kwh=0.0,
+            pv_estimate10_kwh=0.0,
+        ) for slot in carried_prices],
+    )
+    carried_p50 = {
+        carried_prices[0].start: 1000.0,
+        carried_prices[1].start: 1000.0,
+        carried_prices[2].start: 100.0,
+    }
+    carried_p90 = dict(carried_p50)
+    carried_p90[carried_prices[2].start] = 1100.0
+    carried_plan = planner.build_day_plan(
+        carried_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=carried_p50,
+        reserve_load_by_start_w=carried_p90, allow_grid_charge=False,
+    )
+    carried_cheap = carried_plan.tasks[0] if carried_plan else None
+    carried_dear = carried_plan.tasks[1] if carried_plan else None
+    carried_peak = carried_plan.tasks[2] if carried_plan else None
+    checks.append(("unallocated middle source releases only itself and preserves earlier reserve",
+                   carried_cheap is not None
+                   and carried_dear is not None
+                   and carried_peak is not None
+                   and carried_cheap.action == "IDLE"
+                   and carried_cheap.projected_soc_pct == 100.0
+                   and carried_dear.action == "DISCHARGE"
+                   and carried_dear.projected_soc_pct == 90.0
+                   and carried_dear.tou_floor_pct == 90.0
+                   and "upper gain 0.00 kr < 0.30 kr" in carried_dear.reason
+                   and carried_peak.projected_soc_pct == 80.0,
+                   f"cheap={carried_cheap} dear={carried_dear} peak={carried_peak}"))
+
+    # Temporal allocation requires residual re-routing, not a greedy best-edge
+    # pick. The early source can serve either peak, while the later source can
+    # serve only the final peak. Optimal flow assigns early→first and later→last
+    # (9+9), rather than early→last (10) and stranding the first destination.
+    reroute_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.4,
+    ) for i, price in enumerate([1.0, 10.0, 2.0, 11.0])]
+    reroute_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=(1.1 if i in (1, 3) else 0.0),
+        pv_estimate10_kwh=(0.1 if i in (1, 3) else 0.0),
+    ) for i, slot in enumerate(reroute_prices)]
+    reroute_state = replace(
+        p90_only_state,
+        timestamp=reroute_prices[0].start,
+        battery_soc_pct=100.0,
+        current_buy_price=1.0,
+        price_slots=reroute_prices,
+        solar_slots=reroute_solar,
+    )
+    reroute_p50 = {slot.start: 1000.0 for slot in reroute_prices}
+    reroute_p90 = dict(reroute_p50)
+    reroute_p90[reroute_prices[1].start] = 2100.0
+    reroute_p90[reroute_prices[3].start] = 2100.0
+    reroute_plan = planner.build_day_plan(
+        reroute_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=reroute_p50,
+        reserve_load_by_start_w=reroute_p90, allow_grid_charge=False,
+    )
+    reroute_early = reroute_plan.tasks[0] if reroute_plan else None
+    reroute_later = reroute_plan.tasks[2] if reroute_plan else None
+    checks.append(("residual allocation assigns early source to first peak and later source to final peak",
+                   reroute_early is not None
+                   and reroute_later is not None
+                   and reroute_early.action == "IDLE"
+                   and reroute_later.action == "IDLE"
+                   and [task.projected_soc_pct for task in reroute_plan.tasks]
+                   == [100.0, 90.0, 90.0, 80.0]
+                   and [task.tou_floor_pct for task in reroute_plan.tasks]
+                   == [100.0, 90.0, 90.0, 80.0]
+                   and "P90 reserve released" not in reroute_early.reason
+                   and "P90 reserve released" not in reroute_later.reason,
+                   str(reroute_plan.tasks if reroute_plan else None)))
+
+    # Two simultaneously outstanding destinations form a declining ledger, not
+    # one all-or-nothing release. At the first destination exactly its 1 kWh
+    # expires while the other 1 kWh remains protected for the final slot.
+    overlap_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([0.5, 0.5, 1.0, 1.1])]
+    overlap_state = replace(
+        p90_only_state, timestamp=overlap_prices[0].start,
+        battery_soc_pct=100.0, current_buy_price=0.5,
+        price_slots=overlap_prices,
+        solar_slots=[models.SolarSlot(
+            start=slot.start, pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0,
+        ) for slot in overlap_prices],
+    )
+    overlap_p50 = {
+        overlap_prices[0].start: 1000.0,
+        overlap_prices[1].start: 1000.0,
+        overlap_prices[2].start: 100.0,
+        overlap_prices[3].start: 100.0,
+    }
+    overlap_p90 = dict(overlap_p50)
+    overlap_p90[overlap_prices[2].start] = 1100.0
+    overlap_p90[overlap_prices[3].start] = 1100.0
+    overlap_plan = planner.build_day_plan(
+        overlap_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=overlap_p50,
+        reserve_load_by_start_w=overlap_p90, allow_grid_charge=False,
+    )
+    overlap_sources = list(overlap_plan.tasks[:2]) if overlap_plan else []
+    overlap_first_peak = overlap_plan.tasks[2] if overlap_plan else None
+    overlap_last_peak = overlap_plan.tasks[3] if overlap_plan else None
+    checks.append(("first of two destinations releases only its own 1kWh allocation",
+                   len(overlap_sources) == 2
+                   and all(task.projected_soc_pct == 100.0 for task in overlap_sources)
+                   and all(task.tou_floor_pct == 100.0 for task in overlap_sources)
+                   and overlap_first_peak is not None
+                   and overlap_last_peak is not None
+                   and overlap_first_peak.projected_soc_pct == 90.0
+                   and overlap_first_peak.tou_floor_pct == 90.0
+                   and overlap_last_peak.projected_soc_pct < overlap_first_peak.projected_soc_pct
+                   and overlap_last_peak.tou_floor_pct < overlap_first_peak.tou_floor_pct,
+                   str(overlap_plan.tasks if overlap_plan else None)))
+
+    # A refill after the first deadline may cover the second destination only.
+    # Aggregating refill through the final peak used to release both kWh at the
+    # source and leave the first peak unprotected.
+    deadline_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([0.5, 2.0, 0.4, 2.1])]
+    deadline_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=(3.0 if i == 2 else 0.0),
+        pv_estimate10_kwh=(3.0 if i == 2 else 0.0),
+    ) for i, slot in enumerate(deadline_prices)]
+    deadline_state = replace(
+        p90_only_state, timestamp=deadline_prices[0].start,
+        battery_soc_pct=35.0, current_buy_price=0.5,
+        price_slots=deadline_prices, solar_slots=deadline_solar,
+    )
+    deadline_p50 = {
+        deadline_prices[0].start: 2000.0,
+        deadline_prices[1].start: 100.0,
+        deadline_prices[2].start: 0.0,
+        deadline_prices[3].start: 100.0,
+    }
+    deadline_p90 = dict(deadline_p50)
+    deadline_p90[deadline_prices[1].start] = 1100.0
+    deadline_p90[deadline_prices[3].start] = 1100.0
+    deadline_plan = planner.build_day_plan(
+        deadline_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=deadline_p50,
+        reserve_load_by_start_w=deadline_p90, allow_grid_charge=False,
+    )
+    deadline_source = deadline_plan.tasks[0] if deadline_plan else None
+    deadline_first_peak = deadline_plan.tasks[1] if deadline_plan else None
+    deadline_refill = deadline_plan.tasks[2] if deadline_plan else None
+    deadline_last_peak = deadline_plan.tasks[3] if deadline_plan else None
+    checks.append(("refill after first deadline protects first peak and supplies only the second",
+                   deadline_source is not None
+                   and deadline_first_peak is not None
+                   and deadline_refill is not None
+                   and deadline_last_peak is not None
+                   and deadline_source.projected_soc_pct == 25.0
+                   and deadline_source.tou_floor_pct == 25.0
+                   and deadline_first_peak.projected_soc_pct == 15.0
+                   and deadline_first_peak.tou_floor_pct == 15.0
+                   and deadline_refill.projected_soc_pct == 45.0
+                   and deadline_last_peak.tou_floor_pct == 35.0,
+                   str(deadline_plan.tasks if deadline_plan else None)))
+
+    # One very sunny hour cannot refill more than the inverter's physical
+    # hourly charge throughput. Without this cap an 8 kWh P10 surplus erased a
+    # 7 kWh two-peak reserve, although the 70 A battery path can absorb only
+    # about 3.57 kWh in that hour.
+    rate_cap_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.0, 1.0, 0.1, 2.0, 2.1] + [0.0] * 19)]
+    rate_cap_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=(8.0 if i == 2 else 0.0),
+        pv_estimate10_kwh=(8.0 if i == 2 else 0.0),
+    ) for i, slot in enumerate(rate_cap_prices)]
+    rate_cap_state = replace(
+        p90_only_state, timestamp=rate_cap_prices[0].start,
+        battery_soc_pct=100.0, current_buy_price=1.0,
+        price_slots=rate_cap_prices, solar_slots=rate_cap_solar,
+    )
+    rate_cap_p50 = {
+        slot.start: ([3500.0, 3500.0, 0.0, 100.0, 100.0][i]
+                     if i < 5 else 0.0)
+        for i, slot in enumerate(rate_cap_prices)
+    }
+    rate_cap_p90 = dict(rate_cap_p50)
+    rate_cap_p90[rate_cap_prices[3].start] = 3600.0
+    rate_cap_p90[rate_cap_prices[4].start] = 3600.0
+    rate_cap_plan = planner.build_day_plan(
+        rate_cap_state, battery_mode="red", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=rate_cap_p50,
+        reserve_load_by_start_w=rate_cap_p90,
+        allow_grid_charge=False,
+    )
+    rate_cap_second_source = rate_cap_plan.tasks[1] if rate_cap_plan else None
+    checks.append(("one P10 refill slot is capped by 70A throughput before two destinations",
+                   rate_cap_second_source is not None
+                   and rate_cap_second_source.tou_floor_pct >= 65.0,
+                   str(rate_cap_plan.tasks[:5] if rate_cap_plan else None)))
+
+    # Copied/estimated price slots may rank future hours, but execution always
+    # demotes their GRID_CHARGE intent to self-consumption. Such a slot is not a
+    # physical refill and must not release a P90 reserve. The identical real
+    # price slot is allowed to provide its finite 1kWh planned refill.
+    estimated_refill_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+        estimated=(i == 1),
+    ) for i, price in enumerate([0.5, -0.5, 2.0])]
+    real_refill_prices = [replace(slot, estimated=False) for slot in estimated_refill_prices]
+    estimated_refill_state = replace(
+        p90_only_state, timestamp=estimated_refill_prices[0].start,
+        battery_soc_pct=35.0, current_buy_price=0.5,
+        price_slots=estimated_refill_prices,
+        solar_slots=[models.SolarSlot(
+            start=slot.start, pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0,
+        ) for slot in estimated_refill_prices],
+    )
+    estimated_refill_p50 = {
+        estimated_refill_prices[0].start: 2000.0,
+        estimated_refill_prices[1].start: 0.0,
+        estimated_refill_prices[2].start: 100.0,
+    }
+    estimated_refill_p90 = dict(estimated_refill_p50)
+    estimated_refill_p90[estimated_refill_prices[2].start] = 2100.0
+
+    def _estimated_refill_plan(price_slots):
+        return planner.build_day_plan(
+            replace(estimated_refill_state, price_slots=price_slots),
+            battery_mode="blue", min_soc=15.0, max_soc=100.0,
+            capacity_kwh=10.0, load_hourly_w=estimated_refill_p50,
+            reserve_load_by_start_w=estimated_refill_p90,
+            grid_charge_rate_kwh=1.0, allow_grid_charge=True,
+        )
+
+    estimated_refill_plan = _estimated_refill_plan(estimated_refill_prices)
+    real_refill_plan = _estimated_refill_plan(real_refill_prices)
+    estimated_refill_source = estimated_refill_plan.tasks[0] if estimated_refill_plan else None
+    estimated_refill_slot = estimated_refill_plan.slots[1] if estimated_refill_plan else None
+    real_refill_source = real_refill_plan.tasks[0] if real_refill_plan else None
+    checks.append(("estimated grid-charge cannot release reserve while real finite refill can",
+                   estimated_refill_source is not None
+                   and estimated_refill_slot is not None
+                   and real_refill_source is not None
+                   and estimated_refill_source.action == "IDLE"
+                   and estimated_refill_source.projected_soc_pct == 35.0
+                   and estimated_refill_source.tou_floor_pct == 35.0
+                   and not estimated_refill_slot.grid_charge
+                   and estimated_refill_slot.intent == "SELF_CONSUME"
+                   and real_refill_source.projected_soc_pct == 25.0
+                   and real_refill_source.tou_floor_pct == 25.0,
+                   f"estimated={estimated_refill_plan.tasks if estimated_refill_plan else None} "
+                   f"real={real_refill_plan.tasks if real_refill_plan else None}"))
 
     # Conversely, a large P50 load must not inflate a tiny uncertainty tail:
     # only 0.1 kWh is extra, so a 0.40 kr/kWh premium is worth just 0.04 kr.
@@ -5949,7 +6503,9 @@ def test_control_stability_regressions():
                    and all(live_night[i].tou_floor_pct <= live_night[i - 1].tou_floor_pct
                            for i in range(1, len(live_night)))
                    and no_stranded_hour,
-                   str([(t.action, t.projected_soc_pct, t.tou_floor_pct) for t in live_night])))
+                   str([(t.start.hour, t.action, t.projected_soc_pct, t.tou_floor_pct,
+                         t.reason)
+                        for t in (live_plan.tasks if live_plan else [])])))
 
     quarter_state = replace(
         live_midnight,
