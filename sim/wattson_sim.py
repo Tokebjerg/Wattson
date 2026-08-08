@@ -2544,6 +2544,106 @@ def test_dst_transitions():
     checks = []
     from zoneinfo import ZoneInfo
     tz = ZoneInfo("Europe/Copenhagen")
+
+    fold0 = datetime(2026, 10, 25, 2, 0, tzinfo=tz, fold=0)
+    fold1 = datetime(2026, 10, 25, 2, 0, tzinfo=tz, fold=1)
+    fold_instants = horizon.unique_utc_instants([fold0, fold1])
+    checks.append(("DST learned-reserve keys preserve both autumn 02:00 instants",
+                   len(fold_instants) == 2
+                   and fold_instants[0].isoformat() == "2026-10-25T00:00:00+00:00"
+                   and fold_instants[1].isoformat() == "2026-10-25T01:00:00+00:00",
+                   str(fold_instants)))
+
+    spring_elapsed = horizon.hourly_utc_instants(
+        datetime(2026, 3, 29, 0, 0, tzinfo=tz), 6
+    )
+    fall_elapsed = horizon.hourly_utc_instants(
+        datetime(2026, 10, 25, 0, 0, tzinfo=tz), 6
+    )
+    spring_local = [(instant.astimezone(tz).hour, instant.astimezone(tz).fold)
+                    for instant in spring_elapsed]
+    fall_local = [(instant.astimezone(tz).hour, instant.astimezone(tz).fold)
+                  for instant in fall_elapsed]
+    checks.append(("DST elapsed hours skip nonexistent spring 02:00",
+                   spring_local == [(0, 0), (1, 0), (3, 0), (4, 0), (5, 0), (6, 0)],
+                   str(spring_local)))
+    checks.append(("DST elapsed hours count both autumn 02:00 folds",
+                   fall_local == [(0, 0), (1, 0), (2, 0), (2, 1), (3, 0), (4, 0)],
+                   str(fall_local)))
+    checks.append(("DST reserve-window instants remain exactly one physical hour apart",
+                   all((series[i + 1] - series[i]).total_seconds() == 3600
+                       for series in (spring_elapsed, fall_elapsed)
+                       for i in range(len(series) - 1)),
+                   "all deltas=3600s"))
+
+    # Exercise the shipping coordinator method: it must add elapsed UTC hours,
+    # then choose the P90 bucket in Copenhagen local time.
+    co_mod = _coordinator_module()
+    class _ReserveHarness(co_mod.WattsonCoordinator):
+        @property
+        def effective_battery_capacity_kwh(self):
+            return 100.0
+
+    reserve_harness = object.__new__(_ReserveHarness)
+    reserve_harness.load_profile = models.LoadProfile(
+        hourly_w={hour: (hour + 1) * 100.0 for hour in range(24)},
+        hourly_p90_w={hour: (hour + 1) * 100.0 for hour in range(24)},
+        days_observed=28,
+        confidence=1.0,
+    )
+    reserve_harness.site_state = None
+    normal_instant = datetime(2026, 8, 8, 17, 0, tzinfo=timezone.utc)
+    canonical_map = None
+    original_as_local = co_mod.dt_util.as_local
+    co_mod.dt_util.as_local = lambda instant: instant.astimezone(tz)
+    try:
+        spring_reserve = reserve_harness._learned_reserve_pct(
+            datetime(2026, 3, 29, 1, 0, tzinfo=tz)
+        )
+        fall_reserve = reserve_harness._learned_reserve_pct(fold0)
+        canonical_map = co_mod._canonical_load_forecast(
+            reserve_harness.load_profile,
+            (*fold_instants, normal_instant),
+            outdoor_temperature_c=None,
+            conservative=False,
+        )
+    finally:
+        co_mod.dt_util.as_local = original_as_local
+    checks.append(("DST shipping learned reserve uses spring local buckets 01/03/04",
+                   abs(spring_reserve - 1.1) < 1e-9, str(spring_reserve)))
+    checks.append(("DST shipping learned reserve counts autumn bucket 02 twice",
+                   abs(fall_reserve - 1.0) < 1e-9, str(fall_reserve)))
+    checks.append(("DST coordinator load map keeps canonical UTC keys for both folds",
+                   canonical_map is not None
+                   and set(canonical_map) == {
+                       instant.isoformat()
+                       for instant in (*fold_instants, normal_instant)
+                   },
+                   str(canonical_map)))
+    checks.append(("DST planner resolves UTC-keyed load from local or UTC slot timestamps",
+                   canonical_map is not None
+                   and planner.load_forecast_w(canonical_map, fold0) == 300.0
+                   and planner.load_forecast_w(canonical_map, fold1) == 300.0
+                   and planner.load_forecast_w(canonical_map, normal_instant) == 2000.0
+                   and planner.load_forecast_w(
+                       canonical_map, normal_instant.astimezone(tz)
+                   ) == 2000.0,
+                   str(canonical_map)))
+    refill_from_local_slot = planner.conservative_refill_surplus_kwh(
+        [models.SolarSlot(
+            start=normal_instant.astimezone(tz),
+            pv_estimate_kwh=3.0,
+            pv_estimate10_kwh=2.5,
+            pv_estimate90_kwh=3.5,
+        )],
+        canonical_map,
+        normal_instant - timedelta(hours=1),
+        normal_instant + timedelta(hours=1),
+    ) if canonical_map is not None else -1.0
+    checks.append(("DST UTC load key subtracts local-slot load from conservative refill",
+                   abs(refill_from_local_slot - 0.5) < 1e-9,
+                   str(refill_from_local_slot)))
+
     for label, y, m, d, expect_hours in (
         ("spring-forward 29/3 (23h)", 2026, 3, 29, 23),
         ("fall-back 25/10 (25h)", 2026, 10, 25, 25),
@@ -5188,6 +5288,294 @@ def test_control_stability_regressions():
                    and dearer_peak.action == "DISCHARGE"
                    and (dearer_peak.projected_soc_pct or 0.0) >= 15.0,
                    f"{dearer_current}/{dearer_peak}"))
+
+    # Exact 2026-08-08 economic shape from HA's authoritative live plan. At
+    # 19:00 the P50 deficit is 1.335 kWh; 20:00 is only 0.16 kr/kWh dearer.
+    # The old margin-only P90 overlay valued that as a peak, rounded the floor
+    # to 100% and imported the entire current house load. The scale-aware gate
+    # values the actual P90-P50 tail at only ~0.17 kr and opens the battery now.
+    value_now = datetime(
+        2026, 8, 8, 18, 0,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+    value_prices_raw = [
+        1.85, 2.11, 2.27, 2.03, 1.95, 1.79, 1.76, 1.70,
+        1.66, 1.65, 1.63, 1.66, 1.72, 1.64, 1.43,
+    ]
+    value_pv = [
+        2.036, 0.724, 0.123, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.005, 0.164, 0.838, 1.905,
+    ]
+    value_p50_kwh = [
+        1.348, 2.059, 0.792, 0.622, 0.570, 0.567, 0.515, 0.477,
+        0.464, 0.584, 0.504, 0.580, 0.539, 0.535, 0.683,
+    ]
+    value_p90_kwh = list(value_p50_kwh)
+    value_p90_kwh[1] = 2.499
+    value_p90_kwh[2] = 1.861
+
+    def _value_plan(
+        *,
+        prices_raw=value_prices_raw,
+        reserve_min_value_kr=planner.RESERVE_HOLD_MIN_VALUE_KR,
+        reserve_hold_margin=planner.RESERVE_HOLD_MARGIN,
+    ):
+        price_slots = [models.PriceSlot(
+            start=value_now + timedelta(hours=i),
+            spot_price=price,
+            tariff=0.0,
+            total_import_price=price,
+            export_value=0.5,
+        ) for i, price in enumerate(prices_raw)]
+        solar_slots = [models.SolarSlot(
+            start=slot.start,
+            pv_estimate_kwh=value_pv[i],
+            pv_estimate10_kwh=value_pv[i] * 0.45,
+            pv_estimate90_kwh=value_pv[i] * 1.20,
+        ) for i, slot in enumerate(price_slots)]
+        value_state = replace(
+            inversion_state,
+            timestamp=value_now,
+            battery_soc_pct=100.0,
+            pv_power_w=2036.0,
+            load_power_w=1348.0,
+            grid_power_w=-688.0,
+            grid_import_power_w=0.0,
+            grid_export_power_w=688.0,
+            current_buy_price=prices_raw[0],
+            current_sell_price=0.5,
+            forecast_today_kwh=sum(value_pv),
+            price_slots=price_slots,
+            solar_slots=solar_slots,
+        )
+        p50 = {
+            slot.start: value_p50_kwh[i] * 1000.0
+            for i, slot in enumerate(price_slots)
+        }
+        p90 = {
+            slot.start: value_p90_kwh[i] * 1000.0
+            for i, slot in enumerate(price_slots)
+        }
+        return planner.build_day_plan(
+            value_state,
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            capacity_kwh=9.903,
+            load_hourly_w=p50,
+            reserve_load_by_start_w=p90,
+            learned_reserve_pct=15.0,
+            reserve_hold_margin=reserve_hold_margin,
+            reserve_min_value_kr=reserve_min_value_kr,
+        )
+
+    margin_only_plan = _value_plan(reserve_min_value_kr=0.0)
+    value_plan = _value_plan()
+    old_19 = margin_only_plan.tasks[1] if margin_only_plan else None
+    new_19 = value_plan.tasks[1] if value_plan else None
+    new_20 = value_plan.tasks[2] if value_plan else None
+    checks.append(("2026-08-08 exact: margin-only baseline reproduces 19:00 IDLE at a 100% floor",
+                   old_19 is not None
+                   and old_19.action == "IDLE"
+                   and old_19.tou_floor_pct == 100.0,
+                   str(old_19)))
+    checks.append(("2026-08-08 exact: 0.17kr P90-tail value releases 19:00 to cover the house",
+                   new_19 is not None
+                   and new_19.action == "DISCHARGE"
+                   and new_19.projected_soc_pct == 87.0
+                   and new_19.tou_floor_pct == 85.0
+                   and (100.0 - new_19.tou_floor_pct) / 100.0 * 9.903 >= 1.335
+                   and "upper gain 0.17 kr < 0.30 kr" in new_19.reason,
+                   str(new_19)))
+    checks.append(("2026-08-08 exact: materiality release leaves the true 20:00 peak trajectory intact",
+                   new_20 is not None
+                   and new_20.action == "DISCHARGE"
+                   and new_20.projected_soc_pct == 80.0
+                   and new_20.tou_floor_pct == 80.0,
+                   str(new_20)))
+
+    # A genuinely larger premium keeps both the P50 reserve and P90 tail. This
+    # is the winter-safety mirror for the value gate.
+    high_spread_prices = list(value_prices_raw)
+    high_spread_prices[2] = 2.70
+    high_spread_plan = _value_plan(prices_raw=high_spread_prices)
+    high_19 = high_spread_plan.tasks[1] if high_spread_plan else None
+    checks.append(("value gate keeps the 100% reserve when the later peak is materially dearer",
+                   high_19 is not None
+                   and high_19.action == "IDLE"
+                   and high_19.tou_floor_pct == 100.0,
+                   str(high_19)))
+
+    # A future peak can exist only in the uncertainty band: P50 sees a slight
+    # solar surplus, while P90 load and P10 solar imply a material deficit. It
+    # must remain eligible for reserve protection.
+    p90_only_now = datetime(2026, 1, 20, 18, tzinfo=timezone(timedelta(hours=1)))
+    p90_only_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.00, 2.00])]
+    p90_only_solar = [
+        models.SolarSlot(start=p90_only_prices[0].start, pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0),
+        models.SolarSlot(start=p90_only_prices[1].start, pv_estimate_kwh=1.1, pv_estimate10_kwh=0.1),
+    ]
+    p90_only_state = replace(
+        inversion_state, timestamp=p90_only_now, battery_soc_pct=25.0,
+        pv_power_w=0.0, load_power_w=1000.0,
+        grid_power_w=1000.0, grid_import_power_w=1000.0, grid_export_power_w=0.0,
+        current_buy_price=1.0, current_sell_price=0.4,
+        forecast_today_kwh=1.1, price_slots=p90_only_prices, solar_slots=p90_only_solar,
+    )
+    p90_only_p50 = {slot.start: 1000.0 for slot in p90_only_prices}
+    p90_only_p90 = {p90_only_prices[0].start: 1000.0, p90_only_prices[1].start: 2000.0}
+    p90_only_plan = planner.build_day_plan(
+        p90_only_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=p90_only_p50,
+        reserve_load_by_start_w=p90_only_p90,
+        forecast_confidence=0.7, allow_grid_charge=False,
+    )
+    p90_only_current = p90_only_plan.tasks[0] if p90_only_plan else None
+    checks.append(("P90-only dearer deficit remains protected when P50 shows slight solar surplus",
+                   p90_only_current is not None
+                   and p90_only_current.action == "IDLE"
+                   and p90_only_current.projected_soc_pct == 25.0
+                   and p90_only_current.tou_floor_pct == 25.0,
+                   str(p90_only_current)))
+
+    # Materiality is the sum of the physically deliverable P90-P50 tails for
+    # the reserve episode. Three kWh at a 0.20 kr premium are worth 0.60 kr and
+    # must not be fragmented into three apparently sub-0.30 kr decisions.
+    episode_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.0, 1.0, 1.0, 1.2])]
+    episode_state = replace(
+        p90_only_state, timestamp=episode_prices[0].start, battery_soc_pct=100.0,
+        price_slots=episode_prices,
+        solar_slots=[models.SolarSlot(start=slot.start, pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0)
+                     for slot in episode_prices],
+    )
+    episode_p50 = {slot.start: (100.0 if i == 3 else 1000.0)
+                   for i, slot in enumerate(episode_prices)}
+    episode_p90 = dict(episode_p50)
+    episode_p90[episode_prices[3].start] = 3100.0
+    episode_plan = planner.build_day_plan(
+        episode_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=episode_p50,
+        reserve_load_by_start_w=episode_p90, allow_grid_charge=False,
+    )
+    episode_early = list(episode_plan.tasks[:3]) if episode_plan else []
+    checks.append(("aggregate P90 episode keeps a 0.60kr reserve instead of releasing per source hour",
+                   len(episode_early) == 3
+                   and all("P90 reserve released" not in task.reason for task in episode_early),
+                   str(episode_early)))
+
+    # Conversely, a large P50 load must not inflate a tiny uncertainty tail:
+    # only 0.1 kWh is extra, so a 0.40 kr/kWh premium is worth just 0.04 kr.
+    tiny_prices = [models.PriceSlot(
+        start=p90_only_now + timedelta(hours=i), spot_price=price,
+        tariff=0.0, total_import_price=price, export_value=0.4,
+    ) for i, price in enumerate([1.0, 1.4])]
+    tiny_state = replace(
+        p90_only_state, timestamp=tiny_prices[0].start, battery_soc_pct=100.0,
+        price_slots=tiny_prices,
+        solar_slots=[models.SolarSlot(start=slot.start, pv_estimate_kwh=0.0, pv_estimate10_kwh=0.0)
+                     for slot in tiny_prices],
+    )
+    tiny_p50 = {tiny_prices[0].start: 1000.0, tiny_prices[1].start: 2900.0}
+    tiny_p90 = {tiny_prices[0].start: 1000.0, tiny_prices[1].start: 3000.0}
+    tiny_plan = planner.build_day_plan(
+        tiny_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=tiny_p50,
+        reserve_load_by_start_w=tiny_p90, allow_grid_charge=False,
+    )
+    tiny_current = tiny_plan.tasks[0] if tiny_plan else None
+    checks.append(("materiality values only the 0.1kWh P90 tail, not the 2.9kWh P50 load",
+                   tiny_current is not None
+                   and "upper gain 0.04 kr < 0.30 kr" in tiny_current.reason,
+                   str(tiny_current)))
+
+    # The existing HA option must reach the committed day plan, not only the
+    # legacy fallback. Disable the total-value gate here to isolate this wiring.
+    configured_margin_plan = _value_plan(
+        reserve_min_value_kr=0.0,
+        reserve_hold_margin=0.50,
+    )
+    configured_19 = configured_margin_plan.tasks[1] if configured_margin_plan else None
+    checks.append(("configured reserve_hold_margin reaches the normal committed day plan",
+                   configured_19 is not None
+                   and configured_19.action == "DISCHARGE"
+                   and (configured_19.tou_floor_pct or 100.0) < 100.0,
+                   str(configured_19)))
+
+    # Tomorrow-morning display: with the current 15pp learned reserve frozen,
+    # 06:00 imports at a 30% floor. A per-slot P10 release opens the exact same
+    # physical plan down to the hard 15% floor; 07:00's small surplus is labelled
+    # SOLAR_CHARGE and raises projected SOC instead of the misleading IDLE/flat line.
+    morning_prices = [models.PriceSlot(
+        start=value_now + timedelta(hours=12 + i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.5,
+    ) for i, price in enumerate([1.72, 1.64, 1.43, 0.94, 0.39, 0.37])]
+    morning_pv = [0.164, 0.838, 1.905, 4.152, 5.244, 5.963]
+    morning_load_kwh = [0.539, 0.535, 0.683, 1.077, 1.262, 2.033]
+    morning_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=morning_pv[i],
+        pv_estimate10_kwh=morning_pv[i] * 0.5,
+        pv_estimate90_kwh=morning_pv[i] * 1.2,
+    ) for i, slot in enumerate(morning_prices)]
+    morning_state = replace(
+        inversion_state,
+        timestamp=morning_prices[0].start,
+        battery_soc_pct=30.0,
+        pv_power_w=164.0,
+        load_power_w=539.0,
+        grid_power_w=375.0,
+        grid_import_power_w=375.0,
+        grid_export_power_w=0.0,
+        current_buy_price=1.72,
+        current_sell_price=0.5,
+        price_slots=morning_prices,
+        solar_slots=morning_solar,
+    )
+    morning_load = {
+        slot.start: morning_load_kwh[i] * 1000.0
+        for i, slot in enumerate(morning_prices)
+    }
+    held_morning = planner.build_day_plan(
+        morning_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=9.903, load_hourly_w=morning_load,
+        reserve_load_by_start_w=morning_load, learned_reserve_pct=15.0,
+    )
+    released_morning = planner.build_day_plan(
+        morning_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=9.903, load_hourly_w=morning_load,
+        reserve_load_by_start_w=morning_load, learned_reserve_pct=15.0,
+        learned_reserve_by_start_pct={
+            horizon.utc_instant(slot.start): 0.0 for slot in morning_prices
+        },
+    )
+    held_06 = held_morning.tasks[0] if held_morning else None
+    released_06 = released_morning.tasks[0] if released_morning else None
+    released_07 = released_morning.tasks[1] if released_morning else None
+    checks.append(("future learned reserve: sunny 06:00 discharges while cloudy/held plan stays at 30%",
+                   held_06 is not None and released_06 is not None
+                   and held_06.action == "IDLE" and held_06.tou_floor_pct == 30.0
+                   and released_06.action == "DISCHARGE"
+                   and 15.0 <= (released_06.tou_floor_pct or 0.0) <= 25.0,
+                   f"held={held_06} released={released_06}"))
+    checks.append(("future display labels sub-0.5kWh Load-first solar intake at 07:00",
+                   released_07 is not None
+                   and released_07.action == "IDLE"
+                   and planner.display_plan_action(released_07) == "SOLAR_CHARGE"
+                   and released_07.tou_floor_pct == 15.0
+                   and (released_07.tou_floor_pct or 100.0)
+                   <= (released_06.projected_soc_pct or 0.0)
+                   and (released_07.projected_soc_pct or 0.0)
+                   > (released_06.projected_soc_pct or 100.0),
+                   f"06={released_06} 07={released_07}"))
 
     # Exact 2026-08-01 daytime failure shape: the hourly P50 plan says EXPORT,
     # while a live load spike makes PV insufficient. The evening reserve still
