@@ -31,7 +31,7 @@ from .const import (
     INTEGRATION_VERSION,
     LEGACY_BATTERY_MODE_MAP,
 )
-from .horizon import current_price_slot, remaining_price_slots, utc_instant
+from .horizon import current_price_slot, remaining_price_slots
 from .models import (
     BatteryPlan,
     ControlPlan,
@@ -96,17 +96,6 @@ def ev_runtime_state(state: SiteState) -> str:
 # the full spread excluded the 1.39/1.26 kr evening hours from the reserve, so
 # the pack was spent at 0.86 kr and empty at the 1.26 kr hour.)
 RESERVE_HOLD_MARGIN = 0.15
-# The EXTRA P90 uncertainty reserve may deliberately buy the house load now to
-# preserve stored energy for a later, dearer deficit. Do that only when even an
-# optimistic upper bound on the TOTAL value moved between the slots is material.
-# A per-kWh spread alone is scale-blind: 0.16 kr/kWh is meaningful for 5 kWh, but
-# not for the ~1 kWh P90 tail behind the 2026-08-08 full-battery grid import.
-# 0.30 kr is an absolute value gate for one coherent reserve episode. The
-# valuation below is capped on BOTH sides: by P50 energy the source episode was
-# actually going to spend and by the future P90 uncertainty energy it can serve.
-# This prevents a large destination tail inflating one small source decision,
-# without fragmenting a material multi-source episode into sub-threshold hours.
-RESERVE_HOLD_MIN_VALUE_KR = 0.30
 
 # Minimum house deficit (W) before the battery is tapped to cover the load. A
 # small deadband above zero stops the planner micro-cycling around the
@@ -256,19 +245,6 @@ def profile_for(mode: str) -> ProfileWeights:
     return PROFILES.get(_resolve_mode(mode), PROFILES[BATTERY_MODE_BLUE])
 
 
-def display_plan_action(task: PlanTask) -> str:
-    """User-facing action without changing the optimizer or physical command."""
-    if (
-        task.action == "IDLE"
-        and (task.pv_estimate_kwh or 0.0)
-        > (task.load_estimate_kwh or 0.0) + 0.01
-    ):
-        # Deye Load first absorbs this real surplus even when the quantized DP
-        # deliberately emits no distinct action for a sub-0.5 kWh movement.
-        return "SOLAR_CHARGE"
-    return task.action
-
-
 def required_spread(profile: ProfileWeights) -> float:
     return profile.profit_margin + BATTERY_WEAR_COST
 
@@ -319,16 +295,6 @@ def load_forecast_w(load_forecast, start: datetime, default_w: float = 0.0) -> f
         return default_w
     if start in load_forecast:
         return max(0.0, float(load_forecast[start]))
-    try:
-        instant = utc_instant(start)
-    except ValueError:
-        instant = None
-    if instant is not None:
-        if instant in load_forecast:
-            return max(0.0, float(load_forecast[instant]))
-        instant_iso = instant.isoformat()
-        if instant_iso in load_forecast:
-            return max(0.0, float(load_forecast[instant_iso]))
     iso = start.isoformat()
     if iso in load_forecast:
         return max(0.0, float(load_forecast[iso]))
@@ -424,7 +390,7 @@ def conservative_refill_surplus_kwh(
     ev_load_by_start = ev_load_by_start or {}
     total = 0.0
     for slot in solar_slots:
-        if slot.start <= after_start or slot.start >= through_start:
+        if slot.start <= after_start or slot.start > through_start:
             continue
         conservative_solar = (
             slot.pv_estimate10_kwh
@@ -831,7 +797,6 @@ TOU_CAPACITY_STEP_PCT = 5.0  # the Deye quantizes each TOU time-point's capacity
 # FRACTIONAL setpoint (e.g. 50.6) can never equal the 5%-quantized read-back, so the 6 TOU
 # registers rewrite EVERY tick — a limit cycle that was ~95% of the daily register writes
 # (weekly-eval 2026-06-29). Snap the setpoint to the step so it converges.
-LIVE_DIP_BUFFER_PCT = 2.0 * TOU_CAPACITY_STEP_PCT
 
 
 def _snap_tou_capacity(pct: float, *, up: bool) -> float:
@@ -842,28 +807,6 @@ def _snap_tou_capacity(pct: float, *, up: bool) -> float:
     step = TOU_CAPACITY_STEP_PCT
     q = (math.ceil(pct / step) if up else math.floor(pct / step)) * step
     return float(q)
-
-
-def _non_grid_hold_ceiling(
-    soc_pct: float,
-    *,
-    min_soc: float,
-    max_soc: float,
-) -> float:
-    """Lowest native TOU step that does not implicitly release live energy.
-
-    A floor far above the energy that is actually present cannot describe a
-    physical reserve; on Deye it instead acts as an implicit hold. Keep the cap
-    in the safe hold direction: rounding projected/live SOC down would silently
-    open up to 4.9 percentage points and can spend energy in a cheap hour. An
-    intentional self-consumption envelope is opened separately by the planner.
-    """
-    minimum_floor = _snap_tou_capacity(float(min_soc), up=True)
-    available_floor = _snap_tou_capacity(
-        float(min(max_soc, max(0.0, soc_pct))),
-        up=True,
-    )
-    return min(float(max_soc), max(minimum_floor, available_floor))
 
 
 def tou_setpoint(
@@ -926,29 +869,12 @@ def tou_setpoint(
             ),
             False,
         )
-    live_hold_ceiling = _non_grid_hold_ceiling(
-        soc_pct,
-        min_soc=min_soc,
-        max_soc=max_soc,
-    )
     if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
-        return (
-            min(
-                _snap_tou_capacity(float(discharge_floor), up=True),
-                live_hold_ceiling,
-            ),
-            False,
-        )
+        return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
     # Every other state covers the house down to the discharge floor. Round the floor UP
     # to the step (never let the inverter discharge below the intended reserve), clamped
     # to max_soc, so the setpoint is a clean 5-multiple that converges (no limit cycle).
-    return (
-        min(
-            _snap_tou_capacity(float(discharge_floor), up=True),
-            live_hold_ceiling,
-        ),
-        False,
-    )
+    return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
 
 
 # Strategies that bypass the anti-hunt dwell — they apply immediately, never held:
@@ -1044,9 +970,6 @@ def build_day_plan(
     load_hourly_w: dict[int, float] | None = None,
     reserve_load_by_start_w: dict | None = None,
     learned_reserve_pct: float = 0.0,
-    learned_reserve_by_start_pct: dict[datetime, float] | None = None,
-    reserve_hold_margin: float = RESERVE_HOLD_MARGIN,
-    reserve_min_value_kr: float = RESERVE_HOLD_MIN_VALUE_KR,
     solar_charge_priority_soc: float = 0.0,
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
@@ -1094,12 +1017,6 @@ def build_day_plan(
     )
     if not tasks:
         return None
-    hold_margin = float(reserve_hold_margin)
-    if not math.isfinite(hold_margin) or hold_margin < 0.0:
-        hold_margin = RESERVE_HOLD_MARGIN
-    min_hold_value_kr = float(reserve_min_value_kr)
-    if not math.isfinite(min_hold_value_kr) or min_hold_value_kr < 0.0:
-        min_hold_value_kr = RESERVE_HOLD_MIN_VALUE_KR
     # Re-project the projected_soc curve through the sell-throttle BEFORE building the slots,
     # so the committed plan + the SOC-deviation replan trigger reflect the morning-sell. The
     # dashboard schedule gets the SAME treatment via the shared helper in build_control_plan.
@@ -1107,568 +1024,20 @@ def build_day_plan(
         tasks, state, capacity_kwh=capacity_kwh, max_soc=max_soc,
         charge_rate=charge_rate, load_hourly_w=load_hourly_w,
     )
-    planning_base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
-    learned_reserve_by_start_pct = learned_reserve_by_start_pct or {}
+    base_floor = min_soc + max(profile.reserve_soc_offset, learned_reserve_pct)
     slots_by_start = {s.start: s for s in view.slots}
-    solar_slots_by_start = {s.start: s for s in state.solar_slots}
     plan_slots: list[SlotPlan] = []
     committed_tasks: list[PlanTask] = []
     committed_prev_soc = state.battery_soc_pct
-
-    def _battery_served_load_kwh(
-        candidate: PlanTask,
-        *,
-        conservative: bool,
-    ) -> float:
-        """P50/P90 load eligible to be served by the house battery."""
-        ev_kwh = max(0.0, candidate.ev_load_estimate_kwh or 0.0)
-        if conservative and reserve_load_by_start_w:
-            house_kwh = load_forecast_w(
-                reserve_load_by_start_w, candidate.start
-            ) / 1000.0
-        elif load_hourly_w:
-            house_kwh = load_forecast_w(load_hourly_w, candidate.start) / 1000.0
-        else:
-            house_kwh = max(
-                0.0,
-                (candidate.load_estimate_kwh or 0.0) - ev_kwh,
-            )
-        return house_kwh + (0.0 if ev_battery_protected else ev_kwh)
-
-    def _battery_deficit_kwh(candidate: PlanTask, *, conservative: bool) -> float:
-        """P50/P90-load deficit against the median solar trajectory."""
-        battery_load_kwh = _battery_served_load_kwh(
-            candidate,
-            conservative=conservative,
-        )
-        return max(
-            0.0,
-            battery_load_kwh - max(0.0, candidate.pv_estimate_kwh or 0.0),
-        )
-
-    def _uncertainty_tail_kwh(candidate: PlanTask) -> float:
-        """Extra deliverable uncertainty above the economic P50 trajectory.
-
-        Load and solar forecast bands are alternatives, not an assumption that
-        the P90 load spike and P10 solar miss happen together.  Reserve the
-        larger incremental tail once.  This puts both bands through the same
-        finite source allocation, relative-price gate and absolute-value gate,
-        so neither a top-price source nor a small uncertainty event can bypass
-        the economics or be counted twice.
-        """
-        p50_deficit = min(
-            discharge_rate,
-            _battery_deficit_kwh(candidate, conservative=False),
-        )
-        p90_deficit = min(
-            discharge_rate,
-            _battery_deficit_kwh(candidate, conservative=True),
-        )
-        solar_slot = solar_slots_by_start.get(candidate.start)
-        p10_solar_kwh = 0.0
-        if solar_slot is not None:
-            p10_solar_kwh = max(
-                0.0,
-                solar_slot.pv_estimate10_kwh
-                if solar_slot.pv_estimate10_kwh is not None
-                else solar_slot.pv_estimate_kwh * 0.6,
-            )
-        p10_deficit = min(
-            discharge_rate,
-            max(
-                0.0,
-                _battery_served_load_kwh(candidate, conservative=False)
-                - p10_solar_kwh,
-            ),
-        )
-        return max(
-            0.0,
-            p90_deficit - p50_deficit,
-            p10_deficit - p50_deficit,
-        )
-
-    # Raw P50 energy that the optimizer planned to spend in each source slot,
-    # before reserve overlays change the physical TOU floor.  Episode
-    # materiality must use this finite source budget: destination P90 tails are
-    # not stored energy.  Keep the complete raw trajectory so all source hours
-    # belonging to one future uncertainty episode are assessed together.
-    raw_source_energy_by_start: dict[datetime, float] = {}
-    raw_start_soc_by_start: dict[datetime, float] = {}
-    raw_start_soc = float(state.battery_soc_pct)
-    for raw_task in tasks:
-        raw_start_soc_by_start[raw_task.start] = raw_start_soc
-        raw_projected = raw_task.projected_soc_pct
-        raw_discharge_kwh = 0.0
-        if raw_projected is not None:
-            raw_discharge_kwh = max(
-                0.0,
-                (raw_start_soc - float(raw_projected))
-                / 100.0
-                * max(0.1, capacity_kwh),
-            )
-            raw_start_soc = float(raw_projected)
-        raw_source_energy_by_start[raw_task.start] = min(
-            raw_discharge_kwh,
-            discharge_rate,
-            _battery_deficit_kwh(raw_task, conservative=False),
-        )
-
-    def _finite_conservative_solar_refill_by_start(
-        after_start: datetime,
-        through_start: datetime,
-    ) -> dict[datetime, float]:
-        """Raw P10 refill by slot, capped by physical charge throughput."""
-        refill_by_start: dict[datetime, float] = {}
-        expected_load = load_hourly_w or reserve_load_by_start_w
-        for candidate in tasks:
-            if not after_start < candidate.start < through_start:
-                continue
-            solar_slot = solar_slots_by_start.get(candidate.start)
-            if solar_slot is None:
-                continue
-            conservative_solar = max(
-                0.0,
-                solar_slot.pv_estimate10_kwh
-                if solar_slot.pv_estimate10_kwh is not None
-                else solar_slot.pv_estimate_kwh * 0.6,
-            )
-            expected_load_kwh = (
-                load_forecast_w(expected_load, candidate.start) / 1000.0
-            )
-            ev_kwh = max(
-                0.0,
-                (ev_load_by_start or {}).get(candidate.start, 0.0),
-            )
-            conservative_surplus = max(
-                0.0,
-                conservative_solar - expected_load_kwh - ev_kwh,
-            )
-            refill_by_start[candidate.start] = min(
-                conservative_surplus,
-                max(0.0, charge_rate),
-            )
-        return refill_by_start
-
-    def _finite_conservative_solar_refill_kwh(
-        after_start: datetime,
-        through_start: datetime,
-    ) -> float:
-        """Raw finite P10 refill summed across the requested interval."""
-        return sum(
-            _finite_conservative_solar_refill_by_start(
-                after_start,
-                through_start,
-            ).values()
-        )
-
-    def _uncertainty_episode_allocations(
-    ) -> tuple[
-        dict[datetime, float],
-        dict[datetime, float],
-        dict[datetime, float],
-        dict[datetime, datetime],
-        dict[datetime, float],
-        dict[datetime, float],
-    ]:
-        """Allocate every uncertainty tail to concrete raw-P50 source energy once.
-
-        The horizon is one small continuous max-cost-flow problem (normally at
-        most three destination peaks). Residual reverse edges can reassign an
-        earlier choice, so temporal constraints and different source prices are
-        handled correctly. Connected source/destination components define the
-        coherent episodes used by the absolute value gate.
-
-        Returns episode value and allocation by source, plus the cumulative
-        material reserve and its last concrete destination for every slot.
-        """
-        peaks = [
-            candidate for candidate in tasks
-            if candidate.start in view.expensive_starts
-            and _uncertainty_tail_kwh(candidate) > 0.01
-        ]
-        # Later equal-price sources are preferred as a deterministic tie-break:
-        # they hold for less time and let earlier self-consumption proceed. The
-        # monetary optimum is unchanged because the tie-break never enters cost.
-        sources = list(reversed([
-            candidate for candidate in tasks
-            if raw_source_energy_by_start.get(candidate.start, 0.0) > 0.01
-        ]))
-        if not sources or not peaks:
-            return {}, {}, {}, {}, {}, {}
-        source_count = len(sources)
-        peak_count = len(peaks)
-        source_node = 1
-        peak_node = source_node + source_count
-        sink = peak_node + peak_count
-        node_count = sink + 1
-        # Residual edge: [to, reverse_index, remaining_capacity, cost_kr_per_kwh].
-        graph: list[list[list[float | int]]] = [[] for _ in range(node_count)]
-
-        def _add_edge(start: int, end: int, capacity: float, cost: float) -> list[float | int]:
-            forward: list[float | int] = [end, len(graph[end]), capacity, cost]
-            reverse: list[float | int] = [start, len(graph[start]), 0.0, -cost]
-            graph[start].append(forward)
-            graph[end].append(reverse)
-            return forward
-
-        for index, source in enumerate(sources):
-            _add_edge(
-                0,
-                source_node + index,
-                raw_source_energy_by_start[source.start],
-                0.0,
-            )
-        for index, peak in enumerate(peaks):
-            _add_edge(
-                peak_node + index,
-                sink,
-                _uncertainty_tail_kwh(peak),
-                0.0,
-            )
-
-        component_parent = list(range(source_count + peak_count))
-
-        def _component_find(node: int) -> int:
-            while component_parent[node] != node:
-                component_parent[node] = component_parent[component_parent[node]]
-                node = component_parent[node]
-            return node
-
-        def _component_union(left: int, right: int) -> None:
-            left_root = _component_find(left)
-            right_root = _component_find(right)
-            if left_root != right_root:
-                component_parent[right_root] = left_root
-
-        allocation_edges: list[
-            tuple[int, int, float, float, list[float | int]]
-        ] = []
-        for source_index, source in enumerate(sources):
-            for peak_index, peak in enumerate(peaks):
-                premium = peak.total_import_price - source.total_import_price
-                if source.start >= peak.start or premium <= hold_margin:
-                    continue
-                capacity = min(
-                    raw_source_energy_by_start[source.start],
-                    _uncertainty_tail_kwh(peak),
-                )
-                edge = _add_edge(
-                    source_node + source_index,
-                    peak_node + peak_index,
-                    capacity,
-                    -premium,
-                )
-                allocation_edges.append(
-                    (source_index, peak_index, premium, capacity, edge)
-                )
-
-        epsilon = 1e-9
-        while True:
-            distances = [math.inf] * node_count
-            previous: list[tuple[int, int] | None] = [None] * node_count
-            distances[0] = 0.0
-            # Bellman-Ford is small and deterministic here, and unlike greedy
-            # edge sorting it can reroute flow through residual reverse edges.
-            for _ in range(node_count - 1):
-                changed = False
-                for start in range(node_count):
-                    if not math.isfinite(distances[start]):
-                        continue
-                    for edge_index, edge in enumerate(graph[start]):
-                        end = int(edge[0])
-                        capacity = float(edge[2])
-                        cost = float(edge[3])
-                        if capacity <= epsilon:
-                            continue
-                        candidate_distance = distances[start] + cost
-                        if candidate_distance < distances[end] - 1e-12:
-                            distances[end] = candidate_distance
-                            previous[end] = (start, edge_index)
-                            changed = True
-                if not changed:
-                    break
-            if previous[sink] is None or distances[sink] >= -epsilon:
-                break
-            augment = math.inf
-            node = sink
-            while node != 0:
-                prior = previous[node]
-                if prior is None:
-                    augment = 0.0
-                    break
-                start, edge_index = prior
-                augment = min(augment, float(graph[start][edge_index][2]))
-                node = start
-            if augment <= epsilon or not math.isfinite(augment):
-                break
-            node = sink
-            while node != 0:
-                start, edge_index = previous[node]  # type: ignore[misc]
-                edge = graph[start][edge_index]
-                reverse = graph[node][int(edge[1])]
-                edge[2] = float(edge[2]) - augment
-                reverse[2] = float(reverse[2]) + augment
-                node = start
-
-        positive_allocations: list[tuple[int, int, float, float]] = []
-        for (
-            source_index,
-            peak_index,
-            premium,
-            initial_capacity,
-            edge,
-        ) in allocation_edges:
-            allocated_kwh = max(0.0, initial_capacity - float(edge[2]))
-            if allocated_kwh <= epsilon:
-                continue
-            positive_allocations.append(
-                (source_index, peak_index, premium, allocated_kwh)
-            )
-            # Only real flow joins an episode. Merely eligible zero-flow edges
-            # must not let an unrelated material episode promote a small one.
-            _component_union(source_index, source_count + peak_index)
-
-        component_values: dict[int, float] = {}
-        source_allocations: dict[datetime, float] = {
-            source.start: 0.0 for source in sources
-        }
-        for source_index, _peak_index, premium, allocated_kwh in positive_allocations:
-            component = _component_find(source_index)
-            component_values[component] = (
-                component_values.get(component, 0.0)
-                + allocated_kwh * premium
-            )
-            source_start = sources[source_index].start
-            source_allocations[source_start] += allocated_kwh
-        episode_values = {
-            source.start: component_values.get(_component_find(index), 0.0)
-            for index, source in enumerate(sources)
-        }
-        # Translate the matching into a physical ledger. An accepted source
-        # kWh is outstanding after its source slot and through every
-        # intermediate slot, then expires in its own destination slot. This is
-        # deliberately cumulative: a later unallocated source may release its
-        # own kWh without erasing reserve carried from an earlier source.
-        material_allocations = [
-            (sources[source_index].start, peaks[peak_index].start, allocated_kwh)
-            for source_index, peak_index, _premium, allocated_kwh
-            in positive_allocations
-            if component_values.get(_component_find(source_index), 0.0)
-            + epsilon >= min_hold_value_kr
-        ]
-        outstanding_by_start: dict[datetime, float] = {}
-        last_destination_by_start: dict[datetime, datetime] = {}
-        material_source_allocation_by_start: dict[datetime, float] = {}
-        destination_allocation_by_start: dict[datetime, float] = {}
-        for source, destination, allocated_kwh in material_allocations:
-            material_source_allocation_by_start[source] = (
-                material_source_allocation_by_start.get(source, 0.0)
-                + allocated_kwh
-            )
-            destination_allocation_by_start[destination] = (
-                destination_allocation_by_start.get(destination, 0.0)
-                + allocated_kwh
-            )
-
-        def _planned_refill_kwh(
-            after_start: datetime,
-            through_start: datetime,
-        ) -> float:
-            """Finite P10/grid refill available before one deadline."""
-            solar_refill_by_start = _finite_conservative_solar_refill_by_start(
-                after_start,
-                through_start,
-            )
-            refill = 0.0
-            for candidate in tasks:
-                if not after_start < candidate.start < through_start:
-                    continue
-                solar_refill = (
-                    solar_refill_by_start.get(candidate.start, 0.0)
-                    / UNCERTAINTY_REFILL_MARGIN
-                )
-                grid_refill = 0.0
-                if candidate.action == "GRID_CHARGE":
-                    candidate_price_slot = slots_by_start.get(candidate.start)
-                    if (
-                        candidate_price_slot is not None
-                        and not candidate_price_slot.estimated
-                    ):
-                        raw_start = raw_start_soc_by_start.get(candidate.start)
-                        raw_end = candidate.projected_soc_pct
-                        if raw_start is not None and raw_end is not None:
-                            grid_refill = (
-                                max(0.0, float(raw_end) - float(raw_start))
-                                / 100.0
-                                * max(0.1, capacity_kwh)
-                            )
-                # The raw GRID_CHARGE SOC gain can already include concurrent
-                # solar. Use the larger finite supply for that slot, never the
-                # sum, so one physical intake is credited exactly once.
-                refill += max(solar_refill, grid_refill)
-            return refill
-
-        for task in tasks:
-            active = [
-                (destination, allocated_kwh)
-                for source, destination, allocated_kwh in material_allocations
-                if source <= task.start < destination
-            ]
-            if not active:
-                continue
-            # Deadline-aware reserve: later refill may cover only obligations
-            # whose destination is after that refill. For every destination
-            # prefix, keep the cumulative demand that cannot be supplied by
-            # finite P10/grid energy available before that deadline. Looking
-            # only through the last destination wrongly released an imminent
-            # peak because sunshine arrived after it.
-            demand_by_destination: dict[datetime, float] = {}
-            for destination, allocated_kwh in active:
-                demand_by_destination[destination] = (
-                    demand_by_destination.get(destination, 0.0)
-                    + allocated_kwh
-                )
-            cumulative_demand = 0.0
-            required_now = 0.0
-            for destination in sorted(demand_by_destination):
-                cumulative_demand += demand_by_destination[destination]
-                required_now = max(
-                    required_now,
-                    cumulative_demand
-                    - _planned_refill_kwh(task.start, destination),
-                )
-            outstanding_by_start[task.start] = max(0.0, required_now)
-            last_destination_by_start[task.start] = max(
-                destination for destination, _allocated_kwh in active
-            )
-        return (
-            episode_values,
-            source_allocations,
-            outstanding_by_start,
-            last_destination_by_start,
-            destination_allocation_by_start,
-            material_source_allocation_by_start,
-        )
-
-    (
-        uncertainty_episode_value_by_start,
-        uncertainty_source_allocation_by_start,
-        uncertainty_outstanding_by_start,
-        uncertainty_last_destination_by_start,
-        uncertainty_destination_allocation_by_start,
-        uncertainty_material_source_allocation_by_start,
-    ) = _uncertainty_episode_allocations()
-
     for task_index, task in enumerate(tasks):
         committed_start_soc = committed_prev_soc
-        # The learned reserve is sized and P10-released for each future slot by
-        # the coordinator.  Cap a future reserve to energy that the projected
-        # battery actually contains, so a forecast change can never invent a
-        # higher floor or trigger grid catch-up.  The hard minimum is separate.
-        try:
-            reserve_key = utc_instant(task.start)
-        except ValueError:
-            reserve_key = None
-        slot_learned_reserve_pct = max(
-            0.0,
-            float(
-                learned_reserve_by_start_pct.get(
-                    reserve_key,
-                    learned_reserve_by_start_pct.get(task.start, learned_reserve_pct),
-                )
-                if reserve_key is not None
-                else learned_reserve_pct
-            ),
-        )
-        available_floor_pct = (
-            math.floor(max(0.0, committed_start_soc) / TOU_CAPACITY_STEP_PCT)
-            * TOU_CAPACITY_STEP_PCT
-        )
-        available_learned_pct = max(0.0, available_floor_pct - min_soc)
-        slot_learned_reserve_pct = min(
-            slot_learned_reserve_pct,
-            available_learned_pct,
-        )
-        base_floor = min_soc + max(
-            profile.reserve_soc_offset,
-            slot_learned_reserve_pct,
-        )
         price_slot = slots_by_start.get(task.start)
         export_value = price_slot.export_value if price_slot else None
         sell_ok = (export_value or 0) > 0
-        forecast_deficit = (
-            (task.load_estimate_kwh or 0.0) > (task.pv_estimate_kwh or 0.0) + 0.01
-        )
-        battery_deficit_kwh = _battery_deficit_kwh(task, conservative=False)
-
-        # Preserve the optimizer's established P50 peak set exactly. A separate
-        # uncertainty set also admits a P90-only deficit when P50 expects slight
-        # solar surplus: that is exactly the insurance this overlay protects.
-        economic_future_peaks = [
-            candidate for candidate in tasks[task_index + 1:]
-            if candidate.start in view.expensive_starts
-            and candidate.total_import_price > task.total_import_price + hold_margin
-            and _battery_deficit_kwh(candidate, conservative=False) > 0.01
-        ]
-        uncertainty_future_peaks = [
-            candidate for candidate in tasks[task_index + 1:]
-            if candidate.start in view.expensive_starts
-            and candidate.total_import_price > task.total_import_price + hold_margin
-            and _uncertainty_tail_kwh(candidate) > 0.01
-        ]
-        future_peaks = [
-            candidate for candidate in tasks[task_index + 1:]
-            if candidate in economic_future_peaks
-            or candidate in uncertainty_future_peaks
-        ]
-        shiftable_now_kwh = min(
-            battery_deficit_kwh,
-            discharge_rate,
-            max(0.0, committed_start_soc - base_floor)
-            / 100.0
-            * max(0.1, capacity_kwh),
-        )
-        # Use the horizon-wide source/destination allocation. This retains a
-        # real 3h × 1kWh × 0.20kr = 0.60kr episode, while live 19:00 remains
-        # capped by raw P50 spend. A cheaper alternative source takes the finite
-        # destination capacity and releases a dearer source independently.
-        episode_value_kr = uncertainty_episode_value_by_start.get(
-            task.start,
-            0.0,
-        )
-        uncertainty_source_allocation_kwh = (
-            uncertainty_source_allocation_by_start.get(task.start, 0.0)
-        )
-        uncertainty_outstanding_kwh = uncertainty_outstanding_by_start.get(
-            task.start,
-            0.0,
-        )
-        uncertainty_destination_allocation_kwh = (
-            uncertainty_destination_allocation_by_start.get(task.start, 0.0)
-        )
-        uncertainty_material_source_allocation_kwh = (
-            uncertainty_material_source_allocation_by_start.get(task.start, 0.0)
-        )
-        hold_gain_upper_kr = (
-            episode_value_kr
-            if uncertainty_source_allocation_kwh > 0.01
-            else 0.0
-        )
-        marginal_uncertainty_release = bool(
-            forecast_deficit
-            and shiftable_now_kwh > 0.01
-            and raw_source_energy_by_start.get(task.start, 0.0) > 0.01
-            and uncertainty_future_peaks
-            and (
-                uncertainty_source_allocation_kwh <= 0.01
-                or episode_value_kr + 1e-9 < min_hold_value_kr
-            )
-        )
-        # Keep the established peak reserve for ordinary source hours. A slot
-        # in the horizon's top-price set releases that aggregate reserve, while
-        # the finite uncertainty ledger still protects it if an even dearer
-        # destination has a material P90-load or P10-solar tail. This avoids the
-        # old rank-only safety hole without stacking two reserves.
+        # Reserve floor: hold charge for upcoming markedly-dearer peaks (HOLD margin,
+        # not the arbitrage spread — holding stored energy costs no extra cycle);
+        # released at the expensive slots themselves so the pack drains fully into
+        # the peak. Per-hour reservation capped at the pack's real discharge rate.
         if task.start in view.expensive_starts:
             reserve_floor = base_floor
         else:
@@ -1676,7 +1045,7 @@ def build_day_plan(
                 view.slots, task.start, state.solar_slots,
                 reserve_load_by_start_w or load_hourly_w,
                 capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
-                margin=hold_margin, discharge_rate_kwh=discharge_rate,
+                margin=RESERVE_HOLD_MARGIN, discharge_rate_kwh=discharge_rate,
                 confidence=forecast_confidence,
                 ev_load_by_start=ev_load_by_start,
                 ev_battery_protected=ev_battery_protected,
@@ -1695,21 +1064,20 @@ def build_day_plan(
         # 2.39 kr/kWh now was pinned at 100%, then released at 2.17 kr/kWh).
         # Use the same economic peak definition as ``peak_reserve_pct``: only a
         # markedly dearer later slot may justify holding extra uncertainty.
+        future_peaks = [
+            candidate for candidate in tasks[task_index + 1:]
+            if candidate.start in view.expensive_starts
+            and candidate.total_import_price
+            > task.total_import_price + RESERVE_HOLD_MARGIN
+        ]
         conservative_refill_kwh = 0.0
-        refill_through = (
-            future_peaks[-1].start if future_peaks else None
-        )
-        allocated_destination = uncertainty_last_destination_by_start.get(
-            task.start
-        )
-        if allocated_destination is not None and (
-            refill_through is None or allocated_destination > refill_through
-        ):
-            refill_through = allocated_destination
-        if refill_through is not None:
-            conservative_refill_kwh = _finite_conservative_solar_refill_kwh(
+        if future_peaks:
+            conservative_refill_kwh = conservative_refill_surplus_kwh(
+                state.solar_slots,
+                load_hourly_w or reserve_load_by_start_w,
                 task.start,
-                refill_through,
+                future_peaks[-1].start,
+                ev_load_by_start=ev_load_by_start,
             )
         usable_band_kwh = (
             max(0.0, max_soc - base_floor) / 100.0 * max(0.1, capacity_kwh)
@@ -1720,7 +1088,8 @@ def build_day_plan(
             >= usable_band_kwh * RESERVE_REFILL_RELEASE_BAND_MARGIN
         )
         refill_release_pct = (
-            conservative_refill_kwh / UNCERTAINTY_REFILL_MARGIN
+            conservative_refill_kwh
+            / UNCERTAINTY_REFILL_MARGIN
             / max(0.1, capacity_kwh)
             * 100.0
         )
@@ -1745,7 +1114,20 @@ def build_day_plan(
         # the pack even while the displayed SOC curve stayed flat. Enforce the
         # optimizer's end-of-slot SOC for deficit-shaped actions; solar/export
         # actions stay open so the battery can continue covering cloud dips.
+        forecast_deficit = (
+            (task.load_estimate_kwh or 0.0) > (task.pv_estimate_kwh or 0.0) + 0.01
+        )
         committed_projected = task.projected_soc_pct
+        battery_load_kwh = max(0.0, task.load_estimate_kwh or 0.0)
+        if ev_battery_protected:
+            battery_load_kwh = max(
+                0.0,
+                battery_load_kwh - max(0.0, task.ev_load_estimate_kwh or 0.0),
+            )
+        battery_deficit_kwh = max(
+            0.0,
+            battery_load_kwh - max(0.0, task.pv_estimate_kwh or 0.0),
+        )
         refill_backed_self_consumption = bool(
             forecast_deficit
             and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
@@ -1761,15 +1143,9 @@ def build_day_plan(
         # "import => release" guard:
         # a real dearer future peak keeps ``future_peaks`` non-empty and therefore
         # retains the conservative reserve unchanged.
-        future_learned_reserve_release = bool(
-            base_floor < planning_base_floor - 0.1
-        )
         price_dominant_self_consumption = bool(
             forecast_deficit
-            and (
-                task.action == "DISCHARGE"
-                or future_learned_reserve_release
-            )
+            and task.action == "DISCHARGE"
             and task.total_import_price >= 0.0
             and not future_peaks
             and committed_start_soc > base_floor + 0.1
@@ -1801,45 +1177,14 @@ def build_day_plan(
         live_dip_release = bool(
             not forecast_deficit
             and task.action != "GRID_CHARGE"
-            and (
-                conservative_refill_kwh > 0.0
-                or future_learned_reserve_release
-            )
-        )
-        # A forecast-surplus/idle slot must not publish a future floor above the
-        # energy projected to exist when that slot begins. Give Load-first a
-        # bounded 10pp buffer for a cloud/load dip; the 7.5pp SOC-deviation gate
-        # forces a replan before that envelope can be exhausted. This preserves
-        # the remaining reserve instead of opening the whole pack blindly.
-        live_dip_buffer_floor = max(
-            base_floor,
-            _non_grid_hold_ceiling(
-                committed_start_soc,
-                min_soc=min_soc,
-                max_soc=max_soc,
-            ) - LIVE_DIP_BUFFER_PCT,
+            and conservative_refill_kwh > 0.0
         )
         floor = live_dip_floor if live_dip_release else reserve_floor
-        bounded_live_dip_release = bool(
-            live_dip_release and future_learned_reserve_release
-        )
-        if bounded_live_dip_release:
-            floor = min(floor, live_dip_buffer_floor)
         physical_reserve_floor = floor
-        uncertainty_pct = 0.0
-        material_uncertainty_active = bool(
-            uncertainty_outstanding_kwh > 0.01
-            or uncertainty_destination_allocation_kwh > 0.01
-        )
         if (
             committed_projected is not None
-            and (
-                material_uncertainty_active
-                or (
-                    forecast_deficit
-                    and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
-                )
-            )
+            and task.action not in ("GRID_CHARGE", "SOLAR_CHARGE")
+            and (task.action in ("IDLE", "DISCHARGE") or forecast_deficit)
         ):
             # The DP projection already contains the P50 peak reservation. Add
             # only the P90-P50 uncertainty tail after crediting a conservative
@@ -1848,84 +1193,54 @@ def build_day_plan(
             # the optimizer labels sunny refill hours EXPORT, which previously
             # made the reserve pin the pack at 100% and buy the house load.
             uncertainty_kwh = 0.0
-            destination_floor_target: float | None = None
             if reserve_load_by_start_w:
-                if uncertainty_outstanding_kwh > 0.01:
-                    # Extra P90 energy can only defer energy the current P50
-                    # trajectory was actually about to spend.  Headroom up to
-                    # max_soc is not stored energy and must never become a floor
-                    # above the projected/current SOC.
+                if future_peaks:
+                    last_peak = future_peaks[-1].start
+                    raw_uncertainty_kwh = sum(
+                        max(
+                            0.0,
+                            load_forecast_w(reserve_load_by_start_w, candidate.start)
+                            - load_forecast_w(load_hourly_w, candidate.start),
+                        ) / 1000.0
+                        for candidate in future_peaks
+                    )
+                    # Only the headroom above the optimizer's P50 end-SOC can
+                    # become an additional physical reserve. Summing hourly P90
+                    # tails can exceed the whole pack; requiring solar to offset
+                    # that impossible amount pinned a 95% plan at 100% even when
+                    # a conservative 0.6 kWh refill could restore the only 0.5
+                    # kWh actually held back.
                     uncertainty_room_kwh = max(
                         0.0,
-                        (float(committed_start_soc) - float(committed_projected))
+                        (float(max_soc) - float(committed_projected))
                         / 100.0
                         * max(0.0, capacity_kwh),
                     )
                     uncertainty_kwh = min(
+                        raw_uncertainty_kwh,
                         uncertainty_room_kwh,
-                        uncertainty_outstanding_kwh,
                     )
-                if uncertainty_destination_allocation_kwh > 0.01:
-                    # Release the concrete incoming allocation in its own
-                    # destination slot. Using only the raw absolute P50 curve
-                    # pins a refilled/full pack at 100% and leaves no envelope
-                    # for the P90 tail. Apply the raw slot delta to the actual
-                    # committed start SOC, then consume precisely the matched
-                    # tail. ``min`` avoids raising an already-lower P50 path.
-                    raw_start_soc = raw_start_soc_by_start.get(
-                        task.start,
-                        float(committed_start_soc),
+                    planned_grid_refill = any(
+                        candidate.start <= last_peak
+                        and candidate.action == "GRID_CHARGE"
+                        for candidate in tasks[task_index + 1:]
                     )
-                    raw_end_soc = (
-                        float(task.projected_soc_pct)
-                        if task.projected_soc_pct is not None
-                        else raw_start_soc
-                    )
-                    destination_release_pct = _snap_tou_capacity(
-                        uncertainty_destination_allocation_kwh
-                        / max(0.1, capacity_kwh)
-                        * 100.0,
-                        up=True,
-                    )
-                    destination_target = (
-                        float(committed_start_soc)
-                        + min(0.0, raw_end_soc - raw_start_soc)
-                        - destination_release_pct
-                        + uncertainty_material_source_allocation_kwh
-                        / max(0.1, capacity_kwh)
-                        * 100.0
-                    )
-                    destination_floor_target = max(
-                        float(min_soc),
-                        min(float(max_soc), destination_target),
-                    )
+                    if planned_grid_refill:
+                        uncertainty_kwh = 0.0
+                    elif uncertainty_kwh > 0.0:
+                        uncertainty_kwh = max(
+                            0.0,
+                            uncertainty_kwh
+                            - conservative_refill_kwh / UNCERTAINTY_REFILL_MARGIN,
+                        )
             uncertainty_pct = uncertainty_kwh / max(0.1, capacity_kwh) * 100.0
-            projected_with_outstanding = (
-                float(committed_projected) + uncertainty_pct
-            )
-            if destination_floor_target is not None:
-                uncertainty_floor_target = min(
-                    destination_floor_target,
-                    projected_with_outstanding,
-                )
-            else:
-                uncertainty_floor_target = projected_with_outstanding
             # The optimizer projection already contains its P50 economic reserve;
             # peak_reserve_pct is the fallback for non-projected paths and must
             # not be added a second time here.
-            # ``reserve_floor`` is the separate P10-solar/P50-load protection.
-            # The P90-load overlay must not erase it merely because its own tail
-            # is absent or sub-material. A strong finite refill may still lower
-            # both protections to its explicitly backed floor.
-            # Once the finite ledger is active, its projected floor already
-            # carries the larger P90/P10 tail. Re-adding the aggregate reserve
-            # would double-count the same risk and recreate the 100%/35% holds.
-            physical_reserve_floor = (
-                strong_refill_floor if strong_refill else base_floor
-            )
+            physical_reserve_floor = strong_refill_floor if strong_refill else base_floor
             floor = max(
                 physical_reserve_floor,
-                uncertainty_floor_target,
+                float(committed_projected) + uncertainty_pct,
             )
         # Estimated lookahead slots (today's price shape copied forward until the
         # real day-ahead prices publish ~13:00) inform ranking/reserve maths but
@@ -1962,20 +1277,11 @@ def build_day_plan(
             and (
                 refill_backed_self_consumption
                 or (
-                    uncertainty_pct <= 0.1
-                    and marginal_uncertainty_release
-                )
-                or (
-                    uncertainty_pct <= 0.1
-                    and price_dominant_self_consumption
-                    and (
-                        future_learned_reserve_release
-                        or (
-                            view.current is not None
-                            and task.start == view.current.start
-                            and task.action == "DISCHARGE"
-                        )
-                    )
+                    view.current is not None
+                    and task.start == view.current.start
+                    and task.action == "DISCHARGE"
+                    and not future_peaks
+                    and uncertainty_pct <= 0.1
                 )
             )
         )
@@ -1993,16 +1299,6 @@ def build_day_plan(
         else:
             committed_floor = _snap_tou_capacity(float(min(floor, max_soc)), up=True)
         committed_floor = min(committed_floor, float(max_soc))
-        non_grid_floor_capped = False
-        if not grid_charge:
-            non_grid_hold_ceiling = _non_grid_hold_ceiling(
-                committed_start_soc,
-                min_soc=min_soc,
-                max_soc=max_soc,
-            )
-            if committed_floor > non_grid_hold_ceiling + 0.1:
-                committed_floor = non_grid_hold_ceiling
-                non_grid_floor_capped = True
         if (
             committed_projected is not None
             and committed_projected < committed_prev_soc
@@ -2020,39 +1316,11 @@ def build_day_plan(
             and float(committed_projected) >= committed_start_soc - 0.1
         ):
             committed_action = "IDLE"
-        elif (
-            task.action == "IDLE"
-            and committed_projected is not None
-            and float(committed_projected) < committed_start_soc - 0.1
-        ):
-            committed_action = "DISCHARGE"
-        reserve_notes: list[str] = []
-        if marginal_uncertainty_release:
-            reserve_notes.append(
-                "P90 reserve released: upper gain "
-                f"{hold_gain_upper_kr:.2f} kr < {min_hold_value_kr:.2f} kr"
-            )
-        if future_learned_reserve_release:
-            reserve_notes.append(
-                "learned reserve forecast released by conservative P10 refill"
-            )
-        if bounded_live_dip_release and floor < reserve_floor - 0.1:
-            reserve_notes.append(
-                f"forecast-surplus dip buffer released floor to {floor:.0f}%"
-            )
-        if non_grid_floor_capped:
-            reserve_notes.append(
-                "non-grid floor capped to the native hold step at slot-start SOC"
-            )
-        committed_reason = " | ".join(
-            note for note in (task.reason, *reserve_notes) if note
-        )
         committed_tasks.append(replace(
             task,
             action=committed_action,
             projected_soc_pct=committed_projected,
             tou_floor_pct=committed_floor,
-            reason=committed_reason,
         ))
         plan_slots.append(SlotPlan(
             start=task.start,
@@ -2065,7 +1333,7 @@ def build_day_plan(
             export_value=export_value,
             projected_soc_pct=committed_projected,
             ev_load_estimate_kwh=task.ev_load_estimate_kwh,
-            reason=committed_reason or committed_action,
+            reason=committed_action,
         ))
     return DayPlan(
         built_at=state.timestamp,
@@ -4144,7 +3412,6 @@ def peak_coverage_summary(
     min_soc: float,
     capacity_kwh: float,
     ev_battery_protected: bool = False,
-    reserve_hold_margin: float = RESERVE_HOLD_MARGIN,
 ) -> dict[str, float | str | None]:
     """Summarise physical battery coverage across the expensive horizon."""
     view = _horizon_view(state, profile_for(battery_mode))
@@ -4159,7 +3426,7 @@ def peak_coverage_summary(
     expensive = {
         slot.start for slot in view.slots
         if slot.start in view.expensive_starts
-        or slot.total_import_price >= view.mean_price + reserve_hold_margin
+        or slot.total_import_price >= view.mean_price + RESERVE_HOLD_MARGIN
     }
     previous_soc = state.battery_soc_pct
     required = covered = 0.0
@@ -4206,7 +3473,6 @@ def build_control_plan(
     min_soc: float = 15.0,
     max_soc: float = 100.0,
     learned_reserve_pct: float = 0.0,
-    reserve_hold_margin: float = RESERVE_HOLD_MARGIN,
     solar_charge_priority_soc: float = 0.0,
     charge_current_a: float = 70.0,
     discharge_current_a: float = 70.0,
@@ -4266,7 +3532,6 @@ def build_control_plan(
         min_soc=min_soc,
         capacity_kwh=capacity_kwh,
         ev_battery_protected=ev_battery_protected,
-        reserve_hold_margin=reserve_hold_margin,
     )
     ev_action = (ev_plan.desired_action or "none").upper()
     decision_code = (

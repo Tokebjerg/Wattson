@@ -48,6 +48,6 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
-Version 0.26.6 keeps existing entity unique IDs, service names, platforms and
+Version 0.26.4 keeps existing entity unique IDs, service names, platforms and
 config options. Config entries migrate from version 1 to version 2 without
 renaming or rewriting user mappings.

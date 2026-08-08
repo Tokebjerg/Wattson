@@ -16,30 +16,10 @@ rather than raising, so the reactive planner keeps working unchanged.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from .models import PriceSlot, SolarSlot
-
-
-def utc_instant(value: datetime) -> datetime:
-    """Canonical UTC identity for one timezone-aware planning timestamp."""
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("planning timestamps must be timezone-aware")
-    return value.astimezone(timezone.utc)
-
-
-def unique_utc_instants(values: Iterable[datetime]) -> tuple[datetime, ...]:
-    """Sorted physical instants without collapsing the two autumn fold hours."""
-    return tuple(sorted({utc_instant(value) for value in values}))
-
-
-def hourly_utc_instants(start: datetime, hours: int) -> tuple[datetime, ...]:
-    """Elapsed hourly instants from the containing hour, DST gaps/folds included."""
-    local_hour = start.replace(minute=0, second=0, microsecond=0)
-    anchor = utc_instant(local_hour)
-    return tuple(anchor + timedelta(hours=offset) for offset in range(max(0, hours)))
 
 
 def _parse_dt(value: Any) -> datetime | None:
