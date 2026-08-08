@@ -31,7 +31,7 @@ from .const import (
 )
 from .learning import forecast_load_w
 from .models import ControlPlan, SiteState
-from .planner import display_plan_action, ev_cheapest_charge_hours
+from .planner import ev_cheapest_charge_hours
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ def _plan_action_label(coordinator: Any) -> Any:
     plan = getattr(coordinator, "control_plan", None)
     if not plan or not plan.schedule:
         return None
-    action = display_plan_action(plan.schedule[0])
+    action = plan.schedule[0].action
     return ACTION_LABELS.get(action, action)
 
 
@@ -282,15 +282,13 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             "automatiseringsopgaver": [
                 {
                     "hour": task.start.isoformat(),
-                    "action": display_plan_action(task),
-                    "control_action": task.action,
+                    "action": task.action,
                     "total_import_price": task.total_import_price,
                     "pv_estimate_kwh": task.pv_estimate_kwh,
                     "load_estimate_kwh": task.load_estimate_kwh,
                     "ev_load_estimate_kwh": task.ev_load_estimate_kwh,
                     "projected_soc_pct": task.projected_soc_pct,
                     "tou_floor_pct": task.tou_floor_pct,
-                    "reason": task.reason,
                 }
                 for task in c.control_plan.schedule
             ]
