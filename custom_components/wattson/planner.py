@@ -101,9 +101,9 @@ RESERVE_HOLD_MARGIN = 0.15
 # optimistic upper bound on the TOTAL value moved between the slots is material.
 # A per-kWh spread alone is scale-blind: 0.16 kr/kWh is meaningful for 5 kWh, but
 # not for the ~1 kWh P90 tail behind the 2026-08-08 full-battery grid import.
-# 0.30 kr is the lowest materiality guard that releases the live 0.17 kr case
-# without worsening the 20-day winter cost; 0.50 kr released one additional
-# winter tail and moved import to a later peak.
+# 0.30 kr is an absolute value gate for one floor decision. The valuation below
+# is capped by P50 energy that can physically be shifted out of the source slot,
+# so a very large destination P90 tail cannot inflate a small current decision.
 RESERVE_HOLD_MIN_VALUE_KR = 0.30
 
 # Minimum house deficit (W) before the battery is tapped to cover the load. A
@@ -829,6 +829,7 @@ TOU_CAPACITY_STEP_PCT = 5.0  # the Deye quantizes each TOU time-point's capacity
 # FRACTIONAL setpoint (e.g. 50.6) can never equal the 5%-quantized read-back, so the 6 TOU
 # registers rewrite EVERY tick — a limit cycle that was ~95% of the daily register writes
 # (weekly-eval 2026-06-29). Snap the setpoint to the step so it converges.
+LIVE_DIP_BUFFER_PCT = 2.0 * TOU_CAPACITY_STEP_PCT
 
 
 def _snap_tou_capacity(pct: float, *, up: bool) -> float:
@@ -839,6 +840,28 @@ def _snap_tou_capacity(pct: float, *, up: bool) -> float:
     step = TOU_CAPACITY_STEP_PCT
     q = (math.ceil(pct / step) if up else math.floor(pct / step)) * step
     return float(q)
+
+
+def _non_grid_hold_ceiling(
+    soc_pct: float,
+    *,
+    min_soc: float,
+    max_soc: float,
+) -> float:
+    """Lowest native TOU step that does not implicitly release live energy.
+
+    A floor far above the energy that is actually present cannot describe a
+    physical reserve; on Deye it instead acts as an implicit hold. Keep the cap
+    in the safe hold direction: rounding projected/live SOC down would silently
+    open up to 4.9 percentage points and can spend energy in a cheap hour. An
+    intentional self-consumption envelope is opened separately by the planner.
+    """
+    minimum_floor = _snap_tou_capacity(float(min_soc), up=True)
+    available_floor = _snap_tou_capacity(
+        float(min(max_soc, max(0.0, soc_pct))),
+        up=True,
+    )
+    return min(float(max_soc), max(minimum_floor, available_floor))
 
 
 def tou_setpoint(
@@ -901,12 +924,29 @@ def tou_setpoint(
             ),
             False,
         )
+    live_hold_ceiling = _non_grid_hold_ceiling(
+        soc_pct,
+        min_soc=min_soc,
+        max_soc=max_soc,
+    )
     if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
-        return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
+        return (
+            min(
+                _snap_tou_capacity(float(discharge_floor), up=True),
+                live_hold_ceiling,
+            ),
+            False,
+        )
     # Every other state covers the house down to the discharge floor. Round the floor UP
     # to the step (never let the inverter discharge below the intended reserve), clamped
     # to max_soc, so the setpoint is a clean 5-multiple that converges (no limit cycle).
-    return (min(_snap_tou_capacity(float(discharge_floor), up=True), float(max_soc)), False)
+    return (
+        min(
+            _snap_tou_capacity(float(discharge_floor), up=True),
+            live_hold_ceiling,
+        ),
+        False,
+    )
 
 
 # Strategies that bypass the anti-hunt dwell — they apply immediately, never held:
@@ -1173,15 +1213,25 @@ def build_day_plan(
             / 100.0
             * max(0.1, capacity_kwh),
         )
-        # Sum the value of the whole future uncertainty episode, not one source
-        # hour at a time. This is deliberately an optimistic upper bound: P10
-        # refill and available SOC are credited only later. Consequently this
-        # gate can retain a little too much insurance, but can never release a
-        # materially valuable P90 episode by under-counting its future tails.
-        hold_gain_upper_kr = sum(
+        # Value the whole destination uncertainty episode, then cap that value
+        # by the P50 energy this source slot can physically move and the best
+        # available premium. Without the source cap, a 2.9 kWh future P90 tail
+        # made a 1.6 kWh current decision look nearly twice as valuable as it was.
+        raw_tail_value_kr = sum(
             _uncertainty_tail_kwh(candidate)
             * (candidate.total_import_price - task.total_import_price)
             for candidate in uncertainty_future_peaks
+        )
+        max_future_premium = max(
+            (
+                candidate.total_import_price - task.total_import_price
+                for candidate in uncertainty_future_peaks
+            ),
+            default=0.0,
+        )
+        hold_gain_upper_kr = min(
+            raw_tail_value_kr,
+            shiftable_now_kwh * max_future_premium,
         )
         marginal_uncertainty_release = bool(
             forecast_deficit
@@ -1319,9 +1369,30 @@ def build_day_plan(
         live_dip_release = bool(
             not forecast_deficit
             and task.action != "GRID_CHARGE"
-            and conservative_refill_kwh > 0.0
+            and (
+                conservative_refill_kwh > 0.0
+                or future_learned_reserve_release
+            )
+        )
+        # A forecast-surplus/idle slot must not publish a future floor above the
+        # energy projected to exist when that slot begins. Give Load-first a
+        # bounded 10pp buffer for a cloud/load dip; the 7.5pp SOC-deviation gate
+        # forces a replan before that envelope can be exhausted. This preserves
+        # the remaining reserve instead of opening the whole pack blindly.
+        live_dip_buffer_floor = max(
+            base_floor,
+            _non_grid_hold_ceiling(
+                committed_start_soc,
+                min_soc=min_soc,
+                max_soc=max_soc,
+            ) - LIVE_DIP_BUFFER_PCT,
         )
         floor = live_dip_floor if live_dip_release else reserve_floor
+        bounded_live_dip_release = bool(
+            live_dip_release and future_learned_reserve_release
+        )
+        if bounded_live_dip_release:
+            floor = min(floor, live_dip_buffer_floor)
         physical_reserve_floor = floor
         uncertainty_pct = 0.0
         if (
@@ -1451,6 +1522,16 @@ def build_day_plan(
         else:
             committed_floor = _snap_tou_capacity(float(min(floor, max_soc)), up=True)
         committed_floor = min(committed_floor, float(max_soc))
+        non_grid_floor_capped = False
+        if not grid_charge:
+            non_grid_hold_ceiling = _non_grid_hold_ceiling(
+                committed_start_soc,
+                min_soc=min_soc,
+                max_soc=max_soc,
+            )
+            if committed_floor > non_grid_hold_ceiling + 0.1:
+                committed_floor = non_grid_hold_ceiling
+                non_grid_floor_capped = True
         if (
             committed_projected is not None
             and committed_projected < committed_prev_soc
@@ -1483,6 +1564,14 @@ def build_day_plan(
         if future_learned_reserve_release:
             reserve_notes.append(
                 "learned reserve forecast released by conservative P10 refill"
+            )
+        if bounded_live_dip_release and floor < reserve_floor - 0.1:
+            reserve_notes.append(
+                f"forecast-surplus dip buffer released floor to {floor:.0f}%"
+            )
+        if non_grid_floor_capped:
+            reserve_notes.append(
+                "non-grid floor capped to the native hold step at slot-start SOC"
             )
         committed_reason = " | ".join(
             note for note in (task.reason, *reserve_notes) if note

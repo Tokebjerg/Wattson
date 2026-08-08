@@ -5290,10 +5290,11 @@ def test_control_stability_regressions():
                    f"{dearer_current}/{dearer_peak}"))
 
     # Exact 2026-08-08 economic shape from HA's authoritative live plan. At
-    # 19:00 the P50 deficit is 1.335 kWh; 20:00 is only 0.16 kr/kWh dearer.
-    # The old margin-only P90 overlay valued that as a peak, rounded the floor
-    # to 100% and imported the entire current house load. The scale-aware gate
-    # values the actual P90-P50 tail at only ~0.17 kr and opens the battery now.
+    # 19:00 the P50 deficit is 1.625 kWh; 20:00 is only 0.16 kr/kWh dearer.
+    # The old margin-only P90 overlay valued the destination's whole 2.864 kWh
+    # uncertainty tail at 0.46 kr, rounded the floor to 100%, and imported the
+    # current house load. Only 1.625 kWh can physically move out of 19:00, so
+    # even the optimistic value is 0.26 kr and the battery must open now.
     value_now = datetime(
         2026, 8, 8, 18, 0,
         tzinfo=timezone(timedelta(hours=2)),
@@ -5306,13 +5307,20 @@ def test_control_stability_regressions():
         2.036, 0.724, 0.123, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.005, 0.164, 0.838, 1.905,
     ]
+    value_p10 = [value * 0.45 for value in value_pv]
+    value_pv[1] = 0.72410273
+    value_pv[2] = 0.122846685
+    value_p10[1] = 0.62642164
+    value_p10[2] = 0.10750181
     value_p50_kwh = [
         1.348, 2.059, 0.792, 0.622, 0.570, 0.567, 0.515, 0.477,
         0.464, 0.584, 0.504, 0.580, 0.539, 0.535, 0.683,
     ]
+    value_p50_kwh[1] = 2.349388
+    value_p50_kwh[2] = 0.829261
     value_p90_kwh = list(value_p50_kwh)
-    value_p90_kwh[1] = 2.499
-    value_p90_kwh[2] = 1.861
+    value_p90_kwh[1] = 5.492825
+    value_p90_kwh[2] = 5.237346
 
     def _value_plan(
         *,
@@ -5330,7 +5338,7 @@ def test_control_stability_regressions():
         solar_slots = [models.SolarSlot(
             start=slot.start,
             pv_estimate_kwh=value_pv[i],
-            pv_estimate10_kwh=value_pv[i] * 0.45,
+            pv_estimate10_kwh=value_p10[i],
             pv_estimate90_kwh=value_pv[i] * 1.20,
         ) for i, slot in enumerate(price_slots)]
         value_state = replace(
@@ -5379,13 +5387,13 @@ def test_control_stability_regressions():
                    and old_19.action == "IDLE"
                    and old_19.tou_floor_pct == 100.0,
                    str(old_19)))
-    checks.append(("2026-08-08 exact: 0.17kr P90-tail value releases 19:00 to cover the house",
+    checks.append(("2026-08-08 live: source-limited 0.26kr value releases 19:00 to cover the house",
                    new_19 is not None
                    and new_19.action == "DISCHARGE"
-                   and new_19.projected_soc_pct == 87.0
-                   and new_19.tou_floor_pct == 85.0
-                   and (100.0 - new_19.tou_floor_pct) / 100.0 * 9.903 >= 1.335
-                   and "upper gain 0.17 kr < 0.30 kr" in new_19.reason,
+                   and new_19.projected_soc_pct == 84.0
+                   and new_19.tou_floor_pct == 80.0
+                   and (100.0 - new_19.tou_floor_pct) / 100.0 * 9.903 >= 1.625
+                   and "upper gain 0.26 kr < 0.30 kr" in new_19.reason,
                    str(new_19)))
     checks.append(("2026-08-08 exact: materiality release leaves the true 20:00 peak trajectory intact",
                    new_20 is not None
@@ -5441,9 +5449,9 @@ def test_control_stability_regressions():
                    and p90_only_current.tou_floor_pct == 25.0,
                    str(p90_only_current)))
 
-    # Materiality is the sum of the physically deliverable P90-P50 tails for
-    # the reserve episode. Three kWh at a 0.20 kr premium are worth 0.60 kr and
-    # must not be fragmented into three apparently sub-0.30 kr decisions.
+    # Materiality is applied to the physical source decision. A large future
+    # P90 tail may not make each 1 kWh source slot look like a 3 kWh decision:
+    # each slot can move at most 1 kWh, worth 0.20 kr at this premium.
     episode_prices = [models.PriceSlot(
         start=p90_only_now + timedelta(hours=i), spot_price=price,
         tariff=0.0, total_import_price=price, export_value=0.4,
@@ -5464,9 +5472,12 @@ def test_control_stability_regressions():
         reserve_load_by_start_w=episode_p90, allow_grid_charge=False,
     )
     episode_early = list(episode_plan.tasks[:3]) if episode_plan else []
-    checks.append(("aggregate P90 episode keeps a 0.60kr reserve instead of releasing per source hour",
+    checks.append(("P90 episode cannot inflate three separate 0.20kr source decisions",
                    len(episode_early) == 3
-                   and all("P90 reserve released" not in task.reason for task in episode_early),
+                   and all(
+                       "upper gain 0.20 kr < 0.30 kr" in task.reason
+                       for task in episode_early
+                   ),
                    str(episode_early)))
 
     # Conversely, a large P50 load must not inflate a tiny uncertainty tail:
@@ -5577,6 +5588,129 @@ def test_control_stability_regressions():
                    > (released_06.projected_soc_pct or 100.0),
                    f"06={released_06} 07={released_07}"))
 
+    # Full next-day horizon regression for the live 2026-08-09 07:00 failure.
+    # The global top-three price set sits on the previous evening, while a
+    # separate later-day peak calculation used to raise the 07:00 floor to
+    # 100% even though only 25% was projected to exist at slot start.
+    full_morning_now = datetime(
+        2026, 8, 9, 6, 0,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+    full_morning_price_values = [2.4, 1.0] + [0.9] * 9 + [1.2, 1.3, 1.4, 1.5]
+    full_morning_pv_values = [0.0, 0.2] + [0.0] * 13
+    full_morning_load_values = [0.5, 0.1] + [0.0] * 9 + [3.0] * 4
+    full_morning_prices = [models.PriceSlot(
+        start=full_morning_now + timedelta(hours=i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.5,
+    ) for i, price in enumerate(full_morning_price_values)]
+    full_morning_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=full_morning_pv_values[i],
+        pv_estimate10_kwh=0.0,
+        pv_estimate90_kwh=full_morning_pv_values[i] * 1.2,
+    ) for i, slot in enumerate(full_morning_prices)]
+    full_morning_load = {
+        slot.start: full_morning_load_values[i] * 1000.0
+        for i, slot in enumerate(full_morning_prices)
+    }
+    full_morning_state = replace(
+        inversion_state,
+        timestamp=full_morning_now,
+        battery_soc_pct=30.0,
+        pv_power_w=0.0,
+        load_power_w=500.0,
+        grid_power_w=500.0,
+        grid_import_power_w=500.0,
+        grid_export_power_w=0.0,
+        current_buy_price=2.4,
+        current_sell_price=0.5,
+        price_slots=full_morning_prices,
+        solar_slots=full_morning_solar,
+    )
+    full_morning_plan = planner.build_day_plan(
+        full_morning_state,
+        battery_mode="blue",
+        min_soc=15.0,
+        max_soc=100.0,
+        capacity_kwh=10.0,
+        load_hourly_w=full_morning_load,
+        reserve_load_by_start_w=full_morning_load,
+        learned_reserve_pct=15.0,
+        learned_reserve_by_start_pct={
+            horizon.utc_instant(slot.start): 0.0
+            for slot in full_morning_prices
+        },
+        allow_grid_charge=False,
+    )
+    full_06 = full_morning_plan.tasks[0] if full_morning_plan else None
+    full_07 = full_morning_plan.tasks[1] if full_morning_plan else None
+    checks.append(("2026-08-09 full horizon: 06:00 still discharges to the planned 25%",
+                   full_06 is not None
+                   and full_06.action == "DISCHARGE"
+                   and full_06.projected_soc_pct == 25.0
+                   and full_06.tou_floor_pct == 25.0,
+                   str(full_06)))
+    checks.append(("2026-08-09 full horizon: 07:00 opens a bounded 10pp dip instead of a 100% floor",
+                   full_07 is not None
+                   and full_07.action == "IDLE"
+                   and planner.display_plan_action(full_07) == "SOLAR_CHARGE"
+                   and full_07.projected_soc_pct == 30.0
+                   and full_07.tou_floor_pct == 15.0
+                   and "forecast-surplus dip buffer released floor to 15%" in full_07.reason,
+                   str(full_07)))
+
+    # Defence in depth at the physical write boundary: even a stale or malformed
+    # ordinary plan floor may never exceed live SOC. Explicit PROTECT/HOLD and
+    # grid-charge semantics retain their intentional behaviour.
+    stale_idle = models.BatteryPlan(strategy="IDLE", reason="stale floor")
+    stale_floor, stale_grid = planner.tou_setpoint(
+        stale_idle,
+        soc_pct=25.0,
+        min_soc=15.0,
+        discharge_floor=100.0,
+        max_soc=100.0,
+    )
+    quantized_hold_floor, quantized_hold_grid = planner.tou_setpoint(
+        stale_idle,
+        soc_pct=52.0,
+        min_soc=15.0,
+        discharge_floor=100.0,
+        max_soc=100.0,
+    )
+    below_min_floor, below_min_grid = planner.tou_setpoint(
+        stale_idle,
+        soc_pct=14.0,
+        min_soc=15.0,
+        discharge_floor=100.0,
+        max_soc=100.0,
+    )
+    near_full_floor, near_full_grid = planner.tou_setpoint(
+        stale_idle,
+        soc_pct=99.0,
+        min_soc=15.0,
+        discharge_floor=100.0,
+        max_soc=100.0,
+    )
+    protect_floor, protect_grid = planner.tou_setpoint(
+        models.BatteryPlan(strategy="PROTECT", reason="explicit protect"),
+        soc_pct=25.0,
+        min_soc=15.0,
+        discharge_floor=100.0,
+        max_soc=100.0,
+    )
+    checks.append(("live TOU guard caps stale floor to the native hold step and preserves PROTECT",
+                   stale_floor == 25.0 and stale_grid is False
+                   and quantized_hold_floor == 55.0 and quantized_hold_grid is False
+                   and below_min_floor == 15.0 and below_min_grid is False
+                   and near_full_floor == 100.0 and near_full_grid is False
+                   and protect_floor == 100.0 and protect_grid is False,
+                   f"idle25={stale_floor}/{stale_grid} idle52={quantized_hold_floor}/{quantized_hold_grid} "
+                   f"idle14={below_min_floor}/{below_min_grid} idle99={near_full_floor}/{near_full_grid} "
+                   f"protect={protect_floor}/{protect_grid}"))
+
     # Exact 2026-08-01 daytime failure shape: the hourly P50 plan says EXPORT,
     # while a live load spike makes PV insufficient. The evening reserve still
     # targets 100%, but abundant future P10 solar can refill any dip energy before
@@ -5674,8 +5808,11 @@ def test_control_stability_regressions():
         reserve_load_by_start_w=daytime_p90_load,
     )
     no_refill_slot = no_refill_plan.slots[0] if no_refill_plan else None
-    checks.append(("zero P10 refill keeps the full winter-style peak reserve",
-                   no_refill_slot is not None and no_refill_slot.tou_floor_pct == 100.0,
+    checks.append(("zero P10 refill keeps every physically available reserve percent",
+                   no_refill_slot is not None
+                   and no_refill_slot.tou_floor_pct == 85.0
+                   and "non-grid floor capped to the native hold step at slot-start SOC"
+                   in no_refill_slot.reason,
                    str(no_refill_slot)))
 
     # The aggregate hourly P90 tail can be far larger than the pack. Refill
