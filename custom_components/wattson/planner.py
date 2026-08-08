@@ -101,9 +101,11 @@ RESERVE_HOLD_MARGIN = 0.15
 # optimistic upper bound on the TOTAL value moved between the slots is material.
 # A per-kWh spread alone is scale-blind: 0.16 kr/kWh is meaningful for 5 kWh, but
 # not for the ~1 kWh P90 tail behind the 2026-08-08 full-battery grid import.
-# 0.30 kr is an absolute value gate for one floor decision. The valuation below
-# is capped by P50 energy that can physically be shifted out of the source slot,
-# so a very large destination P90 tail cannot inflate a small current decision.
+# 0.30 kr is an absolute value gate for one coherent reserve episode. The
+# valuation below is capped on BOTH sides: by P50 energy the source episode was
+# actually going to spend and by the future P90 uncertainty energy it can serve.
+# This prevents a large destination tail inflating one small source decision,
+# without fragmenting a material multi-source episode into sub-threshold hours.
 RESERVE_HOLD_MIN_VALUE_KR = 0.30
 
 # Minimum house deficit (W) before the battery is tapped to cover the load. A
@@ -1144,6 +1146,93 @@ def build_day_plan(
         )
         return max(0.0, p90_deficit - p50_deficit)
 
+    # Raw P50 energy that the optimizer planned to spend in each source slot,
+    # before reserve overlays change the physical TOU floor.  Episode
+    # materiality must use this finite source budget: destination P90 tails are
+    # not stored energy.  Keep the complete raw trajectory so all source hours
+    # belonging to one future uncertainty episode are assessed together.
+    raw_source_energy_by_start: dict[datetime, float] = {}
+    raw_start_soc = float(state.battery_soc_pct)
+    for raw_task in tasks:
+        raw_projected = raw_task.projected_soc_pct
+        raw_discharge_kwh = 0.0
+        if raw_projected is not None:
+            raw_discharge_kwh = max(
+                0.0,
+                (raw_start_soc - float(raw_projected))
+                / 100.0
+                * max(0.1, capacity_kwh),
+            )
+            raw_start_soc = float(raw_projected)
+        raw_source_energy_by_start[raw_task.start] = min(
+            raw_discharge_kwh,
+            discharge_rate,
+            _battery_deficit_kwh(raw_task, conservative=False),
+        )
+
+    def _uncertainty_episode_value_upper_kr(
+        current_task: PlanTask,
+        future_peaks: list[PlanTask],
+        current_shiftable_kwh: float,
+    ) -> float:
+        """Optimistic value bound for one coherent P50-source/P90-tail episode.
+
+        Source and destination capacity are both finite.  Bounding the episode
+        by their independently weighted totals is deliberately optimistic (safe
+        for insurance), but cannot double-count one large destination tail for
+        every source hour.  Including the full raw source trajectory prevents a
+        genuinely material multi-hour episode being fragmented into several
+        individually sub-threshold decisions.
+        """
+        if not future_peaks:
+            return 0.0
+        source_energy = dict(raw_source_energy_by_start)
+        source_energy[current_task.start] = max(
+            source_energy.get(current_task.start, 0.0),
+            max(0.0, current_shiftable_kwh),
+        )
+        sources = [
+            candidate for candidate in tasks
+            if source_energy.get(candidate.start, 0.0) > 0.01
+            and any(
+                candidate.start < peak.start
+                and peak.total_import_price
+                > candidate.total_import_price + hold_margin
+                for peak in future_peaks
+            )
+        ]
+        if not sources:
+            return 0.0
+        source_value_upper = sum(
+            source_energy[source.start]
+            * max(
+                (
+                    peak.total_import_price - source.total_import_price
+                    for peak in future_peaks
+                    if source.start < peak.start
+                    and peak.total_import_price
+                    > source.total_import_price + hold_margin
+                ),
+                default=0.0,
+            )
+            for source in sources
+        )
+        destination_value_upper = sum(
+            _uncertainty_tail_kwh(peak)
+            * max(
+                (
+                    peak.total_import_price - source.total_import_price
+                    for source in sources
+                    if source.start < peak.start
+                    and peak.total_import_price
+                    > source.total_import_price + hold_margin
+                ),
+                default=0.0,
+            )
+            for peak in future_peaks
+        )
+        return min(source_value_upper, destination_value_upper)
+
     for task_index, task in enumerate(tasks):
         committed_start_soc = committed_prev_soc
         # The learned reserve is sized and P10-released for each future slot by
@@ -1213,25 +1302,14 @@ def build_day_plan(
             / 100.0
             * max(0.1, capacity_kwh),
         )
-        # Value the whole destination uncertainty episode, then cap that value
-        # by the P50 energy this source slot can physically move and the best
-        # available premium. Without the source cap, a 2.9 kWh future P90 tail
-        # made a 1.6 kWh current decision look nearly twice as valuable as it was.
-        raw_tail_value_kr = sum(
-            _uncertainty_tail_kwh(candidate)
-            * (candidate.total_import_price - task.total_import_price)
-            for candidate in uncertainty_future_peaks
-        )
-        max_future_premium = max(
-            (
-                candidate.total_import_price - task.total_import_price
-                for candidate in uncertainty_future_peaks
-            ),
-            default=0.0,
-        )
-        hold_gain_upper_kr = min(
-            raw_tail_value_kr,
-            shiftable_now_kwh * max_future_premium,
+        # Match the whole coherent source/destination episode. This retains a
+        # real 3h × 1kWh × 0.20kr = 0.60kr episode, while the live 19:00 source
+        # remains capped near 1.6kWh × 0.16kr = 0.26kr rather than inheriting the
+        # destination's complete 2.9kWh P90 tail (~0.46kr).
+        hold_gain_upper_kr = _uncertainty_episode_value_upper_kr(
+            task,
+            uncertainty_future_peaks,
+            shiftable_now_kwh,
         )
         marginal_uncertainty_release = bool(
             forecast_deficit

@@ -5449,9 +5449,10 @@ def test_control_stability_regressions():
                    and p90_only_current.tou_floor_pct == 25.0,
                    str(p90_only_current)))
 
-    # Materiality is applied to the physical source decision. A large future
-    # P90 tail may not make each 1 kWh source slot look like a 3 kWh decision:
-    # each slot can move at most 1 kWh, worth 0.20 kr at this premium.
+    # Materiality is matched across the coherent physical source/destination
+    # episode. A large future tail may not inflate one small source hour, but a
+    # real three-hour source budget of 3 kWh at 0.20 kr is worth 0.60 kr in total
+    # and must not be fragmented into three apparently sub-threshold decisions.
     episode_prices = [models.PriceSlot(
         start=p90_only_now + timedelta(hours=i), spot_price=price,
         tariff=0.0, total_import_price=price, export_value=0.4,
@@ -5472,13 +5473,29 @@ def test_control_stability_regressions():
         reserve_load_by_start_w=episode_p90, allow_grid_charge=False,
     )
     episode_early = list(episode_plan.tasks[:3]) if episode_plan else []
-    checks.append(("P90 episode cannot inflate three separate 0.20kr source decisions",
+    checks.append(("aggregate P90 episode keeps a 0.60kr reserve without destination double-counting",
                    len(episode_early) == 3
+                   and all("P90 reserve released" not in task.reason for task in episode_early),
+                   str(episode_early)))
+
+    # The opposite capacity bound matters just as much: three possible source
+    # hours must not count the same 1 kWh destination tail three times. The
+    # coherent episode is worth only 0.20 kr and is therefore released.
+    small_episode_p90 = dict(episode_p50)
+    small_episode_p90[episode_prices[3].start] = 1100.0
+    small_episode_plan = planner.build_day_plan(
+        episode_state, battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=episode_p50,
+        reserve_load_by_start_w=small_episode_p90, allow_grid_charge=False,
+    )
+    small_episode_early = list(small_episode_plan.tasks[:3]) if small_episode_plan else []
+    checks.append(("aggregate P90 episode counts one 1kWh destination tail only once",
+                   len(small_episode_early) == 3
                    and all(
                        "upper gain 0.20 kr < 0.30 kr" in task.reason
-                       for task in episode_early
+                       for task in small_episode_early
                    ),
-                   str(episode_early)))
+                   str(small_episode_early)))
 
     # Conversely, a large P50 load must not inflate a tiny uncertainty tail:
     # only 0.1 kWh is extra, so a 0.40 kr/kWh premium is worth just 0.04 kr.
