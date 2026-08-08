@@ -5402,6 +5402,91 @@ def test_control_stability_regressions():
                    and new_20.tou_floor_pct == 80.0,
                    str(new_20)))
 
+    # Full authoritative schedule shape published by HA at 12:23 on 2026-08-08,
+    # replayed from 18:00 at 100% SOC. The following morning's Solcast P10 is
+    # the actual low-confidence forecast: it contains no conservative surplus
+    # before the price horizon ends. v0.26.6 fixed 19:00 but still published
+    # IDLE/45% at 06:00; the sub-step peak release must fix that exact remainder.
+    live_prices_raw = [
+        1.85, 2.11, 2.27, 2.03, 1.95, 1.79, 1.76, 1.70,
+        1.66, 1.65, 1.63, 1.66, 1.72, 1.64, 1.43, 0.94,
+        0.39, 0.37,
+    ]
+    live_pv = [
+        2.048, 0.727, 0.121, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.005, 0.178, 0.839, 1.889, 3.293,
+        4.557, 5.301,
+    ]
+    live_p10 = [
+        1.799, 0.714, 0.120, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.041, 0.165, 0.469, 1.164,
+        1.867, 2.202,
+    ]
+    live_load = [
+        1.222, 2.186, 0.666, 0.496, 0.444, 0.441, 0.389, 0.352,
+        0.338, 0.356, 0.335, 0.389, 0.363, 0.491, 1.582, 2.392,
+        4.072, 5.524,
+    ]
+    live_slots = [models.PriceSlot(
+        start=value_now + timedelta(hours=i),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.5,
+    ) for i, price in enumerate(live_prices_raw)]
+    live_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=live_pv[i],
+        pv_estimate10_kwh=live_p10[i],
+        pv_estimate90_kwh=live_pv[i] * 1.1,
+    ) for i, slot in enumerate(live_slots)]
+    live_load_w = {
+        slot.start: live_load[i] * 1000.0
+        for i, slot in enumerate(live_slots)
+    }
+    full_live_state = replace(
+        inversion_state,
+        timestamp=value_now,
+        battery_soc_pct=100.0,
+        pv_power_w=2048.0,
+        load_power_w=1222.0,
+        grid_power_w=-826.0,
+        grid_import_power_w=0.0,
+        grid_export_power_w=826.0,
+        current_buy_price=live_prices_raw[0],
+        current_sell_price=0.5,
+        forecast_today_kwh=sum(live_pv),
+        price_slots=live_slots,
+        solar_slots=live_solar,
+    )
+    full_live_plan = planner.build_day_plan(
+        full_live_state,
+        battery_mode="blue",
+        min_soc=15.0,
+        max_soc=100.0,
+        capacity_kwh=10.148,
+        load_hourly_w=live_load_w,
+        reserve_load_by_start_w=dict(live_load_w),
+        learned_reserve_pct=15.0,
+        allow_grid_charge=False,
+    )
+    full_live_06 = full_live_plan.tasks[12] if full_live_plan else None
+    full_live_07 = full_live_plan.tasks[13] if full_live_plan else None
+    checks.append(("2026-08-08/09 full live horizon: raw 06:00 discharge survives the 5%-floor quantization",
+                   full_live_06 is not None
+                   and full_live_06.action == "DISCHARGE"
+                   and full_live_06.projected_soc_pct == 44.0
+                   and full_live_06.tou_floor_pct == 40.0
+                   and "sub-step deficit released above reserve; no materially dearer deficit"
+                   in full_live_06.reason,
+                   str(full_live_06)))
+    checks.append(("2026-08-08/09 full live horizon: 07:00 keeps Load-first open instead of a high hold floor",
+                   full_live_07 is not None
+                   and (full_live_07.pv_estimate_kwh or 0.0)
+                   > (full_live_07.load_estimate_kwh or 0.0)
+                   and (full_live_07.tou_floor_pct or 100.0) <= 40.0,
+                   str(full_live_07)))
+
     # A genuinely larger premium keeps both the P50 reserve and P90 tail. This
     # is the winter-safety mirror for the value gate.
     high_spread_prices = list(value_prices_raw)
@@ -6232,6 +6317,416 @@ def test_control_stability_regressions():
                    and full_07.tou_floor_pct == 15.0
                    and "forecast-surplus dip buffer released floor to 15%" in full_07.reason,
                    str(full_07)))
+
+    # Current-slot mirror of the 2026-08-08 edge: the forecast deficit is only
+    # 0.185 kWh while 15 percentage points remain above the learned 30% floor
+    # and every later deficit hour is cheaper. Solcast P10 is deliberately the
+    # actual very conservative 2026-08-09 shape. The established live path must
+    # still execute the optimizer's raw DISCHARGE without spending the learned
+    # reserve itself; the full 18-hour fixture above covers the new future path.
+    micro_price_values = [1.72, 1.64, 1.43, 0.94, 0.39, 0.37] + [0.35] * 18
+    micro_prices = [models.PriceSlot(
+        start=full_morning_now + timedelta(hours=i),
+        spot_price=micro_price_values[i],
+        tariff=0.0,
+        total_import_price=micro_price_values[i],
+        export_value=0.5,
+    ) for i in range(24)]
+    micro_pv_values = [0.178, 0.839, 1.889, 3.293, 4.557, 5.301] + [0.0] * 18
+    micro_p10_values = [0.041, 0.165, 0.469, 1.164, 1.867, 2.202] + [0.0] * 18
+    micro_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=micro_pv_values[i],
+        pv_estimate10_kwh=micro_p10_values[i],
+    ) for i, slot in enumerate(micro_prices)]
+    micro_load_values = [0.363, 0.491, 1.582, 2.392, 4.072, 5.524] + [0.0] * 18
+    micro_load = {
+        slot.start: micro_load_values[i] * 1000.0
+        for i, slot in enumerate(micro_prices)
+    }
+    micro_state = replace(
+        full_morning_state,
+        timestamp=full_morning_now,
+        battery_soc_pct=45.0,
+        pv_power_w=178.0,
+        load_power_w=363.0,
+        grid_power_w=185.0,
+        grid_import_power_w=185.0,
+        current_buy_price=1.72,
+        price_slots=micro_prices,
+        solar_slots=micro_solar,
+    )
+
+    def _micro_plan(prices, load, *, state=micro_state, solar=micro_solar):
+        return planner.build_day_plan(
+            replace(state, price_slots=prices, solar_slots=solar),
+            battery_mode="blue", min_soc=15.0, max_soc=100.0,
+            capacity_kwh=10.0, load_hourly_w=load,
+            reserve_load_by_start_w=load,
+            learned_reserve_pct=15.0,
+            allow_grid_charge=False,
+        )
+
+    micro_plan = _micro_plan(micro_prices, micro_load)
+    micro_current = micro_plan.tasks[0] if micro_plan else None
+    checks.append(("sub-bucket 06:00 deficit self-consumes above the learned floor when no dearer peak remains",
+                   micro_current is not None
+                   and micro_current.action == "DISCHARGE"
+                   and micro_current.projected_soc_pct == 43.0
+                   and micro_current.tou_floor_pct == 40.0,
+                   str(micro_current)))
+
+    # Isolate the v0.26.7 boundary. A 0.040 kWh deficit is below the optimizer's
+    # 0.05 kWh discharge gate, so the raw schedule deliberately says IDLE. The
+    # physical-floor overlay must preserve that deadband/wear decision even if
+    # the slot happens to be the highest-priced remaining deficit.
+    idle_load = dict(micro_load)
+    idle_load[micro_prices[0].start] = 218.0
+    idle_state = replace(
+        micro_state,
+        load_power_w=218.0,
+        grid_power_w=40.0,
+        grid_import_power_w=40.0,
+    )
+    raw_idle_tasks, _, _ = planner.build_schedule_optimal(
+        idle_state,
+        planner.profile_for("blue"),
+        idle_load,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        learned_reserve_pct=15.0,
+        charge_rate_kwh=planner.battery_rate_kwh(70.0),
+        discharge_rate_kwh=planner.battery_rate_kwh(70.0),
+        allow_grid_charge=False,
+    )
+    raw_idle_current = raw_idle_tasks[0] if raw_idle_tasks else None
+    idle_plan = _micro_plan(
+        micro_prices,
+        idle_load,
+        state=idle_state,
+    )
+    idle_current = idle_plan.tasks[0] if idle_plan else None
+    checks.append(("raw sub-gate deficit is IDLE before physical floor quantization",
+                   raw_idle_current is not None
+                   and raw_idle_current.action == "IDLE"
+                   and raw_idle_current.projected_soc_pct == 45.0,
+                   str(raw_idle_current)))
+    checks.append(("physical floor quantization never overrides an isolated raw-IDLE decision",
+                   idle_current is not None
+                   and idle_current.action == "IDLE"
+                   and idle_current.projected_soc_pct == 45.0
+                   and idle_current.tou_floor_pct == 45.0,
+                   str(idle_current)))
+
+    # A slightly dearer later deficit (inside the normal 0.15 kr hold margin)
+    # blocks an unrefilled release. Local P10 refill must not manufacture a
+    # discharge the economic optimizer declined; it is finite reserve evidence,
+    # not permission to bypass the optimizer's wear/deadband decision.
+    near_peak_prices = list(micro_prices)
+    near_peak_prices[2] = replace(
+        near_peak_prices[2],
+        spot_price=1.78,
+        total_import_price=1.78,
+    )
+    near_peak_load = dict(idle_load)
+    near_peak_load[near_peak_prices[2].start] = 3000.0
+    no_refill_solar = list(micro_solar)
+    no_refill_plan = _micro_plan(
+        near_peak_prices,
+        near_peak_load,
+        state=replace(idle_state, solar_slots=no_refill_solar),
+        solar=no_refill_solar,
+    )
+    no_refill_current = no_refill_plan.tasks[0] if no_refill_plan else None
+    checks.append(("raw-IDLE deficit remains held without refill before a slightly dearer deficit",
+                   no_refill_current is not None
+                   and no_refill_current.action == "IDLE"
+                   and no_refill_current.projected_soc_pct == 45.0
+                   and no_refill_current.tou_floor_pct == 45.0,
+                   str(no_refill_current)))
+
+    refill_solar = list(micro_solar)
+    refill_solar[1] = replace(
+        refill_solar[1],
+        pv_estimate10_kwh=0.839,
+    )
+    refill_plan = _micro_plan(
+        near_peak_prices,
+        near_peak_load,
+        state=replace(idle_state, solar_slots=refill_solar),
+        solar=refill_solar,
+    )
+    refill_current = refill_plan.tasks[0] if refill_plan else None
+    checks.append(("finite P10 refill cannot override raw-IDLE before a slightly dearer deficit",
+                   refill_current is not None
+                   and refill_current.action == "IDLE"
+                   and refill_current.projected_soc_pct == 45.0
+                   and refill_current.tou_floor_pct == 45.0,
+                   str(refill_current)))
+
+    late_refill_solar = list(micro_solar)
+    late_refill_solar[3] = replace(
+        late_refill_solar[3],
+        pv_estimate10_kwh=3.0,
+    )
+    late_refill_plan = _micro_plan(
+        near_peak_prices,
+        near_peak_load,
+        state=replace(idle_state, solar_slots=late_refill_solar),
+        solar=late_refill_solar,
+    )
+    late_refill_current = late_refill_plan.tasks[0] if late_refill_plan else None
+    checks.append(("P10 refill after the slightly dearer deficit cannot justify an early release",
+                   late_refill_current is not None
+                   and late_refill_current.action == "IDLE"
+                   and late_refill_current.projected_soc_pct == 45.0
+                   and late_refill_current.tou_floor_pct == 45.0,
+                   str(late_refill_current)))
+
+    protected_prices = list(micro_prices)
+    protected_prices[2] = replace(
+        protected_prices[2],
+        spot_price=4.0,
+        total_import_price=4.0,
+    )
+    protected_load = dict(micro_load)
+    protected_load[protected_prices[2].start] = 3000.0
+    protected_plan = _micro_plan(protected_prices, protected_load)
+    protected_current = protected_plan.tasks[0] if protected_plan else None
+    checks.append(("sub-bucket release stays blocked for a materially dearer protected deficit",
+                   protected_current is not None
+                   and protected_current.action == "IDLE"
+                   and protected_current.projected_soc_pct == 45.0
+                   and protected_current.tou_floor_pct == 45.0,
+                   str(protected_current)))
+
+    # A real dearer destination need not rank in top-3: three even dearer
+    # solar/no-load hours can occupy that set. Put the candidate one hour in the
+    # future so the normal current-slot release rule cannot mask the v0.26.7
+    # full-horizon guard. The raw optimizer has enough energy for both deficits
+    # and selects DISCHARGE, but the future one-step floor snap must still wait
+    # because a concrete 1.95 kr/kWh deficit remains later in the horizon.
+    non_top3_now = micro_prices[0].start - timedelta(hours=1)
+    non_top3_values = [0.35, 1.72, 2.2, 2.1, 1.95, 2.0] + [0.35] * 18
+    non_top3_prices = [models.PriceSlot(
+        start=non_top3_now + timedelta(hours=i),
+        spot_price=non_top3_values[i],
+        tariff=0.0,
+        total_import_price=non_top3_values[i],
+        export_value=0.5,
+    ) for i in range(24)]
+    non_top3_load = {slot.start: 0.0 for slot in non_top3_prices}
+    non_top3_load[non_top3_prices[1].start] = 363.0
+    non_top3_load[non_top3_prices[4].start] = 1000.0
+    non_top3_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=0.0,
+        pv_estimate10_kwh=0.0,
+        pv_estimate90_kwh=0.0,
+    ) for slot in non_top3_prices]
+    non_top3_solar[1] = replace(
+        non_top3_solar[1],
+        pv_estimate_kwh=0.178,
+        pv_estimate10_kwh=0.178,
+        pv_estimate90_kwh=0.178,
+    )
+    non_top3_future_state = replace(
+        micro_state,
+        timestamp=non_top3_now,
+        current_buy_price=0.35,
+        pv_power_w=0.0,
+        load_power_w=0.0,
+        grid_power_w=0.0,
+        grid_import_power_w=0.0,
+        price_slots=non_top3_prices,
+        solar_slots=non_top3_solar,
+    )
+    non_top3_raw_future, _, _ = planner.build_schedule_optimal(
+        non_top3_future_state,
+        planner.profile_for("blue"),
+        non_top3_load,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        learned_reserve_pct=15.0,
+        charge_rate_kwh=planner.battery_rate_kwh(70.0),
+        discharge_rate_kwh=planner.battery_rate_kwh(70.0),
+        allow_grid_charge=False,
+    )
+    non_top3_raw_target = (
+        non_top3_raw_future[1] if non_top3_raw_future else None
+    )
+    non_top3_plan = planner.build_day_plan(
+        non_top3_future_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=non_top3_load,
+        reserve_load_by_start_w=non_top3_load,
+        learned_reserve_pct=15.0,
+        allow_grid_charge=False,
+    )
+    non_top3_target = non_top3_plan.tasks[1] if non_top3_plan else None
+    checks.append(("fourth-ranked dearer deficit blocks the future sub-step floor release",
+                   non_top3_raw_target is not None
+                   and non_top3_raw_target.action == "DISCHARGE"
+                   and non_top3_raw_target.projected_soc_pct == 43.0
+                   and non_top3_target is not None
+                   and non_top3_target.action == "IDLE"
+                   and non_top3_target.projected_soc_pct == 45.0
+                   and non_top3_target.tou_floor_pct == 45.0,
+                   f"raw={non_top3_raw_target}; committed="
+                   f"{non_top3_plan.tasks[:6] if non_top3_plan else None}"))
+
+    # At the hourly rollover the slot is no longer a coarse command written in
+    # advance: the established v0.26.6 current-slot path has fresh SOC/load/PV
+    # and executes the optimizer's real DISCHARGE. Keep that live behaviour
+    # byte-for-byte instead of extending the conservative future-only guard and
+    # stranding energy in an equal-priced raw-IDLE destination.
+    non_top3_current_prices = non_top3_prices[1:]
+    non_top3_current_solar = non_top3_solar[1:]
+    non_top3_current_load = {
+        start: watts for start, watts in non_top3_load.items()
+        if start >= non_top3_current_prices[0].start
+    }
+    non_top3_current_state = replace(
+        micro_state,
+        timestamp=non_top3_current_prices[0].start,
+        current_buy_price=1.72,
+        price_slots=non_top3_current_prices,
+        solar_slots=non_top3_current_solar,
+    )
+    non_top3_raw, _, _ = planner.build_schedule_optimal(
+        non_top3_current_state,
+        planner.profile_for("blue"),
+        non_top3_current_load,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        learned_reserve_pct=15.0,
+        charge_rate_kwh=planner.battery_rate_kwh(70.0),
+        discharge_rate_kwh=planner.battery_rate_kwh(70.0),
+        allow_grid_charge=False,
+    )
+    non_top3_raw_current = non_top3_raw[0] if non_top3_raw else None
+    non_top3_current_plan = _micro_plan(
+        non_top3_current_prices,
+        non_top3_current_load,
+        state=non_top3_current_state,
+        solar=non_top3_current_solar,
+    )
+    non_top3_current = (
+        non_top3_current_plan.tasks[0] if non_top3_current_plan else None
+    )
+    checks.append(("future-only fourth-ranked guard yields to the validated current-slot release",
+                   non_top3_raw_current is not None
+                   and non_top3_raw_current.action == "DISCHARGE"
+                   and non_top3_raw_current.projected_soc_pct == 43.0
+                   and non_top3_current is not None
+                   and non_top3_current.action == "DISCHARGE"
+                   and non_top3_current.projected_soc_pct == 43.0
+                   and non_top3_current.tou_floor_pct == 40.0,
+                   f"raw={non_top3_raw_current}; committed={non_top3_current}"))
+
+    # If a materially dearer first destination makes the physical overlay hold
+    # an earlier raw discharge, the raw absolute SOC curve is now below the
+    # committed curve. The next (highest) sub-step must transfer only its own
+    # 2pp raw delta: 45 -> 43 with a 40% floor. Copying the raw absolute 39%
+    # would incorrectly open two native registers (45 -> 35).
+    delta_now = datetime(2026, 1, 19, 6, tzinfo=timezone(timedelta(hours=1)))
+    delta_values = [1.00, 1.20] + [0.20] * 22
+    delta_prices = [models.PriceSlot(
+        start=delta_now + timedelta(hours=i),
+        spot_price=delta_values[i],
+        tariff=0.0,
+        total_import_price=delta_values[i],
+        export_value=0.5,
+    ) for i in range(24)]
+    delta_solar = [models.SolarSlot(
+        start=slot.start,
+        pv_estimate_kwh=0.0,
+        pv_estimate10_kwh=0.0,
+        pv_estimate90_kwh=0.0,
+    ) for slot in delta_prices]
+    delta_load = {slot.start: 0.0 for slot in delta_prices}
+    delta_load[delta_prices[0].start] = 400.0
+    delta_load[delta_prices[1].start] = 200.0
+    delta_state = replace(
+        micro_state,
+        timestamp=delta_now,
+        battery_soc_pct=45.0,
+        pv_power_w=0.0,
+        load_power_w=400.0,
+        grid_power_w=400.0,
+        grid_import_power_w=400.0,
+        current_buy_price=1.00,
+        price_slots=delta_prices,
+        solar_slots=delta_solar,
+    )
+    delta_raw, _, _ = planner.build_schedule_optimal(
+        delta_state,
+        planner.profile_for("blue"),
+        delta_load,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        learned_reserve_pct=15.0,
+        charge_rate_kwh=planner.battery_rate_kwh(70.0),
+        discharge_rate_kwh=planner.battery_rate_kwh(70.0),
+        allow_grid_charge=False,
+    )
+    delta_plan = planner.build_day_plan(
+        delta_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=delta_load,
+        reserve_load_by_start_w=delta_load,
+        learned_reserve_pct=15.0,
+        allow_grid_charge=False,
+    )
+    delta_first = delta_plan.tasks[0] if delta_plan else None
+    delta_second = delta_plan.tasks[1] if delta_plan else None
+    checks.append(("sub-step release transfers only its raw per-slot SOC delta and opens one native step",
+                   len(delta_raw) >= 2
+                   and delta_raw[0].projected_soc_pct == 41.0
+                   and delta_raw[1].projected_soc_pct == 39.0
+                   and delta_first is not None
+                   and delta_first.action == "IDLE"
+                   and delta_first.projected_soc_pct == 45.0
+                   and delta_first.tou_floor_pct == 45.0
+                   and delta_second is not None
+                   and delta_second.action == "DISCHARGE"
+                   and delta_second.projected_soc_pct == 43.0
+                   and delta_second.tou_floor_pct == 40.0,
+                   f"raw={delta_raw[:2]}; committed={delta_plan.tasks[:2] if delta_plan else None}"))
+
+    # Equal-price (and within-margin) hours must not strand a native step. The
+    # economic upside of moving <=0.5 kWh between them is immaterial, while the
+    # later raw task may be IDLE and therefore unable to release a hold. This is
+    # the focused mirror of the 2026-01-19 winter-stress regression.
+    equal_prices = [replace(
+        slot,
+        spot_price=2.86 if i < 2 else 0.20,
+        total_import_price=2.86 if i < 2 else 0.20,
+    ) for i, slot in enumerate(delta_prices)]
+    equal_state = replace(
+        delta_state,
+        current_buy_price=2.86,
+        price_slots=equal_prices,
+    )
+    equal_plan = planner.build_day_plan(
+        equal_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.0, load_hourly_w=delta_load,
+        reserve_load_by_start_w=delta_load,
+        learned_reserve_pct=15.0,
+        allow_grid_charge=False,
+    )
+    equal_first = equal_plan.tasks[0] if equal_plan else None
+    checks.append(("equal-price future deficit cannot strand the current sub-step release",
+                   equal_first is not None
+                   and equal_first.action == "DISCHARGE"
+                   and equal_first.projected_soc_pct == 41.0
+                   and equal_first.tou_floor_pct == 40.0,
+                   str(equal_plan.tasks[:2] if equal_plan else None)))
 
     # Defence in depth at the physical write boundary: even a stale or malformed
     # ordinary plan floor may never exceed live SOC. Explicit PROTECT/HOLD and

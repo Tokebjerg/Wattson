@@ -1621,6 +1621,24 @@ def build_day_plan(
             if candidate in economic_future_peaks
             or candidate in uncertainty_future_peaks
         ]
+        # ``view.expensive_starts`` is only a top-N optimization set. The local
+        # future sub-step snap therefore asks the stronger safety question: is
+        # there *any materially dearer* later concrete P50 or uncertainty
+        # deficit?
+        # A real fourth-ranked deficit can otherwise be hidden behind three
+        # dearer solar-surplus hours and be stranded after an early release.
+        # Equal or only marginally dearer hours must not block a native step:
+        # the most they can gain on this <=5%-SOC envelope is immaterial, and a
+        # raw-IDLE destination cannot reliably release that held energy later.
+        any_materially_dearer_future_deficit = any(
+            candidate.total_import_price
+            > task.total_import_price + hold_margin + 1e-9
+            and (
+                _battery_deficit_kwh(candidate, conservative=False) > 0.01
+                or _uncertainty_tail_kwh(candidate) > 0.01
+            )
+            for candidate in tasks[task_index + 1:]
+        )
         shiftable_now_kwh = min(
             battery_deficit_kwh,
             discharge_rate,
@@ -1764,15 +1782,48 @@ def build_day_plan(
         future_learned_reserve_release = bool(
             base_floor < planning_base_floor - 0.1
         )
+        # Deye's 5%-SOC register can round a real future deficit entirely away:
+        # the optimizer projects a sub-step discharge, but an upward-snapped
+        # floor turns it back into a physical hold. Open at most one native
+        # register step only after the economic optimizer itself selected
+        # DISCHARGE, when no materially dearer concrete deficit remains and at
+        # least one further native step stays above the learned/base floor. Raw
+        # IDLE remains untouched, including its wear/deadband choice. The new
+        # path applies only to future register points; the current point retains
+        # the established live rule with fresh measurements. The trajectory
+        # guard also excludes active material uncertainty allocations, so this
+        # cannot consume a promised peak tail.
+        local_release_kwh = min(battery_deficit_kwh, discharge_rate)
+        local_release_is_sub_step = bool(
+            local_release_kwh
+            <= capacity_kwh * TOU_CAPACITY_STEP_PCT / 100.0 + 1e-9
+        )
+        sub_step_value_safe_release = bool(
+            not any_materially_dearer_future_deficit
+            and local_release_is_sub_step
+            and committed_start_soc
+            >= base_floor + 2.0 * TOU_CAPACITY_STEP_PCT - 1e-9
+        )
         price_dominant_self_consumption = bool(
             forecast_deficit
-            and (
-                task.action == "DISCHARGE"
-                or future_learned_reserve_release
-            )
+            and (task.action == "DISCHARGE" or future_learned_reserve_release)
             and task.total_import_price >= 0.0
             and not future_peaks
             and committed_start_soc > base_floor + 0.1
+        )
+        material_uncertainty_active = bool(
+            uncertainty_outstanding_kwh > 0.01
+            or uncertainty_destination_allocation_kwh > 0.01
+        )
+        sub_step_release_active = bool(
+            sub_step_value_safe_release
+            and task.action == "DISCHARGE"
+            and price_dominant_self_consumption
+            and not material_uncertainty_active
+            and (
+                view.current is None
+                or task.start != view.current.start
+            )
         )
         protected_self_consumption = bool(
             refill_backed_self_consumption
@@ -1796,6 +1847,28 @@ def build_day_plan(
             committed_projected = min(
                 float(committed_projected) if committed_projected is not None else committed_start_soc,
                 self_consumption_end,
+            )
+        if sub_step_release_active and task.projected_soc_pct is not None:
+            # This new path changes only Deye's coarse physical floor. Transfer
+            # the optimizer's PER-SLOT discharge delta onto the committed path,
+            # never its raw absolute SOC. Earlier overlays may have held or spent
+            # energy relative to the raw curve; copying the absolute value would
+            # either double-spend that history or suppress this real discharge.
+            raw_slot_start_soc = raw_start_soc_by_start.get(
+                task.start,
+                float(committed_start_soc),
+            )
+            raw_slot_release_pct = max(
+                0.0,
+                raw_slot_start_soc - float(task.projected_soc_pct),
+            )
+            slot_release_pct = min(
+                TOU_CAPACITY_STEP_PCT,
+                raw_slot_release_pct,
+            )
+            committed_projected = max(
+                float(min_soc),
+                float(committed_start_soc) - slot_release_pct,
             )
 
         live_dip_release = bool(
@@ -1827,10 +1900,6 @@ def build_day_plan(
             floor = min(floor, live_dip_buffer_floor)
         physical_reserve_floor = floor
         uncertainty_pct = 0.0
-        material_uncertainty_active = bool(
-            uncertainty_outstanding_kwh > 0.01
-            or uncertainty_destination_allocation_kwh > 0.01
-        )
         if (
             committed_projected is not None
             and (
@@ -1970,6 +2039,7 @@ def build_day_plan(
                     and price_dominant_self_consumption
                     and (
                         future_learned_reserve_release
+                        or sub_step_release_active
                         or (
                             view.current is not None
                             and task.start == view.current.start
@@ -1992,6 +2062,20 @@ def build_day_plan(
             )
         else:
             committed_floor = _snap_tou_capacity(float(min(floor, max_soc)), up=True)
+        if sub_step_release_active:
+            # Defence in depth: regardless of any earlier raw/committed-path
+            # divergence, this path may open at most ONE native register step
+            # below the lower native step at slot start. Using the safe upward
+            # hold ceiling here would leave only a fractional discharge whenever
+            # SOC is between register steps, repeatedly stranding the raw plan.
+            committed_floor = max(
+                committed_floor,
+                _snap_tou_capacity(float(min_soc), up=True),
+                _snap_tou_capacity(
+                    float(min(max_soc, max(0.0, committed_start_soc))),
+                    up=False,
+                ) - TOU_CAPACITY_STEP_PCT,
+            )
         committed_floor = min(committed_floor, float(max_soc))
         non_grid_floor_capped = False
         if not grid_charge:
@@ -2035,6 +2119,12 @@ def build_day_plan(
         if future_learned_reserve_release:
             reserve_notes.append(
                 "learned reserve forecast released by conservative P10 refill"
+            )
+        if (
+            sub_step_release_active
+        ):
+            reserve_notes.append(
+                "sub-step deficit released above reserve; no materially dearer deficit"
             )
         if bounded_live_dip_release and floor < reserve_floor - 0.1:
             reserve_notes.append(
