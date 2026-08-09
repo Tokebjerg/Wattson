@@ -6849,6 +6849,102 @@ def test_control_stability_regressions():
                    and daytime_execution.strategy == "DISCHARGE_TO_LOAD",
                    f"{daytime_task}/{daytime_slot}/{daytime_execution}"))
 
+    # Exact 2026-08-09 17:00 failure: P50 expected 1.693 kWh solar surplus, so
+    # the slot was EXPORT, while live cooking created a 5.33 kW house deficit.
+    # A conservative aggregate reserve pinned all six Deye floors to 100% even
+    # though the concrete later expensive demand was only 5.05 kWh. Preserve
+    # that demand plus 1 kWh, leaving the remaining full-pack energy available
+    # immediately for the house. The absolute 75% floor must not depend on SOC.
+    cooking_now = datetime(
+        2026, 8, 9, 17, 30,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+    cooking_start = cooking_now.replace(minute=0)
+    cooking_prices_values = [1.32, 1.96, 2.12, 2.19, 1.98, 1.80] + [0.80] * 18
+    cooking_load_kwh = [1.991, 1.20, 1.60, 1.50, 1.20, 0.85] + [0.0] * 18
+    cooking_solar_kwh = [3.684, 1.00, 0.30, 0.0, 0.0, 0.0] + [0.0] * 18
+    cooking_prices = [models.PriceSlot(
+        start=cooking_start + timedelta(hours=index),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.75,
+    ) for index, price in enumerate(cooking_prices_values)]
+    cooking_solar = [models.SolarSlot(
+        start=cooking_start + timedelta(hours=index),
+        pv_estimate_kwh=pv_kwh,
+        pv_estimate10_kwh=pv_kwh,
+        pv_estimate90_kwh=pv_kwh,
+    ) for index, pv_kwh in enumerate(cooking_solar_kwh)]
+    cooking_load = {
+        cooking_start + timedelta(hours=index): load_kwh * 1000.0
+        for index, load_kwh in enumerate(cooking_load_kwh)
+    }
+    cooking_p90_load = dict(cooking_load)
+    for index in range(1, 6):
+        cooking_p90_load[cooking_start + timedelta(hours=index)] = 4000.0
+    cooking_state = replace(
+        daytime_state,
+        timestamp=cooking_now,
+        battery_soc_pct=100.0,
+        pv_power_w=2100.0,
+        load_power_w=7430.0,
+        grid_power_w=5330.0,
+        grid_import_power_w=5330.0,
+        grid_export_power_w=0.0,
+        current_buy_price=1.32,
+        current_sell_price=0.75,
+        price_slots=cooking_prices,
+        solar_slots=cooking_solar,
+    )
+    cooking_plan = planner.build_day_plan(
+        cooking_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.12, load_hourly_w=cooking_load,
+        reserve_load_by_start_w=cooking_p90_load,
+        allow_grid_charge=False,
+    )
+    cooking_slot = cooking_plan.slots[0] if cooking_plan else None
+    cooking_task = cooking_plan.tasks[0] if cooking_plan else None
+    cooking_execution = planner.execute_slot(
+        cooking_slot, cooking_state,
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        allow_grid_charge=False, allow_negative_export=False,
+        export_limit_default_w=6000.0,
+    )[0] if cooking_slot else None
+    checks.append(("2026-08-09 cooking peak uses the energy above an absolute 75% future-demand floor",
+                   cooking_task is not None
+                   and cooking_slot is not None
+                   and cooking_task.action == "EXPORT"
+                   and cooking_slot.tou_floor_pct == 75.0
+                   and cooking_execution is not None
+                   and cooking_execution.strategy == "DISCHARGE_TO_LOAD"
+                   and "protects 5.05 kWh future demand + 1.00 kWh buffer"
+                   in cooking_slot.reason,
+                   f"{cooking_task}/{cooking_slot}/{cooking_execution}"))
+
+    cooking_lower_soc_plan = planner.build_day_plan(
+        replace(cooking_state, battery_soc_pct=82.0),
+        battery_mode="blue", min_soc=15.0, max_soc=100.0,
+        capacity_kwh=10.12, load_hourly_w=cooking_load,
+        reserve_load_by_start_w=cooking_p90_load,
+        allow_grid_charge=False,
+    )
+    lower_soc_slot = cooking_lower_soc_plan.slots[0] if cooking_lower_soc_plan else None
+    checks.append(("energy-backed live-deficit floor is absolute and cannot ratchet on a rolling SOC replan",
+                   lower_soc_slot is not None
+                   and lower_soc_slot.tou_floor_pct == 75.0,
+                   str(lower_soc_slot)))
+
+    saturated_floor = planner.energy_backed_reserve_floor_pct(
+        base_floor_pct=15.0,
+        max_soc_pct=100.0,
+        capacity_kwh=10.12,
+        protected_future_kwh=9.0,
+    )
+    checks.append(("future demand larger than the usable band retains the full 100% floor",
+                   abs(saturated_floor - 100.0) < 1e-9, str(saturated_floor)))
+
     # The release is proportional, not all-or-nothing: 2.2kWh P10 surplus with
     # the 1.10 margin restores exactly 20 percentage points of a 10kWh pack.
     partial_p10 = [replace(
@@ -6862,8 +6958,8 @@ def test_control_stability_regressions():
         reserve_load_by_start_w=daytime_p90_load,
     )
     partial_slot = partial_plan.slots[0] if partial_plan else None
-    checks.append(("partial P10 refill opens only the energy it can restore before the peak",
-                   partial_slot is not None and partial_slot.tou_floor_pct == 80.0,
+    checks.append(("partial P10 refill plus the energy-backed margin protects the peak without a full-pack hold",
+                   partial_slot is not None and partial_slot.tou_floor_pct == 75.0,
                    str(partial_slot)))
 
     no_p10 = [replace(slot, pv_estimate10_kwh=0.0) for slot in daytime_solar]

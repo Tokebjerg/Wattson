@@ -832,6 +832,12 @@ TOU_CAPACITY_STEP_PCT = 5.0  # the Deye quantizes each TOU time-point's capacity
 # registers rewrite EVERY tick — a limit cycle that was ~95% of the daily register writes
 # (weekly-eval 2026-06-29). Snap the setpoint to the step so it converges.
 LIVE_DIP_BUFFER_PCT = 2.0 * TOU_CAPACITY_STEP_PCT
+# A forecast-surplus slot may encounter a real house deficit after the hourly
+# plan was committed. Keep one kWh beyond the median future expensive demand;
+# this absorbs forecast/load error without turning a desired future SOC target
+# into a hard 100% hold now. The allowance is an energy quantity, so it behaves
+# consistently across battery sizes and cannot ratchet with live SOC.
+LIVE_DEFICIT_RESERVE_BUFFER_KWH = 1.0
 
 
 def _snap_tou_capacity(pct: float, *, up: bool) -> float:
@@ -864,6 +870,35 @@ def _non_grid_hold_ceiling(
         up=True,
     )
     return min(float(max_soc), max(minimum_floor, available_floor))
+
+
+def energy_backed_reserve_floor_pct(
+    *,
+    base_floor_pct: float,
+    max_soc_pct: float,
+    capacity_kwh: float,
+    protected_future_kwh: float,
+    safety_buffer_kwh: float = LIVE_DEFICIT_RESERVE_BUFFER_KWH,
+) -> float:
+    """Absolute SOC floor backed by concrete future energy demand.
+
+    ``base_floor_pct`` remains unavailable energy. Above it, reserve only the
+    later demand plus a bounded safety allowance. Because the result is derived
+    from future kWh rather than current SOC, repeated rolling replans cannot
+    raise the floor after a live load spike has used part of the open envelope.
+    """
+    base = max(0.0, min(float(max_soc_pct), float(base_floor_pct)))
+    future = max(0.0, float(protected_future_kwh))
+    if future <= 0.01:
+        return base
+    capacity = max(0.1, float(capacity_kwh))
+    buffer_kwh = max(0.0, min(float(safety_buffer_kwh), capacity * 0.10))
+    usable_kwh = max(0.0, (float(max_soc_pct) - base) / 100.0 * capacity)
+    reserved_kwh = min(usable_kwh, future + buffer_kwh)
+    return min(
+        float(max_soc_pct),
+        base + reserved_kwh / capacity * 100.0,
+    )
 
 
 def tou_setpoint(
@@ -1260,6 +1295,72 @@ def build_day_plan(
                 through_start,
             ).values()
         )
+
+    def _energy_backed_live_deficit_floor(
+        task_index: int,
+        task: PlanTask,
+        *,
+        base_floor_pct: float,
+    ) -> tuple[float, float, float]:
+        """Floor and future kWh protected from an unexpected current deficit.
+
+        Walk backwards through the remaining horizon. Median deficits in every
+        materially dearer slot are concrete demand; finite P10 surplus before a
+        deadline can refill energy already released. This deadline ordering is
+        what makes the result safe without pinning a full battery to 100%.
+        """
+        required_kwh = 0.0
+        has_protected_demand = False
+        for candidate in reversed(tasks[task_index + 1:]):
+            if candidate.total_import_price > task.total_import_price + hold_margin:
+                deficit_kwh = min(
+                    discharge_rate,
+                    _battery_deficit_kwh(candidate, conservative=False),
+                )
+                if deficit_kwh > 0.01:
+                    has_protected_demand = True
+                    required_kwh += deficit_kwh
+
+            solar_slot = solar_slots_by_start.get(candidate.start)
+            conservative_solar_kwh = 0.0
+            if solar_slot is not None:
+                conservative_solar_kwh = max(
+                    0.0,
+                    solar_slot.pv_estimate10_kwh
+                    if solar_slot.pv_estimate10_kwh is not None
+                    else solar_slot.pv_estimate_kwh * 0.6,
+                )
+            refill_kwh = min(
+                charge_rate,
+                max(
+                    0.0,
+                    conservative_solar_kwh
+                    - _battery_served_load_kwh(candidate, conservative=False),
+                ),
+            )
+            required_kwh = max(0.0, required_kwh - refill_kwh)
+
+        if not has_protected_demand:
+            required_kwh = 0.0
+        applied_buffer_kwh = (
+            max(
+                0.0,
+                min(
+                    LIVE_DEFICIT_RESERVE_BUFFER_KWH,
+                    max(0.1, capacity_kwh) * 0.10,
+                ),
+            )
+            if required_kwh > 0.01
+            else 0.0
+        )
+        floor_pct = energy_backed_reserve_floor_pct(
+            base_floor_pct=base_floor_pct,
+            max_soc_pct=max_soc,
+            capacity_kwh=capacity_kwh,
+            protected_future_kwh=required_kwh,
+            safety_buffer_kwh=applied_buffer_kwh,
+        )
+        return floor_pct, required_kwh, applied_buffer_kwh
 
     def _uncertainty_episode_allocations(
     ) -> tuple[
@@ -1899,6 +2000,30 @@ def build_day_plan(
         if bounded_live_dip_release:
             floor = min(floor, live_dip_buffer_floor)
         physical_reserve_floor = floor
+        energy_backed_live_candidate = False
+        energy_backed_live_release = False
+        energy_backed_floor = reserve_floor
+        protected_future_kwh = 0.0
+        live_deficit_buffer_kwh = 0.0
+        if (
+            not forecast_deficit
+            and task.action != "GRID_CHARGE"
+            and task.total_import_price > 0.0
+            and view.current is not None
+            and task.start == view.current.start
+        ):
+            (
+                energy_backed_floor,
+                protected_future_kwh,
+                live_deficit_buffer_kwh,
+            ) = (
+                _energy_backed_live_deficit_floor(
+                    task_index,
+                    task,
+                    base_floor_pct=base_floor,
+                )
+            )
+            energy_backed_live_candidate = True
         uncertainty_pct = 0.0
         if (
             committed_projected is not None
@@ -1995,6 +2120,20 @@ def build_day_plan(
             floor = max(
                 physical_reserve_floor,
                 uncertainty_floor_target,
+            )
+        energy_backed_live_release = bool(
+            energy_backed_live_candidate
+            and energy_backed_floor < floor - 0.1
+        )
+        if energy_backed_live_release:
+            # This is the complete physical reserve policy for an unexpected
+            # current deficit: P50 future demand plus the bounded energy margin.
+            # Apply it after the uncertainty overlay so an aggregate SOC target
+            # cannot recreate the full-pack hold this path is designed to avoid.
+            floor = min(floor, energy_backed_floor)
+            physical_reserve_floor = min(
+                physical_reserve_floor,
+                energy_backed_floor,
             )
         # Estimated lookahead slots (today's price shape copied forward until the
         # real day-ahead prices publish ~13:00) inform ranking/reserve maths but
@@ -2129,6 +2268,12 @@ def build_day_plan(
         if bounded_live_dip_release and floor < reserve_floor - 0.1:
             reserve_notes.append(
                 f"forecast-surplus dip buffer released floor to {floor:.0f}%"
+            )
+        if energy_backed_live_release:
+            reserve_notes.append(
+                "energy-backed live-deficit floor "
+                f"{committed_floor:.0f}% protects {protected_future_kwh:.2f} kWh "
+                f"future demand + {live_deficit_buffer_kwh:.2f} kWh buffer"
             )
         if non_grid_floor_capped:
             reserve_notes.append(

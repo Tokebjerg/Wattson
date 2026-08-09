@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.26.7"
+INTEGRATION_VERSION = "0.26.8"
 
 PLATFORMS = [
     Platform.SENSOR,
