@@ -285,6 +285,13 @@ class SlotPlan:
     projected_soc_pct: float | None = None
     ev_load_estimate_kwh: float | None = None
     reason: str = ""
+    # Absolute reserve cap derived from concrete, materially valuable future
+    # demand.  The coordinator watchdog may fall back to this floor if another
+    # overlay ever re-introduces an unbacked hold while the house imports.
+    reserve_floor_cap_pct: float | None = None
+    reserve_protected_kwh: float = 0.0
+    reserve_protected_value_kr: float = 0.0
+    reserve_buffer_kwh: float = 0.0
 
 
 @dataclass(frozen=True)

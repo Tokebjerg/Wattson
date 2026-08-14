@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.26.8"
+INTEGRATION_VERSION = "0.26.9"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -403,6 +403,17 @@ EV_WRITE_COOLDOWN_SECONDS = 10
 # 100 % floor and curtailing the PV strings.
 SELF_CONSUMPTION_WATCHDOG_SECONDS = 30
 SELF_CONSUMPTION_WATCHDOG_SURPLUS_W = 500.0
+
+# Defence in depth for an unbacked TOU reserve. The planner publishes the
+# highest floor justified by concrete future demand; sustained import while the
+# battery idles at a materially higher floor releases only that excess. The
+# five-minute latch avoids immediately restoring the bad floor after import
+# disappears as a consequence of the correction.
+AVOIDABLE_IMPORT_WATCHDOG_SECONDS = 90
+AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS = 300
+AVOIDABLE_IMPORT_WATCHDOG_GRID_W = 300.0
+AVOIDABLE_IMPORT_WATCHDOG_BATTERY_IDLE_W = 250.0
+AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT = 1.0
 
 # Anti-hunt: the battery inverter mode (solar_sell + limit-control + energy-priority
 # + discharge current + grid-charge) may change at most once per this many seconds.

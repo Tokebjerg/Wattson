@@ -40,11 +40,24 @@ from .const import (
 from .deye_contract import TRICKLE_CHARGE_A
 from .horizon import current_price_slot
 from .learning import forecast_confidence, solar_bias_factor
-from .planner import effective_solar_surplus_w, value_increment_kr
+from .planner import (
+    RESERVE_HOLD_MIN_VALUE_KR,
+    effective_solar_surplus_w,
+    value_increment_kr,
+)
 
 
 EV_SOLAR_VALUE_PERIODS = ("today", "week", "month", "year", "total")
 GRID_IMPORT_PERIODS = ("today", "week", "month", "year", "total")
+GRID_IMPORT_CAUSES = (
+    "battery_grid_charge",
+    "ev_charging",
+    "discharge_limit",
+    "safe_or_manual",
+    "reserve_hold",
+    "avoidable",
+    "other",
+)
 EV_SOLAR_VALUE_ATTRS = {
     "savings": "ev_solar_savings_{period}_kr",
     "gross": "ev_solar_gross_savings_{period}_kr",
@@ -53,6 +66,89 @@ EV_SOLAR_VALUE_ATTRS = {
     "grid_backed_kwh": "ev_solar_grid_backed_kwh_{period}",
     "ev_kwh": "ev_solar_ev_kwh_{period}",
 }
+
+
+def classify_grid_import_power(
+    *,
+    grid_import_w: float,
+    battery_power_w: float,
+    battery_soc_pct: float | None,
+    ev_power_w: float,
+    max_discharge_w: float,
+    battery_strategy: str | None,
+    desired_grid_charge: bool,
+    safe_mode: bool,
+    desired_floor_pct: float | None,
+    base_floor_pct: float,
+    recovery_floor_pct: float | None,
+    reserve_value_kr: float,
+    min_reserve_value_kr: float = RESERVE_HOLD_MIN_VALUE_KR,
+) -> dict[str, float]:
+    """Split measured import into mutually exclusive physical/control causes."""
+    causes = {cause: 0.0 for cause in GRID_IMPORT_CAUSES}
+    remaining = max(0.0, float(grid_import_w or 0.0))
+
+    def take(cause: str, watts: float) -> None:
+        nonlocal remaining
+        allocated = min(remaining, max(0.0, float(watts or 0.0)))
+        causes[cause] += allocated
+        remaining -= allocated
+
+    if desired_grid_charge:
+        take("battery_grid_charge", max(0.0, -float(battery_power_w or 0.0)))
+
+    take("ev_charging", max(0.0, float(ev_power_w or 0.0)))
+
+    battery_discharge_w = max(0.0, float(battery_power_w or 0.0))
+    discharge_headroom_w = max(0.0, float(max_discharge_w) - battery_discharge_w)
+    take("discharge_limit", max(0.0, remaining - discharge_headroom_w))
+
+    manual_or_protect = battery_strategy in {
+        "OVERRIDE_CHARGE",
+        "OVERRIDE_SOLAR_CHARGE",
+        "OVERRIDE_HOLD",
+        "HOLD",
+        "HOLD_FULL",
+        "PROTECT",
+        "NEUTRAL",
+    }
+    if remaining > 0.0 and (safe_mode or manual_or_protect):
+        take("safe_or_manual", remaining)
+
+    if remaining > 0.0 and battery_soc_pct is not None and desired_floor_pct is not None:
+        at_floor = float(battery_soc_pct) <= float(desired_floor_pct) + 1.0
+        unbacked_floor = bool(
+            recovery_floor_pct is not None
+            and float(desired_floor_pct) > float(recovery_floor_pct) + 0.1
+        )
+        if at_floor:
+            valid_reserve = bool(
+                not unbacked_floor
+                and (
+                    float(desired_floor_pct) <= float(base_floor_pct) + 0.1
+                    or float(reserve_value_kr) + 1e-9 >= float(min_reserve_value_kr)
+                )
+            )
+            take("reserve_hold" if valid_reserve else "avoidable", remaining)
+
+    if (
+        remaining > 0.0
+        and recovery_floor_pct is not None
+        and desired_floor_pct is not None
+        and float(desired_floor_pct) > float(recovery_floor_pct) + 0.1
+    ):
+        take("avoidable", remaining)
+
+    if (
+        remaining > 0.0
+        and battery_soc_pct is not None
+        and float(battery_soc_pct) > float(base_floor_pct) + 2.0
+        and abs(float(battery_power_w or 0.0)) < 250.0
+    ):
+        take("avoidable", remaining)
+
+    take("other", remaining)
+    return causes
 
 
 class TelemetryMixin:
@@ -186,12 +282,15 @@ class TelemetryMixin:
         # (forecast minus actual while there was no sink). Restored by its sensor.
         self.curtailed_today_kwh: float = 0.0
         self.curtailed_negative_kwh: float = 0.0
-        # Self-diagnosis: grid energy imported today while the battery HAD usable charge
-        # and was NOT deliberately grid-charging — the "bought grid while the battery sat
-        # idle above the floor" pattern the user kept catching by hand. Surfaced as an alert.
+        # Causal import ledger. The legacy avoidable value remains as an alias for
+        # dashboards/alerts, but is now the strict "avoidable" bucket instead of
+        # a hard-coded SOC>25 heuristic that mislabeled EV and inverter-limit load.
+        self.grid_import_cause_kwh_today: dict[str, float] = {
+            cause: 0.0 for cause in GRID_IMPORT_CAUSES
+        }
         self.avoidable_grid_kwh_today: float = 0.0
-        self._avoidable_day = None
-        self._avoidable_last_tick = None
+        self._grid_import_cause_day = None
+        self._grid_import_cause_last_tick = None
         # #8/#5 (weekly-eval, SHADOW-first): EV "Ren sol" telemetry — OUTCOME (grid-backed
         # kWh while the car charges in solar mode, the P4 metric) + CAUSE (the surplus
         # signal the loop USES vs the reclaim-less SHADOW signal; their gap is the
@@ -270,6 +369,12 @@ class TelemetryMixin:
         self._grid_import_month = month
         self._grid_import_year = today.year
         self._grid_import_last_tick = now
+        self.grid_import_cause_kwh_today = {
+            cause: 0.0 for cause in GRID_IMPORT_CAUSES
+        }
+        self.avoidable_grid_kwh_today = 0.0
+        self._grid_import_cause_day = today
+        self._grid_import_cause_last_tick = now
 
         self._evsh_day = today
         self._ev_solar_savings_week = iso_week
@@ -897,44 +1002,66 @@ class TelemetryMixin:
         if state.current_sell_price is not None and state.current_sell_price <= 0:
             self.curtailed_negative_kwh += inc
 
-    def _accumulate_avoidable_grid(self, plan) -> None:
-        """Self-diagnosis: grid energy (kWh) imported today while the battery was ABOVE its
-        floor and NOT deliberately grid-charging — the house pulled from the grid while the
-        pack sat idle with usable charge. This is the recurring "bought grid at night / Ren
-        sol took from grid" pattern, made measurable so Wattson can ALERT on it instead of
-        waiting for the user to notice. Capped at the ~70 A the pack could have delivered;
-        deliberate grid-charge / paid negative-price import is excluded."""
+    def _accumulate_grid_import_causes(
+        self,
+        plan,
+        *,
+        slot,
+        base_floor_pct: float,
+        max_discharge_w: float,
+    ) -> None:
+        """Accumulate measured import once, split by mutually exclusive cause."""
         state = self.site_state
         if state is None:
             return
         now = dt_util.utcnow()
         today = dt_util.now().date()
-        if self._avoidable_day != today:
-            self._avoidable_day = today
+        if self._grid_import_cause_day != today:
+            self._grid_import_cause_day = today
+            self.grid_import_cause_kwh_today = {
+                cause: 0.0 for cause in GRID_IMPORT_CAUSES
+            }
             self.avoidable_grid_kwh_today = 0.0
-            self._avoidable_last_tick = None
-        last = self._avoidable_last_tick
-        self._avoidable_last_tick = now
+            self._grid_import_cause_last_tick = None
+        last = self._grid_import_cause_last_tick
+        self._grid_import_cause_last_tick = now
         if last is None:
             return
         dt_hours = (now - last).total_seconds() / 3600.0
         if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
             return
-        strat = plan.battery.strategy if (plan is not None and plan.battery is not None) else None
-        if strat in ("GRID_CHARGE", "ABSORB_NEGATIVE", "OVERRIDE_CHARGE", "HOLD_FULL",
-                     "OVERRIDE_SOLAR_CHARGE", "OVERRIDE_HOLD"):
-            return  # deliberate import / hold (incl. user overrides that block discharge) — not avoidable
-        soc = state.battery_soc_pct
-        if soc is None:
-            return
         grid_in = max(0.0, state.grid_import_power_w or 0.0)
-        batt = state.battery_power_w or 0.0  # <0 charging, >0 discharging
-        # Avoidable only when: meaningful import, the pack has usable charge well above the
-        # hard min, AND the pack is not already discharging hard (if it is, the import is the
-        # unavoidable bit beyond the ~70 A cap, not idle-while-buying).
-        if grid_in <= 300.0 or soc <= 25.0 or batt >= 2000.0:
+        if grid_in <= 0.0:
             return
-        self.avoidable_grid_kwh_today += min(grid_in, 3500.0) * dt_hours / 1000.0
+        battery = plan.battery if plan is not None else None
+        causes_w = classify_grid_import_power(
+            grid_import_w=grid_in,
+            battery_power_w=state.battery_power_w or 0.0,
+            battery_soc_pct=state.battery_soc_pct,
+            ev_power_w=state.easee_power_w or 0.0,
+            max_discharge_w=max_discharge_w,
+            battery_strategy=battery.strategy if battery is not None else None,
+            desired_grid_charge=bool(
+                battery is not None and battery.desired_grid_charge
+            ),
+            safe_mode=bool(plan is not None and plan.safe_mode),
+            desired_floor_pct=(
+                battery.desired_tou_capacity_pct if battery is not None else None
+            ),
+            base_floor_pct=base_floor_pct,
+            recovery_floor_pct=getattr(slot, "reserve_floor_cap_pct", None),
+            reserve_value_kr=float(
+                getattr(slot, "reserve_protected_value_kr", 0.0) or 0.0
+            ),
+        )
+        for cause, watts in causes_w.items():
+            self.grid_import_cause_kwh_today[cause] = (
+                self.grid_import_cause_kwh_today.get(cause, 0.0)
+                + watts * dt_hours / 1000.0
+            )
+        self.avoidable_grid_kwh_today = self.grid_import_cause_kwh_today[
+            "avoidable"
+        ]
 
     def _accumulate_ev_shadow(self, plan) -> None:
         """#8/#5: EV "Ren sol" outcome telemetry and surplus regression guard.

@@ -32,6 +32,7 @@ from .const import (
 from .learning import forecast_load_w
 from .models import ControlPlan, SiteState
 from .planner import display_plan_action, ev_cheapest_charge_hours
+from .telemetry import GRID_IMPORT_CAUSES
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(WattsonImportSavingsSensor(coordinator, entry, period))
         entities.append(WattsonGridImportCostSensor(coordinator, entry, period))
         entities.append(WattsonGridImportEnergySensor(coordinator, entry, period))
+    for cause in GRID_IMPORT_CAUSES:
+        entities.append(WattsonGridImportCauseSensor(coordinator, entry, cause))
     for period in ("today", "week", "month", "year", "total"):
         entities.append(WattsonExportRevenueSensor(coordinator, entry, period))
     for period in ("today", "week", "month", "year", "total"):
@@ -389,6 +392,33 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 ),
                 "self_consumption_watchdog_active": getattr(
                     self.coordinator, "_self_consumption_watchdog_active", False
+                ),
+                "avoidable_import_watchdog_active": getattr(
+                    self.coordinator, "_avoidable_import_watchdog_active", False
+                ),
+                "avoidable_import_watchdog_active_until": (
+                    self.coordinator._avoidable_import_watchdog_active_until.isoformat()
+                    if getattr(
+                        self.coordinator,
+                        "_avoidable_import_watchdog_active_until",
+                        None,
+                    )
+                    else None
+                ),
+                "grid_import_causes_today_kwh": {
+                    cause: round(value, 3)
+                    for cause, value in getattr(
+                        self.coordinator, "grid_import_cause_kwh_today", {}
+                    ).items()
+                },
+                "reserve_floor_cap_pct": (
+                    getattr(
+                        self.coordinator._day_plan.slot_for(site_state.timestamp),
+                        "reserve_floor_cap_pct",
+                        None,
+                    )
+                    if getattr(self.coordinator, "_day_plan", None) is not None
+                    else None
                 ),
                 "physical_tou_floor_pct": (
                     control_plan.battery.desired_tou_capacity_pct if control_plan else None
@@ -738,6 +768,95 @@ class WattsonGridImportEnergySensor(CoordinatorEntity, RestoreSensor):
             "imported_kwh_precise": round(kwh, 6),
             "avg_buy_price_kr_kwh": round(cost / kwh, 3) if kwh > 0.001 else None,
             "note": "Målt energi købt fra nettet. Samme tick og periodegrænser som den tilsvarende importomkostning.",
+        }
+
+
+class WattsonGridImportCauseSensor(CoordinatorEntity, RestoreSensor):
+    """Daily measured grid import attributed to one exclusive cause."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    _NAMES = {
+        "battery_grid_charge": "Grid Import Cause Battery Charge Today",
+        "ev_charging": "Grid Import Cause EV Charging Today",
+        "discharge_limit": "Grid Import Cause Discharge Limit Today",
+        "safe_or_manual": "Grid Import Cause Safe Or Manual Today",
+        "reserve_hold": "Grid Import Cause Valid Reserve Today",
+        "avoidable": "Grid Import Cause Avoidable Today",
+        "other": "Grid Import Cause Other Today",
+    }
+    _DESCRIPTIONS = {
+        "battery_grid_charge": "Målt netenergi som faktisk lader husbatteriet.",
+        "ev_charging": "Målt netenergi mens elbilen lader.",
+        "discharge_limit": "Forbrug over batteriets fysiske afladningsloft.",
+        "safe_or_manual": "Import under sikker tilstand eller manuel batteristyring.",
+        "reserve_hold": "Import mens en konkret og økonomisk gyldig reserve holdes.",
+        "avoidable": "Import som batteriet kunne have dækket uden at bryde planen.",
+        "other": "Import som ikke entydigt kan placeres i de andre årsager.",
+    }
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry, cause: str) -> None:
+        super().__init__(coordinator)
+        if cause not in self._NAMES:
+            raise ValueError(f"Unsupported grid import cause: {cause}")
+        self._cause = cause
+        self._attr_name = self._NAMES[cause]
+        self._attr_unique_id = f"{entry.entry_id}_grid_import_cause_{cause}_today"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.display_name,
+            manufacturer=NAME,
+            model="Home Assistant Energy Orchestrator",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if (
+            last_state is None
+            or last_state.state in (None, "unknown", "unavailable")
+            or dt_util.as_local(last_state.last_updated).date() != dt_util.now().date()
+        ):
+            return
+        try:
+            value = float(last_state.attributes.get("kwh_precise", last_state.state))
+        except (TypeError, ValueError):
+            return
+        self.coordinator.grid_import_cause_kwh_today[self._cause] = value
+        self.coordinator._grid_import_cause_day = dt_util.now().date()
+        self.coordinator.avoidable_grid_kwh_today = (
+            self.coordinator.grid_import_cause_kwh_today.get("avoidable", 0.0)
+        )
+
+    @property
+    def native_value(self) -> float:
+        return round(
+            float(
+                self.coordinator.grid_import_cause_kwh_today.get(
+                    self._cause, 0.0
+                )
+            ),
+            3,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        value = float(
+            self.coordinator.grid_import_cause_kwh_today.get(self._cause, 0.0)
+        )
+        total = float(getattr(self.coordinator, "grid_import_kwh_today", 0.0) or 0.0)
+        return {
+            "cause": self._cause,
+            "kwh_precise": round(value, 6),
+            "share_of_grid_import_pct": (
+                round(value / total * 100.0, 1) if total > 0.001 else None
+            ),
+            "note": self._DESCRIPTIONS[self._cause],
         }
 
 
@@ -1154,7 +1273,7 @@ class WattsonCurtailedSolarSensor(CoordinatorEntity, RestoreSensor):
             "negative_price_kwh": round(neg, 2),
             "unintended_kwh": round(max(0.0, total - neg), 2),
             "avoidable_grid_kwh": round(getattr(self.coordinator, "avoidable_grid_kwh_today", 0.0), 2),
-            "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm. avoidable_grid_kwh = strøm købt mens batteriet havde brugbar ladning.",
+            "note": "Estimat: bias-korrigeret prognose minus faktisk PV mens batteri var fuldt og salg slået fra. Negativ-pris-andelen er bevidst; resten er en regressions-alarm. avoidable_grid_kwh er kun import, som den årsagsopdelte måling vurderer at batteriet kunne have dækket uden at bryde planen.",
         }
 
 

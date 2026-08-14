@@ -1301,16 +1301,16 @@ def build_day_plan(
         task: PlanTask,
         *,
         base_floor_pct: float,
-    ) -> tuple[float, float, float]:
-        """Floor and future kWh protected from an unexpected current deficit.
+    ) -> tuple[float, float, float, float]:
+        """Floor and future value protected while serving the current slot.
 
         Walk backwards through the remaining horizon. Median deficits in every
         materially dearer slot are concrete demand; finite P10 surplus before a
-        deadline can refill energy already released. This deadline ordering is
-        what makes the result safe without pinning a full battery to 100%.
+        deadline can refill energy already released. When refill is finite, keep
+        the highest-value obligations first. The absolute-value gate prevents a
+        tiny price difference from pinning several kWh overnight.
         """
-        required_kwh = 0.0
-        has_protected_demand = False
+        obligations: list[list[float]] = []
         for candidate in reversed(tasks[task_index + 1:]):
             if candidate.total_import_price > task.total_import_price + hold_margin:
                 deficit_kwh = min(
@@ -1318,8 +1318,10 @@ def build_day_plan(
                     _battery_deficit_kwh(candidate, conservative=False),
                 )
                 if deficit_kwh > 0.01:
-                    has_protected_demand = True
-                    required_kwh += deficit_kwh
+                    obligations.append([
+                        deficit_kwh,
+                        candidate.total_import_price - task.total_import_price,
+                    ])
 
             solar_slot = solar_slots_by_start.get(candidate.start)
             conservative_solar_kwh = 0.0
@@ -1338,10 +1340,24 @@ def build_day_plan(
                     - _battery_served_load_kwh(candidate, conservative=False),
                 ),
             )
-            required_kwh = max(0.0, required_kwh - refill_kwh)
+            if refill_kwh > 0.01 and obligations:
+                # Conservative refill makes the least valuable held energy
+                # redundant first, preserving the best remaining price spread.
+                obligations.sort(key=lambda item: item[1])
+                remaining_refill = refill_kwh
+                for obligation in obligations:
+                    released = min(obligation[0], remaining_refill)
+                    obligation[0] -= released
+                    remaining_refill -= released
+                    if remaining_refill <= 0.01:
+                        break
+                obligations = [item for item in obligations if item[0] > 0.01]
 
-        if not has_protected_demand:
+        required_kwh = sum(item[0] for item in obligations)
+        protected_value_kr = sum(item[0] * item[1] for item in obligations)
+        if protected_value_kr + 1e-9 < min_hold_value_kr:
             required_kwh = 0.0
+            protected_value_kr = 0.0
         applied_buffer_kwh = (
             max(
                 0.0,
@@ -1360,7 +1376,7 @@ def build_day_plan(
             protected_future_kwh=required_kwh,
             safety_buffer_kwh=applied_buffer_kwh,
         )
-        return floor_pct, required_kwh, applied_buffer_kwh
+        return floor_pct, required_kwh, applied_buffer_kwh, protected_value_kr
 
     def _uncertainty_episode_allocations(
     ) -> tuple[
@@ -2004,18 +2020,17 @@ def build_day_plan(
         energy_backed_live_release = False
         energy_backed_floor = reserve_floor
         protected_future_kwh = 0.0
+        protected_future_value_kr = 0.0
         live_deficit_buffer_kwh = 0.0
         if (
-            not forecast_deficit
-            and task.action != "GRID_CHARGE"
+            task.action != "GRID_CHARGE"
             and task.total_import_price > 0.0
-            and view.current is not None
-            and task.start == view.current.start
         ):
             (
                 energy_backed_floor,
                 protected_future_kwh,
                 live_deficit_buffer_kwh,
+                protected_future_value_kr,
             ) = (
                 _energy_backed_live_deficit_floor(
                     task_index,
@@ -2123,6 +2138,9 @@ def build_day_plan(
             )
         energy_backed_live_release = bool(
             energy_backed_live_candidate
+            and not forecast_deficit
+            and view.current is not None
+            and task.start == view.current.start
             and energy_backed_floor < floor - 0.1
         )
         if energy_backed_live_release:
@@ -2273,7 +2291,8 @@ def build_day_plan(
             reserve_notes.append(
                 "energy-backed live-deficit floor "
                 f"{committed_floor:.0f}% protects {protected_future_kwh:.2f} kWh "
-                f"future demand + {live_deficit_buffer_kwh:.2f} kWh buffer"
+                f"future demand + {live_deficit_buffer_kwh:.2f} kWh buffer "
+                f"({protected_future_value_kr:.2f} kr value)"
             )
         if non_grid_floor_capped:
             reserve_notes.append(
@@ -2282,6 +2301,15 @@ def build_day_plan(
         committed_reason = " | ".join(
             note for note in (task.reason, *reserve_notes) if note
         )
+        watchdog_reserve_cap = energy_backed_floor
+        if material_uncertainty_active and not energy_backed_live_release:
+            # The finite P90/P10 ledger is already energy- and value-backed.
+            # It must never look like an excess aggregate reserve to the live
+            # watchdog, even when its floor exceeds the median-demand cap.
+            watchdog_reserve_cap = max(
+                watchdog_reserve_cap,
+                committed_floor,
+            )
         committed_tasks.append(replace(
             task,
             action=committed_action,
@@ -2301,6 +2329,17 @@ def build_day_plan(
             projected_soc_pct=committed_projected,
             ev_load_estimate_kwh=task.ev_load_estimate_kwh,
             reason=committed_reason or committed_action,
+            reserve_floor_cap_pct=(
+                _snap_tou_capacity(
+                    float(min(watchdog_reserve_cap, max_soc)),
+                    up=True,
+                )
+                if energy_backed_live_candidate
+                else None
+            ),
+            reserve_protected_kwh=protected_future_kwh,
+            reserve_protected_value_kr=protected_future_value_kr,
+            reserve_buffer_kwh=live_deficit_buffer_kwh,
         ))
     return DayPlan(
         built_at=state.timestamp,

@@ -5090,6 +5090,170 @@ def test_control_stability_regressions():
                    not first and tripped and latched and not cleared and charging_ignored,
                    f"{first}/{tripped}/{latched}/{cleared}/charging_ignored={charging_ignored}"))
 
+    # A planned TOU floor can only block house self-consumption above the
+    # energy-backed cap for 90 seconds. The correction then stays latched long
+    # enough for the inverter and meter to settle, while EV/manual/safe paths
+    # remain untouched.
+    reserve_slot = models.SlotPlan(
+        start=base,
+        intent="SELF_CONSUME",
+        sell=True,
+        grid_charge=False,
+        tou_floor_pct=55.0,
+        charge_current_a=None,
+        total_import_price=1.64,
+        reserve_floor_cap_pct=35.0,
+        reserve_protected_kwh=1.0,
+        reserve_protected_value_kr=0.35,
+        reserve_buffer_kwh=1.0,
+    )
+    import_watchdog = object.__new__(co_mod.WattsonCoordinator)
+    import_watchdog.site_state = replace(
+        sunny_state,
+        pv_power_w=0.0,
+        load_power_w=500.0,
+        grid_power_w=500.0,
+        grid_import_power_w=500.0,
+        battery_soc_pct=55.0,
+        battery_power_w=0.0,
+    )
+    import_watchdog._avoidable_import_watchdog_since = None
+    import_watchdog._avoidable_import_watchdog_active_until = None
+    import_watchdog._avoidable_import_watchdog_active = False
+    idle_plan = models.BatteryPlan(strategy="IDLE", reason="reserve test")
+    import_first = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan, slot=reserve_slot, safe_reasons=[], now=base
+    )
+    import_early = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(seconds=89),
+    )
+    import_trip = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(seconds=90),
+    )
+    import_watchdog.site_state = replace(
+        import_watchdog.site_state, grid_import_power_w=0.0
+    )
+    import_latched = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(minutes=3),
+    )
+    import_watchdog.site_state = replace(
+        import_watchdog.site_state, battery_soc_pct=40.0
+    )
+    import_no_catchup = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(minutes=7),
+    )
+    import_watchdog.site_state = replace(
+        import_watchdog.site_state, battery_soc_pct=55.0
+    )
+    import_expired = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(minutes=13),
+    )
+    checks.append(("unbacked TOU reserve releases after 90s and stays stable for five minutes",
+                   import_first is None and import_early is None
+                   and import_trip == 35.0 and import_latched == 35.0
+                   and import_no_catchup == 35.0 and import_expired is None,
+                   f"{import_first}/{import_early}/{import_trip}/{import_latched}/"
+                   f"no_catchup={import_no_catchup}/{import_expired}"))
+
+    import_watchdog.site_state = replace(
+        import_watchdog.site_state,
+        grid_import_power_w=500.0,
+        easee_status="charging",
+        easee_power_w=1800.0,
+    )
+    ev_ignored = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(minutes=14),
+    )
+    manual_ignored = import_watchdog._update_avoidable_import_watchdog(
+        models.BatteryPlan(strategy="OVERRIDE_HOLD", reason="manual"),
+        slot=reserve_slot,
+        safe_reasons=[],
+        now=base + timedelta(minutes=16),
+    )
+    safe_ignored = import_watchdog._update_avoidable_import_watchdog(
+        idle_plan,
+        slot=reserve_slot,
+        safe_reasons=["Stale required entities"],
+        now=base + timedelta(minutes=18),
+    )
+    checks.append(("import watchdog never overrides EV, manual hold, or safe mode",
+                   ev_ignored is None and manual_ignored is None and safe_ignored is None,
+                   f"ev={ev_ignored}/manual={manual_ignored}/safe={safe_ignored}"))
+
+    cause_common = dict(
+        battery_soc_pct=55.0,
+        max_discharge_w=3570.0,
+        battery_strategy="IDLE",
+        desired_grid_charge=False,
+        safe_mode=False,
+        desired_floor_pct=55.0,
+        base_floor_pct=15.0,
+        recovery_floor_pct=35.0,
+        reserve_value_kr=0.35,
+    )
+    avoidable_causes = telemetry.classify_grid_import_power(
+        grid_import_w=500.0,
+        battery_power_w=0.0,
+        ev_power_w=0.0,
+        **cause_common,
+    )
+    ev_causes = telemetry.classify_grid_import_power(
+        grid_import_w=1200.0,
+        battery_power_w=0.0,
+        ev_power_w=1200.0,
+        **cause_common,
+    )
+    limit_causes = telemetry.classify_grid_import_power(
+        grid_import_w=900.0,
+        battery_power_w=3500.0,
+        ev_power_w=0.0,
+        **cause_common,
+    )
+    valid_reserve_causes = telemetry.classify_grid_import_power(
+        grid_import_w=500.0,
+        battery_power_w=0.0,
+        ev_power_w=0.0,
+        **{
+            **cause_common,
+            "battery_soc_pct": 35.0,
+            "desired_floor_pct": 35.0,
+        },
+    )
+    cause_totals_ok = all(
+        abs(sum(causes.values()) - expected) < 1e-9
+        for causes, expected in (
+            (avoidable_causes, 500.0),
+            (ev_causes, 1200.0),
+            (limit_causes, 900.0),
+            (valid_reserve_causes, 500.0),
+        )
+    )
+    checks.append(("grid import causes are exclusive and distinguish EV, limits, reserve, and avoidable hold",
+                   cause_totals_ok
+                   and avoidable_causes["avoidable"] == 500.0
+                   and ev_causes["ev_charging"] == 1200.0
+                   and limit_causes["discharge_limit"] == 830.0
+                   and valid_reserve_causes["reserve_hold"] == 500.0,
+                   f"avoidable={avoidable_causes}/ev={ev_causes}/limit={limit_causes}/reserve={valid_reserve_causes}"))
+
     budget = object.__new__(co_mod.WattsonCoordinator)
     budget.ev_mode = const.EV_MODE_SOLAR_ONLY
     budget.site_state = replace(
@@ -5493,11 +5657,14 @@ def test_control_stability_regressions():
     high_spread_prices[2] = 2.70
     high_spread_plan = _value_plan(prices_raw=high_spread_prices)
     high_19 = high_spread_plan.tasks[1] if high_spread_plan else None
+    high_19_slot = high_spread_plan.slots[1] if high_spread_plan else None
     checks.append(("value gate keeps the 100% reserve when the later peak is materially dearer",
                    high_19 is not None
+                   and high_19_slot is not None
                    and high_19.action == "IDLE"
-                   and high_19.tou_floor_pct == 100.0,
-                   str(high_19)))
+                   and high_19.tou_floor_pct == 100.0
+                   and high_19_slot.reserve_floor_cap_pct == 100.0,
+                   f"{high_19}/{high_19_slot}"))
 
     # A future peak can exist only in the uncertainty band: P50 sees a slight
     # solar surplus, while P90 load and P10 solar imply a material deficit. It
@@ -5527,12 +5694,15 @@ def test_control_stability_regressions():
         forecast_confidence=0.7, allow_grid_charge=False,
     )
     p90_only_current = p90_only_plan.tasks[0] if p90_only_plan else None
+    p90_only_slot = p90_only_plan.slots[0] if p90_only_plan else None
     checks.append(("P90-only dearer deficit remains protected when P50 shows slight solar surplus",
                    p90_only_current is not None
+                   and p90_only_slot is not None
                    and p90_only_current.action == "IDLE"
                    and p90_only_current.projected_soc_pct == 25.0
-                   and p90_only_current.tou_floor_pct == 25.0,
-                   str(p90_only_current)))
+                   and p90_only_current.tou_floor_pct == 25.0
+                   and p90_only_slot.reserve_floor_cap_pct == 25.0,
+                   f"{p90_only_current}/{p90_only_slot}"))
 
     # The source may itself rank among the day's three dearest hours and still
     # precede an even dearer destination. A rank-only release used to drain the
@@ -6936,6 +7106,65 @@ def test_control_stability_regressions():
                    and lower_soc_slot.tou_floor_pct == 75.0,
                    str(lower_soc_slot)))
 
+    value_start = cooking_start
+    value_load = {
+        value_start + timedelta(hours=index): (1000.0 if index == 1 else 500.0)
+        for index in range(24)
+    }
+    value_solar = [models.SolarSlot(
+        start=value_start + timedelta(hours=index),
+        pv_estimate_kwh=0.0,
+        pv_estimate10_kwh=0.0,
+        pv_estimate90_kwh=0.0,
+    ) for index in range(24)]
+
+    def value_gate_plan(future_price):
+        prices = [models.PriceSlot(
+            start=value_start + timedelta(hours=index),
+            spot_price=(future_price if index == 1 else 1.0),
+            tariff=0.0,
+            total_import_price=(future_price if index == 1 else 1.0),
+            export_value=0.4,
+        ) for index in range(24)]
+        return planner.build_day_plan(
+            replace(
+                cooking_state,
+                timestamp=value_start + timedelta(minutes=30),
+                battery_soc_pct=55.0,
+                pv_power_w=0.0,
+                load_power_w=500.0,
+                grid_power_w=500.0,
+                grid_import_power_w=500.0,
+                price_slots=prices,
+                solar_slots=value_solar,
+            ),
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            capacity_kwh=10.0,
+            load_hourly_w=value_load,
+            reserve_load_by_start_w=value_load,
+            allow_grid_charge=False,
+        )
+
+    immaterial_plan = value_gate_plan(1.20)
+    material_plan = value_gate_plan(1.50)
+    immaterial_slot = immaterial_plan.slots[0] if immaterial_plan else None
+    material_slot = material_plan.slots[0] if material_plan else None
+    checks.append(("energy-backed reserve ignores a future peak worth less than 0.30 kr",
+                   immaterial_slot is not None
+                   and immaterial_slot.reserve_floor_cap_pct == 15.0
+                   and immaterial_slot.reserve_protected_kwh == 0.0
+                   and immaterial_slot.reserve_protected_value_kr == 0.0,
+                   str(immaterial_slot)))
+    checks.append(("energy-backed reserve keeps concrete future demand with material value",
+                   material_slot is not None
+                   and material_slot.reserve_floor_cap_pct == 35.0
+                   and abs(material_slot.reserve_protected_kwh - 1.0) < 1e-9
+                   and abs(material_slot.reserve_protected_value_kr - 0.5) < 1e-9
+                   and material_slot.reserve_buffer_kwh == 1.0,
+                   str(material_slot)))
+
     saturated_floor = planner.energy_backed_reserve_floor_pct(
         base_floor_pct=15.0,
         max_soc_pct=100.0,
@@ -7596,6 +7825,14 @@ def test_value_sensor_baseline_sync():
                        and getattr(d, f"grid_import_cost_{p}_kr") == 0.0
                        for p in ("today", "week", "month", "year", "total")),
                    "grid import"))
+    checks.append(("grid import cause sensors reset with the shared baseline",
+                   d.avoidable_grid_kwh_today == 0.0
+                   and d._grid_import_cause_day == today
+                   and all(
+                       d.grid_import_cause_kwh_today[cause] == 0.0
+                       for cause in telemetry.GRID_IMPORT_CAUSES
+                   ),
+                   str(d.grid_import_cause_kwh_today)))
     checks.append(("EV solar savings periods reset",
                    all(getattr(d, attr_template.format(period=p)) == 0.0
                        for p in ("today", "week", "month", "year", "total")
@@ -7622,7 +7859,8 @@ def test_value_sensor_baseline_sync():
     checks.append(("last ticks share one baseline instant",
                    d._import_savings_last_tick is d._export_revenue_last_tick
                    and d._export_revenue_last_tick is d._grid_import_last_tick
-                   and d._grid_import_last_tick is d._evsh_last_tick,
+                   and d._grid_import_last_tick is d._grid_import_cause_last_tick
+                   and d._grid_import_cause_last_tick is d._evsh_last_tick,
                    "same object"))
     checks.append(("EV shadow side counters reset",
                    d.ev_solar_grid_backed_kwh == 0.0

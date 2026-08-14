@@ -140,6 +140,11 @@ from .const import (
     EV_CURRENT_RETUNE_SECONDS,
     PLAN_REPLAN_INTERVAL_SECONDS,
     PLAN_SOC_DEVIATION_PCT,
+    AVOIDABLE_IMPORT_WATCHDOG_BATTERY_IDLE_W,
+    AVOIDABLE_IMPORT_WATCHDOG_GRID_W,
+    AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS,
+    AVOIDABLE_IMPORT_WATCHDOG_SECONDS,
+    AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT,
     SELF_CONSUMPTION_WATCHDOG_SECONDS,
     SELF_CONSUMPTION_WATCHDOG_SURPLUS_W,
     MASTER_LOCK_BACKOFF_SECONDS,
@@ -170,7 +175,16 @@ from .telemetry import TelemetryMixin
 from .trace import DecisionTraceBuffer
 from .safety import write_allowed
 from .mapping import build_entity_mapping
-from .models import BatteryPlan, Capabilities, ControlPlan, EntityMapping, EvPlan, SiteState, SolarSlot
+from .models import (
+    BatteryPlan,
+    Capabilities,
+    ControlPlan,
+    EntityMapping,
+    EvPlan,
+    SiteState,
+    SlotPlan,
+    SolarSlot,
+)
 from .horizon import (
     current_price_slot,
     hourly_utc_instants,
@@ -617,6 +631,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_solar_grid_budget_last_tick: datetime | None = None
         self._self_consumption_watchdog_since: datetime | None = None
         self._self_consumption_watchdog_active: bool = False
+        self._avoidable_import_watchdog_since: datetime | None = None
+        self._avoidable_import_watchdog_active_until: datetime | None = None
+        self._avoidable_import_watchdog_active: bool = False
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -1462,9 +1479,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                   "tilstand og styrer ikke før data er friske igen. Tjek klatremis/Modbus-forbindelsen.")
         if self.avoidable_grid_kwh_today >= 1.0:
             alert("avoidable_grid", "Wattson: købte strøm trods ladning på batteriet",
-                  f"~{self.avoidable_grid_kwh_today:.1f} kWh er hentet fra nettet i dag mens batteriet "
-                  "havde brugbar ladning over gulvet og ikke lå til grid-ladning. Tjek om reserven/gulvet "
-                  "er sat for højt for dagen (fx en solrig dag hvor batteriet kunne dække huset).")
+                  f"~{self.avoidable_grid_kwh_today:.1f} kWh er hentet fra nettet i dag, som Wattsons "
+                  "årsagsmåling vurderer, at batteriet kunne have dækket uden at bryde en gyldig reserve, "
+                  "manuel styring eller en fysisk effektgrænse. Import-vagten frigiver automatisk et "
+                  "eventuelt ubeskyttet TOU-gulv efter 90 sekunders vedvarende mønster.")
         if self.register_writes_today >= 2000 and self.register_tuple_changes_today <= 60:
             alert("limit_cycle", "Wattson: mistanke om register-limit-cycle",
                   f"{self.register_writes_today} register-skrivninger i dag, men kun "
@@ -1506,7 +1524,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             lines.append("**I nat:** ingen net-ladning — batteriet/solen dækkede huset.")
         av = getattr(self, "avoidable_grid_kwh_today", 0.0)
         if av >= 0.3:
-            lines.append(f"⚠️ {av:.1f} kWh købt fra nettet mens batteriet havde brugbar ladning (se anomali-alarm).")
+            lines.append(
+                f"⚠️ {av:.1f} kWh vurderet undgåelig net-import efter fradrag af "
+                "EV, fysisk afladningsgrænse, sikkerhed og gyldig reserve."
+            )
         st = self.site_state
         if st is not None and st.battery_soc_pct is not None:
             lines.append(f"**Batteri nu:** {st.battery_soc_pct:.0f} %.")
@@ -1937,6 +1958,92 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         ).total_seconds() >= SELF_CONSUMPTION_WATCHDOG_SECONDS:
             self._self_consumption_watchdog_active = True
         return self._self_consumption_watchdog_active
+
+    def _update_avoidable_import_watchdog(
+        self,
+        battery_plan: BatteryPlan,
+        *,
+        slot: SlotPlan | None,
+        safe_reasons: list[str],
+        now: datetime,
+    ) -> float | None:
+        """Release only the part of a TOU floor lacking an energy justification."""
+        recovery_floor = getattr(slot, "reserve_floor_cap_pct", None)
+        planned_floor = getattr(slot, "tou_floor_pct", None)
+        excluded_strategies = {
+            "GRID_CHARGE",
+            "ABSORB_NEGATIVE",
+            "OVERRIDE_CHARGE",
+            "OVERRIDE_SOLAR_CHARGE",
+            "OVERRIDE_HOLD",
+            "HOLD",
+            "HOLD_FULL",
+            "PROTECT",
+        }
+        excluded = bool(
+            slot is None
+            or self.site_state is None
+            or recovery_floor is None
+            or planned_floor is None
+            or safe_reasons
+            or float(getattr(slot, "total_import_price", 0.0) or 0.0) <= 0.0
+            or max(0.0, self.site_state.easee_power_w or 0.0) >= 200.0
+            or battery_plan.strategy in excluded_strategies
+        )
+        unbacked = bool(
+            not excluded
+            and float(planned_floor) > float(recovery_floor) + 0.1
+        )
+        if not unbacked:
+            self._avoidable_import_watchdog_since = None
+            self._avoidable_import_watchdog_active_until = None
+            self._avoidable_import_watchdog_active = False
+            return None
+
+        if (
+            self._avoidable_import_watchdog_active_until is not None
+            and now < self._avoidable_import_watchdog_active_until
+        ):
+            self._avoidable_import_watchdog_active = True
+            return float(recovery_floor)
+
+        # Never restore a released floor above the SOC already reached. Doing
+        # so would recreate the import merely to "catch up" to the old reserve.
+        if (
+            self._avoidable_import_watchdog_active_until is not None
+            and self.site_state.battery_soc_pct
+            < float(planned_floor) - AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT
+        ):
+            self._avoidable_import_watchdog_active_until = now + timedelta(
+                seconds=AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS
+            )
+            self._avoidable_import_watchdog_active = True
+            return float(recovery_floor)
+
+        self._avoidable_import_watchdog_active_until = None
+        self._avoidable_import_watchdog_active = False
+        stalled = bool(
+            self.site_state.grid_import_power_w >= AVOIDABLE_IMPORT_WATCHDOG_GRID_W
+            and abs(self.site_state.battery_power_w or 0.0)
+            < AVOIDABLE_IMPORT_WATCHDOG_BATTERY_IDLE_W
+            and self.site_state.battery_soc_pct
+            >= float(planned_floor) - AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT
+        )
+        if not stalled:
+            self._avoidable_import_watchdog_since = None
+            return None
+        if self._avoidable_import_watchdog_since is None:
+            self._avoidable_import_watchdog_since = now
+            return None
+        if (
+            now - self._avoidable_import_watchdog_since
+        ).total_seconds() < AVOIDABLE_IMPORT_WATCHDOG_SECONDS:
+            return None
+        self._avoidable_import_watchdog_active = True
+        self._avoidable_import_watchdog_active_until = now + timedelta(
+            seconds=AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS
+        )
+        return float(recovery_floor)
 
     def _reset_control_fingerprints(self) -> None:
         """Force the next active tick to re-assert both physical plans."""
@@ -3239,6 +3346,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             )
         else:
             discharge_floor = min_soc + max(profile_for(self.battery_mode).reserve_soc_offset, learned_reserve_pct, peak_reserve)
+        avoidable_import_floor = self._update_avoidable_import_watchdog(
+            battery_plan,
+            slot=_slot,
+            safe_reasons=safe_reasons,
+            now=dt_util.utcnow(),
+        )
+        if avoidable_import_floor is not None:
+            discharge_floor = min(discharge_floor, avoidable_import_floor)
+            battery_plan = replace(
+                battery_plan,
+                reason=(
+                    f"{battery_plan.reason} | import-vagt: frigiver ubeskyttet "
+                    f"TOU-reserve til {avoidable_import_floor:.0f}%"
+                ),
+            )
         if self._update_self_consumption_watchdog(
             battery_plan,
             now=dt_util.utcnow(),
@@ -3318,7 +3440,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # control loop — it is pure observability. Swallow + log any error here.
         if accounting_due:
             try:
-                self._accumulate_avoidable_grid(self.control_plan)
+                self._accumulate_grid_import_causes(
+                    self.control_plan,
+                    slot=_slot,
+                    base_floor_pct=base_discharge_floor,
+                    max_discharge_w=battery_rate_kwh(
+                        self.battery_discharge_current
+                    ) * 1000.0,
+                )
                 self._accumulate_ev_shadow(self.control_plan)
                 self._check_anomalies()
                 self._maybe_daily_digest()
