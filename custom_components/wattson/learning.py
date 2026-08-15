@@ -38,6 +38,9 @@ def build_load_profile(
     buckets: dict[int, list[tuple[float, float]]] = {}
     weekday_buckets: dict[int, list[tuple[float, float]]] = {}
     weekend_buckets: dict[int, list[tuple[float, float]]] = {}
+    quarter_buckets: dict[int, list[tuple[float, float]]] = {}
+    weekday_quarter_buckets: dict[int, list[tuple[float, float]]] = {}
+    weekend_quarter_buckets: dict[int, list[tuple[float, float]]] = {}
     days: set = set()
     parsed: list[tuple[datetime, float]] = []
     for timestamp, value in samples:
@@ -50,12 +53,37 @@ def build_load_profile(
     if not parsed:
         return None
     newest = max(ts for ts, _ in parsed)
+    # Preserve the established hourly contract: first average each physical
+    # hour, then learn across days. Recorder previously supplied one hourly mean;
+    # feeding all 5-minute rows directly into the hourly median would overweight
+    # long within-hour plateaus and alter the incumbent planner.
+    hourly_groups: dict[datetime, list[float]] = {}
     for timestamp, watts in parsed:
+        hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
+        hourly_groups.setdefault(hour_start, []).append(watts)
+    hourly_parsed = [
+        (timestamp, sum(values) / len(values))
+        for timestamp, values in hourly_groups.items()
+        if values
+    ]
+    for timestamp, watts in hourly_parsed:
         age_days = max(0.0, (newest - timestamp).total_seconds() / 86400.0)
         weight = 0.5 ** (age_days / half_life_days) if half_life_days > 0 else 1.0
         buckets.setdefault(timestamp.hour, []).append((watts, weight))
         day_buckets = weekend_buckets if timestamp.weekday() >= 5 else weekday_buckets
         day_buckets.setdefault(timestamp.hour, []).append((watts, weight))
+        days.add(timestamp.date())
+    for timestamp, watts in parsed:
+        age_days = max(0.0, (newest - timestamp).total_seconds() / 86400.0)
+        weight = 0.5 ** (age_days / half_life_days) if half_life_days > 0 else 1.0
+        quarter = timestamp.hour * 4 + min(3, timestamp.minute // 15)
+        quarter_buckets.setdefault(quarter, []).append((watts, weight))
+        day_quarter_buckets = (
+            weekend_quarter_buckets
+            if timestamp.weekday() >= 5
+            else weekday_quarter_buckets
+        )
+        day_quarter_buckets.setdefault(quarter, []).append((watts, weight))
         days.add(timestamp.date())
 
     def _quantile(b: dict[int, list[tuple[float, float]]], quantile: float) -> dict[int, float]:
@@ -123,6 +151,12 @@ def build_load_profile(
         hourly_p90_w=_quantile(buckets, 0.9),
         weekday_p90_w=_quantile(weekday_buckets, 0.9),
         weekend_p90_w=_quantile(weekend_buckets, 0.9),
+        quarter_hourly_w=_quantile(quarter_buckets, 0.5),
+        weekday_quarter_hourly_w=_quantile(weekday_quarter_buckets, 0.5),
+        weekend_quarter_hourly_w=_quantile(weekend_quarter_buckets, 0.5),
+        quarter_hourly_p90_w=_quantile(quarter_buckets, 0.9),
+        weekday_quarter_hourly_p90_w=_quantile(weekday_quarter_buckets, 0.9),
+        weekend_quarter_hourly_p90_w=_quantile(weekend_quarter_buckets, 0.9),
         days_observed=days_observed,
         confidence=round(confidence, 3),
         temperature_reference_c=round(temp_reference, 2) if temp_reference is not None else None,
@@ -137,6 +171,7 @@ def forecast_load_w(
     *,
     outdoor_temperature_c: float | None = None,
     conservative: bool = False,
+    quarter_hour: bool = False,
 ) -> float:
     """Date-aware P50/P90 house-load forecast for one timestamp.
 
@@ -146,8 +181,22 @@ def forecast_load_w(
     """
     if profile is None:
         return 0.0
-    table = profile.conservative_hourly_for(start) if conservative else profile.hourly_for(start)
-    watts = max(0.0, float(table.get(start.hour, profile.hourly_w.get(start.hour, 0.0))))
+    quarter = start.hour * 4 + min(3, start.minute // 15)
+    hourly_table = profile.conservative_hourly_for(start) if conservative else profile.hourly_for(start)
+    quarter_table = (
+        profile.quarter_hourly_for(start, conservative=conservative)
+        if quarter_hour
+        else {}
+    )
+    watts = max(
+        0.0,
+        float(
+            quarter_table.get(
+                quarter,
+                hourly_table.get(start.hour, profile.hourly_w.get(start.hour, 0.0)),
+            )
+        ),
+    )
     if (
         outdoor_temperature_c is not None
         and profile.temperature_reference_c is not None
@@ -157,7 +206,10 @@ def forecast_load_w(
         watts += cold_degrees * profile.temperature_slope_w_per_c
     # Weather correction cannot make one bucket more than 2.5x its learned
     # uncorrected demand. This bounds bad temperature sensors/history.
-    base = max(1.0, float(table.get(start.hour, watts)))
+    base = max(
+        1.0,
+        float(quarter_table.get(quarter, hourly_table.get(start.hour, watts))),
+    )
     return min(watts, base * 2.5)
 
 

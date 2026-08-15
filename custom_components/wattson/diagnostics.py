@@ -28,6 +28,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
             "execution": coordinator.execution_status,
             "tick_metrics": coordinator.tick_metrics,
             "decision_traces": coordinator._decision_traces.as_list(),
+            "optimizer": coordinator._decision_ledger.as_dict(),
         },
         TO_REDACT,
     )

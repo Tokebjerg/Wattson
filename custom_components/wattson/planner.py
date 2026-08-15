@@ -43,6 +43,8 @@ from .models import (
     SlotPlan,
 )
 
+# Stable incumbent horizon. The scenario candidate extends this to 48 hours via
+# ``dp_schedule(horizon_hours=48)`` and must earn promotion through replay first.
 SCHEDULE_MAX_HOURS = 24
 
 # Don't grid-charge when solar already covers charging. Live: suppress grid
@@ -1091,6 +1093,7 @@ def build_day_plan(
     ev_load_by_start: dict[datetime, float] | None = None,
     ev_battery_protected: bool = False,
     allow_grid_charge: bool = True,
+    schedule_override: list[PlanTask] | tuple[PlanTask, ...] | None = None,
 ) -> DayPlan | None:
     """Build the committed slot plan for the remaining horizon.
 
@@ -1114,19 +1117,22 @@ def build_day_plan(
         return None
     charge_rate = battery_rate_kwh(charge_current_a)
     discharge_rate = battery_rate_kwh(discharge_current_a)
-    tasks, _, _ = build_schedule_optimal(
-        state, profile, load_hourly_w,
-        capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
-        learned_reserve_pct=learned_reserve_pct,
-        solar_charge_priority_soc=solar_charge_priority_soc,
-        charge_rate_kwh=charge_rate,
-        discharge_rate_kwh=discharge_rate,
-        grid_charge_rate_kwh=grid_charge_rate_kwh,
-        battery_care_soc=battery_care_soc,
-        ev_load_by_start=ev_load_by_start,
-        ev_battery_protected=ev_battery_protected,
-        allow_grid_charge=allow_grid_charge,
-    )
+    if schedule_override is None:
+        tasks, _, _ = build_schedule_optimal(
+            state, profile, load_hourly_w,
+            capacity_kwh=capacity_kwh, min_soc=min_soc, max_soc=max_soc,
+            learned_reserve_pct=learned_reserve_pct,
+            solar_charge_priority_soc=solar_charge_priority_soc,
+            charge_rate_kwh=charge_rate,
+            discharge_rate_kwh=discharge_rate,
+            grid_charge_rate_kwh=grid_charge_rate_kwh,
+            battery_care_soc=battery_care_soc,
+            ev_load_by_start=ev_load_by_start,
+            ev_battery_protected=ev_battery_protected,
+            allow_grid_charge=allow_grid_charge,
+        )
+    else:
+        tasks = list(schedule_override)
     if not tasks:
         return None
     hold_margin = float(reserve_hold_margin)
@@ -2340,6 +2346,7 @@ def build_day_plan(
             reserve_protected_kwh=protected_future_kwh,
             reserve_protected_value_kr=protected_future_value_kr,
             reserve_buffer_kwh=live_deficit_buffer_kwh,
+            duration_minutes=task.duration_minutes,
         ))
     return DayPlan(
         built_at=state.timestamp,
@@ -3104,6 +3111,7 @@ def dp_schedule(
     ev_load_by_start: dict[datetime, float] | None = None,
     ev_battery_protected: bool = False,
     allow_grid_charge: bool = True,
+    horizon_hours: int = SCHEDULE_MAX_HOURS,
 ) -> tuple[list[PlanTask], str | None, str | None]:
     """DP-optimal forward schedule (same contract as ``_build_schedule``)."""
     view = _horizon_view(state, profile)
@@ -3122,7 +3130,7 @@ def dp_schedule(
     # assuming one night hour fills the pack and under-scheduling cheap hours. PV
     # charge (pv_charge below) still uses the full ``rate``.
     grid_rate = grid_charge_rate_kwh if grid_charge_rate_kwh is not None else SCHEDULE_GRID_CHARGE_RATE_KWH
-    slots = view.slots[:SCHEDULE_MAX_HOURS]
+    slots = view.slots[:max(1, int(horizon_hours))]
     hours = []
     for slot in slots:
         pv = solar_by_start.get(slot.start)
@@ -3155,6 +3163,7 @@ def dp_schedule(
             for (s, sk, lk, _hp, ev, _def, pgrid) in hours
         ),
         ev_battery_protected, allow_grid_charge,
+        int(horizon_hours),
     )
     cached = _DP_CACHE.get(fp)
     if cached is not None:
@@ -3411,6 +3420,7 @@ def build_schedule_optimal(
     be worse than the pre-DP baseline by its own model's judgment."""
     h_kwargs = dict(kwargs)
     h_kwargs.pop("battery_care_soc", None)
+    h_kwargs.pop("horizon_hours", None)
     heuristic = _build_schedule(state, profile, load_hourly_w, **h_kwargs)
     try:
         dp = dp_schedule(state, profile, load_hourly_w, **kwargs)

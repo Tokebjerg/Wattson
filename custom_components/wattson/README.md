@@ -7,6 +7,8 @@ independent fault domains.
 
 - `snapshot.py` normalizes Home Assistant state and caches price/solar horizons.
 - `planning_engine.py` is the stable boundary around the pure planner.
+- `optimizer.py` builds and scores the 48-hour P10/P50/P90 candidate.
+- `decision_ledger.py` persists exact replay inputs and staged rollout evidence.
 - `ev_session.py` owns physical plug-in session identity and observed phase capability.
 - `execution.py` records independent Deye and Easee command results.
 - `runtime.py` separates the 10-second safety loop from slower accounting/model work.
@@ -48,8 +50,11 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
-Version 0.26.9 adds an energy-backed TOU reserve diagnostic, a debounced
-corrective watchdog for sustained avoidable import, and daily causal grid-import
-sensors. Existing entity unique IDs, service names, platforms and config options
-remain unchanged. Config entries migrate from version 1 to version 2 without
-renaming or rewriting user mappings.
+Version 0.27.0 adds a restart-safe seven-day decision ledger, exact
+counterfactual scorecards, a 48-hour P10/P50/P90 scenario candidate evaluated at
+15-minute cadence, staged shadow/canary/active rollout with automatic rollback,
+15-minute load learning, time-of-day solar calibration and learned PV/discharge
+rates. The established planner remains active until the candidate has at least
+seven days and 96 valid comparisons with no material regression. Existing entity
+IDs, services, safety floors, manual overrides and the physical 70 A ceiling are
+unchanged.

@@ -25,6 +25,7 @@ from .const import (
     CONF_BATTERY_MAX_SOC,
     DEFAULT_BATTERY_CAPACITY_KWH,
     CONF_SOLAR_BIAS_HISTORY,
+    CONF_SOLAR_BIAS_BUCKET_HISTORY,
     CONF_SOLAR_BIAS_INTRADAY,
     DEFAULT_BATTERY_MAX_SOC,
     EV_MODE_SOLAR_ONLY,
@@ -266,6 +267,15 @@ class TelemetryMixin:
         # measurement that would justify a bucketed correction later).
         self._tod_actual_wh: dict[str, float] = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
         self._tod_forecast_wh: dict[str, float] = {"morning": 0.0, "midday": 0.0, "evening": 0.0}
+        raw_bucket_history = entry_value(entry, CONF_SOLAR_BIAS_BUCKET_HISTORY, {}) or {}
+        self._solar_bias_bucket_history: dict[str, list[float]] = {
+            bucket: [
+                float(value)
+                for value in (raw_bucket_history.get(bucket, []) if isinstance(raw_bucket_history, dict) else [])
+                if isinstance(value, (int, float)) and value > 0
+            ][-SOLAR_BIAS_MAX_DAYS:]
+            for bucket in ("morning", "midday", "evening")
+        }
         self._solar_last_tick: datetime | None = None
         self._solar_bias_persisted_at: datetime | None = None
         # Restore the running day's accumulation (persisted ~15-minutely):
@@ -276,6 +286,13 @@ class TelemetryMixin:
                 self._solar_accum_day = dt_util.now().date()
                 self._solar_actual_wh = float(_intraday.get("actual_wh", 0.0) or 0.0)
                 self._solar_forecast_wh = float(_intraday.get("forecast_wh", 0.0) or 0.0)
+                for bucket in self._tod_actual_wh:
+                    self._tod_actual_wh[bucket] = float(
+                        (_intraday.get("tod_actual_wh", {}) or {}).get(bucket, 0.0) or 0.0
+                    )
+                    self._tod_forecast_wh[bucket] = float(
+                        (_intraday.get("tod_forecast_wh", {}) or {}).get(bucket, 0.0) or 0.0
+                    )
             except (TypeError, ValueError):
                 self._solar_actual_wh = self._solar_forecast_wh = 0.0
         # Curtailment telemetry: estimated PV kWh the inverter throttled today
@@ -876,6 +893,23 @@ class TelemetryMixin:
                 self._forecast_confidence = forecast_confidence(
                     history, min_days=SOLAR_BIAS_MIN_DAYS,
                 )
+                bucket_history = {
+                    key: list(values)
+                    for key, values in self._solar_bias_bucket_history.items()
+                }
+                for bucket in bucket_history:
+                    forecast_wh = self._tod_forecast_wh.get(bucket, 0.0)
+                    actual_wh = self._tod_actual_wh.get(bucket, 0.0)
+                    if forecast_wh >= SOLAR_BIAS_MIN_FORECAST_W and actual_wh > 0.0:
+                        values = bucket_history[bucket]
+                        values.append(round(actual_wh / forecast_wh, 4))
+                        bucket_history[bucket] = values[-SOLAR_BIAS_MAX_DAYS:]
+                self._solar_bias_bucket_history = bucket_history
+                update_entry_options(
+                    self.hass,
+                    self.config_entry,
+                    **{CONF_SOLAR_BIAS_BUCKET_HISTORY: bucket_history},
+                )
             self._solar_accum_day = today
             self._solar_actual_wh = 0.0
             self._solar_forecast_wh = 0.0
@@ -915,6 +949,12 @@ class TelemetryMixin:
                     "date": today.isoformat(),
                     "actual_wh": round(self._solar_actual_wh, 1),
                     "forecast_wh": round(self._solar_forecast_wh, 1),
+                    "tod_actual_wh": {
+                        key: round(value, 1) for key, value in self._tod_actual_wh.items()
+                    },
+                    "tod_forecast_wh": {
+                        key: round(value, 1) for key, value in self._tod_forecast_wh.items()
+                    },
                 }
             })
 

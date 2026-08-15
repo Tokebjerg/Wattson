@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.26.9"
+INTEGRATION_VERSION = "0.27.0"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -229,6 +229,10 @@ LEARNING_REBUILD_SECONDS = 6 * 3600  # rebuild the profile at most every 6 hours
 # Solcast forecast used in planning. Tightly clamped so a bad day can't distort
 # the plan, and neutral (1.0) until enough days are seen.
 CONF_SOLAR_BIAS_HISTORY = "solar_bias_history"      # persisted list of daily ratios
+# Daily actual/forecast ratios split into morning, midday and evening. The
+# planner applies a bucket only after the same minimum observation count as the
+# global factor; sparse buckets safely fall back to the global correction.
+CONF_SOLAR_BIAS_BUCKET_HISTORY = "solar_bias_bucket_history"
 # Intraday accumulation {date, actual_wh, forecast_wh}, persisted every ~15 min so
 # a restart doesn't throw the running day away (the factor sat at 1.0 for days
 # because near-daily restarts kept wiping the in-memory accumulators).

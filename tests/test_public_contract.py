@@ -83,6 +83,7 @@ class PublicContractTests(unittest.TestCase):
                 "battery_model",
                 "peak_uncovered_energy",
                 "solar_forecast_bias",
+                "optimizer_status",
                 "next_cheap_window",
                 "next_expensive_window",
                 "plan_schedule",

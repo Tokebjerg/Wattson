@@ -104,6 +104,8 @@ safety = importlib.import_module("wattson.safety")
 deye_contract = importlib.import_module("wattson.deye_contract")
 ev_recovery = importlib.import_module("wattson.ev_recovery")
 battery_model = importlib.import_module("wattson.battery_model")
+optimizer = importlib.import_module("wattson.optimizer")
+decision_ledger = importlib.import_module("wattson.decision_ledger")
 State = sys.modules["homeassistant.core"].State
 
 
@@ -1431,6 +1433,21 @@ def test_d_learning():
     checks.append(("predicted_load_kwh 1h@18 = 2.0", abs(learning.predicted_load_kwh(prof, 18, 1) - 2.0) < 1e-6, str(learning.predicted_load_kwh(prof, 18, 1))))
     checks.append(("predicted_load_kwh wraps past midnight", abs(learning.predicted_load_kwh(prof, 23, 5) - 0.3) < 1e-6, str(learning.predicted_load_kwh(prof, 23, 5))))
     checks.append(("predicted_today_kwh = 2.3", abs(learning.predicted_today_kwh(prof) - 2.3) < 1e-6, str(learning.predicted_today_kwh(prof))))
+    quarter_samples = []
+    for d in range(10):
+        quarter_samples.extend([
+            (datetime(2026, 5, 1 + d, 18, 0, tzinfo=TZ), 800.0),
+            (datetime(2026, 5, 1 + d, 18, 15, tzinfo=TZ), 2400.0),
+        ])
+    quarter_profile = learning.build_load_profile(quarter_samples)
+    checks.append(("15-minute load model preserves a short 18:15 peak",
+                   learning.forecast_load_w(
+                       quarter_profile, datetime(2026, 6, 7, 18, 15, tzinfo=TZ), quarter_hour=True
+                   )
+                   > learning.forecast_load_w(
+                       quarter_profile, datetime(2026, 6, 7, 18, 0, tzinfo=TZ), quarter_hour=True
+                   ),
+                   str(quarter_profile.quarter_hourly_w)))
     checks.append(("no samples -> None profile", learning.build_load_profile([]) is None, "none"))
 
     # Reserve gating: expensive hour, SOC 50, blue (profile floor 30).
@@ -8059,6 +8076,125 @@ def test_winter_planning_upgrade():
     return checks
 
 
+def test_next_level_optimizer():
+    """v0.27: 48h scenarios, 15-minute replay and staged promotion."""
+    checks = []
+    now = datetime(2026, 8, 15, 0, 0, tzinfo=timezone.utc)
+    prices = []
+    solar = []
+    load_p50 = {}
+    load_p90 = {}
+    for hour in range(48):
+        start = now + timedelta(hours=hour)
+        local_hour = start.hour
+        price = 0.45 if local_hour < 6 else (2.6 if 17 <= local_hour < 21 else 1.2)
+        prices.append(models.PriceSlot(
+            start=start, spot_price=price, tariff=0.0,
+            total_import_price=price, export_value=max(0.0, price - 0.3),
+        ))
+        pv = 3.2 if 9 <= local_hour < 16 else 0.0
+        solar.append(models.SolarSlot(
+            start=start, pv_estimate_kwh=pv,
+            pv_estimate10_kwh=pv * 0.55, pv_estimate90_kwh=pv * 1.15,
+        ))
+        for minute in (0, 15, 30, 45):
+            instant = start + timedelta(minutes=minute)
+            load_p50[instant.isoformat()] = 1800.0 if 17 <= local_hour < 20 else 550.0
+            load_p90[instant.isoformat()] = 2600.0 if 17 <= local_hour < 20 else 850.0
+    state = models.SiteState(
+        timestamp=now, pv_power_w=0.0, load_power_w=500.0,
+        load_includes_ev=False, grid_power_w=0.0,
+        grid_import_power_w=0.0, grid_export_power_w=0.0,
+        battery_soc_pct=42.0, battery_power_w=500.0,
+        inverter_online=True, inverter_status="normal",
+        easee_online=True, easee_status="disconnected", easee_power_w=0.0,
+        easee_session_kwh=0.0, easee_phase_mode="auto",
+        current_buy_price=0.45, current_sell_price=0.15,
+        forecast_today_kwh=22.4, price_slots=prices, solar_slots=solar,
+    )
+    candidate = optimizer.build_scenario_plan(
+        state, battery_mode="blue", load_p50_by_start=load_p50,
+        load_p90_by_start=load_p90, capacity_kwh=10.0,
+        min_soc=15.0, max_soc=100.0, learned_reserve_pct=0.0,
+        charge_rate_kwh_h=3.57, discharge_rate_kwh_h=3.57,
+        grid_charge_rate_kwh_h=1.15, battery_care_soc=98.0,
+        ev_load_by_start={}, ev_battery_protected=True, allow_grid_charge=True,
+    )
+    checks.append(("scenario MPC builds the full 48-hour candidate",
+                   candidate is not None and len(candidate.tasks) == 48,
+                   str(len(candidate.tasks) if candidate else None)))
+    checks.append(("candidate is scored in downside, median and upside scenarios",
+                   candidate is not None and len(candidate.score.scenarios) == 3,
+                   str(candidate.score.scenarios if candidate else None)))
+    checks.append(("15-minute replay preserves the 15% hard floor",
+                   candidate is not None
+                   and min(item.min_soc_pct for item in candidate.score.scenarios) >= 14.9,
+                   str([item.min_soc_pct for item in candidate.score.scenarios] if candidate else None)))
+    checks.append(("scenario candidate passes structural invariants",
+                   candidate is not None and candidate.score.valid,
+                   str(candidate.score.violations if candidate else None)))
+    realized_discharge = optimizer.score_realized_interval(
+        action="DISCHARGE", start_soc_pct=60.0, pv_kwh=0.0, load_kwh=0.5,
+        ev_kwh=0.0, duration_hours=0.25, import_price=2.5,
+        export_price=0.5, replacement_price=0.5, capacity_kwh=10.0,
+        min_soc=15.0, max_soc=100.0, battery_care_soc=98.0,
+        charge_rate_kwh_h=3.57, discharge_rate_kwh_h=3.57,
+        grid_charge_rate_kwh_h=1.15,
+    )
+    realized_hold = optimizer.score_realized_interval(
+        action="GRID_CHARGE", start_soc_pct=60.0, pv_kwh=0.0, load_kwh=0.5,
+        ev_kwh=0.0, duration_hours=0.25, import_price=2.5,
+        export_price=0.5, replacement_price=0.5, capacity_kwh=10.0,
+        min_soc=15.0, max_soc=100.0, battery_care_soc=98.0,
+        charge_rate_kwh_h=3.57, discharge_rate_kwh_h=3.57,
+        grid_charge_rate_kwh_h=1.15,
+    )
+    checks.append(("realized 15-minute replay prices the measured interval",
+                   realized_discharge.cost_kr < realized_hold.cost_kr,
+                   f"{realized_discharge.cost_kr}/{realized_hold.cost_kr}"))
+
+    lifecycle = decision_ledger.OptimizerLifecycle()
+    for day in range(7):
+        for quarter in range(14):
+            lifecycle.observe(
+                now=now + timedelta(days=day, minutes=15 * quarter),
+                version="0.27.0", advantage_kr=0.10, valid=True, live_fault=None,
+            )
+    checks.append(("optimizer promotes only after seven days and 96 comparisons",
+                   lifecycle.phase == "canary", lifecycle.status))
+    lifecycle.observe(
+        now=now + timedelta(days=7), version="0.27.0",
+        advantage_kr=0.1, valid=True, live_fault="avoidable_import_watchdog",
+    )
+    checks.append(("canary automatically rolls back on a live control fault",
+                   lifecycle.phase == "rollback"
+                   and lifecycle.rollback_reason == "avoidable_import_watchdog",
+                   lifecycle.status))
+    checks.append(("canary rejects a new paid grid-charge action",
+                   not optimizer.low_risk_canary(
+                       (models.PlanTask(now, "IDLE", 1.0),),
+                       (models.PlanTask(now, "GRID_CHARGE", 1.0),),
+                   ), "guard"))
+
+    learned = battery_model.BatteryModelState()
+    for _ in range(4):
+        learned = battery_model.observe_pv_charge_rate(
+            learned, 3.2, configured_kwh_h=3.57
+        )
+        learned = battery_model.observe_discharge_rate(
+            learned, 3.0, configured_kwh_h=3.57
+        )
+    checks.append(("physical model learns bounded PV and discharge rates",
+                   battery_model.effective_pv_charge_rate_kwh(learned, 3.57) < 3.57
+                   and battery_model.effective_discharge_rate_kwh(learned, 3.57) < 3.57,
+                   learned.as_dict()))
+    restored_lifecycle = decision_ledger.OptimizerLifecycle.from_dict(lifecycle.as_dict())
+    checks.append(("rollout and replay score survive a restart",
+                   restored_lifecycle.as_dict() == lifecycle.as_dict(),
+                   restored_lifecycle.status))
+    return checks
+
+
 def main():
     passed = failed = 0
     print("=" * 100)
@@ -8120,6 +8256,7 @@ def main():
                          ("CONTROL STABILITY REGRESSIONS · 2026-07-29", test_control_stability_regressions),
                          ("ROLLING PLAN · EV LOAD / P10 / AUDIT", test_rolling_planner_upgrade),
                          ("WINTER PLAN · DATED LOAD / BATTERY MODEL / PEAK", test_winter_planning_upgrade),
+                         ("NEXT LEVEL · 48H SCENARIO MPC / REPLAY / ROLLBACK", test_next_level_optimizer),
                          ("EV MINIMUM SOC · METERED RECOVERY", test_ev_minimum_recovery),
                          ("VALUE SENSOR BASELINE SYNC", test_value_sensor_baseline_sync),
                          ("PHASE F · SAVINGS / VALUE", test_f_savings),

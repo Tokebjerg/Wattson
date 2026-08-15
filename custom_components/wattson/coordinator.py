@@ -72,6 +72,9 @@ from .const import (
     CONF_SOLAR_CHARGE_PRIORITY_SOC,
     DEFAULT_SOLAR_CHARGE_PRIORITY_SOC,
     CONF_SOLAR_BIAS_HISTORY,
+    SOLAR_BIAS_MIN_DAYS,
+    SOLAR_BIAS_MIN_FACTOR,
+    SOLAR_BIAS_MAX_FACTOR,
     LOAD_SMOOTH_SECONDS,
     DERIVED_LOAD_MAX_W,
     CONF_EV_WINDOW_START,
@@ -111,6 +114,7 @@ from .const import (
     DEFAULT_NAME,
     DEFAULT_STALE_SECONDS,
     DOMAIN,
+    INTEGRATION_VERSION,
     EV_MODE_SOLAR_ONLY,
     EV_MODE_SCHEDULED_CHEAPEST,
     EV_MODES,
@@ -158,9 +162,13 @@ from .const import (
 from .battery_model import (
     BatteryModelState,
     effective_capacity_kwh,
+    effective_discharge_rate_kwh,
     effective_grid_rate_kwh,
+    effective_pv_charge_rate_kwh,
     observe_capacity,
+    observe_discharge_rate,
     observe_grid_rate,
+    observe_pv_charge_rate,
 )
 from .control import EaseeController, KlatremisController
 from .deye_contract import floor_sell_safe, force_discharge_register_open
@@ -194,9 +202,17 @@ from .horizon import (
 from .learning import (
     build_load_profile,
     forecast_load_w,
+    solar_bias_factor,
 )
 from .models import LoadProfile
 from .planning_engine import PlanningEngine
+from .decision_ledger import DecisionLedger, build_decision_record
+from .optimizer import (
+    build_scenario_plan,
+    low_risk_canary,
+    score_realized_interval,
+    score_schedule,
+)
 from .runtime import CadenceGate, TickContext, TickMetrics
 from .settings import WattsonConfig
 from .snapshot import SnapshotBuilder
@@ -240,6 +256,7 @@ def _canonical_load_forecast(
     *,
     outdoor_temperature_c: float | None,
     conservative: bool,
+    quarter_hour: bool = False,
 ) -> dict[str, float] | None:
     """Build a UTC-keyed forecast while evaluating learned buckets locally."""
     if profile is None:
@@ -250,6 +267,7 @@ def _canonical_load_forecast(
             dt_util.as_local(instant),
             outdoor_temperature_c=outdoor_temperature_c,
             conservative=conservative,
+            quarter_hour=quarter_hour,
         )
         for instant in instants
     }
@@ -677,11 +695,24 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_session_store = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.ev_session"
         )
+        self._decision_ledger_store = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}.decision_ledger"
+        )
+        self._decision_ledger = DecisionLedger()
+        self._optimizer_selected_engine = "incumbent"
+        self._optimizer_candidate_source: str | None = None
+        self._optimizer_active_score = None
+        self._optimizer_candidate_score = None
+        self._optimizer_interval: dict[str, Any] | None = None
         self._battery_model = BatteryModelState()
         self._battery_model_last_tick: datetime | None = None
         self._battery_model_capacity_day = None
         self._battery_model_grid_hours = 0.0
         self._battery_model_grid_kwh = 0.0
+        self._battery_model_pv_hours = 0.0
+        self._battery_model_pv_kwh = 0.0
+        self._battery_model_discharge_hours = 0.0
+        self._battery_model_discharge_kwh = 0.0
         self._ev_minimum_recovery: EvMinimumRecovery | None = None
         self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
@@ -727,6 +758,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Wattson could not restore EV minimum recovery: %s", err)
+        try:
+            self._decision_ledger = DecisionLedger.from_dict(
+                await self._decision_ledger_store.async_load()
+            )
+            self._decision_ledger.lifecycle.ensure_version(
+                now=dt_util.utcnow(),
+                version=INTEGRATION_VERSION,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson could not restore decision ledger: %s", err)
         await self._async_update_load_profile()
 
     def _apply_runtime_settings(self, settings: WattsonConfig) -> None:
@@ -801,7 +842,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_session.mark_persisted()
 
     async def _async_update_load_profile(self) -> None:
-        """Phase D: build the hour-of-day house-load profile from Recorder history.
+        """Build 15-minute and hourly house-load profiles from Recorder history.
 
         Defensive: any failure (no recorder, no statistics, API change) leaves the
         profile unchanged/None so the planner simply runs without a learned reserve.
@@ -818,7 +859,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             start = end - timedelta(days=LEARNING_WINDOW_DAYS)
             # EV exclusion: when the whole-site load includes the EV charger, the
             # car's 5-11 kW sessions would poison the HOUSE profile (the planner
-            # handles the EV separately). Fetch the charger's hourly statistics
+            # handles the EV separately). Fetch the charger's 5-minute statistics
             # too and subtract them. NOTE the Easee power sensor reports kW
             # (unit lesson learned 2026-06-09) — statistics keep the entity unit.
             ev_entity = (
@@ -833,7 +874,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 | ({temp_entity} if temp_entity else set())
             )
             stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period, self.hass, start, end, wanted, "hour", None, {"mean"}
+                statistics_during_period, self.hass, start, end, wanted, "5minute", None, {"mean"}
             )
             rows = stats.get(load_entity, []) if stats else []
 
@@ -845,14 +886,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     return raw_start
                 return None
 
-            ev_by_hour: dict[datetime, float] = {}
+            ev_by_period: dict[datetime, float] = {}
             for row in (stats.get(ev_entity, []) if (stats and ev_entity) else []):
                 ts = _row_ts(row)
                 mean = row.get("mean")
                 if ts is None or mean is None:
                     continue
                 try:
-                    ev_by_hour[ts] = float(mean) * 1000.0  # kW -> W
+                    ev_by_period[ts] = float(mean) * 1000.0  # kW -> W
                 except (TypeError, ValueError):
                     continue
             temperature_samples: list[tuple[datetime, float | None]] = []
@@ -897,10 +938,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 mean = row.get("mean")
                 if ts is None:
                     continue
-                if mean is not None and ts in ev_by_hour:
+                if mean is not None and ts in ev_by_period:
                     try:
                         raw = float(mean)
-                        mean = max(0.0, raw - ev_by_hour[ts])
+                        mean = max(0.0, raw - ev_by_period[ts])
                         # F5: a partial-hour EV session (or an over-counted Easee row)
                         # can subtract MORE than the hour's metered load, clamping the
                         # house bucket to 0 and dropping a real load sample. The F3
@@ -908,8 +949,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         # gap is visible.
                         if mean == 0.0 and raw > 300.0:
                             _LOGGER.debug(
-                                "Wattson load-learn: EV subtraction zeroed hour %s (house %.0fW - EV %.0fW)",
-                                ts, raw, ev_by_hour[ts],
+                                "Wattson load-learn: EV subtraction zeroed period %s (house %.0fW - EV %.0fW)",
+                                ts, raw, ev_by_period[ts],
                             )
                     except (TypeError, ValueError):
                         pass
@@ -978,6 +1019,20 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         ))
         return effective_grid_rate_kwh(self._battery_model, configured)
 
+    @property
+    def effective_pv_charge_rate_kwh(self) -> float:
+        return effective_pv_charge_rate_kwh(
+            self._battery_model,
+            battery_rate_kwh(self.battery_charge_current),
+        )
+
+    @property
+    def effective_discharge_rate_kwh(self) -> float:
+        return effective_discharge_rate_kwh(
+            self._battery_model,
+            battery_rate_kwh(self.battery_discharge_current),
+        )
+
     async def _async_update_battery_model(self) -> None:
         """Learn effective capacity/rate from clean physical segments."""
         state = self.site_state
@@ -1045,8 +1100,163 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._battery_model_grid_hours = 0.0
             self._battery_model_grid_kwh = 0.0
 
+        pv_charging = bool(
+            not grid_commanded
+            and valid_tick
+            and 10.0 <= state.battery_soc_pct <= 98.0
+            and state.battery_power_w < -100.0
+            and state.pv_power_w - state.load_power_w > 100.0
+        )
+        if pv_charging:
+            self._battery_model_pv_hours += dt_hours
+            self._battery_model_pv_kwh += (-state.battery_power_w / 1000.0) * dt_hours
+        elif self._battery_model_pv_hours > 0.0:
+            if self._battery_model_pv_hours >= 0.25 and self._battery_model_pv_kwh >= 0.2:
+                self._battery_model = observe_pv_charge_rate(
+                    self._battery_model,
+                    self._battery_model_pv_kwh / self._battery_model_pv_hours,
+                    configured_kwh_h=battery_rate_kwh(self.battery_charge_current),
+                    updated_at=now.isoformat(),
+                )
+            self._battery_model_pv_hours = 0.0
+            self._battery_model_pv_kwh = 0.0
+
+        discharging = bool(
+            valid_tick
+            and state.battery_power_w > 100.0
+            and state.grid_import_power_w < 300.0
+            and state.battery_soc_pct > 10.0
+        )
+        if discharging:
+            self._battery_model_discharge_hours += dt_hours
+            self._battery_model_discharge_kwh += (state.battery_power_w / 1000.0) * dt_hours
+        elif self._battery_model_discharge_hours > 0.0:
+            if (
+                self._battery_model_discharge_hours >= 0.25
+                and self._battery_model_discharge_kwh >= 0.2
+            ):
+                self._battery_model = observe_discharge_rate(
+                    self._battery_model,
+                    self._battery_model_discharge_kwh
+                    / self._battery_model_discharge_hours,
+                    configured_kwh_h=battery_rate_kwh(self.battery_discharge_current),
+                    updated_at=now.isoformat(),
+                )
+            self._battery_model_discharge_hours = 0.0
+            self._battery_model_discharge_kwh = 0.0
+
         if self._battery_model != previous:
             await self._battery_model_store.async_save(self._battery_model.as_dict())
+
+    def _accumulate_optimizer_interval(self, now: datetime) -> None:
+        """Accumulate measured exogenous energy for shadow counterfactual replay."""
+        interval = self._optimizer_interval
+        state = self.site_state
+        if interval is None or state is None:
+            return
+        last = interval.get("last_tick")
+        interval["last_tick"] = now
+        if not isinstance(last, datetime):
+            return
+        dt_hours = (now - last).total_seconds() / 3600.0
+        if dt_hours <= 0.0 or dt_hours > VALUE_MAX_TICK_SECONDS / 3600.0:
+            return
+        slot = current_price_slot(state.price_slots, state.timestamp)
+        import_price = (
+            slot.total_import_price
+            if slot is not None
+            else float(state.current_buy_price or 0.0)
+        )
+        export_price = (
+            slot.export_value
+            if slot is not None and slot.export_value is not None
+            else float(state.current_sell_price or 0.0)
+        )
+        interval["duration_hours"] += dt_hours
+        interval["pv_kwh"] += max(0.0, state.pv_power_w) / 1000.0 * dt_hours
+        interval["load_kwh"] += max(0.0, state.load_power_w) / 1000.0 * dt_hours
+        interval["ev_kwh"] += max(0.0, state.easee_power_w or 0.0) / 1000.0 * dt_hours
+        interval["import_price_hours"] += import_price * dt_hours
+        interval["export_price_hours"] += export_price * dt_hours
+
+    def _finish_optimizer_interval(self) -> dict[str, Any] | None:
+        interval = self._optimizer_interval
+        self._optimizer_interval = None
+        if interval is None or interval.get("duration_hours", 0.0) < 0.10:
+            return None
+        duration = float(interval["duration_hours"])
+        common = {
+            "start_soc_pct": interval["start_soc_pct"],
+            "pv_kwh": interval["pv_kwh"],
+            "load_kwh": interval["load_kwh"],
+            "ev_kwh": interval["ev_kwh"],
+            "duration_hours": duration,
+            "import_price": interval["import_price_hours"] / duration,
+            "export_price": interval["export_price_hours"] / duration,
+            "replacement_price": interval["replacement_price"],
+            "capacity_kwh": interval["capacity_kwh"],
+            "min_soc": interval["min_soc"],
+            "max_soc": interval["max_soc"],
+            "battery_care_soc": interval["battery_care_soc"],
+            "charge_rate_kwh_h": interval["charge_rate_kwh_h"],
+            "discharge_rate_kwh_h": interval["discharge_rate_kwh_h"],
+            "grid_charge_rate_kwh_h": interval["grid_charge_rate_kwh_h"],
+            "ev_battery_protected": True,
+        }
+        active = score_realized_interval(action=interval["active_action"], **common)
+        candidate = score_realized_interval(action=interval["candidate_action"], **common)
+        return {
+            "started_at": interval["started_at"],
+            "duration_hours": round(duration, 4),
+            "pv_kwh": round(interval["pv_kwh"], 4),
+            "load_kwh": round(interval["load_kwh"], 4),
+            "ev_kwh": round(interval["ev_kwh"], 4),
+            "active": active.__dict__,
+            "candidate": candidate.__dict__,
+            "advantage_kr": round(active.cost_kr - candidate.cost_kr, 5),
+            "candidate_valid": bool(interval["candidate_valid"]),
+        }
+
+    def _start_optimizer_interval(
+        self,
+        *,
+        now: datetime,
+        active_action: str,
+        candidate_action: str,
+        candidate_valid: bool,
+        capacity_kwh: float,
+        min_soc: float,
+        max_soc: float,
+        grid_charge_rate_kwh_h: float,
+    ) -> None:
+        future_prices = [
+            slot.total_import_price
+            for slot in (self.site_state.price_slots if self.site_state else [])
+            if slot.start >= now and not slot.estimated
+        ]
+        replacement_price = max(0.0, min(future_prices, default=0.0))
+        self._optimizer_interval = {
+            "started_at": now.isoformat(),
+            "last_tick": now,
+            "duration_hours": 0.0,
+            "pv_kwh": 0.0,
+            "load_kwh": 0.0,
+            "ev_kwh": 0.0,
+            "import_price_hours": 0.0,
+            "export_price_hours": 0.0,
+            "start_soc_pct": self.site_state.battery_soc_pct if self.site_state else min_soc,
+            "active_action": active_action,
+            "candidate_action": candidate_action,
+            "candidate_valid": candidate_valid,
+            "replacement_price": replacement_price,
+            "capacity_kwh": capacity_kwh,
+            "min_soc": min_soc,
+            "max_soc": max_soc,
+            "battery_care_soc": self.battery_care_soc,
+            "charge_rate_kwh_h": self.effective_pv_charge_rate_kwh,
+            "discharge_rate_kwh_h": self.effective_discharge_rate_kwh,
+            "grid_charge_rate_kwh_h": grid_charge_rate_kwh_h,
+        }
 
     async def _async_update_ev_minimum_recovery(
         self,
@@ -1341,21 +1551,32 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._solar_forecast_degraded = True
 
     def _apply_solar_bias(self) -> None:
-        """Scale the (raw) Solcast forecast slots by the learned correction factor
-        so planning uses bias-corrected production. Call AFTER _accumulate_solar_bias
-        (which must see the raw forecast)."""
+        """Apply calibrated morning/midday/evening Solcast correction factors."""
         state = self.site_state
-        factor = self._solar_bias_factor
-        if state is None or factor == 1.0 or not state.solar_slots:
+        if state is None or not state.solar_slots:
             return
+
+        def _factor(slot: SolarSlot) -> float:
+            hour = dt_util.as_local(slot.start).hour
+            bucket = "morning" if hour < 11 else ("midday" if hour < 16 else "evening")
+            history = getattr(self, "_solar_bias_bucket_history", {}).get(bucket, [])
+            if len(history) < SOLAR_BIAS_MIN_DAYS:
+                return self._solar_bias_factor
+            return solar_bias_factor(
+                history,
+                min_days=SOLAR_BIAS_MIN_DAYS,
+                lo=SOLAR_BIAS_MIN_FACTOR,
+                hi=SOLAR_BIAS_MAX_FACTOR,
+            )
+
         self.site_state = replace(
             state,
             solar_slots=[
                 replace(
                     s,
-                    pv_estimate_kwh=s.pv_estimate_kwh * factor,
-                    pv_estimate10_kwh=(s.pv_estimate10_kwh * factor if s.pv_estimate10_kwh is not None else None),
-                    pv_estimate90_kwh=(s.pv_estimate90_kwh * factor if s.pv_estimate90_kwh is not None else None),
+                    pv_estimate_kwh=s.pv_estimate_kwh * _factor(s),
+                    pv_estimate10_kwh=(s.pv_estimate10_kwh * _factor(s) if s.pv_estimate10_kwh is not None else None),
+                    pv_estimate90_kwh=(s.pv_estimate90_kwh * _factor(s) if s.pv_estimate90_kwh is not None else None),
                 )
                 for s in state.solar_slots
             ],
@@ -2523,6 +2744,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._accumulate_export_revenue()
             self._accumulate_counterfactual()
             self._accumulate_battery_health()
+            self._accumulate_optimizer_interval(tick.now)
         if self._cadence.due(
             "battery_model",
             tick.now,
@@ -2555,10 +2777,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # Canonical physical instants preserve both 02:00 hours on the autumn
         # DST fold. Python considers two local ZoneInfo datetimes with different
         # ``fold`` values equal, so a local set/dict silently loses one of them.
-        _forecast_instants = unique_utc_instants((
+        _hourly_forecast_instants = unique_utc_instants((
             *(slot.start for slot in self.site_state.price_slots),
             *(slot.start for slot in self.site_state.solar_slots),
         ))
+        _forecast_instants = _hourly_forecast_instants
+        _scenario_instants = unique_utc_instants(
+            instant + timedelta(minutes=offset)
+            for instant in _hourly_forecast_instants
+            for offset in (0, 15, 30, 45)
+        )
         # Keep lookup keys in canonical UTC. Providers are free to expose the
         # same physical slot as UTC or local time; the planner canonicalises the
         # lookup while the learned profile is still evaluated in local time.
@@ -2573,6 +2801,20 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             _forecast_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
             conservative=True,
+        )
+        _scenario_load = _canonical_load_forecast(
+            self.load_profile,
+            _scenario_instants,
+            outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            conservative=False,
+            quarter_hour=True,
+        )
+        _scenario_reserve_load = _canonical_load_forecast(
+            self.load_profile,
+            _scenario_instants,
+            outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            conservative=True,
+            quarter_hour=True,
         )
         raw_learned_reserve_pct = self._learned_reserve_pct()
         learned_reserve_pct = raw_learned_reserve_pct
@@ -2769,8 +3011,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ),
         )
         if _replan_reason is not None and self.site_state.price_slots:
+            _realized_outcome = self._finish_optimizer_interval()
+            if _realized_outcome is not None:
+                self._decision_ledger.attach_outcome(_realized_outcome)
             _previous_day_plan = self._day_plan
-            _new_day_plan = self._planning_engine.battery.build_day_plan(
+            _active_day_plan = self._planning_engine.battery.build_day_plan(
                 self.site_state,
                 battery_mode=self.battery_mode,
                 min_soc=_min_soc,
@@ -2791,13 +3036,207 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 ev_battery_protected=_ev_battery_protected,
                 allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
             )
-            if _new_day_plan is not None:
+            if _active_day_plan is not None:
                 if _replan_reason == "rolling_15m":
-                    _new_day_plan = preserve_routine_discharge_commitments(
+                    _active_day_plan = preserve_routine_discharge_commitments(
                         _previous_day_plan,
-                        _new_day_plan,
+                        _active_day_plan,
                     )
-                self._day_plan = _new_day_plan
+                _candidate = build_scenario_plan(
+                    self.site_state,
+                    battery_mode=self.battery_mode,
+                    load_p50_by_start=_load_hourly,
+                    load_p90_by_start=_reserve_load,
+                    evaluation_load_p50_by_start=_scenario_load,
+                    evaluation_load_p90_by_start=_scenario_reserve_load,
+                    capacity_kwh=_capacity,
+                    min_soc=_min_soc,
+                    max_soc=_max_soc,
+                    learned_reserve_pct=learned_reserve_pct,
+                    charge_rate_kwh_h=self.effective_pv_charge_rate_kwh,
+                    discharge_rate_kwh_h=self.effective_discharge_rate_kwh,
+                    grid_charge_rate_kwh_h=_grid_charge_rate,
+                    battery_care_soc=self.battery_care_soc,
+                    ev_load_by_start=_ev_load_by_start,
+                    ev_battery_protected=_ev_battery_protected,
+                    allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
+                )
+                _candidate_day_plan = None
+                if _candidate is not None:
+                    _candidate_day_plan = self._planning_engine.battery.build_day_plan(
+                        self.site_state,
+                        battery_mode=self.battery_mode,
+                        min_soc=_min_soc,
+                        max_soc=_max_soc,
+                        capacity_kwh=_capacity,
+                        load_hourly_w=_load_hourly,
+                        reserve_load_by_start_w=_reserve_load,
+                        learned_reserve_pct=learned_reserve_pct,
+                        learned_reserve_by_start_pct=_learned_reserve_by_start,
+                        reserve_hold_margin=self.reserve_hold_margin,
+                        solar_charge_priority_soc=solar_charge_priority,
+                        charge_current_a=self.battery_charge_current,
+                        discharge_current_a=self.battery_discharge_current,
+                        battery_care_soc=self.battery_care_soc,
+                        grid_charge_rate_kwh=_grid_charge_rate,
+                        forecast_confidence=self._forecast_confidence,
+                        ev_load_by_start=_ev_load_by_start,
+                        ev_battery_protected=_ev_battery_protected,
+                        allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
+                        schedule_override=_candidate.tasks,
+                    )
+                    if _candidate_day_plan is not None and _replan_reason == "rolling_15m":
+                        _candidate_day_plan = preserve_routine_discharge_commitments(
+                            _previous_day_plan,
+                            _candidate_day_plan,
+                        )
+
+                _active_score = score_schedule(
+                    _active_day_plan.tasks,
+                    self.site_state,
+                    load_p50_by_start=_scenario_load,
+                    load_p90_by_start=_scenario_reserve_load,
+                    ev_load_by_start=_ev_load_by_start,
+                    capacity_kwh=_capacity,
+                    min_soc=_min_soc,
+                    max_soc=_max_soc,
+                    charge_rate_kwh_h=self.effective_pv_charge_rate_kwh,
+                    discharge_rate_kwh_h=self.effective_discharge_rate_kwh,
+                    grid_charge_rate_kwh_h=_grid_charge_rate,
+                    battery_care_soc=self.battery_care_soc,
+                )
+                _candidate_score = (
+                    score_schedule(
+                        _candidate_day_plan.tasks[:len(_active_day_plan.tasks)],
+                        self.site_state,
+                        load_p50_by_start=_scenario_load,
+                        load_p90_by_start=_scenario_reserve_load,
+                        ev_load_by_start=_ev_load_by_start,
+                        capacity_kwh=_capacity,
+                        min_soc=_min_soc,
+                        max_soc=_max_soc,
+                        charge_rate_kwh_h=self.effective_pv_charge_rate_kwh,
+                        discharge_rate_kwh_h=self.effective_discharge_rate_kwh,
+                        grid_charge_rate_kwh_h=_grid_charge_rate,
+                        battery_care_soc=self.battery_care_soc,
+                    )
+                    if _candidate_day_plan is not None
+                    else None
+                )
+                _live_fault = None
+                if (
+                    self.site_state.stale_required_entities
+                    or self.site_state.missing_entities
+                    or self.site_state.issues
+                ):
+                    _live_fault = "degraded_required_input"
+                elif self.site_state.battery_soc_pct < _min_soc - 0.5:
+                    _live_fault = "battery_soc_below_hard_floor"
+                elif self._avoidable_import_watchdog_active:
+                    _live_fault = "avoidable_import_watchdog"
+
+                _selected_day_plan = _active_day_plan
+                self._optimizer_selected_engine = "incumbent"
+                self._optimizer_candidate_source = _candidate.source if _candidate else None
+                self._optimizer_active_score = _active_score
+                self._optimizer_candidate_score = _candidate_score
+                if _candidate_score is not None:
+                    _advantage = (
+                        _active_score.risk_adjusted_cost_kr
+                        - _candidate_score.risk_adjusted_cost_kr
+                    )
+                    if _advantage < -1.0:
+                        _live_fault = _live_fault or "candidate_model_regret"
+                    if _realized_outcome is not None:
+                        self._decision_ledger.lifecycle.observe(
+                            now=_now_local,
+                            version=INTEGRATION_VERSION,
+                            advantage_kr=float(_realized_outcome["advantage_kr"]),
+                            valid=bool(_realized_outcome["candidate_valid"]),
+                            live_fault=_live_fault,
+                        )
+                    elif (
+                        _live_fault is not None
+                        and self._decision_ledger.lifecycle.phase in {"canary", "active"}
+                    ):
+                        self._decision_ledger.lifecycle.observe(
+                            now=_now_local,
+                            version=INTEGRATION_VERSION,
+                            advantage_kr=_advantage,
+                            valid=_candidate_score.valid,
+                            live_fault=_live_fault,
+                        )
+                    _phase = self._decision_ledger.lifecycle.phase
+                    _canary_safe = low_risk_canary(
+                        tuple(_active_day_plan.tasks),
+                        tuple(_candidate_day_plan.tasks),
+                    )
+                    if (
+                        _live_fault is None
+                        and _candidate_score.valid
+                        and (
+                            _phase == "active"
+                            or (_phase == "canary" and _canary_safe)
+                        )
+                    ):
+                        _selected_day_plan = _candidate_day_plan
+                        self._optimizer_selected_engine = "scenario_mpc"
+                        self._decision_ledger.lifecycle.mark_candidate_used()
+                    self._decision_ledger.append(
+                        build_decision_record(
+                            now=_now_local,
+                            version=INTEGRATION_VERSION,
+                            replan_reason=_replan_reason,
+                            state=self.site_state,
+                            active_tasks=tuple(_active_day_plan.tasks),
+                            candidate_tasks=tuple(_candidate_day_plan.tasks),
+                            active_score=_active_score,
+                            candidate_score=_candidate_score,
+                            selected_engine=self._optimizer_selected_engine,
+                            candidate_source=_candidate.source if _candidate else "none",
+                            load_p50_by_start=_scenario_load or _load_hourly or {},
+                            load_p90_by_start=_scenario_reserve_load or _reserve_load or {},
+                            ev_load_by_start=_ev_load_by_start,
+                            config={
+                                "battery_mode": self.battery_mode,
+                                "min_soc": _min_soc,
+                                "max_soc": _max_soc,
+                                "capacity_kwh": _capacity,
+                                "battery_care_soc": self.battery_care_soc,
+                                "charge_rate_kwh_h": self.effective_pv_charge_rate_kwh,
+                                "discharge_rate_kwh_h": self.effective_discharge_rate_kwh,
+                                "grid_charge_rate_kwh_h": _grid_charge_rate,
+                                "learned_reserve_pct": learned_reserve_pct,
+                                "allow_grid_charge": _allow_grid_charge and not _cold_grid_charge_blocked,
+                            },
+                        )
+                    )
+                    await self._decision_ledger_store.async_save(
+                        self._decision_ledger.as_dict()
+                    )
+                    self._start_optimizer_interval(
+                        now=_now_local,
+                        active_action=_active_day_plan.tasks[0].action,
+                        candidate_action=_candidate_day_plan.tasks[0].action,
+                        candidate_valid=_candidate_score.valid,
+                        capacity_kwh=_capacity,
+                        min_soc=_min_soc,
+                        max_soc=_max_soc,
+                        grid_charge_rate_kwh_h=_grid_charge_rate,
+                    )
+                elif self._decision_ledger.lifecycle.phase in {"canary", "active"}:
+                    self._decision_ledger.lifecycle.observe(
+                        now=_now_local,
+                        version=INTEGRATION_VERSION,
+                        advantage_kr=0.0,
+                        valid=False,
+                        live_fault="candidate_unavailable",
+                    )
+                    await self._decision_ledger_store.async_save(
+                        self._decision_ledger.as_dict()
+                    )
+
+                self._day_plan = _selected_day_plan
                 self._day_plan_fp = _plan_fp
                 self._last_replan_at = _now_local
                 self._last_replan_reason = _replan_reason
@@ -3422,7 +3861,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             schedule_override=(
                 tuple(
                     task for task in self._day_plan.tasks
-                    if task.start + timedelta(hours=1) > self.site_state.timestamp
+                    if task.start + timedelta(minutes=max(1, task.duration_minutes))
+                    > self.site_state.timestamp
                 )
                 if self._day_plan else None
             ),

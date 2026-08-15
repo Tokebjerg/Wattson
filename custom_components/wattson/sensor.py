@@ -187,6 +187,8 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             "hourly_p90_w": {str(h): round(c.load_profile.hourly_p90_w.get(h, 0.0)) for h in range(24)},
             "forecast_hourly_w": _daily_load_forecast(c),
             "forecast_p90_hourly_w": _daily_load_forecast(c, conservative=True),
+            "quarter_hour_buckets": len(c.load_profile.quarter_hourly_w),
+            "quarter_hour_p90_buckets": len(c.load_profile.quarter_hourly_p90_w),
             "outdoor_temperature_c": (
                 c.site_state.outdoor_temperature_c if c.site_state else None
             ),
@@ -219,6 +221,12 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             "effective_grid_charge_rate_kwh": round(c.effective_grid_charge_rate_kwh, 3),
             "learned_grid_charge_rate_kwh": c._battery_model.grid_charge_rate_kwh,
             "grid_rate_observations": c._battery_model.grid_rate_observations,
+            "effective_pv_charge_rate_kwh": round(c.effective_pv_charge_rate_kwh, 3),
+            "learned_pv_charge_rate_kwh": c._battery_model.pv_charge_rate_kwh,
+            "pv_rate_observations": c._battery_model.pv_rate_observations,
+            "effective_discharge_rate_kwh": round(c.effective_discharge_rate_kwh, 3),
+            "learned_discharge_rate_kwh": c._battery_model.discharge_rate_kwh,
+            "discharge_rate_observations": c._battery_model.discharge_rate_observations,
             "updated_at": c._battery_model.updated_at,
         },
     ),
@@ -249,15 +257,41 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             # #5/v0.24.36: the reserve-release confidence derived from the same ratios —
             # 1.0 = full trust, 0.6 floor = recent optimistic forecasts hold more reserve.
             "forecast_confidence": round(getattr(c, "_forecast_confidence", 1.0), 3),
-            # #12 (observe-only): today's actual/forecast ratio per time-of-day bucket —
-            # measures whether morning/midday/evening forecasts are biased differently
-            # (not yet applied to control). null until a bucket has meaningful forecast.
+            "bucket_history": getattr(c, "_solar_bias_bucket_history", {}),
+            # Today's actual/forecast ratio per bucket. Persisted bucket history
+            # is applied after three observations; sparse buckets use global bias.
             "time_of_day_bias_today": {
                 b: round(getattr(c, "_tod_actual_wh", {}).get(b, 0.0)
                          / getattr(c, "_tod_forecast_wh", {}).get(b, 0.0), 3)
                 if getattr(c, "_tod_forecast_wh", {}).get(b, 0.0) > 200.0 else None
                 for b in ("morning", "midday", "evening")
             },
+        },
+    ),
+    WattsonSensorDescription(
+        key="optimizer_status",
+        name="Optimizer Status",
+        icon="mdi:chart-timeline-variant-shimmer",
+        value_fn=lambda c: c._decision_ledger.lifecycle.phase,
+        attrs_fn=lambda c: {
+            **c._decision_ledger.lifecycle.status,
+            **c._decision_ledger.replay_status,
+            "selected_engine": c._optimizer_selected_engine,
+            "candidate_source": c._optimizer_candidate_source,
+            "horizon_hours": 48,
+            "evaluation_step_minutes": 15,
+            "active_score": (
+                c._optimizer_active_score.risk_adjusted_cost_kr
+                if c._optimizer_active_score else None
+            ),
+            "candidate_score": (
+                c._optimizer_candidate_score.risk_adjusted_cost_kr
+                if c._optimizer_candidate_score else None
+            ),
+            "candidate_violations": (
+                list(c._optimizer_candidate_score.violations)
+                if c._optimizer_candidate_score else []
+            ),
         },
     ),
     WattsonSensorDescription(
@@ -379,6 +413,11 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     else None
                 ),
                 "replans_today": getattr(self.coordinator, "replan_count_today", 0),
+                "optimizer": {
+                    **self.coordinator._decision_ledger.lifecycle.status,
+                    "selected_engine": self.coordinator._optimizer_selected_engine,
+                    "candidate_source": self.coordinator._optimizer_candidate_source,
+                },
                 "ev_runtime_state": control_plan.ev_runtime_state if control_plan else None,
                 "battery_override": getattr(self.coordinator, "battery_override_execution", {}),
                 "ev_override": getattr(self.coordinator, "ev_override_execution", {}),

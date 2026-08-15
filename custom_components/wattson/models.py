@@ -82,6 +82,16 @@ class LoadProfile:
     hourly_p90_w: dict[int, float] = field(default_factory=dict)
     weekday_p90_w: dict[int, float] = field(default_factory=dict)
     weekend_p90_w: dict[int, float] = field(default_factory=dict)
+    # 15-minute load shape (index 0-95). The hourly maps remain the stable
+    # public/fallback contract; the quarter-hour maps let the scenario engine
+    # evaluate short cooking/heating peaks without pretending the whole hour
+    # has the same demand.
+    quarter_hourly_w: dict[int, float] = field(default_factory=dict)
+    weekday_quarter_hourly_w: dict[int, float] = field(default_factory=dict)
+    weekend_quarter_hourly_w: dict[int, float] = field(default_factory=dict)
+    quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
+    weekday_quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
+    weekend_quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
     # Robust cold-load model: extra house demand per degree below the reference
     # temperature. Zero samples/slope means weather correction is inactive.
     temperature_reference_c: float | None = None
@@ -107,6 +117,31 @@ class LoadProfile:
             return self.hourly_p90_w or self.hourly_w
         bucket = self.weekend_p90_w if day.weekday() >= 5 else self.weekday_p90_w
         return bucket or self.hourly_p90_w or self.hourly_for(day)
+
+    def quarter_hourly_for(
+        self,
+        day: "datetime | date | None",
+        *,
+        conservative: bool = False,
+    ) -> dict[int, float]:
+        """15-minute table for ``day``, falling back to the hourly profile."""
+        if conservative:
+            if day is None:
+                return self.quarter_hourly_p90_w
+            bucket = (
+                self.weekend_quarter_hourly_p90_w
+                if day.weekday() >= 5
+                else self.weekday_quarter_hourly_p90_w
+            )
+            return bucket or self.quarter_hourly_p90_w
+        if day is None:
+            return self.quarter_hourly_w
+        bucket = (
+            self.weekend_quarter_hourly_w
+            if day.weekday() >= 5
+            else self.weekday_quarter_hourly_w
+        )
+        return bucket or self.quarter_hourly_w
 
 
 @dataclass(frozen=True)
@@ -262,6 +297,7 @@ class PlanTask:
     # Physical Deye discharge floor committed for this hour.  Keeping it on the
     # public task makes the dashboard SOC curve auditable against the inverter.
     tou_floor_pct: float | None = None
+    duration_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -292,6 +328,7 @@ class SlotPlan:
     reserve_protected_kwh: float = 0.0
     reserve_protected_value_kr: float = 0.0
     reserve_buffer_kwh: float = 0.0
+    duration_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -311,7 +348,9 @@ class DayPlan:
                 current = slot
             else:
                 break
-        if current is not None and (now - current.start).total_seconds() < 3600:
+        if current is not None and (
+            now - current.start
+        ).total_seconds() < max(1, current.duration_minutes) * 60:
             return current
         return None
 
@@ -320,7 +359,8 @@ class DayPlan:
         if self.initial_soc_pct is None or not self.slots:
             return None
         for index, slot in enumerate(self.slots):
-            if not (slot.start <= now < slot.start + timedelta(hours=1)):
+            slot_end = slot.start + timedelta(minutes=max(1, slot.duration_minutes))
+            if not (slot.start <= now < slot_end):
                 continue
             end_soc = slot.projected_soc_pct
             if end_soc is None:
@@ -333,7 +373,7 @@ class DayPlan:
             if start_soc is None:
                 return None
             effective_start = max(slot.start, self.built_at) if index == 0 else slot.start
-            duration = max(1.0, (slot.start + timedelta(hours=1) - effective_start).total_seconds())
+            duration = max(1.0, (slot_end - effective_start).total_seconds())
             progress = max(0.0, min(1.0, (now - effective_start).total_seconds() / duration))
             return float(start_soc) + (float(end_soc) - float(start_soc)) * progress
         return None
