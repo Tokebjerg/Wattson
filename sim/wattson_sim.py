@@ -7442,6 +7442,166 @@ def test_rolling_planner_upgrade():
                    reason(soc_deviation_pct=7.4) is None
                    and reason(soc_deviation_pct=7.5) == "soc_deviation:+7.5pp",
                    f"{reason(soc_deviation_pct=7.4)}/{reason(soc_deviation_pct=7.5)}"))
+    checks.append(("morning reserve lowers the SOC-deviation trigger to 2.5pp",
+                   reason(soc_deviation_pct=-2.4, soc_deviation_threshold_pct=2.5) is None
+                   and reason(soc_deviation_pct=-2.5, soc_deviation_threshold_pct=2.5)
+                   == "soc_deviation:-2.5pp",
+                   str(reason(soc_deviation_pct=-2.5, soc_deviation_threshold_pct=2.5))))
+
+    bridge_base = datetime(2026, 8, 21, 0, 0, tzinfo=timezone.utc)
+    bridge_prices_values = [1.90, 1.81, 1.73, 1.73, 1.74, 1.86, 2.12, 2.16, 1.95]
+    bridge_p50_solar = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.085, 0.665, 1.799]
+    bridge_p10_solar = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.040, 0.300, 1.100]
+    bridge_p50_load = [341, 358, 341, 354, 334, 334, 685, 634, 550]
+    bridge_p90_load = [500, 500, 500, 500, 500, 500, 1250, 900, 700]
+    bridge_prices = [models.PriceSlot(
+        start=bridge_base + timedelta(hours=hour),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.5,
+    ) for hour, price in enumerate(bridge_prices_values)]
+    bridge_solar = [models.SolarSlot(
+        start=bridge_base + timedelta(hours=hour),
+        pv_estimate_kwh=bridge_p50_solar[hour],
+        pv_estimate10_kwh=bridge_p10_solar[hour],
+        pv_estimate90_kwh=bridge_p50_solar[hour],
+    ) for hour in range(9)]
+    bridge_tasks = [models.PlanTask(
+        start=bridge_base + timedelta(hours=hour),
+        action="DISCHARGE",
+        total_import_price=bridge_prices_values[hour],
+        pv_estimate_kwh=bridge_p50_solar[hour],
+        load_estimate_kwh=bridge_p50_load[hour] / 1000.0,
+        projected_soc_pct=max(15.0, 49.0 - 4.0 * hour),
+        reason="morning regression",
+    ) for hour in range(9)]
+    bridge_p90 = {
+        bridge_base + timedelta(hours=hour): value
+        for hour, value in enumerate(bridge_p90_load)
+    }
+    bridge_reserve = planner.morning_bridge_reserve_by_start(
+        bridge_tasks,
+        price_slots=bridge_prices,
+        solar_slots=bridge_solar,
+        reserve_load_by_start_w=bridge_p90,
+        ev_battery_protected=True,
+        hold_margin=0.15,
+        discharge_rate_kwh_h=3.57,
+        local_timezone=timezone.utc,
+    )
+    checks.append(("morning bridge starts in the cheapest night valley and releases at the final peak",
+                   bridge_base not in bridge_reserve
+                   and bridge_base + timedelta(hours=1) not in bridge_reserve
+                   and bridge_reserve[bridge_base + timedelta(hours=2)][0] > 2.0
+                   and 0.9 < bridge_reserve[bridge_base + timedelta(hours=6)][0] < 1.3
+                   and bridge_base + timedelta(hours=7) not in bridge_reserve,
+                   str(bridge_reserve)))
+    flat_prices = [replace(slot, total_import_price=1.75, spot_price=1.75)
+                   for slot in bridge_prices]
+    flat_bridge = planner.morning_bridge_reserve_by_start(
+        bridge_tasks,
+        price_slots=flat_prices,
+        solar_slots=bridge_solar,
+        reserve_load_by_start_w=bridge_p90,
+        ev_battery_protected=True,
+        hold_margin=0.15,
+        discharge_rate_kwh_h=3.57,
+        local_timezone=timezone.utc,
+    )
+    checks.append(("morning bridge does not hold energy without a material morning premium",
+                   flat_bridge == {}, str(flat_bridge)))
+    uplifted_bridge = planner.morning_bridge_reserve_by_start(
+        bridge_tasks,
+        price_slots=bridge_prices,
+        solar_slots=bridge_solar,
+        reserve_load_by_start_w=bridge_p90,
+        ev_battery_protected=True,
+        hold_margin=0.15,
+        discharge_rate_kwh_h=3.57,
+        local_timezone=timezone.utc,
+        live_load_uplift_w=750.0,
+    )
+    checks.append(("sustained morning P90 miss increases the remaining protected energy",
+                   uplifted_bridge[bridge_base + timedelta(hours=6)][0]
+                   > bridge_reserve[bridge_base + timedelta(hours=6)][0],
+                   f"base={bridge_reserve} uplifted={uplifted_bridge}"))
+
+    uplift_samples = []
+    uplift = 0.0
+    for minute in range(6):
+        uplift_samples, uplift = co_mod._sustained_morning_load_uplift(
+            uplift_samples,
+            now=bridge_base + timedelta(minutes=minute),
+            local_hour=6,
+            measured_house_load_w=2100.0,
+            p90_house_load_w=1200.0,
+        )
+    spike_samples, spike_uplift = co_mod._sustained_morning_load_uplift(
+        [],
+        now=bridge_base,
+        local_hour=6,
+        measured_house_load_w=4000.0,
+        p90_house_load_w=1200.0,
+    )
+    cleared_samples, cleared_uplift = co_mod._sustained_morning_load_uplift(
+        uplift_samples,
+        now=bridge_base + timedelta(hours=10),
+        local_hour=10,
+        measured_house_load_w=2100.0,
+        p90_house_load_w=1200.0,
+    )
+    checks.append(("live morning uplift requires five sustained minutes and clears after 09:00",
+                   uplift == 750.0 and spike_uplift == 0.0
+                   and spike_samples and cleared_uplift == 0.0
+                   and cleared_samples == [],
+                   f"sustained={uplift} spike={spike_uplift} cleared={cleared_uplift}"))
+
+    bridge_state = models.SiteState(
+        timestamp=bridge_base + timedelta(minutes=30),
+        pv_power_w=0.0,
+        load_power_w=341.0,
+        load_includes_ev=True,
+        grid_power_w=0.0,
+        grid_import_power_w=0.0,
+        grid_export_power_w=0.0,
+        battery_soc_pct=53.0,
+        battery_power_w=341.0,
+        inverter_online=True,
+        inverter_status="ok",
+        easee_online=True,
+        easee_status="awaiting_start",
+        easee_power_w=0.0,
+        easee_session_kwh=0.0,
+        easee_phase_mode="three_phase",
+        current_buy_price=1.90,
+        current_sell_price=0.5,
+        forecast_today_kwh=sum(bridge_p50_solar),
+        price_slots=bridge_prices,
+        solar_slots=bridge_solar,
+    )
+    bridge_plan = planner.build_day_plan(
+        bridge_state,
+        battery_mode="blue",
+        min_soc=15.0,
+        max_soc=100.0,
+        capacity_kwh=10.0,
+        load_hourly_w={
+            bridge_base + timedelta(hours=hour): value
+            for hour, value in enumerate(bridge_p50_load)
+        },
+        reserve_load_by_start_w=bridge_p90,
+        ev_battery_protected=True,
+        allow_grid_charge=False,
+        schedule_override=bridge_tasks,
+    )
+    bridge_slots = {slot.start: slot for slot in bridge_plan.slots} if bridge_plan else {}
+    checks.append(("committed morning bridge raises only hold floors and never enables grid charge",
+                   bool(bridge_slots)
+                   and "morning bridge" in bridge_slots[bridge_base + timedelta(hours=2)].reason
+                   and bridge_slots[bridge_base + timedelta(hours=2)].tou_floor_pct >= 35.0
+                   and not any(slot.grid_charge for slot in bridge_slots.values()),
+                   str(bridge_slots)))
     checks.append(("manual SOC settings cannot cross their paired boundaries",
                    co_mod._clamp_battery_min_soc(95.0, 90.0) == 89.0
                    and co_mod._clamp_battery_max_soc(20.0, 25.0) == 26.0

@@ -398,6 +398,12 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
         site_state: SiteState | None = getattr(self.coordinator, "site_state", None)
         control_plan: ControlPlan | None = getattr(self.coordinator, "control_plan", None)
         if self.entity_description.key == "site_status" and site_state is not None:
+            day_plan = getattr(self.coordinator, "_day_plan", None)
+            current_day_slot = (
+                day_plan.slot_for(site_state.timestamp)
+                if day_plan is not None
+                else None
+            )
             return {
                 "stale_entities": site_state.stale_entities,
                 "missing_entities": site_state.missing_entities,
@@ -451,14 +457,30 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     ).items()
                 },
                 "reserve_floor_cap_pct": (
-                    getattr(
-                        self.coordinator._day_plan.slot_for(site_state.timestamp),
-                        "reserve_floor_cap_pct",
-                        None,
-                    )
-                    if getattr(self.coordinator, "_day_plan", None) is not None
-                    else None
+                    getattr(current_day_slot, "reserve_floor_cap_pct", None)
                 ),
+                "morning_bridge": {
+                    "active": bool(
+                        current_day_slot is not None
+                        and "morning bridge" in current_day_slot.reason
+                    ),
+                    "protected_kwh": round(
+                        getattr(current_day_slot, "reserve_protected_kwh", 0.0),
+                        3,
+                    ),
+                    "floor_pct": getattr(
+                        current_day_slot,
+                        "tou_floor_pct",
+                        None,
+                    ),
+                    "live_load_uplift_w": round(
+                        getattr(
+                            self.coordinator,
+                            "_morning_load_uplift_w",
+                            0.0,
+                        )
+                    ),
+                },
                 "physical_tou_floor_pct": (
                     control_plan.battery.desired_tou_capacity_pct if control_plan else None
                 ),

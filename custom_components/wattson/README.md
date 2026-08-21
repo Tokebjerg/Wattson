@@ -50,11 +50,11 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
-Version 0.27.0 adds a restart-safe seven-day decision ledger, exact
-counterfactual scorecards, a 48-hour P10/P50/P90 scenario candidate evaluated at
-15-minute cadence, staged shadow/canary/active rollout with automatic rollback,
-15-minute load learning, time-of-day solar calibration and learned PV/discharge
-rates. The established planner remains active until the candidate has at least
-seven days and 96 valid comparisons with no material regression. Existing entity
-IDs, services, safety floors, manual overrides and the physical 70 A ceiling are
-unchanged.
+Version 0.27.1 adds a hold-only overnight-to-morning bridge. From the cheapest
+pre-06 price valley it protects materially valuable 06:00-09:00 P90 house load
+after P10 solar, then releases the reserve into the morning peak. A sustained
+five-minute load miss can raise the bridge in bounded 250 W steps, and an active
+morning guard replans on a 2.5 percentage-point SOC deviation. The bridge cannot
+enable grid charging or exceed energy already in the battery. The staged
+48-hour optimizer, entity IDs, services, manual overrides, 15% hard floor and
+physical 70 A ceiling are unchanged.

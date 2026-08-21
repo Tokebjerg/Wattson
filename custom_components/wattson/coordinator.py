@@ -217,11 +217,13 @@ from .runtime import CadenceGate, TickContext, TickMetrics
 from .settings import WattsonConfig
 from .snapshot import SnapshotBuilder
 from .planner import (
+    MORNING_BRIDGE_LIVE_UPLIFT_MAX_W,
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     RESERVE_HOLD_MARGIN,
     SELL_SAFE_CHARGE_A,
     apply_mode_dwell,
     battery_rate_kwh,
+    load_forecast_w,
     execute_slot,
     mode_dwell_exempt,
     apply_cold_guard,
@@ -298,6 +300,7 @@ def _rolling_replan_reason(
     ev_connected: bool,
     soc_deviation_pct: float | None,
     interval_elapsed: bool,
+    soc_deviation_threshold_pct: float = PLAN_SOC_DEVIATION_PCT,
 ) -> str | None:
     """Choose one stable, auditable reason for rebuilding the rolling plan."""
     if pending_reason:
@@ -314,11 +317,53 @@ def _rolling_replan_reason(
         return "solar_forecast_changed"
     if previous_ev_connected is not None and previous_ev_connected != ev_connected:
         return "ev_connected" if ev_connected else "ev_disconnected"
-    if soc_deviation_pct is not None and abs(soc_deviation_pct) >= PLAN_SOC_DEVIATION_PCT:
+    if (
+        soc_deviation_pct is not None
+        and abs(soc_deviation_pct) >= max(0.5, soc_deviation_threshold_pct)
+    ):
         return f"soc_deviation:{soc_deviation_pct:+.1f}pp"
     if interval_elapsed:
         return "rolling_15m"
     return None
+
+
+MORNING_LOAD_UPLIFT_WINDOW_SECONDS = 20 * 60
+MORNING_LOAD_UPLIFT_MIN_SPAN_SECONDS = 5 * 60
+MORNING_LOAD_UPLIFT_STEP_W = 250.0
+
+
+def _sustained_morning_load_uplift(
+    samples: list[tuple[datetime, float]],
+    *,
+    now: datetime,
+    local_hour: int,
+    measured_house_load_w: float,
+    p90_house_load_w: float,
+) -> tuple[list[tuple[datetime, float]], float]:
+    """Track a sustained positive P90 miss without reacting to short spikes."""
+    if not 0 <= local_hour < 9:
+        return [], 0.0
+    cutoff = now - timedelta(seconds=MORNING_LOAD_UPLIFT_WINDOW_SECONDS)
+    retained = [(at, error) for at, error in samples if at >= cutoff]
+    retained.append((now, max(0.0, measured_house_load_w - p90_house_load_w)))
+    if (
+        len(retained) < 3
+        or (retained[-1][0] - retained[0][0]).total_seconds()
+        < MORNING_LOAD_UPLIFT_MIN_SPAN_SECONDS
+    ):
+        return retained, 0.0
+    errors = sorted(error for _at, error in retained)
+    middle = len(errors) // 2
+    median = (
+        errors[middle]
+        if len(errors) % 2
+        else (errors[middle - 1] + errors[middle]) / 2.0
+    )
+    uplift = (
+        int(max(0.0, median) // MORNING_LOAD_UPLIFT_STEP_W)
+        * MORNING_LOAD_UPLIFT_STEP_W
+    )
+    return retained, min(MORNING_BRIDGE_LIVE_UPLIFT_MAX_W, uplift)
 
 
 def _price_horizon_changed(
@@ -716,6 +761,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_minimum_recovery: EvMinimumRecovery | None = None
         self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
+        self._morning_load_error_samples: list[tuple[datetime, float]] = []
+        self._morning_load_uplift_w: float = 0.0
         self._repairs_state: dict[str, list] = {}
         # #6 heartbeat: the last successful tick + the gap before it, so a stall or
         # restart leaves a visible trace on site_status (a big gap in history). The
@@ -2816,6 +2863,37 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             conservative=True,
             quarter_hour=True,
         )
+        _current_forecast_hour = utc_instant(self.site_state.timestamp).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        _measured_house_load_w = max(
+            0.0,
+            self.site_state.load_power_w
+            - (
+                max(0.0, self.site_state.easee_power_w or 0.0)
+                if self.site_state.load_includes_ev
+                else 0.0
+            ),
+        )
+        _p90_house_load_w = load_forecast_w(
+            _reserve_load,
+            _current_forecast_hour,
+            _measured_house_load_w,
+        )
+        (
+            self._morning_load_error_samples,
+            self._morning_load_uplift_w,
+        ) = _sustained_morning_load_uplift(
+            self._morning_load_error_samples,
+            now=utc_instant(self.site_state.timestamp),
+            local_hour=dt_util.as_local(
+                utc_instant(self.site_state.timestamp)
+            ).hour,
+            measured_house_load_w=_measured_house_load_w,
+            p90_house_load_w=_p90_house_load_w,
+        )
         raw_learned_reserve_pct = self._learned_reserve_pct()
         learned_reserve_pct = raw_learned_reserve_pct
         ev_windows = f"{self.ev_window_start:02d}:00-{self.ev_window_end:02d}:00"
@@ -2952,6 +3030,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             round(learned_reserve_pct / 5.0), _learned_reserve_fp,
             round(self.reserve_hold_margin, 2), _grid_charge_rate,
             _load_fp,
+            round(self._morning_load_uplift_w),
             round(self._forecast_confidence, 2),
             round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
             round(self.battery_discharge_current, 1), round(self.battery_care_soc, 1),
@@ -2988,6 +3067,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if _expected_soc is not None
             else None
         )
+        _morning_bridge_guard_active = bool(
+            0 <= dt_util.as_local(utc_instant(_now_local)).hour < 9
+            and (
+                self._morning_load_uplift_w > 0.0
+                or self.site_state.battery_soc_pct <= _min_soc + 25.0
+                or (_slot is not None and "morning bridge" in _slot.reason)
+            )
+        )
         _horizon_grew = _price_horizon_changed(
             self._last_price_horizon_fp,
             _price_fp,
@@ -3005,6 +3092,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             previous_ev_connected=self._last_ev_connected,
             ev_connected=_ev_connected,
             soc_deviation_pct=_soc_deviation,
+            soc_deviation_threshold_pct=(
+                2.5 if _morning_bridge_guard_active else PLAN_SOC_DEVIATION_PCT
+            ),
             interval_elapsed=(
                 self._last_replan_at is None
                 or (_now_local - self._last_replan_at).total_seconds() >= PLAN_REPLAN_INTERVAL_SECONDS
@@ -3034,6 +3124,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 forecast_confidence=self._forecast_confidence,
                 ev_load_by_start=_ev_load_by_start,
                 ev_battery_protected=_ev_battery_protected,
+                morning_load_uplift_w=self._morning_load_uplift_w,
                 allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
             )
             if _active_day_plan is not None:
@@ -3082,6 +3173,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         forecast_confidence=self._forecast_confidence,
                         ev_load_by_start=_ev_load_by_start,
                         ev_battery_protected=_ev_battery_protected,
+                        morning_load_uplift_w=self._morning_load_uplift_w,
                         allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
                         schedule_override=_candidate.tasks,
                     )
