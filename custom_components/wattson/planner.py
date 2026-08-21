@@ -110,18 +110,21 @@ RESERVE_HOLD_MARGIN = 0.15
 # without fragmenting a material multi-source episode into sub-threshold hours.
 RESERVE_HOLD_MIN_VALUE_KR = 0.30
 
-# Overnight-to-morning bridge.  The ordinary optimizer is allowed to use the
-# battery in the first cheap night hours, but once the night's cheapest valley
-# begins it protects conservative house demand for the 06:00-09:00 morning
-# peak.  This is a hold-only overlay: the non-grid floor ceiling below prevents
-# it from ever buying energy merely to reach the protected floor.
-MORNING_BRIDGE_SOURCE_END_HOUR = 6
-MORNING_BRIDGE_END_HOUR = 9
-MORNING_BRIDGE_SOURCE_PRICE_BAND_KR = 0.03
-MORNING_BRIDGE_MIN_VALUE_KR = 0.10
-MORNING_BRIDGE_BUFFER_KWH = 0.50
-MORNING_BRIDGE_MAX_PROTECTED_KWH = 2.50
-MORNING_BRIDGE_LIVE_UPLIFT_MAX_W = 1500.0
+# Dynamic low-price-to-scarcity bridge.  The ordinary optimizer may use the
+# battery before a cheap valley, but once the valley starts this overlay carries
+# conservative demand into every materially dearer deficit window later that
+# local day.  It is hold-only; the separate last-opportunity layer below is the
+# only path allowed to BUY a missing reserve, and must pass stricter economics.
+SCARCITY_BRIDGE_SOURCE_PRICE_BAND_KR = 0.03
+SCARCITY_BRIDGE_MIN_VALUE_KR = RESERVE_HOLD_MIN_VALUE_KR
+SCARCITY_BRIDGE_BUFFER_KWH = 0.50
+SCARCITY_BRIDGE_MAX_PROTECTED_KWH = 3.00
+SCARCITY_BRIDGE_LIVE_UPLIFT_MAX_W = 1500.0
+SCARCITY_BRIDGE_UPLIFT_FULL_HOURS = 2.0
+SCARCITY_BRIDGE_UPLIFT_END_HOURS = 6.0
+
+# Compatibility alias used by coordinator diagnostics and older simulations.
+MORNING_BRIDGE_LIVE_UPLIFT_MAX_W = SCARCITY_BRIDGE_LIVE_UPLIFT_MAX_W
 
 # Minimum house deficit (W) before the battery is tapped to cover the load. A
 # small deadband above zero stops the planner micro-cycling around the
@@ -350,7 +353,7 @@ def load_forecast_w(load_forecast, start: datetime, default_w: float = 0.0) -> f
     return max(0.0, float(load_forecast.get(start.hour, default_w)))
 
 
-def morning_bridge_reserve_by_start(
+def scarcity_bridge_reserve_by_start(
     tasks: list[PlanTask],
     *,
     price_slots,
@@ -361,13 +364,15 @@ def morning_bridge_reserve_by_start(
     discharge_rate_kwh_h: float,
     local_timezone,
     live_load_uplift_w: float = 0.0,
+    observed_at: datetime | None = None,
 ) -> dict[datetime, tuple[float, float]]:
-    """Return protected morning energy and risk value for each plan slot.
+    """Return protected energy and risk value for each scarcity bridge slot.
 
-    The bridge begins at the first slot in the cheapest pre-06 price valley and
-    carries P90 house load minus P10 solar into materially dearer 06:00-09:00
-    slots.  Its 0.5 kWh buffer is released linearly from 06:00 to 07:00 so the
-    final morning peak can consume the reserve instead of stranding it.
+    Every real-price deficit chooses the cheapest preceding real-price valley on
+    the same local day.  Material destinations sharing a valley form one finite
+    reserve episode.  P90 house load, P10 solar, EV battery protection and a
+    decaying live load correction are all represented in energy before the floor
+    is calculated.  The current destination consumes its own allocation.
     """
     if not tasks or not price_slots:
         return {}
@@ -412,119 +417,454 @@ def morning_bridge_reserve_by_start(
         return p10_hour * max(1, task.duration_minutes) / 60.0
 
     uplift_w = min(
-        MORNING_BRIDGE_LIVE_UPLIFT_MAX_W,
+        SCARCITY_BRIDGE_LIVE_UPLIFT_MAX_W,
         max(0.0, float(live_load_uplift_w)),
     )
-    result: dict[datetime, tuple[float, float]] = {}
-    task_dates = {_local(task.start).date() for task in tasks}
-    for plan_date in task_dates:
+    observed_instant = observed_at
+    if observed_instant is not None and observed_instant.tzinfo is None:
+        observed_instant = None
+
+    def _uplift_factor(start: datetime) -> float:
+        if uplift_w <= 0.0 or observed_instant is None:
+            return 1.0 if uplift_w > 0.0 else 0.0
+        hours = max(
+            0.0,
+            (start - observed_instant).total_seconds() / 3600.0,
+        )
+        if hours <= SCARCITY_BRIDGE_UPLIFT_FULL_HOURS:
+            return 1.0
+        if hours >= SCARCITY_BRIDGE_UPLIFT_END_HOURS:
+            return 0.0
+        return (
+            SCARCITY_BRIDGE_UPLIFT_END_HOURS - hours
+        ) / (
+            SCARCITY_BRIDGE_UPLIFT_END_HOURS
+            - SCARCITY_BRIDGE_UPLIFT_FULL_HOURS
+        )
+
+    # destination tuple: task, conservative deficit, premium, source price.
+    episodes: dict[datetime, list[tuple[PlanTask, float, float, float]]] = {}
+    for candidate in tasks:
+        price_slot = _containing_price_slot(candidate.start)
+        if price_slot is None or price_slot.estimated:
+            continue
+        local_candidate = _local(candidate.start)
         source_slots = [
             slot for slot in price_slots
-            if _local(slot.start).date() == plan_date
-            and 0 <= _local(slot.start).hour < MORNING_BRIDGE_SOURCE_END_HOUR
-            and not slot.estimated
+            if not slot.estimated
+            and _local(slot.start).date() == local_candidate.date()
+            and slot.start < candidate.start
         ]
         if not source_slots:
             continue
         source_price = min(slot.total_import_price for slot in source_slots)
-        bridge_sources = [
-            slot for slot in source_slots
+        premium = price_slot.total_import_price - source_price
+        if premium <= hold_margin + 1e-9:
+            continue
+        bridge_start = min(
+            slot.start
+            for slot in source_slots
             if slot.total_import_price
-            <= source_price + MORNING_BRIDGE_SOURCE_PRICE_BAND_KR + 1e-9
-        ]
-        bridge_start = min(slot.start for slot in bridge_sources)
+            <= source_price + SCARCITY_BRIDGE_SOURCE_PRICE_BAND_KR + 1e-9
+        )
+        duration_h = max(1, candidate.duration_minutes) / 60.0
+        fallback_house_w = (
+            max(
+                0.0,
+                (candidate.load_estimate_kwh or 0.0)
+                - (candidate.ev_load_estimate_kwh or 0.0),
+            )
+            / duration_h
+            * 1000.0
+        )
+        p90_house_kwh = (
+            load_forecast_w(
+                reserve_load_by_start_w,
+                candidate.start,
+                fallback_house_w,
+            )
+            + uplift_w * _uplift_factor(candidate.start)
+        ) / 1000.0 * duration_h
+        ev_kwh = (
+            0.0
+            if ev_battery_protected
+            else max(0.0, candidate.ev_load_estimate_kwh or 0.0)
+        )
+        conservative_deficit_kwh = min(
+            max(0.0, discharge_rate_kwh_h) * duration_h,
+            max(0.0, p90_house_kwh + ev_kwh - _p10_solar_kwh(candidate)),
+        )
+        p50_deficit_kwh = min(
+            max(0.0, discharge_rate_kwh_h) * duration_h,
+            max(
+                0.0,
+                fallback_house_w / 1000.0 * duration_h
+                + ev_kwh
+                - max(0.0, candidate.pv_estimate_kwh or 0.0),
+            ),
+        )
+        uncertainty_tail_kwh = max(
+            0.0,
+            conservative_deficit_kwh - p50_deficit_kwh,
+        )
+        if uncertainty_tail_kwh > 0.01:
+            episodes.setdefault(bridge_start, []).append(
+                (candidate, uncertainty_tail_kwh, premium, source_price)
+            )
 
-        destinations: list[tuple[PlanTask, float, float]] = []
-        for candidate in tasks:
-            local_candidate = _local(candidate.start)
-            if (
-                local_candidate.date() != plan_date
-                or not MORNING_BRIDGE_SOURCE_END_HOUR
-                <= local_candidate.hour
-                < MORNING_BRIDGE_END_HOUR
-            ):
-                continue
-            price_slot = _containing_price_slot(candidate.start)
-            if price_slot is None or price_slot.estimated:
-                continue
-            premium = price_slot.total_import_price - source_price
-            if premium <= hold_margin + 1e-9:
-                continue
-            duration_h = max(1, candidate.duration_minutes) / 60.0
-            p90_house_kwh = (
-                load_forecast_w(
-                    reserve_load_by_start_w,
-                    candidate.start,
+    result_energy: dict[datetime, float] = {}
+    result_value: dict[datetime, float] = {}
+    for bridge_start, destinations in episodes.items():
+        # Credit each deadline only with conservative refill physically arriving
+        # before it.  Prefix accounting prevents one sunny slot from refilling
+        # both an earlier and a later obligation.
+        cumulative_demand_kwh = 0.0
+        previous_required_kwh = 0.0
+        adjusted_destinations: list[tuple[PlanTask, float, float, float]] = []
+        for destination, deficit_kwh, premium, source_price in sorted(
+            destinations,
+            key=lambda item: item[0].start,
+        ):
+            cumulative_demand_kwh += deficit_kwh
+            refill_kwh = 0.0
+            for refill_task in tasks:
+                if not bridge_start <= refill_task.start < destination.start:
+                    continue
+                duration_h = max(1, refill_task.duration_minutes) / 60.0
+                fallback_house_w = (
                     max(
                         0.0,
-                        (candidate.load_estimate_kwh or 0.0)
-                        - (candidate.ev_load_estimate_kwh or 0.0),
+                        (refill_task.load_estimate_kwh or 0.0)
+                        - (refill_task.ev_load_estimate_kwh or 0.0),
                     )
                     / duration_h
-                    * 1000.0,
+                    * 1000.0
                 )
-                + uplift_w
-            ) / 1000.0 * duration_h
-            ev_kwh = (
-                0.0
-                if ev_battery_protected
-                else max(0.0, candidate.ev_load_estimate_kwh or 0.0)
-            )
-            deficit_kwh = min(
-                max(0.0, discharge_rate_kwh_h) * duration_h,
-                max(0.0, p90_house_kwh + ev_kwh - _p10_solar_kwh(candidate)),
-            )
-            if deficit_kwh > 0.01:
-                destinations.append((candidate, deficit_kwh, premium))
-
-        episode_value_kr = sum(
-            deficit_kwh * premium
-            for _candidate, deficit_kwh, premium in destinations
-        )
-        if episode_value_kr + 1e-9 < MORNING_BRIDGE_MIN_VALUE_KR:
-            continue
-        morning_start = datetime.combine(
-            plan_date,
-            time(MORNING_BRIDGE_SOURCE_END_HOUR),
-            tzinfo=_local(bridge_start).tzinfo,
-        )
-        buffer_release = morning_start + timedelta(hours=1)
-        for task in tasks:
-            local_task = _local(task.start)
-            if (
-                local_task.date() != plan_date
-                or task.start < bridge_start
-                or local_task.hour >= MORNING_BRIDGE_END_HOUR
-            ):
-                continue
-            # The current destination is allowed to spend its own allocation;
-            # only later obligations remain behind the physical floor.
-            protected_kwh = sum(
-                deficit_kwh
-                for destination, deficit_kwh, _premium in destinations
-                if destination.start > task.start
-            )
-            if local_task < buffer_release:
-                release_window_s = max(
-                    1.0,
-                    (buffer_release - morning_start).total_seconds(),
+                p90_house_kwh = (
+                    load_forecast_w(
+                        reserve_load_by_start_w,
+                        refill_task.start,
+                        fallback_house_w,
+                    )
+                    + uplift_w * _uplift_factor(refill_task.start)
+                ) / 1000.0 * duration_h
+                ev_kwh = (
+                    0.0
+                    if ev_battery_protected
+                    else max(0.0, refill_task.ev_load_estimate_kwh or 0.0)
                 )
-                remaining_fraction = min(
-                    1.0,
+                refill_kwh += min(
+                    max(0.0, discharge_rate_kwh_h) * duration_h,
                     max(
                         0.0,
-                        (buffer_release - local_task).total_seconds()
-                        / release_window_s,
+                        _p10_solar_kwh(refill_task)
+                        - p90_house_kwh
+                        - ev_kwh,
                     ),
                 )
-                protected_kwh += MORNING_BRIDGE_BUFFER_KWH * remaining_fraction
-            protected_kwh = min(
-                MORNING_BRIDGE_MAX_PROTECTED_KWH,
-                max(0.0, protected_kwh),
+            required_kwh = max(
+                0.0,
+                cumulative_demand_kwh - refill_kwh,
             )
-            if protected_kwh > 0.01:
-                result[task.start] = (protected_kwh, episode_value_kr)
-    return result
+            incremental_required_kwh = max(
+                0.0,
+                required_kwh - previous_required_kwh,
+            )
+            previous_required_kwh = required_kwh
+            if incremental_required_kwh > 0.01:
+                adjusted_destinations.append((
+                    destination,
+                    incremental_required_kwh,
+                    premium,
+                    source_price,
+                ))
+        destinations = adjusted_destinations
+        # A single isolated spike is already covered by the optimizer's finite
+        # P90/P10 reserve.  The bridge exists for a sustained scarcity window;
+        # overlaying it on one slot would double-count the same uncertainty and
+        # could also trigger an unnecessary last-opportunity grid charge.
+        if len(destinations) < 2:
+            continue
+        episode_value_kr = sum(
+            deficit_kwh * premium
+            for _candidate, deficit_kwh, premium, _source_price in destinations
+        )
+        if episode_value_kr + 1e-9 < SCARCITY_BRIDGE_MIN_VALUE_KR:
+            continue
+        first_destination = min(candidate.start for candidate, *_rest in destinations)
+        first_task = min(
+            (candidate for candidate, *_rest in destinations),
+            key=lambda candidate: candidate.start,
+        )
+        buffer_release = first_destination + timedelta(
+            minutes=max(1, first_task.duration_minutes)
+        )
+        for task in tasks:
+            if task.start < bridge_start or task.start >= max(
+                candidate.start for candidate, *_rest in destinations
+            ):
+                continue
+            # The current destination consumes its own allocation. Only later
+            # obligations remain behind the physical floor.
+            protected_kwh = sum(
+                deficit_kwh
+                for destination, deficit_kwh, _premium, _source_price in destinations
+                if destination.start > task.start
+            )
+            if len(destinations) >= 2 and task.start < buffer_release:
+                if task.start < first_destination:
+                    remaining_fraction = 1.0
+                else:
+                    release_seconds = max(
+                        1.0,
+                        (buffer_release - first_destination).total_seconds(),
+                    )
+                    remaining_fraction = max(
+                        0.0,
+                        (buffer_release - task.start).total_seconds()
+                        / release_seconds,
+                    )
+                protected_kwh += (
+                    SCARCITY_BRIDGE_BUFFER_KWH * remaining_fraction
+                )
+            if protected_kwh <= 0.01:
+                continue
+            result_energy[task.start] = (
+                result_energy.get(task.start, 0.0) + protected_kwh
+            )
+            result_value[task.start] = (
+                result_value.get(task.start, 0.0) + episode_value_kr
+            )
+
+    return {
+        start: (
+            min(SCARCITY_BRIDGE_MAX_PROTECTED_KWH, protected_kwh),
+            result_value.get(start, 0.0),
+        )
+        for start, protected_kwh in result_energy.items()
+        if protected_kwh > 0.01
+    }
+
+
+def morning_bridge_reserve_by_start(
+    tasks: list[PlanTask],
+    **kwargs,
+) -> dict[datetime, tuple[float, float]]:
+    """Backward-compatible name for the generalized scarcity bridge."""
+    return scarcity_bridge_reserve_by_start(tasks, **kwargs)
+
+
+def apply_last_opportunity_grid_charge(
+    tasks: list[PlanTask],
+    *,
+    state: SiteState,
+    scarcity_bridge_by_start: dict[datetime, tuple[float, float]],
+    profile: ProfileWeights,
+    base_floor_pct: float,
+    capacity_kwh: float,
+    min_soc: float,
+    max_soc: float,
+    battery_care_soc: float,
+    grid_charge_rate_kwh_h: float,
+    allow_grid_charge: bool,
+) -> list[PlanTask]:
+    """Buy only a missing material reserve before its last feasible source.
+
+    The DP remains the primary economic scheduler.  This guard acts only when a
+    finite scarcity bridge proves that the committed SOC path will arrive below
+    the required reserve.  It scans backwards from the release boundary, accepts
+    only real-price, non-solar slots whose cycle clears the normal efficiency,
+    wear and profile margin, and targets the least reachable native 5% step.
+    """
+    if not allow_grid_charge or not tasks or not scarcity_bridge_by_start:
+        return tasks
+    capacity = max(0.1, float(capacity_kwh))
+    care_native = _snap_tou_capacity(
+        min(float(max_soc), float(battery_care_soc)),
+        up=False,
+    )
+    if care_native <= min_soc + 0.1:
+        return tasks
+    price_by_start = {slot.start: slot for slot in state.price_slots}
+    adjusted = list(tasks)
+
+    def _projected(index: int) -> float:
+        projected = adjusted[index].projected_soc_pct
+        if projected is not None:
+            return float(projected)
+        if index <= 0:
+            return float(state.battery_soc_pct)
+        return _projected(index - 1)
+
+    bridge_kwh = [
+        scarcity_bridge_by_start.get(task.start, (0.0, 0.0))[0]
+        for task in adjusted
+    ]
+    release_boundaries = [
+        index
+        for index, protected_kwh in enumerate(bridge_kwh)
+        if protected_kwh > 0.01
+        and (
+            index == len(bridge_kwh) - 1
+            or bridge_kwh[index + 1] < protected_kwh - 0.01
+        )
+    ]
+    for boundary in release_boundaries:
+        protected_kwh = bridge_kwh[boundary]
+        required_pct = min(
+            care_native,
+            _snap_tou_capacity(
+                energy_backed_reserve_floor_pct(
+                    base_floor_pct=base_floor_pct,
+                    max_soc_pct=max_soc,
+                    capacity_kwh=capacity,
+                    protected_future_kwh=protected_kwh,
+                    safety_buffer_kwh=0.0,
+                ),
+                up=True,
+            ),
+        )
+        available_pct = _projected(boundary)
+        if available_pct >= required_pct - 0.1:
+            continue
+
+        episode_start = boundary
+        while episode_start > 0 and bridge_kwh[episode_start - 1] > 0.01:
+            episode_start -= 1
+        destination_prices = [
+            task.total_import_price
+            for index, task in enumerate(adjusted[boundary + 1:], boundary + 1)
+            if (
+                index == boundary + 1
+                or bridge_kwh[index] < bridge_kwh[boundary] - 0.01
+            )
+        ]
+        max_destination_price = max(destination_prices, default=None)
+        if max_destination_price is None:
+            continue
+
+        missing_pct = max(0.0, required_pct - _projected(boundary))
+        selected_sources: list[int] = []
+        selected_capacity_pct = 0.0
+        for source_index in range(boundary, episode_start - 1, -1):
+            if selected_capacity_pct >= missing_pct - 0.1:
+                break
+            source = adjusted[source_index]
+            price_slot = price_by_start.get(source.start)
+            if price_slot is None or price_slot.estimated:
+                continue
+            if not arbitrage_worthwhile(
+                price_slot.total_import_price,
+                max_destination_price,
+                profile,
+            ):
+                continue
+            if (
+                (source.pv_estimate_kwh or 0.0)
+                > (source.load_estimate_kwh or 0.0) + 0.05
+            ):
+                continue
+            duration_h = max(1, source.duration_minutes) / 60.0
+            if source_index == 0:
+                start_pct = float(state.battery_soc_pct)
+                if source.start <= state.timestamp < source.start + timedelta(
+                    minutes=max(1, source.duration_minutes)
+                ):
+                    elapsed_h = max(
+                        0.0,
+                        (state.timestamp - source.start).total_seconds() / 3600.0,
+                    )
+                    duration_h = max(0.0, duration_h - elapsed_h)
+            else:
+                start_pct = _projected(source_index - 1)
+            raw_end_pct = _projected(source_index)
+            max_target_pct = min(
+                care_native,
+                start_pct
+                + max(0.0, grid_charge_rate_kwh_h)
+                * duration_h
+                / capacity
+                * 100.0,
+            )
+            available_pct = max(0.0, max_target_pct - raw_end_pct)
+            if available_pct <= 0.1:
+                continue
+            selected_sources.append(source_index)
+            selected_capacity_pct += available_pct
+
+        if not selected_sources:
+            continue
+
+        # Selection is intentionally backwards (latest useful slots first), but
+        # physical targets must be constructed forwards.  Otherwise a two-hour
+        # bridge could ask both hours to stop at 30%, even though the second hour
+        # must continue from the first hour's 30% and stop at 40%.
+        baseline_projected = [
+            _projected(index) for index in range(len(adjusted))
+        ]
+        selected_set = set(selected_sources)
+        carry_pct = 0.0
+        remaining_pct = missing_pct
+        for index in range(min(selected_sources), boundary + 1):
+            source = adjusted[index]
+            carried_end_pct = baseline_projected[index] + carry_pct
+            if index in selected_set and remaining_pct > 0.1:
+                if index <= 0:
+                    carried_start_pct = float(state.battery_soc_pct)
+                else:
+                    carried_start_pct = baseline_projected[index - 1] + carry_pct
+                duration_h = max(1, source.duration_minutes) / 60.0
+                if index == 0 and source.start <= state.timestamp < source.start + timedelta(
+                    minutes=max(1, source.duration_minutes)
+                ):
+                    elapsed_h = max(
+                        0.0,
+                        (state.timestamp - source.start).total_seconds() / 3600.0,
+                    )
+                    duration_h = max(0.0, duration_h - elapsed_h)
+                max_target_pct = min(
+                    care_native,
+                    carried_start_pct
+                    + max(0.0, grid_charge_rate_kwh_h)
+                    * duration_h
+                    / capacity
+                    * 100.0,
+                )
+                desired_target_pct = min(
+                    max_target_pct,
+                    carried_end_pct + remaining_pct,
+                )
+                native_target = _snap_tou_capacity(desired_target_pct, up=True)
+                if native_target > max_target_pct + 0.1:
+                    native_target = _snap_tou_capacity(max_target_pct, up=False)
+                native_target = min(care_native, native_target)
+                delta_pct = max(0.0, native_target - carried_end_pct)
+                if delta_pct > 0.1:
+                    carry_pct += delta_pct
+                    remaining_pct = max(0.0, remaining_pct - delta_pct)
+                    reason = " | ".join(filter(None, (
+                        source.reason,
+                        "last opportunity grid charge targets "
+                        f"{native_target:.0f}% for {protected_kwh:.2f} kWh "
+                        "material future deficit",
+                    )))
+                    adjusted[index] = replace(
+                        source,
+                        action="GRID_CHARGE",
+                        projected_soc_pct=native_target,
+                        grid_charge_target_soc_pct=native_target,
+                        reason=reason,
+                    )
+                    continue
+            if carry_pct > 0.1:
+                adjusted[index] = replace(
+                    source,
+                    projected_soc_pct=min(
+                        float(max_soc),
+                        baseline_projected[index] + carry_pct,
+                    ),
+                )
+    return adjusted
 
 
 def future_solar_surplus_kwh(slots, solar_by_start, load_hourly_w, after_start, cheaper_than) -> float:
@@ -1343,7 +1683,7 @@ def build_day_plan(
     learned_reserve_by_start_pct = learned_reserve_by_start_pct or {}
     slots_by_start = {s.start: s for s in view.slots}
     solar_slots_by_start = {s.start: s for s in state.solar_slots}
-    morning_bridge_by_start = morning_bridge_reserve_by_start(
+    scarcity_bridge_by_start = scarcity_bridge_reserve_by_start(
         tasks,
         price_slots=state.price_slots,
         solar_slots=state.solar_slots,
@@ -1353,6 +1693,24 @@ def build_day_plan(
         discharge_rate_kwh_h=discharge_rate,
         local_timezone=state.timestamp.tzinfo,
         live_load_uplift_w=morning_load_uplift_w,
+        observed_at=state.timestamp,
+    )
+    tasks = apply_last_opportunity_grid_charge(
+        tasks,
+        state=state,
+        scarcity_bridge_by_start=scarcity_bridge_by_start,
+        profile=profile,
+        base_floor_pct=planning_base_floor,
+        capacity_kwh=capacity_kwh,
+        min_soc=min_soc,
+        max_soc=max_soc,
+        battery_care_soc=battery_care_soc,
+        grid_charge_rate_kwh_h=(
+            grid_charge_rate_kwh
+            if grid_charge_rate_kwh is not None
+            else SCHEDULE_GRID_CHARGE_RATE_KWH
+        ),
+        allow_grid_charge=allow_grid_charge,
     )
     plan_slots: list[SlotPlan] = []
     committed_tasks: list[PlanTask] = []
@@ -2361,31 +2719,34 @@ def build_day_plan(
                 physical_reserve_floor,
                 energy_backed_floor,
             )
-        morning_bridge_kwh, morning_bridge_value_kr = (
-            morning_bridge_by_start.get(task.start, (0.0, 0.0))
+        scarcity_bridge_kwh, scarcity_bridge_value_kr = (
+            scarcity_bridge_by_start.get(task.start, (0.0, 0.0))
         )
-        morning_bridge_floor = base_floor
-        morning_bridge_active = bool(
-            morning_bridge_kwh > 0.01
+        scarcity_bridge_floor = base_floor
+        scarcity_bridge_candidate = bool(
+            scarcity_bridge_kwh > 0.01
             and task.action != "GRID_CHARGE"
         )
-        if morning_bridge_active:
-            morning_bridge_floor = energy_backed_reserve_floor_pct(
+        scarcity_bridge_active = False
+        if scarcity_bridge_candidate:
+            scarcity_bridge_floor = energy_backed_reserve_floor_pct(
                 base_floor_pct=base_floor,
                 max_soc_pct=max_soc,
                 capacity_kwh=capacity_kwh,
-                protected_future_kwh=morning_bridge_kwh,
+                protected_future_kwh=scarcity_bridge_kwh,
                 safety_buffer_kwh=0.0,
             )
+            scarcity_bridge_active = scarcity_bridge_floor > floor + 0.1
             # Applied after the live-deficit release so that a transient sunny
             # classification cannot erase the explicit overnight-to-morning
             # obligation.  The non-grid ceiling below still prevents catch-up
             # charging if the battery is already below this floor.
-            floor = max(floor, morning_bridge_floor)
-            physical_reserve_floor = max(
-                physical_reserve_floor,
-                morning_bridge_floor,
-            )
+            if scarcity_bridge_active:
+                floor = max(floor, scarcity_bridge_floor)
+                physical_reserve_floor = max(
+                    physical_reserve_floor,
+                    scarcity_bridge_floor,
+                )
         # Estimated lookahead slots (today's price shape copied forward until the
         # real day-ahead prices publish ~13:00) inform ranking/reserve maths but
         # are never COMMITTED to buying decisions — if EDS stays down so long
@@ -2527,12 +2888,12 @@ def build_day_plan(
                 f"future demand + {live_deficit_buffer_kwh:.2f} kWh buffer "
                 f"({protected_future_value_kr:.2f} kr value)"
             )
-        if morning_bridge_active:
+        if scarcity_bridge_active:
             reserve_notes.append(
-                "morning bridge holds "
-                f"{morning_bridge_kwh:.2f} kWh for 06:00-09:00 "
+                "scarcity bridge holds "
+                f"{scarcity_bridge_kwh:.2f} kWh for later expensive "
                 "P90-load/P10-solar "
-                f"({morning_bridge_value_kr:.2f} kr risk value)"
+                f"({scarcity_bridge_value_kr:.2f} kr risk value)"
             )
         if non_grid_floor_capped:
             reserve_notes.append(
@@ -2541,11 +2902,28 @@ def build_day_plan(
         committed_reason = " | ".join(
             note for note in (task.reason, *reserve_notes) if note
         )
+        grid_charge_target_soc_pct = None
+        if grid_charge and intent == "GRID_CHARGE":
+            projected_target = (
+                float(committed_projected)
+                if committed_projected is not None
+                else float(committed_start_soc)
+            )
+            grid_charge_target_soc_pct = min(
+                _snap_tou_capacity(
+                    min(float(max_soc), float(battery_care_soc)),
+                    up=False,
+                ),
+                _snap_tou_capacity(
+                    max(float(min_soc), projected_target),
+                    up=True,
+                ),
+            )
         watchdog_reserve_cap = energy_backed_floor
-        if morning_bridge_active:
+        if scarcity_bridge_active:
             watchdog_reserve_cap = max(
                 watchdog_reserve_cap,
-                morning_bridge_floor,
+                scarcity_bridge_floor,
             )
         if material_uncertainty_active and not energy_backed_live_release:
             # The finite P90/P10 ledger is already energy- and value-backed.
@@ -2559,6 +2937,7 @@ def build_day_plan(
             task,
             action=committed_action,
             projected_soc_pct=committed_projected,
+            grid_charge_target_soc_pct=grid_charge_target_soc_pct,
             tou_floor_pct=committed_floor,
             reason=committed_reason,
         ))
@@ -2573,22 +2952,23 @@ def build_day_plan(
             export_value=export_value,
             projected_soc_pct=committed_projected,
             ev_load_estimate_kwh=task.ev_load_estimate_kwh,
+            grid_charge_target_soc_pct=grid_charge_target_soc_pct,
             reason=committed_reason or committed_action,
             reserve_floor_cap_pct=(
                 _snap_tou_capacity(
                     float(min(watchdog_reserve_cap, max_soc)),
                     up=True,
                 )
-                if energy_backed_live_candidate or morning_bridge_active
+                if energy_backed_live_candidate or scarcity_bridge_active
                 else None
             ),
             reserve_protected_kwh=max(
                 protected_future_kwh,
-                morning_bridge_kwh,
+                scarcity_bridge_kwh,
             ),
             reserve_protected_value_kr=max(
                 protected_future_value_kr,
-                morning_bridge_value_kr,
+                scarcity_bridge_value_kr,
             ),
             reserve_buffer_kwh=live_deficit_buffer_kwh,
             duration_minutes=task.duration_minutes,
@@ -2780,7 +3160,15 @@ def execute_slot(
         # overshooting both wastes money (charging dearer than needed) and
         # displaces tomorrow's free sun. Capped by battery care (LFP at 100 %);
         # paid negative-price absorption keeps the full max via ABSORB above.
-        plan_target = slot.projected_soc_pct if slot.projected_soc_pct is not None else battery_care_soc
+        plan_target = (
+            slot.grid_charge_target_soc_pct
+            if slot.grid_charge_target_soc_pct is not None
+            else (
+                slot.projected_soc_pct
+                if slot.projected_soc_pct is not None
+                else battery_care_soc
+            )
+        )
         return (
             BatteryPlan(
                 strategy="GRID_CHARGE",

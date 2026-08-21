@@ -92,11 +92,54 @@ class LoadProfile:
     quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
     weekday_quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
     weekend_quarter_hourly_p90_w: dict[int, float] = field(default_factory=dict)
+    # Long-horizon hourly profiles retain seasonal demand without expanding the
+    # high-resolution 5-minute Recorder query. Keys are winter/spring/summer/
+    # autumn; weekday/weekend maps preserve the established day-type split.
+    seasonal_hourly_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_weekday_hourly_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_weekend_hourly_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_hourly_p90_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_weekday_hourly_p90_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_weekend_hourly_p90_w: dict[str, dict[int, float]] = field(default_factory=dict)
+    seasonal_days_observed: dict[str, int] = field(default_factory=dict)
     # Robust cold-load model: extra house demand per degree below the reference
     # temperature. Zero samples/slope means weather correction is inactive.
     temperature_reference_c: float | None = None
     temperature_slope_w_per_c: float = 0.0
     temperature_samples: int = 0
+
+    @staticmethod
+    def season_for(day: "datetime | date") -> str:
+        month = day.month
+        if month in (12, 1, 2):
+            return "winter"
+        if month in (3, 4, 5):
+            return "spring"
+        if month in (6, 7, 8):
+            return "summer"
+        return "autumn"
+
+    def _seasonal_hourly_for(
+        self,
+        day: "datetime | date | None",
+        *,
+        conservative: bool,
+    ) -> dict[int, float]:
+        if day is None:
+            return {}
+        season = self.season_for(day)
+        if self.seasonal_days_observed.get(season, 0) < 7:
+            return {}
+        if conservative:
+            combined = self.seasonal_hourly_p90_w
+            weekday = self.seasonal_weekday_hourly_p90_w
+            weekend = self.seasonal_weekend_hourly_p90_w
+        else:
+            combined = self.seasonal_hourly_w
+            weekday = self.seasonal_weekday_hourly_w
+            weekend = self.seasonal_weekend_hourly_w
+        day_bucket = weekend if day.weekday() >= 5 else weekday
+        return day_bucket.get(season) or combined.get(season, {})
 
     def hourly_for(self, day: "datetime | date | None") -> dict[int, float]:
         """Per-hour load map for the given day, falling back to the all-days mean.
@@ -107,6 +150,9 @@ class LoadProfile:
         """
         if day is None:
             return self.hourly_w
+        seasonal = self._seasonal_hourly_for(day, conservative=False)
+        if seasonal:
+            return seasonal
         weekday = day.weekday()
         bucket = self.weekend_hourly_w if weekday >= 5 else self.weekday_hourly_w
         return bucket or self.hourly_w
@@ -115,6 +161,9 @@ class LoadProfile:
         """P90 map for ``day``, falling back conservatively to the median map."""
         if day is None:
             return self.hourly_p90_w or self.hourly_w
+        seasonal = self._seasonal_hourly_for(day, conservative=True)
+        if seasonal:
+            return seasonal
         bucket = self.weekend_p90_w if day.weekday() >= 5 else self.weekday_p90_w
         return bucket or self.hourly_p90_w or self.hourly_for(day)
 
@@ -293,6 +342,7 @@ class PlanTask:
     load_estimate_kwh: float | None = None  # expected total consumption incl. EV
     ev_load_estimate_kwh: float | None = None
     projected_soc_pct: float | None = None
+    grid_charge_target_soc_pct: float | None = None
     reason: str = ""
     # Physical Deye discharge floor committed for this hour.  Keeping it on the
     # public task makes the dashboard SOC curve auditable against the inverter.
@@ -320,6 +370,10 @@ class SlotPlan:
     export_value: float | None = None
     projected_soc_pct: float | None = None
     ev_load_estimate_kwh: float | None = None
+    # Explicit native Deye target for a grid-charge slot.  The economic SOC
+    # projection may use finer buckets; this target is the least 5%-register
+    # step that physically supplies the required stored energy.
+    grid_charge_target_soc_pct: float | None = None
     reason: str = ""
     # Absolute reserve cap derived from concrete, materially valuable future
     # demand.  The coordinator watchdog may fall back to this floor if another

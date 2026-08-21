@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "wattson"
 NAME = "Wattson"
-INTEGRATION_VERSION = "0.27.1"
+INTEGRATION_VERSION = "0.27.2"
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -214,6 +214,7 @@ DEFAULT_EXPORT_LIMIT_W = 6000.0
 
 # Phase D learning parameters.
 LEARNING_WINDOW_DAYS = 28          # how far back to read load history
+SEASONAL_LEARNING_WINDOW_DAYS = 365  # hourly history for season/day-type profiles
 LEARNING_MIN_DAYS = 7              # min observed days before the reserve is applied
 LEARNING_RESERVE_HOURS = 3         # hours of predicted load to hold back for self-use
                                    # (near-term: protects the morning ramp without

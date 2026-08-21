@@ -1448,6 +1448,47 @@ def test_d_learning():
                        quarter_profile, datetime(2026, 6, 7, 18, 0, tzinfo=TZ), quarter_hour=True
                    ),
                    str(quarter_profile.quarter_hourly_w)))
+
+    recent_samples = [
+        (datetime(2026, 8, 1 + day, 18, 0, tzinfo=TZ), 1000.0)
+        for day in range(10)
+    ]
+    winter_samples = []
+    summer_samples = []
+    day = datetime(2026, 1, 1, 18, 0, tzinfo=TZ)
+    while len(winter_samples) < 8:
+        if day.weekday() < 5:
+            winter_samples.append((day, 2200.0))
+        day += timedelta(days=1)
+    day = datetime(2026, 7, 1, 18, 0, tzinfo=TZ)
+    while len(summer_samples) < 8:
+        if day.weekday() < 5:
+            summer_samples.append((day, 600.0))
+        day += timedelta(days=1)
+    seasonal_profile = learning.build_load_profile(
+        recent_samples,
+        seasonal_samples=winter_samples + summer_samples,
+    )
+    winter_forecast = learning.forecast_load_w(
+        seasonal_profile, datetime(2026, 1, 20, 18, 0, tzinfo=TZ)
+    )
+    summer_forecast = learning.forecast_load_w(
+        seasonal_profile, datetime(2026, 7, 21, 18, 0, tzinfo=TZ)
+    )
+    checks.append(("seasonal model keeps winter and summer weekday demand separate",
+                   winter_forecast == 2200.0 and summer_forecast == 600.0,
+                   f"winter={winter_forecast} summer={summer_forecast} "
+                   f"days={seasonal_profile.seasonal_days_observed}"))
+    sparse_seasonal_profile = learning.build_load_profile(
+        recent_samples,
+        seasonal_samples=winter_samples[:6],
+    )
+    sparse_winter_forecast = learning.forecast_load_w(
+        sparse_seasonal_profile, datetime(2026, 1, 20, 18, 0, tzinfo=TZ)
+    )
+    checks.append(("seasonal model falls back to the recent profile until seven matching days exist",
+                   sparse_winter_forecast == 1000.0,
+                   str(sparse_winter_forecast)))
     checks.append(("no samples -> None profile", learning.build_load_profile([]) is None, "none"))
 
     # Reserve gating: expensive hour, SOC 50, blue (profile floor 30).
@@ -7442,7 +7483,7 @@ def test_rolling_planner_upgrade():
                    reason(soc_deviation_pct=7.4) is None
                    and reason(soc_deviation_pct=7.5) == "soc_deviation:+7.5pp",
                    f"{reason(soc_deviation_pct=7.4)}/{reason(soc_deviation_pct=7.5)}"))
-    checks.append(("morning reserve lowers the SOC-deviation trigger to 2.5pp",
+    checks.append(("scarcity reserve lowers the SOC-deviation trigger to 2.5pp",
                    reason(soc_deviation_pct=-2.4, soc_deviation_threshold_pct=2.5) is None
                    and reason(soc_deviation_pct=-2.5, soc_deviation_threshold_pct=2.5)
                    == "soc_deviation:-2.5pp",
@@ -7490,10 +7531,10 @@ def test_rolling_planner_upgrade():
         discharge_rate_kwh_h=3.57,
         local_timezone=timezone.utc,
     )
-    checks.append(("morning bridge starts in the cheapest night valley and releases at the final peak",
+    checks.append(("scarcity bridge starts in the cheapest night valley and releases at the final peak",
                    bridge_base not in bridge_reserve
                    and bridge_base + timedelta(hours=1) not in bridge_reserve
-                   and bridge_reserve[bridge_base + timedelta(hours=2)][0] > 2.0
+                   and 1.5 < bridge_reserve[bridge_base + timedelta(hours=2)][0] < 2.0
                    and 0.9 < bridge_reserve[bridge_base + timedelta(hours=6)][0] < 1.3
                    and bridge_base + timedelta(hours=7) not in bridge_reserve,
                    str(bridge_reserve)))
@@ -7511,6 +7552,57 @@ def test_rolling_planner_upgrade():
     )
     checks.append(("morning bridge does not hold energy without a material morning premium",
                    flat_bridge == {}, str(flat_bridge)))
+
+    evening_base = bridge_base + timedelta(hours=12)
+    evening_prices = [models.PriceSlot(
+        start=evening_base + timedelta(hours=hour),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.4,
+    ) for hour, price in enumerate([0.50, 0.40, 0.30, 0.31, 0.80, 1.00, 2.00, 2.10])]
+    evening_tasks = [models.PlanTask(
+        start=slot.start,
+        action="DISCHARGE",
+        total_import_price=slot.total_import_price,
+        pv_estimate_kwh=0.0,
+        load_estimate_kwh=1.0,
+        projected_soc_pct=max(15.0, 70.0 - 5.0 * hour),
+    ) for hour, slot in enumerate(evening_prices)]
+    evening_p90 = {
+        task.start: (2000.0 if task.start.hour in (18, 19) else 1000.0)
+        for task in evening_tasks
+    }
+    evening_bridge = planner.scarcity_bridge_reserve_by_start(
+        evening_tasks,
+        price_slots=evening_prices,
+        solar_slots=[],
+        reserve_load_by_start_w=evening_p90,
+        ev_battery_protected=True,
+        hold_margin=0.15,
+        discharge_rate_kwh_h=3.57,
+        local_timezone=timezone.utc,
+    )
+    checks.append(("scarcity bridge also spans a sustained expensive evening window",
+                   evening_base + timedelta(hours=2) in evening_bridge
+                   and evening_bridge[evening_base + timedelta(hours=2)][0] >= 2.0
+                   and evening_base + timedelta(hours=6) in evening_bridge
+                   and evening_base + timedelta(hours=7) not in evening_bridge,
+                   str(evening_bridge)))
+    single_peak_p90 = dict(evening_p90)
+    single_peak_p90[evening_base + timedelta(hours=6)] = 1000.0
+    single_peak_bridge = planner.scarcity_bridge_reserve_by_start(
+        evening_tasks,
+        price_slots=evening_prices,
+        solar_slots=[],
+        reserve_load_by_start_w=single_peak_p90,
+        ev_battery_protected=True,
+        hold_margin=0.15,
+        discharge_rate_kwh_h=3.57,
+        local_timezone=timezone.utc,
+    )
+    checks.append(("isolated price spike stays with the incumbent finite reserve instead of being double-counted",
+                   single_peak_bridge == {}, str(single_peak_bridge)))
     uplifted_bridge = planner.morning_bridge_reserve_by_start(
         bridge_tasks,
         price_slots=bridge_prices,
@@ -7557,6 +7649,43 @@ def test_rolling_planner_upgrade():
                    and cleared_samples == [],
                    f"sustained={uplift} spike={spike_uplift} cleared={cleared_uplift}"))
 
+    evening_samples = []
+    evening_uplift = 0.0
+    evening_now = bridge_base + timedelta(hours=18)
+    for minute in range(6):
+        evening_samples, evening_uplift = co_mod._sustained_load_uplift(
+            evening_samples,
+            now=evening_now + timedelta(minutes=minute),
+            measured_house_load_w=2100.0,
+            p90_house_load_w=1200.0,
+        )
+    correction_now = evening_now + timedelta(minutes=5)
+    correction_instants = tuple(
+        correction_now + timedelta(hours=hours) for hours in (1, 3, 6)
+    )
+    correction_source = {instant.isoformat(): 1000.0 for instant in correction_instants}
+    corrected_p90 = co_mod._apply_live_load_uplift(
+        correction_source,
+        correction_instants,
+        now=correction_now,
+        uplift_w=evening_uplift,
+        strength=1.0,
+    )
+    corrected_p50 = co_mod._apply_live_load_uplift(
+        correction_source,
+        correction_instants,
+        now=correction_now,
+        uplift_w=evening_uplift,
+        strength=0.5,
+    )
+    checks.append(("sustained live-load correction works in the evening and decays over six hours",
+                   evening_uplift == 750.0
+                   and corrected_p90[correction_instants[0].isoformat()] == 1750.0
+                   and corrected_p90[correction_instants[1].isoformat()] == 1562.5
+                   and corrected_p90[correction_instants[2].isoformat()] == 1000.0
+                   and corrected_p50[correction_instants[0].isoformat()] == 1375.0,
+                   f"uplift={evening_uplift} p90={corrected_p90} p50={corrected_p50}"))
+
     bridge_state = models.SiteState(
         timestamp=bridge_base + timedelta(minutes=30),
         pv_power_w=0.0,
@@ -7596,12 +7725,82 @@ def test_rolling_planner_upgrade():
         schedule_override=bridge_tasks,
     )
     bridge_slots = {slot.start: slot for slot in bridge_plan.slots} if bridge_plan else {}
-    checks.append(("committed morning bridge raises only hold floors and never enables grid charge",
+    checks.append(("committed scarcity bridge exposes protected energy and never enables grid charge when disabled",
                    bool(bridge_slots)
-                   and "morning bridge" in bridge_slots[bridge_base + timedelta(hours=2)].reason
                    and bridge_slots[bridge_base + timedelta(hours=2)].tou_floor_pct >= 35.0
+                   and bridge_slots[bridge_base + timedelta(hours=2)].reserve_protected_kwh > 1.5
                    and not any(slot.grid_charge for slot in bridge_slots.values()),
                    str(bridge_slots)))
+
+    last_base = bridge_base + timedelta(hours=16)
+    last_prices = [models.PriceSlot(
+        start=last_base + timedelta(hours=hour),
+        spot_price=price,
+        tariff=0.0,
+        total_import_price=price,
+        export_value=0.4,
+    ) for hour, price in enumerate([0.40, 0.45, 2.00, 2.10])]
+    last_state = replace(
+        bridge_state,
+        timestamp=last_base,
+        battery_soc_pct=20.0,
+        current_buy_price=0.40,
+        price_slots=last_prices,
+        solar_slots=[],
+    )
+    last_tasks = [models.PlanTask(
+        start=slot.start,
+        action="DISCHARGE",
+        total_import_price=slot.total_import_price,
+        pv_estimate_kwh=0.0,
+        load_estimate_kwh=1.0,
+        projected_soc_pct=(20.0 if hour < 3 else 15.0),
+    ) for hour, slot in enumerate(last_prices)]
+    last_bridge = {
+        last_tasks[0].start: (2.5, 4.0),
+        last_tasks[1].start: (2.5, 4.0),
+        last_tasks[2].start: (1.0, 4.0),
+    }
+    last_charged = planner.apply_last_opportunity_grid_charge(
+        last_tasks,
+        state=last_state,
+        scarcity_bridge_by_start=last_bridge,
+        profile=planner.profile_for("blue"),
+        base_floor_pct=15.0,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        battery_care_soc=98.0,
+        grid_charge_rate_kwh_h=1.15,
+        allow_grid_charge=True,
+    )
+    checks.append(("last-opportunity charge uses chronological native targets and buys only the missing reserve",
+                   last_charged[0].action == "GRID_CHARGE"
+                   and last_charged[0].grid_charge_target_soc_pct == 30.0
+                   and last_charged[1].action == "GRID_CHARGE"
+                   and last_charged[1].grid_charge_target_soc_pct == 40.0,
+                   str(last_charged)))
+    estimated_last_prices = [
+        replace(slot, estimated=(index == 1))
+        for index, slot in enumerate(last_prices)
+    ]
+    estimated_last = planner.apply_last_opportunity_grid_charge(
+        last_tasks,
+        state=replace(last_state, price_slots=estimated_last_prices),
+        scarcity_bridge_by_start=last_bridge,
+        profile=planner.profile_for("blue"),
+        base_floor_pct=15.0,
+        capacity_kwh=10.0,
+        min_soc=15.0,
+        max_soc=100.0,
+        battery_care_soc=98.0,
+        grid_charge_rate_kwh_h=1.15,
+        allow_grid_charge=True,
+    )
+    checks.append(("last-opportunity charge never commits an estimated price slot",
+                   estimated_last[1].action != "GRID_CHARGE"
+                   and estimated_last[1].grid_charge_target_soc_pct is None,
+                   str(estimated_last)))
     checks.append(("manual SOC settings cannot cross their paired boundaries",
                    co_mod._clamp_battery_min_soc(95.0, 90.0) == 89.0
                    and co_mod._clamp_battery_max_soc(20.0, 25.0) == 26.0

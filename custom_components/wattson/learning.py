@@ -23,6 +23,7 @@ LEARNING_HALF_LIFE_DAYS = 10.0
 def build_load_profile(
     samples: Iterable[tuple[datetime, float | None]],
     *,
+    seasonal_samples: Iterable[tuple[datetime, float | None]] | None = None,
     temperature_samples: Iterable[tuple[datetime, float | None]] | None = None,
     full_days: int = LEARNING_FULL_DAYS,
     half_life_days: float = LEARNING_HALF_LIFE_DAYS,
@@ -42,14 +43,20 @@ def build_load_profile(
     weekday_quarter_buckets: dict[int, list[tuple[float, float]]] = {}
     weekend_quarter_buckets: dict[int, list[tuple[float, float]]] = {}
     days: set = set()
-    parsed: list[tuple[datetime, float]] = []
-    for timestamp, value in samples:
-        if value is None:
-            continue
-        try:
-            parsed.append((timestamp, float(value)))
-        except (TypeError, ValueError):
-            continue
+    def _parse(
+        values: Iterable[tuple[datetime, float | None]],
+    ) -> list[tuple[datetime, float]]:
+        parsed_values: list[tuple[datetime, float]] = []
+        for timestamp, value in values:
+            if value is None:
+                continue
+            try:
+                parsed_values.append((timestamp, float(value)))
+            except (TypeError, ValueError):
+                continue
+        return parsed_values
+
+    parsed = _parse(samples)
     if not parsed:
         return None
     newest = max(ts for ts, _ in parsed)
@@ -112,6 +119,70 @@ def build_load_profile(
     weekday_w = _quantile(weekday_buckets, 0.5)
     weekend_w = _quantile(weekend_buckets, 0.5)
 
+    seasonal_parsed = _parse(seasonal_samples or hourly_parsed)
+    seasonal_groups: dict[datetime, list[float]] = {}
+    for timestamp, watts in seasonal_parsed:
+        hour_start = timestamp.replace(minute=0, second=0, microsecond=0)
+        seasonal_groups.setdefault(hour_start, []).append(watts)
+    seasonal_hourly_parsed = [
+        (timestamp, sum(values) / len(values))
+        for timestamp, values in seasonal_groups.items()
+        if values
+    ]
+    seasonal_newest = max(
+        (timestamp for timestamp, _watts in seasonal_hourly_parsed),
+        default=newest,
+    )
+    seasonal_buckets: dict[str, dict[int, list[tuple[float, float]]]] = {}
+    seasonal_weekday_buckets: dict[str, dict[int, list[tuple[float, float]]]] = {}
+    seasonal_weekend_buckets: dict[str, dict[int, list[tuple[float, float]]]] = {}
+    seasonal_days: dict[str, set] = {}
+    for timestamp, watts in seasonal_hourly_parsed:
+        season = LoadProfile.season_for(timestamp)
+        age_days = max(
+            0.0,
+            (seasonal_newest - timestamp).total_seconds() / 86400.0,
+        )
+        # Long enough to retain the preceding matching season, while still
+        # preferring the most recent observed winter/autumn behavior.
+        weight = 0.5 ** (age_days / 180.0)
+        seasonal_buckets.setdefault(season, {}).setdefault(
+            timestamp.hour, []
+        ).append((watts, weight))
+        day_buckets = (
+            seasonal_weekend_buckets
+            if timestamp.weekday() >= 5
+            else seasonal_weekday_buckets
+        )
+        day_buckets.setdefault(season, {}).setdefault(
+            timestamp.hour, []
+        ).append((watts, weight))
+        seasonal_days.setdefault(season, set()).add(timestamp.date())
+
+    def _nested_quantile(
+        source: dict[str, dict[int, list[tuple[float, float]]]],
+        quantile: float,
+    ) -> dict[str, dict[int, float]]:
+        return {
+            season: _quantile(season_source, quantile)
+            for season, season_source in source.items()
+        }
+
+    seasonal_hourly_w = _nested_quantile(seasonal_buckets, 0.5)
+    seasonal_weekday_w = _nested_quantile(seasonal_weekday_buckets, 0.5)
+    seasonal_weekend_w = _nested_quantile(seasonal_weekend_buckets, 0.5)
+    seasonal_p90_w = _nested_quantile(seasonal_buckets, 0.9)
+    seasonal_weekday_p90_w = _nested_quantile(
+        seasonal_weekday_buckets, 0.9
+    )
+    seasonal_weekend_p90_w = _nested_quantile(
+        seasonal_weekend_buckets, 0.9
+    )
+    seasonal_day_counts = {
+        season: len(season_dates)
+        for season, season_dates in seasonal_days.items()
+    }
+
     # Temperature correction is deliberately conservative and optional. First
     # remove the normal hour-of-day shape, then regress the residual demand on
     # degrees colder than the median observed temperature. This avoids teaching
@@ -125,9 +196,22 @@ def build_load_profile(
         except (TypeError, ValueError):
             continue
     paired: list[tuple[float, float]] = []
-    for timestamp, watts in parsed:
+    for timestamp, watts in seasonal_hourly_parsed:
         temp = temp_by_hour.get(timestamp.replace(minute=0, second=0, microsecond=0))
-        baseline = hourly_w.get(timestamp.hour)
+        season = LoadProfile.season_for(timestamp)
+        seasonal_day_map = (
+            seasonal_weekend_w
+            if timestamp.weekday() >= 5
+            else seasonal_weekday_w
+        )
+        baseline = None
+        if seasonal_day_counts.get(season, 0) >= 7:
+            baseline = seasonal_day_map.get(season, {}).get(
+                timestamp.hour,
+                seasonal_hourly_w.get(season, {}).get(timestamp.hour),
+            )
+        if baseline is None:
+            baseline = hourly_w.get(timestamp.hour)
         if temp is not None and baseline is not None:
             paired.append((temp, watts - baseline))
     temp_reference: float | None = None
@@ -157,6 +241,13 @@ def build_load_profile(
         quarter_hourly_p90_w=_quantile(quarter_buckets, 0.9),
         weekday_quarter_hourly_p90_w=_quantile(weekday_quarter_buckets, 0.9),
         weekend_quarter_hourly_p90_w=_quantile(weekend_quarter_buckets, 0.9),
+        seasonal_hourly_w=seasonal_hourly_w,
+        seasonal_weekday_hourly_w=seasonal_weekday_w,
+        seasonal_weekend_hourly_w=seasonal_weekend_w,
+        seasonal_hourly_p90_w=seasonal_p90_w,
+        seasonal_weekday_hourly_p90_w=seasonal_weekday_p90_w,
+        seasonal_weekend_hourly_p90_w=seasonal_weekend_p90_w,
+        seasonal_days_observed=seasonal_day_counts,
         days_observed=days_observed,
         confidence=round(confidence, 3),
         temperature_reference_c=round(temp_reference, 2) if temp_reference is not None else None,
@@ -188,14 +279,37 @@ def forecast_load_w(
         if quarter_hour
         else {}
     )
+    if conservative:
+        generic_hourly = (
+            profile.weekend_p90_w
+            if start.weekday() >= 5
+            else profile.weekday_p90_w
+        ) or profile.hourly_p90_w or profile.hourly_w
+    else:
+        generic_hourly = (
+            profile.weekend_hourly_w
+            if start.weekday() >= 5
+            else profile.weekday_hourly_w
+        ) or profile.hourly_w
+    quarter_value = quarter_table.get(quarter)
+    if quarter_value is not None:
+        generic_hour = max(
+            1.0,
+            float(generic_hourly.get(start.hour, quarter_value)),
+        )
+        seasonal_hour = max(
+            0.0,
+            float(hourly_table.get(start.hour, generic_hour)),
+        )
+        seasonal_factor = min(1.8, max(0.6, seasonal_hour / generic_hour))
+        selected_watts = float(quarter_value) * seasonal_factor
+    else:
+        selected_watts = float(
+            hourly_table.get(start.hour, profile.hourly_w.get(start.hour, 0.0))
+        )
     watts = max(
         0.0,
-        float(
-            quarter_table.get(
-                quarter,
-                hourly_table.get(start.hour, profile.hourly_w.get(start.hour, 0.0)),
-            )
-        ),
+        selected_watts,
     )
     if (
         outdoor_temperature_c is not None
@@ -208,7 +322,11 @@ def forecast_load_w(
     # uncorrected demand. This bounds bad temperature sensors/history.
     base = max(
         1.0,
-        float(quarter_table.get(quarter, hourly_table.get(start.hour, watts))),
+        float(
+            quarter_value * seasonal_factor
+            if quarter_value is not None
+            else hourly_table.get(start.hour, watts)
+        ),
     )
     return min(watts, base * 2.5)
 

@@ -93,6 +93,7 @@ from .const import (
     DEFAULT_BATTERY_CARE_MAX_SOC,
     DEFAULT_BATTERY_CAPACITY_KWH,
     LEARNING_WINDOW_DAYS,
+    SEASONAL_LEARNING_WINDOW_DAYS,
     LEARNING_MIN_DAYS,
     LEARNING_RESERVE_HOURS,
     LEARNING_RESERVE_MAX_PCT,
@@ -327,29 +328,28 @@ def _rolling_replan_reason(
     return None
 
 
-MORNING_LOAD_UPLIFT_WINDOW_SECONDS = 20 * 60
-MORNING_LOAD_UPLIFT_MIN_SPAN_SECONDS = 5 * 60
-MORNING_LOAD_UPLIFT_STEP_W = 250.0
+LIVE_LOAD_UPLIFT_WINDOW_SECONDS = 20 * 60
+LIVE_LOAD_UPLIFT_MIN_SPAN_SECONDS = 5 * 60
+LIVE_LOAD_UPLIFT_STEP_W = 250.0
+LIVE_LOAD_UPLIFT_FULL_HOURS = 2.0
+LIVE_LOAD_UPLIFT_END_HOURS = 6.0
 
 
-def _sustained_morning_load_uplift(
+def _sustained_load_uplift(
     samples: list[tuple[datetime, float]],
     *,
     now: datetime,
-    local_hour: int,
     measured_house_load_w: float,
     p90_house_load_w: float,
 ) -> tuple[list[tuple[datetime, float]], float]:
     """Track a sustained positive P90 miss without reacting to short spikes."""
-    if not 0 <= local_hour < 9:
-        return [], 0.0
-    cutoff = now - timedelta(seconds=MORNING_LOAD_UPLIFT_WINDOW_SECONDS)
+    cutoff = now - timedelta(seconds=LIVE_LOAD_UPLIFT_WINDOW_SECONDS)
     retained = [(at, error) for at, error in samples if at >= cutoff]
     retained.append((now, max(0.0, measured_house_load_w - p90_house_load_w)))
     if (
         len(retained) < 3
         or (retained[-1][0] - retained[0][0]).total_seconds()
-        < MORNING_LOAD_UPLIFT_MIN_SPAN_SECONDS
+        < LIVE_LOAD_UPLIFT_MIN_SPAN_SECONDS
     ):
         return retained, 0.0
     errors = sorted(error for _at, error in retained)
@@ -360,10 +360,64 @@ def _sustained_morning_load_uplift(
         else (errors[middle - 1] + errors[middle]) / 2.0
     )
     uplift = (
-        int(max(0.0, median) // MORNING_LOAD_UPLIFT_STEP_W)
-        * MORNING_LOAD_UPLIFT_STEP_W
+        int(max(0.0, median) // LIVE_LOAD_UPLIFT_STEP_W)
+        * LIVE_LOAD_UPLIFT_STEP_W
     )
     return retained, min(MORNING_BRIDGE_LIVE_UPLIFT_MAX_W, uplift)
+
+
+def _sustained_morning_load_uplift(
+    samples: list[tuple[datetime, float]],
+    *,
+    now: datetime,
+    local_hour: int,
+    measured_house_load_w: float,
+    p90_house_load_w: float,
+) -> tuple[list[tuple[datetime, float]], float]:
+    """Compatibility wrapper for simulations written before v0.27.2."""
+    if not 0 <= local_hour < 9:
+        return [], 0.0
+    return _sustained_load_uplift(
+        samples,
+        now=now,
+        measured_house_load_w=measured_house_load_w,
+        p90_house_load_w=p90_house_load_w,
+    )
+
+
+def _apply_live_load_uplift(
+    forecast: dict[str, float] | None,
+    instants: tuple[datetime, ...],
+    *,
+    now: datetime,
+    uplift_w: float,
+    strength: float,
+) -> dict[str, float] | None:
+    """Apply a decaying sustained-load correction to a canonical forecast."""
+    if forecast is None or uplift_w <= 0.0 or strength <= 0.0:
+        return forecast
+    corrected = dict(forecast)
+    for instant in instants:
+        hours = max(0.0, (instant - now).total_seconds() / 3600.0)
+        if hours <= LIVE_LOAD_UPLIFT_FULL_HOURS:
+            factor = 1.0
+        elif hours >= LIVE_LOAD_UPLIFT_END_HOURS:
+            factor = 0.0
+        else:
+            factor = (
+                LIVE_LOAD_UPLIFT_END_HOURS - hours
+            ) / (
+                LIVE_LOAD_UPLIFT_END_HOURS - LIVE_LOAD_UPLIFT_FULL_HOURS
+            )
+        if factor <= 0.0:
+            continue
+        key = instant.isoformat()
+        corrected[key] = max(
+            0.0,
+            float(corrected.get(key, 0.0))
+            + uplift_w * strength * factor,
+        )
+    return corrected
 
 
 def _price_horizon_changed(
@@ -761,6 +815,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_minimum_recovery: EvMinimumRecovery | None = None
         self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
+        self._live_load_error_samples: list[tuple[datetime, float]] = []
+        self._live_load_uplift_w: float = 0.0
+        # Compatibility attributes retained for existing diagnostics consumers.
         self._morning_load_error_samples: list[tuple[datetime, float]] = []
         self._morning_load_uplift_w: float = 0.0
         self._repairs_state: dict[str, list] = {}
@@ -923,6 +980,24 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             stats = await get_instance(self.hass).async_add_executor_job(
                 statistics_during_period, self.hass, start, end, wanted, "5minute", None, {"mean"}
             )
+            try:
+                seasonal_stats = await get_instance(self.hass).async_add_executor_job(
+                    statistics_during_period,
+                    self.hass,
+                    end - timedelta(days=SEASONAL_LEARNING_WINDOW_DAYS),
+                    end,
+                    wanted,
+                    "hour",
+                    None,
+                    {"mean"},
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Wattson could not read seasonal hourly statistics; "
+                    "using recent profile only: %s",
+                    err,
+                )
+                seasonal_stats = {}
             rows = stats.get(load_entity, []) if stats else []
 
             def _row_ts(row):
@@ -945,6 +1020,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     continue
             temperature_samples: list[tuple[datetime, float | None]] = []
             for row in (stats.get(temp_entity, []) if (stats and temp_entity) else []):
+                ts = _row_ts(row)
+                mean = row.get("mean")
+                if ts is not None:
+                    temperature_samples.append((dt_util.as_local(ts), mean))
+            for row in (
+                seasonal_stats.get(temp_entity, [])
+                if (seasonal_stats and temp_entity)
+                else []
+            ):
                 ts = _row_ts(row)
                 mean = row.get("mean")
                 if ts is not None:
@@ -1002,8 +1086,42 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     except (TypeError, ValueError):
                         pass
                 samples.append((dt_util.as_local(ts), mean))
+            seasonal_ev_by_period: dict[datetime, float] = {}
+            for row in (
+                seasonal_stats.get(ev_entity, [])
+                if (seasonal_stats and ev_entity)
+                else []
+            ):
+                ts = _row_ts(row)
+                mean = row.get("mean")
+                if ts is None or mean is None:
+                    continue
+                try:
+                    seasonal_ev_by_period[ts] = float(mean) * 1000.0
+                except (TypeError, ValueError):
+                    continue
+            seasonal_samples: list[tuple[datetime, float | None]] = []
+            for row in (
+                seasonal_stats.get(load_entity, [])
+                if seasonal_stats
+                else []
+            ):
+                ts = _row_ts(row)
+                mean = row.get("mean")
+                if ts is None:
+                    continue
+                if mean is not None and ts in seasonal_ev_by_period:
+                    try:
+                        mean = max(
+                            0.0,
+                            float(mean) - seasonal_ev_by_period[ts],
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                seasonal_samples.append((dt_util.as_local(ts), mean))
             profile = build_load_profile(
                 samples,
+                seasonal_samples=seasonal_samples or None,
                 temperature_samples=temperature_samples,
             )
             if profile is not None:
@@ -2883,16 +3001,43 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             _measured_house_load_w,
         )
         (
-            self._morning_load_error_samples,
-            self._morning_load_uplift_w,
-        ) = _sustained_morning_load_uplift(
-            self._morning_load_error_samples,
+            self._live_load_error_samples,
+            self._live_load_uplift_w,
+        ) = _sustained_load_uplift(
+            self._live_load_error_samples,
             now=utc_instant(self.site_state.timestamp),
-            local_hour=dt_util.as_local(
-                utc_instant(self.site_state.timestamp)
-            ).hour,
             measured_house_load_w=_measured_house_load_w,
             p90_house_load_w=_p90_house_load_w,
+        )
+        self._morning_load_error_samples = list(self._live_load_error_samples)
+        self._morning_load_uplift_w = self._live_load_uplift_w
+        _load_hourly = _apply_live_load_uplift(
+            _load_hourly,
+            _forecast_instants,
+            now=utc_instant(self.site_state.timestamp),
+            uplift_w=self._live_load_uplift_w,
+            strength=0.5,
+        )
+        _reserve_load = _apply_live_load_uplift(
+            _reserve_load,
+            _forecast_instants,
+            now=utc_instant(self.site_state.timestamp),
+            uplift_w=self._live_load_uplift_w,
+            strength=1.0,
+        )
+        _scenario_load = _apply_live_load_uplift(
+            _scenario_load,
+            _scenario_instants,
+            now=utc_instant(self.site_state.timestamp),
+            uplift_w=self._live_load_uplift_w,
+            strength=0.5,
+        )
+        _scenario_reserve_load = _apply_live_load_uplift(
+            _scenario_reserve_load,
+            _scenario_instants,
+            now=utc_instant(self.site_state.timestamp),
+            uplift_w=self._live_load_uplift_w,
+            strength=1.0,
         )
         raw_learned_reserve_pct = self._learned_reserve_pct()
         learned_reserve_pct = raw_learned_reserve_pct
@@ -3030,7 +3175,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             round(learned_reserve_pct / 5.0), _learned_reserve_fp,
             round(self.reserve_hold_margin, 2), _grid_charge_rate,
             _load_fp,
-            round(self._morning_load_uplift_w),
+            round(self._live_load_uplift_w),
             round(self._forecast_confidence, 2),
             round(solar_charge_priority, 1), round(self.battery_charge_current, 1),
             round(self.battery_discharge_current, 1), round(self.battery_care_soc, 1),
@@ -3067,12 +3212,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if _expected_soc is not None
             else None
         )
-        _morning_bridge_guard_active = bool(
-            0 <= dt_util.as_local(utc_instant(_now_local)).hour < 9
-            and (
-                self._morning_load_uplift_w > 0.0
-                or self.site_state.battery_soc_pct <= _min_soc + 25.0
-                or (_slot is not None and "morning bridge" in _slot.reason)
+        _scarcity_guard_active = bool(
+            self._live_load_uplift_w > 0.0
+            or (
+                _slot is not None
+                and "scarcity bridge" in _slot.reason
             )
         )
         _horizon_grew = _price_horizon_changed(
@@ -3093,7 +3237,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_connected=_ev_connected,
             soc_deviation_pct=_soc_deviation,
             soc_deviation_threshold_pct=(
-                2.5 if _morning_bridge_guard_active else PLAN_SOC_DEVIATION_PCT
+                2.5 if _scarcity_guard_active else PLAN_SOC_DEVIATION_PCT
             ),
             interval_elapsed=(
                 self._last_replan_at is None
@@ -3124,7 +3268,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 forecast_confidence=self._forecast_confidence,
                 ev_load_by_start=_ev_load_by_start,
                 ev_battery_protected=_ev_battery_protected,
-                morning_load_uplift_w=self._morning_load_uplift_w,
+                # Canonical P50/P90 forecasts above already contain the live
+                # correction; do not add it a second time inside the bridge.
+                morning_load_uplift_w=0.0,
                 allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
             )
             if _active_day_plan is not None:
@@ -3173,7 +3319,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         forecast_confidence=self._forecast_confidence,
                         ev_load_by_start=_ev_load_by_start,
                         ev_battery_protected=_ev_battery_protected,
-                        morning_load_uplift_w=self._morning_load_uplift_w,
+                        morning_load_uplift_w=0.0,
                         allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
                         schedule_override=_candidate.tasks,
                     )

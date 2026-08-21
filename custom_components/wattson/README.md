@@ -50,11 +50,15 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
-Version 0.27.1 adds a hold-only overnight-to-morning bridge. From the cheapest
-pre-06 price valley it protects materially valuable 06:00-09:00 P90 house load
-after P10 solar, then releases the reserve into the morning peak. A sustained
-five-minute load miss can raise the bridge in bounded 250 W steps, and an active
-morning guard replans on a 2.5 percentage-point SOC deviation. The bridge cannot
-enable grid charging or exceed energy already in the battery. The staged
-48-hour optimizer, entity IDs, services, manual overrides, 15% hard floor and
-physical 70 A ceiling are unchanged.
+Version 0.27.2 generalizes the morning bridge to sustained expensive scarcity
+windows anywhere in the day. It protects only the incremental P90-load/P10-solar
+tail not already covered by the economic trajectory, credits finite conservative
+solar refill before each deadline, and releases the reserve through the window.
+If the projected battery still cannot reach a material reserve, a last-opportunity
+guard buys only the missing energy in real-price, economically valid slots and
+publishes explicit native 5% SOC charge targets. Sustained live load misses now
+correct P50/P90 forecasts all day with a two-to-six-hour decay. A separate 365-day
+hourly model adds season and weekday/weekend context while the established 28-day
+high-resolution profile remains the fallback. The staged 48-hour optimizer,
+entity IDs, services, manual overrides, 15% hard floor and physical 70 A ceiling
+are unchanged.

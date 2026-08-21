@@ -195,6 +195,12 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
             "temperature_reference_c": c.load_profile.temperature_reference_c,
             "temperature_slope_w_per_c": c.load_profile.temperature_slope_w_per_c,
             "temperature_samples": c.load_profile.temperature_samples,
+            "active_season": c.load_profile.season_for(dt_util.now()),
+            "seasonal_days_observed": c.load_profile.seasonal_days_observed,
+            "active_season_hourly_w": c.load_profile.hourly_for(dt_util.now()),
+            "active_season_p90_w": c.load_profile.conservative_hourly_for(
+                dt_util.now()
+            ),
         }
         if getattr(c, "load_profile", None)
         else None,
@@ -324,6 +330,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "load_estimate_kwh": task.load_estimate_kwh,
                     "ev_load_estimate_kwh": task.ev_load_estimate_kwh,
                     "projected_soc_pct": task.projected_soc_pct,
+                    "grid_charge_target_soc_pct": task.grid_charge_target_soc_pct,
                     "tou_floor_pct": task.tou_floor_pct,
                     "reason": task.reason,
                 }
@@ -459,10 +466,10 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "reserve_floor_cap_pct": (
                     getattr(current_day_slot, "reserve_floor_cap_pct", None)
                 ),
-                "morning_bridge": {
+                "scarcity_bridge": {
                     "active": bool(
                         current_day_slot is not None
-                        and "morning bridge" in current_day_slot.reason
+                        and "scarcity bridge" in current_day_slot.reason
                     ),
                     "protected_kwh": round(
                         getattr(current_day_slot, "reserve_protected_kwh", 0.0),
@@ -476,10 +483,50 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     "live_load_uplift_w": round(
                         getattr(
                             self.coordinator,
-                            "_morning_load_uplift_w",
+                            "_live_load_uplift_w",
                             0.0,
                         )
                     ),
+                },
+                # Backward-compatible alias for dashboards created with v0.27.1.
+                "morning_bridge": {
+                    "active": bool(
+                        current_day_slot is not None
+                        and "scarcity bridge" in current_day_slot.reason
+                    ),
+                    "protected_kwh": round(
+                        getattr(current_day_slot, "reserve_protected_kwh", 0.0),
+                        3,
+                    ),
+                    "floor_pct": getattr(
+                        current_day_slot,
+                        "tou_floor_pct",
+                        None,
+                    ),
+                    "live_load_uplift_w": round(
+                        getattr(self.coordinator, "_live_load_uplift_w", 0.0)
+                    ),
+                },
+                "live_load_correction": {
+                    "uplift_w": round(
+                        getattr(self.coordinator, "_live_load_uplift_w", 0.0)
+                    ),
+                    "window_minutes": round(
+                        (
+                            self.coordinator._live_load_error_samples[-1][0]
+                            - self.coordinator._live_load_error_samples[0][0]
+                        ).total_seconds()
+                        / 60.0,
+                        1,
+                    )
+                    if len(
+                        getattr(
+                            self.coordinator,
+                            "_live_load_error_samples",
+                            [],
+                        )
+                    ) >= 2
+                    else 0.0,
                 },
                 "physical_tou_floor_pct": (
                     control_plan.battery.desired_tou_capacity_pct if control_plan else None
