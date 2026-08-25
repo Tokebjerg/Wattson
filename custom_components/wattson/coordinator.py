@@ -1,6 +1,7 @@
 """Coordinator for Wattson."""
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
@@ -190,6 +191,7 @@ from .models import (
     ControlPlan,
     EntityMapping,
     EvPlan,
+    PlanTask,
     SiteState,
     SlotPlan,
     SolarSlot,
@@ -333,6 +335,10 @@ LIVE_LOAD_UPLIFT_MIN_SPAN_SECONDS = 5 * 60
 LIVE_LOAD_UPLIFT_STEP_W = 250.0
 LIVE_LOAD_UPLIFT_FULL_HOURS = 2.0
 LIVE_LOAD_UPLIFT_END_HOURS = 6.0
+DISCHARGE_BUDGET_IMPORT_SECONDS = 30
+DISCHARGE_BUDGET_STEP_SECONDS = 5 * 60
+DISCHARGE_BUDGET_NATIVE_STEP_PCT = 5.0
+EV_COMPLETE_STABLE_SECONDS = 2 * 60
 
 
 def _sustained_load_uplift(
@@ -812,6 +818,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._battery_model_pv_kwh = 0.0
         self._battery_model_discharge_hours = 0.0
         self._battery_model_discharge_kwh = 0.0
+        self._discharge_budget_slot_start: datetime | None = None
+        self._discharge_budget_floor_pct: float | None = None
+        self._discharge_budget_import_since: datetime | None = None
+        self._discharge_budget_last_step_at: datetime | None = None
+        self._ev_completed_since: datetime | None = None
+        self._ev_completed_session_kwh: float | None = None
         self._ev_minimum_recovery: EvMinimumRecovery | None = None
         self._ev_minimum_recovery_last_saved_kwh = 0.0
         self._load_samples: list[tuple[datetime, float]] = []
@@ -1018,6 +1030,35 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     ev_by_period[ts] = float(mean) * 1000.0  # kW -> W
                 except (TypeError, ValueError):
                     continue
+
+            def _period_lookup(values: dict[datetime, float]):
+                timestamps = sorted(values)
+
+                def _nearest(
+                    timestamp: datetime,
+                    *,
+                    tolerance_seconds: float,
+                ) -> float | None:
+                    direct = values.get(timestamp)
+                    if direct is not None:
+                        return direct
+                    index = bisect_left(timestamps, timestamp)
+                    candidates = timestamps[max(0, index - 1) : index + 1]
+                    if not candidates:
+                        return None
+                    nearest = min(
+                        candidates,
+                        key=lambda candidate: abs(
+                            (candidate - timestamp).total_seconds()
+                        ),
+                    )
+                    if abs((nearest - timestamp).total_seconds()) > tolerance_seconds:
+                        return None
+                    return values[nearest]
+
+                return _nearest
+
+            ev_period_value = _period_lookup(ev_by_period)
             temperature_samples: list[tuple[datetime, float | None]] = []
             for row in (stats.get(temp_entity, []) if (stats and temp_entity) else []):
                 ts = _row_ts(row)
@@ -1069,10 +1110,23 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 mean = row.get("mean")
                 if ts is None:
                     continue
-                if mean is not None and ts in ev_by_period:
+                ev_value = (
+                    ev_period_value(
+                        ts,
+                        tolerance_seconds=3 * 60,
+                    )
+                    if ev_entity
+                    else 0.0
+                )
+                # When whole-site load contains EV power, an unmatched Easee row
+                # is ambiguous. Excluding it is safer than teaching the P90 model
+                # that a 5-11 kW charging session belongs to the house.
+                if ev_entity and ev_value is None:
+                    continue
+                if mean is not None and ev_value is not None:
                     try:
                         raw = float(mean)
-                        mean = max(0.0, raw - ev_by_period[ts])
+                        mean = max(0.0, raw - ev_value)
                         # F5: a partial-hour EV session (or an over-counted Easee row)
                         # can subtract MORE than the hour's metered load, clamping the
                         # house bucket to 0 and dropping a real load sample. The F3
@@ -1081,7 +1135,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         if mean == 0.0 and raw > 300.0:
                             _LOGGER.debug(
                                 "Wattson load-learn: EV subtraction zeroed period %s (house %.0fW - EV %.0fW)",
-                                ts, raw, ev_by_period[ts],
+                                ts, raw, ev_value,
                             )
                     except (TypeError, ValueError):
                         pass
@@ -1100,6 +1154,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     seasonal_ev_by_period[ts] = float(mean) * 1000.0
                 except (TypeError, ValueError):
                     continue
+            seasonal_ev_period_value = _period_lookup(seasonal_ev_by_period)
             seasonal_samples: list[tuple[datetime, float | None]] = []
             for row in (
                 seasonal_stats.get(load_entity, [])
@@ -1110,11 +1165,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 mean = row.get("mean")
                 if ts is None:
                     continue
-                if mean is not None and ts in seasonal_ev_by_period:
+                ev_value = (
+                    seasonal_ev_period_value(
+                        ts,
+                        tolerance_seconds=30 * 60,
+                    )
+                    if ev_entity
+                    else 0.0
+                )
+                if ev_entity and ev_value is None:
+                    continue
+                if mean is not None and ev_value is not None:
                     try:
                         mean = max(
                             0.0,
-                            float(mean) - seasonal_ev_by_period[ts],
+                            float(mean) - ev_value,
                         )
                     except (TypeError, ValueError):
                         pass
@@ -1265,36 +1330,75 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._battery_model_grid_hours = 0.0
             self._battery_model_grid_kwh = 0.0
 
-        pv_charging = bool(
+        configured_pv_rate = battery_rate_kwh(self.battery_charge_current)
+        configured_pv_w = configured_pv_rate * 1000.0
+        observed_pv_w = max(0.0, -state.battery_power_w)
+        available_pv_w = max(
+            0.0,
+            state.pv_power_w - state.load_power_w,
+            observed_pv_w + state.grid_export_power_w,
+        )
+        pv_saturated = bool(
             not grid_commanded
             and valid_tick
             and 10.0 <= state.battery_soc_pct <= 98.0
-            and state.battery_power_w < -100.0
-            and state.pv_power_w - state.load_power_w > 100.0
+            and observed_pv_w >= configured_pv_w * 0.35
+            and (
+                observed_pv_w >= configured_pv_w * 0.85
+                or (
+                    available_pv_w >= configured_pv_w * 0.85
+                    and state.grid_export_power_w >= 100.0
+                )
+            )
         )
-        if pv_charging:
+        if pv_saturated:
             self._battery_model_pv_hours += dt_hours
-            self._battery_model_pv_kwh += (-state.battery_power_w / 1000.0) * dt_hours
+            self._battery_model_pv_kwh += (observed_pv_w / 1000.0) * dt_hours
         elif self._battery_model_pv_hours > 0.0:
             if self._battery_model_pv_hours >= 0.25 and self._battery_model_pv_kwh >= 0.2:
                 self._battery_model = observe_pv_charge_rate(
                     self._battery_model,
                     self._battery_model_pv_kwh / self._battery_model_pv_hours,
-                    configured_kwh_h=battery_rate_kwh(self.battery_charge_current),
+                    configured_kwh_h=configured_pv_rate,
+                    saturated=True,
                     updated_at=now.isoformat(),
                 )
             self._battery_model_pv_hours = 0.0
             self._battery_model_pv_kwh = 0.0
 
-        discharging = bool(
-            valid_tick
-            and state.battery_power_w > 100.0
-            and state.grid_import_power_w < 300.0
-            and state.battery_soc_pct > 10.0
+        configured_discharge_rate = battery_rate_kwh(self.battery_discharge_current)
+        configured_discharge_w = configured_discharge_rate * 1000.0
+        observed_discharge_w = max(0.0, state.battery_power_w)
+        previous_floor = (
+            getattr(previous_plan.battery, "desired_tou_capacity_pct", None)
+            if previous_plan is not None
+            else None
         )
-        if discharging:
+        discharge_commanded = bool(
+            previous_plan is not None
+            and getattr(previous_plan.battery, "desired_discharge_current_a", 0.0) != 0.0
+            and (
+                previous_floor is None
+                or state.battery_soc_pct > float(previous_floor) + 1.0
+            )
+        )
+        physical_deficit_w = max(0.0, state.load_power_w - state.pv_power_w)
+        discharge_saturated = bool(
+            valid_tick
+            and discharge_commanded
+            and state.battery_soc_pct > self.battery_min_soc + 2.0
+            and observed_discharge_w >= configured_discharge_w * 0.35
+            and (
+                observed_discharge_w >= configured_discharge_w * 0.85
+                or (
+                    state.grid_import_power_w >= 150.0
+                    and physical_deficit_w >= observed_discharge_w + 100.0
+                )
+            )
+        )
+        if discharge_saturated:
             self._battery_model_discharge_hours += dt_hours
-            self._battery_model_discharge_kwh += (state.battery_power_w / 1000.0) * dt_hours
+            self._battery_model_discharge_kwh += (observed_discharge_w / 1000.0) * dt_hours
         elif self._battery_model_discharge_hours > 0.0:
             if (
                 self._battery_model_discharge_hours >= 0.25
@@ -1304,7 +1408,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     self._battery_model,
                     self._battery_model_discharge_kwh
                     / self._battery_model_discharge_hours,
-                    configured_kwh_h=battery_rate_kwh(self.battery_discharge_current),
+                    configured_kwh_h=configured_discharge_rate,
+                    saturated=True,
                     updated_at=now.isoformat(),
                 )
             self._battery_model_discharge_hours = 0.0
@@ -1368,8 +1473,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "grid_charge_rate_kwh_h": interval["grid_charge_rate_kwh_h"],
             "ev_battery_protected": True,
         }
-        active = score_realized_interval(action=interval["active_action"], **common)
-        candidate = score_realized_interval(action=interval["candidate_action"], **common)
+        active = score_realized_interval(**interval["active_setpoint"], **common)
+        candidate = score_realized_interval(**interval["candidate_setpoint"], **common)
         return {
             "started_at": interval["started_at"],
             "duration_hours": round(duration, 4),
@@ -1386,8 +1491,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self,
         *,
         now: datetime,
-        active_action: str,
-        candidate_action: str,
+        active_task: PlanTask,
+        candidate_task: PlanTask,
         candidate_valid: bool,
         capacity_kwh: float,
         min_soc: float,
@@ -1400,6 +1505,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if slot.start >= now and not slot.estimated
         ]
         replacement_price = max(0.0, min(future_prices, default=0.0))
+        def _setpoint(task: PlanTask) -> dict[str, Any]:
+            return {
+                "action": task.action,
+                "tou_floor_pct": task.tou_floor_pct,
+                "grid_charge_target_soc_pct": task.grid_charge_target_soc_pct,
+                "sell": task.sell,
+                "charge_current_a": task.charge_current_a,
+                "intent": task.intent,
+            }
+
         self._optimizer_interval = {
             "started_at": now.isoformat(),
             "last_tick": now,
@@ -1410,8 +1525,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "import_price_hours": 0.0,
             "export_price_hours": 0.0,
             "start_soc_pct": self.site_state.battery_soc_pct if self.site_state else min_soc,
-            "active_action": active_action,
-            "candidate_action": candidate_action,
+            "active_setpoint": _setpoint(active_task),
+            "candidate_setpoint": _setpoint(candidate_task),
             "candidate_valid": candidate_valid,
             "replacement_price": replacement_price,
             "capacity_kwh": capacity_kwh,
@@ -2431,6 +2546,90 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         )
         return float(recovery_floor)
 
+    def _update_discharge_budget_floor(
+        self,
+        battery_plan: BatteryPlan,
+        *,
+        slot: SlotPlan | None,
+        safe_reasons: list[str],
+        now: datetime,
+        min_soc: float,
+    ) -> float | None:
+        """Open one measured, value-safe native step when a slot budget runs out."""
+        excluded_strategies = {
+            "GRID_CHARGE",
+            "ABSORB_NEGATIVE",
+            "OVERRIDE_CHARGE",
+            "OVERRIDE_SOLAR_CHARGE",
+            "OVERRIDE_HOLD",
+            "HOLD",
+            "HOLD_FULL",
+            "PROTECT",
+        }
+        eligible = bool(
+            slot is not None
+            and self.site_state is not None
+            and slot.discharge_extension_allowed
+            and not safe_reasons
+            and battery_plan.strategy not in excluded_strategies
+            and max(0.0, self.site_state.easee_power_w or 0.0) < 200.0
+            and slot.total_import_price > 0.0
+        )
+        if not eligible:
+            self._discharge_budget_slot_start = None
+            self._discharge_budget_floor_pct = None
+            self._discharge_budget_import_since = None
+            self._discharge_budget_last_step_at = None
+            return None
+
+        if self._discharge_budget_slot_start != slot.start:
+            self._discharge_budget_slot_start = slot.start
+            self._discharge_budget_floor_pct = float(slot.tou_floor_pct)
+            self._discharge_budget_import_since = None
+            self._discharge_budget_last_step_at = None
+
+        current_floor = float(self._discharge_budget_floor_pct or slot.tou_floor_pct)
+        protected_floor = max(
+            float(min_soc),
+            float(slot.reserve_floor_cap_pct or min_soc),
+            float(slot.tou_floor_pct) - DISCHARGE_BUDGET_NATIVE_STEP_PCT,
+        )
+        if current_floor < float(slot.tou_floor_pct) - 0.1:
+            # Never raise a released floor again within the same physical slot.
+            return current_floor
+
+        stalled_at_budget = bool(
+            self.site_state.grid_import_power_w >= AVOIDABLE_IMPORT_WATCHDOG_GRID_W
+            and abs(self.site_state.battery_power_w or 0.0)
+            < AVOIDABLE_IMPORT_WATCHDOG_BATTERY_IDLE_W
+            and self.site_state.battery_soc_pct
+            <= current_floor + AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT
+            and current_floor > protected_floor + 0.1
+        )
+        if not stalled_at_budget:
+            self._discharge_budget_import_since = None
+            return None
+        if self._discharge_budget_import_since is None:
+            self._discharge_budget_import_since = now
+            return None
+        if (
+            now - self._discharge_budget_import_since
+        ).total_seconds() < DISCHARGE_BUDGET_IMPORT_SECONDS:
+            return None
+        if (
+            self._discharge_budget_last_step_at is not None
+            and (now - self._discharge_budget_last_step_at).total_seconds()
+            < DISCHARGE_BUDGET_STEP_SECONDS
+        ):
+            return None
+        self._discharge_budget_floor_pct = max(
+            protected_floor,
+            current_floor - DISCHARGE_BUDGET_NATIVE_STEP_PCT,
+        )
+        self._discharge_budget_last_step_at = now
+        self._discharge_budget_import_since = None
+        return self._discharge_budget_floor_pct
+
     def _reset_control_fingerprints(self) -> None:
         """Force the next active tick to re-assert both physical plans."""
         self._last_ev_fp = None
@@ -2886,6 +3085,39 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             one_phase_ceiling_w=EV_SINGLE_PHASE_OBSERVED_CEILING_W,
         )
         self._sync_ev_session_compatibility_fields()
+        _raw_ev_status = (self.site_state.easee_status or "").strip().lower()
+        _raw_ev_completed = bool(
+            _raw_ev_status in {"completed", "complete", "finished"}
+            and max(0.0, self.site_state.easee_power_w or 0.0) < 200.0
+        )
+        _session_kwh = self.site_state.easee_session_kwh
+        if not _raw_ev_completed:
+            self._ev_completed_since = None
+            self._ev_completed_session_kwh = None
+        elif (
+            self._ev_completed_since is None
+            or (
+                (_session_kwh is None)
+                != (self._ev_completed_session_kwh is None)
+            )
+            or (
+                _session_kwh is not None
+                and self._ev_completed_session_kwh is not None
+                and abs(_session_kwh - self._ev_completed_session_kwh) > 0.01
+            )
+        ):
+            self._ev_completed_since = tick.now
+            self._ev_completed_session_kwh = _session_kwh
+        _ev_completed_stable = bool(
+            _raw_ev_completed
+            and self._ev_completed_since is not None
+            and (tick.now - self._ev_completed_since).total_seconds()
+            >= EV_COMPLETE_STABLE_SECONDS
+        )
+        self.site_state = replace(
+            self.site_state,
+            easee_completed_stable=_ev_completed_stable,
+        )
         if new_ev_session:
             self._reset_ev_phase_transition_state()
         if not self._ev_session.allows_vehicle_soc(
@@ -3059,7 +3291,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             DEFAULT_EV_CHARGE_SPEED_PCT_H,
         ))
         _ev_runtime = ev_runtime_state(self.site_state)
-        _ev_connected = _ev_runtime != "disconnected"
+        # For planning, a completed session is inactive even though the cable is
+        # still connected. This transition triggers the same immediate rolling
+        # replan as a disconnect and clears phantom EV demand from the horizon.
+        _ev_connected = _ev_runtime not in {"disconnected", "complete"}
         await self._async_update_ev_minimum_recovery(
             ev_runtime=_ev_runtime,
             ev_max_amps=ev_max_amps,
@@ -3454,8 +3689,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     )
                     self._start_optimizer_interval(
                         now=_now_local,
-                        active_action=_active_day_plan.tasks[0].action,
-                        candidate_action=_candidate_day_plan.tasks[0].action,
+                        active_task=_active_day_plan.tasks[0],
+                        candidate_task=_candidate_day_plan.tasks[0],
                         candidate_valid=_candidate_score.valid,
                         capacity_kwh=_capacity,
                         min_soc=_min_soc,
@@ -4036,6 +4271,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 reason=(
                     f"{battery_plan.reason} | import-vagt: frigiver ubeskyttet "
                     f"TOU-reserve til {avoidable_import_floor:.0f}%"
+                ),
+            )
+        discharge_budget_floor = self._update_discharge_budget_floor(
+            battery_plan,
+            slot=_slot,
+            safe_reasons=safe_reasons,
+            now=dt_util.utcnow(),
+            min_soc=min_soc,
+        )
+        if discharge_budget_floor is not None:
+            discharge_floor = min(discharge_floor, discharge_budget_floor)
+            battery_plan = replace(
+                battery_plan,
+                reason=(
+                    f"{battery_plan.reason} | afladningsbudget: målt merforbrug "
+                    f"åbner ét ekstra TOU-trin til {discharge_budget_floor:.0f}%"
                 ),
             )
         if self._update_self_consumption_watchdog(

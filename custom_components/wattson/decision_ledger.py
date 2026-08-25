@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from statistics import mean
+import math
+from statistics import mean, pstdev
 from typing import Any
 
 from .models import PlanTask, SiteState
@@ -16,6 +17,10 @@ PROMOTION_MIN_DAYS = 7
 PROMOTION_MIN_MEAN_ADVANTAGE_KR = 0.05
 PROMOTION_MIN_WIN_RATE = 0.60
 PROMOTION_MAX_WORST_REGRET_KR = 0.75
+PROMOTION_DECISIVE_EPSILON_KR = 0.005
+PROMOTION_MIN_DECISIVE_EVALUATIONS = 24
+PROMOTION_MIN_CUMULATIVE_ADVANTAGE_KR = 1.00
+PROMOTION_CONFIDENCE_Z = 1.645
 CANARY_MIN_DAYS = 2
 CANARY_MIN_USES = 16
 ROLLBACK_REGRET_KR = 1.0
@@ -29,6 +34,37 @@ def _parse_time(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def _promotion_statistics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    advantages = [float(row.get("advantage_kr", 0.0)) for row in rows]
+    decisive = [
+        value for value in advantages
+        if abs(value) >= PROMOTION_DECISIVE_EPSILON_KR
+    ]
+    daily: dict[str, float] = {}
+    for row, value in zip(rows, advantages):
+        day = str(row.get("at", ""))[:10]
+        if day:
+            daily[day] = daily.get(day, 0.0) + value
+    decisive_mean = mean(decisive) if decisive else 0.0
+    standard_error = (
+        pstdev(decisive) / math.sqrt(len(decisive))
+        if len(decisive) > 1
+        else 0.0
+    )
+    return {
+        "decisive": len(decisive),
+        "neutral": len(advantages) - len(decisive),
+        "win_rate": (
+            sum(value > 0.0 for value in decisive) / len(decisive)
+            if decisive else 0.0
+        ),
+        "decisive_mean": decisive_mean,
+        "cumulative": sum(advantages),
+        "lower_confidence_bound": decisive_mean - PROMOTION_CONFIDENCE_Z * standard_error,
+        "worst_daily_regret": max((max(0.0, -value) for value in daily.values()), default=0.0),
+    }
 
 
 @dataclass
@@ -124,13 +160,15 @@ class OptimizerLifecycle:
         valid_rows = [row for row in self.comparisons if row.get("valid")]
         if self.phase == "shadow" and len(valid_rows) >= PROMOTION_MIN_EVALUATIONS:
             days = {str(row.get("at", ""))[:10] for row in valid_rows if row.get("at")}
-            advantages = [float(row.get("advantage_kr", 0.0)) for row in valid_rows]
-            win_rate = sum(value > 0.0 for value in advantages) / len(advantages)
+            stats = _promotion_statistics(valid_rows)
             if (
                 len(days) >= PROMOTION_MIN_DAYS
-                and mean(advantages) >= PROMOTION_MIN_MEAN_ADVANTAGE_KR
-                and win_rate >= PROMOTION_MIN_WIN_RATE
-                and min(advantages) >= -PROMOTION_MAX_WORST_REGRET_KR
+                and stats["decisive"] >= PROMOTION_MIN_DECISIVE_EVALUATIONS
+                and stats["decisive_mean"] >= PROMOTION_MIN_MEAN_ADVANTAGE_KR
+                and stats["win_rate"] >= PROMOTION_MIN_WIN_RATE
+                and stats["cumulative"] >= PROMOTION_MIN_CUMULATIVE_ADVANTAGE_KR
+                and stats["lower_confidence_bound"] > 0.0
+                and stats["worst_daily_regret"] <= PROMOTION_MAX_WORST_REGRET_KR
             ):
                 self._set_phase("canary", now)
         elif self.phase == "canary":
@@ -150,6 +188,7 @@ class OptimizerLifecycle:
     def status(self) -> dict[str, Any]:
         valid = [row for row in self.comparisons if row.get("valid")]
         advantages = [float(row.get("advantage_kr", 0.0)) for row in valid]
+        stats = _promotion_statistics(valid)
         return {
             "phase": self.phase,
             "phase_started_at": self.phase_started_at,
@@ -157,10 +196,14 @@ class OptimizerLifecycle:
             "evaluations": len(valid),
             "days_observed": len({str(row.get("at", ""))[:10] for row in valid}),
             "mean_advantage_kr": round(mean(advantages), 4) if advantages else 0.0,
-            "win_rate": round(sum(value > 0.0 for value in advantages) / len(advantages), 3)
-            if advantages
-            else 0.0,
+            "decisive_evaluations": stats["decisive"],
+            "neutral_evaluations": stats["neutral"],
+            "decisive_mean_advantage_kr": round(float(stats["decisive_mean"]), 4),
+            "cumulative_advantage_kr": round(float(stats["cumulative"]), 4),
+            "lower_confidence_bound_kr": round(float(stats["lower_confidence_bound"]), 4),
+            "win_rate": round(float(stats["win_rate"]), 3),
             "worst_regret_kr": round(max((max(0.0, -value) for value in advantages), default=0.0), 4),
+            "worst_daily_regret_kr": round(float(stats["worst_daily_regret"]), 4),
             "canary_uses": self.canary_uses,
             "rollback_reason": self.rollback_reason,
         }

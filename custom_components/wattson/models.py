@@ -287,6 +287,9 @@ class SiteState:
     price_slots: list[PriceSlot] = field(default_factory=list)
     solar_slots: list[SolarSlot] = field(default_factory=list)
     outdoor_temperature_c: float | None = None
+    # Coordinator-debounced completion evidence. Raw ``completed`` alone can be
+    # transient while Easee closes a session and must not clear a live EV budget.
+    easee_completed_stable: bool = False
 
     @property
     def solar_surplus_w(self) -> float:
@@ -347,6 +350,14 @@ class PlanTask:
     # Physical Deye discharge floor committed for this hour.  Keeping it on the
     # public task makes the dashboard SOC curve auditable against the inverter.
     tou_floor_pct: float | None = None
+    # Exact physical setpoint used by replay/shadow scoring. Older callers may
+    # omit these and retain the action-based fallback.
+    intent: str | None = None
+    sell: bool | None = None
+    charge_current_a: float | None = None
+    reserve_floor_cap_pct: float | None = None
+    discharge_budget_kwh: float = 0.0
+    discharge_extension_allowed: bool = False
     duration_minutes: int = 60
 
 
@@ -382,6 +393,10 @@ class SlotPlan:
     reserve_protected_kwh: float = 0.0
     reserve_protected_value_kr: float = 0.0
     reserve_buffer_kwh: float = 0.0
+    # Live controller may spend at most one additional native 5%-SOC step when
+    # measured demand exhausts this plan budget and no dearer reserve is at risk.
+    discharge_budget_kwh: float = 0.0
+    discharge_extension_allowed: bool = False
     duration_minutes: int = 60
 
 

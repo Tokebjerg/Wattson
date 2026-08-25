@@ -50,6 +50,11 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
+Version 0.28.0 makes the economic model physically auditable: saturated-only
+battery-rate learning, completed-session EV clearing, bounded native-step
+discharge release, robust residual P90 load bands, exact setpoint shadow scoring,
+and a 15-minute equal-terminal-SOC economic gate.
+
 Version 0.27.2 generalizes the morning bridge to sustained expensive scarcity
 windows anywhere in the day. It protects only the incremental P90-load/P10-solar
 tail not already covered by the economic trajectory, credits finite conservative

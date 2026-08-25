@@ -79,12 +79,17 @@ def battery_rate_kwh(current_a: float) -> float:
 
 
 def ev_runtime_state(state: SiteState) -> str:
-    """Classify Easee into disconnected, connected, waiting, or charging."""
+    """Classify Easee into disconnected, connected, waiting, charging, or complete."""
     status = (state.easee_status or "").strip().lower()
     if not state.easee_online or status in {"", "disconnected", "unknown", "unavailable"}:
         return "disconnected"
     if max(0.0, state.easee_power_w or 0.0) >= 200.0 or status == "charging":
         return "charging"
+    if (
+        status in {"completed", "complete", "finished"}
+        and state.easee_completed_stable
+    ):
+        return "complete"
     if status in {*EV_CONNECTED_IDLE_STATUSES, "paused"}:
         return "waiting"
     return "connected"
@@ -2933,12 +2938,51 @@ def build_day_plan(
                 watchdog_reserve_cap,
                 committed_floor,
             )
+        reserve_floor_cap = (
+            _snap_tou_capacity(
+                float(min(watchdog_reserve_cap, max_soc)),
+                up=True,
+            )
+            if energy_backed_live_candidate or scarcity_bridge_active
+            else None
+        )
+        discharge_budget_kwh = max(
+            0.0,
+            (
+                committed_start_soc
+                - float(
+                    committed_projected
+                    if committed_projected is not None
+                    else committed_start_soc
+                )
+            )
+            / 100.0
+            * max(0.1, capacity_kwh),
+        )
+        discharge_extension_allowed = bool(
+            committed_action == "DISCHARGE"
+            and forecast_deficit
+            and task.total_import_price > 0.0
+            and not any_materially_dearer_future_deficit
+            and not material_uncertainty_active
+            and not scarcity_bridge_active
+            and committed_floor > max(
+                float(min_soc),
+                float(reserve_floor_cap or min_soc),
+            ) + 0.1
+        )
         committed_tasks.append(replace(
             task,
             action=committed_action,
             projected_soc_pct=committed_projected,
             grid_charge_target_soc_pct=grid_charge_target_soc_pct,
             tou_floor_pct=committed_floor,
+            intent=intent,
+            sell=sell,
+            charge_current_a=charge_a,
+            reserve_floor_cap_pct=reserve_floor_cap,
+            discharge_budget_kwh=round(discharge_budget_kwh, 3),
+            discharge_extension_allowed=discharge_extension_allowed,
             reason=committed_reason,
         ))
         plan_slots.append(SlotPlan(
@@ -2954,14 +2998,7 @@ def build_day_plan(
             ev_load_estimate_kwh=task.ev_load_estimate_kwh,
             grid_charge_target_soc_pct=grid_charge_target_soc_pct,
             reason=committed_reason or committed_action,
-            reserve_floor_cap_pct=(
-                _snap_tou_capacity(
-                    float(min(watchdog_reserve_cap, max_soc)),
-                    up=True,
-                )
-                if energy_backed_live_candidate or scarcity_bridge_active
-                else None
-            ),
+            reserve_floor_cap_pct=reserve_floor_cap,
             reserve_protected_kwh=max(
                 protected_future_kwh,
                 scarcity_bridge_kwh,
@@ -2971,6 +3008,8 @@ def build_day_plan(
                 scarcity_bridge_value_kr,
             ),
             reserve_buffer_kwh=live_deficit_buffer_kwh,
+            discharge_budget_kwh=round(discharge_budget_kwh, 3),
+            discharge_extension_allowed=discharge_extension_allowed,
             duration_minutes=task.duration_minutes,
         ))
     return DayPlan(
@@ -4306,6 +4345,11 @@ def build_ev_plan(
     runtime_state = ev_runtime_state(state)
     if runtime_state == "disconnected":
         return EvPlan(mode=ev_mode, reason="EV status unavailable")
+    if runtime_state == "complete":
+        return EvPlan(
+            mode=ev_mode,
+            reason="EV charging session is complete; no further charging planned",
+        )
 
     current_phase_mode = (state.easee_phase_mode or "").lower()
     current_phase_normalized = (
@@ -4667,6 +4711,22 @@ def ev_cheapest_charge_hours(
     None when there is no horizon to plan over."""
     if not state.price_slots:
         return None
+    if ev_runtime_state(state) == "complete":
+        horizon = remaining_price_slots(state.price_slots, state.timestamp)
+        return {
+            "deadline": None,
+            "wanted_hours": 0,
+            "note": "charging session complete",
+            "hours": [
+                {
+                    "hour": slot.start.isoformat(),
+                    "price": round(slot.total_import_price, 3),
+                    "charge": False,
+                    "estimated": bool(slot.estimated),
+                }
+                for slot in horizon
+            ],
+        }
     deadline = None
     if ev_ready_hour is not None and 0 <= int(ev_ready_hour) <= 23:
         deadline = state.timestamp.replace(hour=int(ev_ready_hour), minute=0, second=0, microsecond=0)
@@ -4743,7 +4803,7 @@ def projected_ev_load_by_start(
     their scheduled charging hours; their unmet EV load is marked
     battery-protected by the caller.
     """
-    if ev_runtime_state(state) == "disconnected" or not state.price_slots:
+    if ev_runtime_state(state) in {"disconnected", "complete"} or not state.price_slots:
         return {}
     slots = remaining_price_slots(state.price_slots, state.timestamp)[:SCHEDULE_MAX_HOURS]
     if not slots:

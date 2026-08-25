@@ -13,7 +13,7 @@ import math
 
 from .const import BATTERY_ROUND_TRIP_EFFICIENCY, BATTERY_WEAR_COST
 from .models import PlanTask, SiteState, SolarSlot
-from .planner import dp_schedule, load_forecast_w, profile_for
+from .planner import battery_rate_kwh, dp_schedule, load_forecast_w, profile_for
 
 
 MPC_HORIZON_HOURS = 48
@@ -196,6 +196,19 @@ def score_schedule(
                 ((task.load_estimate_kwh or 0.0) - (task.ev_load_estimate_kwh or 0.0))
                 * 1000.0,
             )
+            task_floor_kwh = max(
+                floor_kwh,
+                min(
+                    max_kwh,
+                    float(task.tou_floor_pct or min_soc) / 100.0 * capacity,
+                ),
+            )
+            task_charge_rate = charge_rate_kwh_h
+            if task.charge_current_a is not None:
+                task_charge_rate = min(
+                    task_charge_rate,
+                    battery_rate_kwh(task.charge_current_a),
+                )
             for quarter in range(4):
                 quarter_start = task.start + quarter * timedelta(minutes=MPC_STEP_MINUTES)
                 house_kwh = _load_w(load_map, quarter_start, fallback_house_w) / 1000.0 * step_h
@@ -207,16 +220,31 @@ def score_schedule(
 
                 pv_input = min(
                     surplus,
-                    charge_rate_kwh_h * step_h,
+                    task_charge_rate * step_h,
                     max(0.0, max_kwh - soc) / charge_eff,
                 )
                 soc += pv_input * charge_eff
                 surplus -= pv_input
 
                 if task.action == "GRID_CHARGE":
-                    target = max_kwh if price.total_import_price < 0.0 else care_kwh
+                    target = (
+                        max_kwh
+                        if price.total_import_price < 0.0
+                        else care_kwh
+                    )
+                    if task.grid_charge_target_soc_pct is not None:
+                        target = min(
+                            target,
+                            max(
+                                floor_kwh,
+                                float(task.grid_charge_target_soc_pct)
+                                / 100.0
+                                * capacity,
+                            ),
+                        )
                     grid_input = min(
                         grid_charge_rate_kwh_h * step_h,
+                        max(0.0, task_charge_rate * step_h - pv_input),
                         max(0.0, target - soc) / charge_eff,
                     )
                     soc += grid_input * charge_eff
@@ -226,7 +254,7 @@ def score_schedule(
                     max_deliver = min(
                         deficit,
                         discharge_rate_kwh_h * step_h,
-                        max(0.0, soc - floor_kwh) * discharge_eff,
+                        max(0.0, soc - task_floor_kwh) * discharge_eff,
                     )
                     soc_draw = max_deliver / discharge_eff
                     soc -= soc_draw
@@ -235,9 +263,10 @@ def score_schedule(
                     cost += soc_draw * BATTERY_WEAR_COST
 
                 sellable = (
-                    task.action != "LIMIT_EXPORT"
-                    and (price.export_value is None or price.export_value > 0.0)
-                )
+                    bool(task.sell)
+                    if task.sell is not None
+                    else task.action not in {"LIMIT_EXPORT", "GRID_CHARGE"}
+                ) and (price.export_value is None or price.export_value > 0.0)
                 if sellable and surplus > 0.0:
                     export_price = max(0.0, price.export_value or 0.0)
                     exported += surplus
@@ -361,7 +390,7 @@ def build_scenario_plan(
 
 
 def low_risk_canary(active_tasks: tuple[PlanTask, ...], candidate_tasks: tuple[PlanTask, ...]) -> bool:
-    """Canary may differ only in a direction that cannot introduce paid charging."""
+    """Canary may differ only within a bounded, reserve-safe physical setpoint."""
     if not active_tasks or not candidate_tasks:
         return False
     active = active_tasks[0]
@@ -369,6 +398,26 @@ def low_risk_canary(active_tasks: tuple[PlanTask, ...], candidate_tasks: tuple[P
     if candidate.action == "GRID_CHARGE" and active.action != "GRID_CHARGE":
         return False
     if candidate.action == "EXPORT" and active.action == "LIMIT_EXPORT":
+        return False
+    active_sell = bool(active.sell) if active.sell is not None else active.action == "EXPORT"
+    candidate_sell = (
+        bool(candidate.sell) if candidate.sell is not None else candidate.action == "EXPORT"
+    )
+    if candidate_sell and not active_sell:
+        return False
+    active_floor = float(active.tou_floor_pct or 0.0)
+    candidate_floor = float(candidate.tou_floor_pct or 0.0)
+    protected_floor = float(candidate.reserve_floor_cap_pct or 0.0)
+    if candidate_floor + 1e-6 < protected_floor:
+        return False
+    if candidate_floor < active_floor - 5.0 - 1e-6:
+        return False
+    if (
+        candidate.action == "GRID_CHARGE"
+        and active.action == "GRID_CHARGE"
+        and float(candidate.grid_charge_target_soc_pct or 100.0)
+        > float(active.grid_charge_target_soc_pct or 100.0) + 5.0
+    ):
         return False
     return True
 
@@ -392,10 +441,21 @@ def score_realized_interval(
     discharge_rate_kwh_h: float,
     grid_charge_rate_kwh_h: float,
     ev_battery_protected: bool = True,
+    tou_floor_pct: float | None = None,
+    grid_charge_target_soc_pct: float | None = None,
+    sell: bool | None = None,
+    charge_current_a: float | None = None,
+    intent: str | None = None,
 ) -> RealizedIntervalScore:
     """Counterfactual score for one completed interval using measured energy."""
     capacity = max(0.1, capacity_kwh)
-    floor = min_soc / 100.0 * capacity
+    floor = max(
+        min_soc / 100.0 * capacity,
+        min(
+            max_soc / 100.0 * capacity,
+            float(tou_floor_pct or min_soc) / 100.0 * capacity,
+        ),
+    )
     ceiling = max_soc / 100.0 * capacity
     care = min(ceiling, battery_care_soc / 100.0 * capacity)
     soc = max(floor, min(ceiling, start_soc_pct / 100.0 * capacity))
@@ -410,9 +470,15 @@ def score_realized_interval(
     if not ev_battery_protected:
         house_deficit += max(0.0, ev_kwh - solar_to_ev)
 
+    physical_charge_rate = max(0.0, charge_rate_kwh_h)
+    if charge_current_a is not None:
+        physical_charge_rate = min(
+            physical_charge_rate,
+            battery_rate_kwh(charge_current_a),
+        )
     pv_input = min(
         solar_left,
-        max(0.0, charge_rate_kwh_h) * duration_hours,
+        physical_charge_rate * duration_hours,
         max(0.0, ceiling - soc) / eta,
     )
     soc += pv_input * eta
@@ -421,8 +487,17 @@ def score_realized_interval(
     cost = protected_ev_grid * import_price
     if action == "GRID_CHARGE":
         target = ceiling if import_price < 0.0 else care
+        if grid_charge_target_soc_pct is not None:
+            target = min(
+                target,
+                max(
+                    min_soc / 100.0 * capacity,
+                    float(grid_charge_target_soc_pct) / 100.0 * capacity,
+                ),
+            )
         grid_input = min(
             max(0.0, grid_charge_rate_kwh_h) * duration_hours,
+            max(0.0, physical_charge_rate * duration_hours - pv_input),
             max(0.0, target - soc) / eta,
         )
         soc += grid_input * eta
@@ -440,7 +515,12 @@ def score_realized_interval(
         cost += (house_deficit - delivered) * import_price + draw * BATTERY_WEAR_COST
 
     exported = 0.0
-    if action != "LIMIT_EXPORT" and export_price > 0.0:
+    sell_enabled = (
+        bool(sell)
+        if sell is not None
+        else action not in {"LIMIT_EXPORT", "GRID_CHARGE"}
+    )
+    if sell_enabled and export_price > 0.0:
         exported = solar_left
         cost -= exported * export_price
     # Value remaining stored energy equally for both policies; without a

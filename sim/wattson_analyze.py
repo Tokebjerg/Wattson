@@ -25,10 +25,11 @@ import wattson_backtest as bt  # noqa: E402
 TZ = bt.TZ
 MIN_SOC = bt.MIN_SOC
 
-# Deliberately tolerant no-harm floors around the established 20-day baseline.
-# These catch a material economic regression while leaving room for better planning
-# to move individual days around as the optimizer evolves.
-MIN_MEAN_EFFICIENCY_PCT = 85.0
+# The physical 15-minute replay must remain above the previous 90.5% baseline.
+# Per-day guards still leave room for the rolling planner to move energy between
+# individual hours as the optimizer evolves.
+MIN_MEAN_EFFICIENCY_PCT = 90.5
+MIN_WEIGHTED_EFFICIENCY_PCT = 90.5
 MIN_WORST_PLAN_VS_REACTIVE_DKK = -1.0
 MAX_PLAN_WORSE_THAN_REACTIVE_RATIO = 0.50
 MAX_MISSED_DISCHARGE_DAY_RATIO = 0.55
@@ -51,11 +52,32 @@ def analyze(path):
     try:
         _, w_cost = bt.run_wattson(d, spot, sell, pv, load, use_reserve=True)
         _, w_old = bt.run_wattson(d, spot, sell, pv, load, use_reserve=False)
-        rows, w_plan = bt.run_wattson_planned(d, spot, sell, pv, load)
+        rows, w_plan = bt.run_wattson_rolling(
+            d, spot, sell, pv, load, dataset=day
+        )
         nb = bt.run_no_battery(spot, sell, pv, load)
         dumb = bt.run_dumb_battery(spot, sell, pv, load)
-        orac = bt.run_oracle(spot, sell, pv, load)
-        orac_h = bt.run_oracle(spot, sell, pv, load, no_battery_export=True)
+        terminal_soc_kwh = (
+            rows[-1]["soc_kwh"]
+            if rows else bt.START_SOC / 100.0 * bt.CAPACITY_KWH
+        )
+        orac = bt.run_oracle(
+            spot,
+            sell,
+            pv,
+            load,
+            step_minutes=15,
+            terminal_soc_kwh=terminal_soc_kwh,
+        )
+        orac_h = bt.run_oracle(
+            spot,
+            sell,
+            pv,
+            load,
+            no_battery_export=True,
+            step_minutes=15,
+            terminal_soc_kwh=terminal_soc_kwh,
+        )
     except Exception:
         return {"date": day["date"], "error": traceback.format_exc()}
 
@@ -73,7 +95,10 @@ def analyze(path):
         future = []
         for r2 in rows[idx:]:
             h2 = r2["h"]
-            deficit = min(max(0.0, load[h2] - pv[h2]), bt.RATE_KWH)
+            deficit = min(
+                max(0.0, load[h2] - pv[h2]) / 4.0,
+                bt.DISCHARGE_RATE_KWH / 4.0,
+            )
             if deficit > 0.05:
                 future.append((imp_prices[h2], h2, deficit))
         future.sort(reverse=True)  # dearest first
@@ -104,11 +129,17 @@ def analyze(path):
         if reg != prev_reg:
             reg_switches += 1 if prev_reg is not None else 0
             prev_reg = reg
-        if r["gi"] > 0.3 and imp_prices[h] > avg_imp and r["soc"] > MIN_SOC + 5 and _greedy_serves(idx):
-            missed_discharge.append({"h": h, "price": round(imp_prices[h], 2),
+        if (
+            r["gi"] > 0.075
+            and imp_prices[h] > avg_imp
+            and r["soc"] > MIN_SOC + 5
+            and _greedy_serves(idx)
+        ):
+            missed_discharge.append({"h": h, "minute": r.get("minute", 0),
+                                     "price": round(imp_prices[h], 2),
                                      "soc": r["soc"], "import_kwh": round(r["gi"], 2),
                                      "strat": r["strat"]})
-        if r["ge"] > 0.3 and exp_vals[h] < 0:
+        if r["ge"] > 0.075 and exp_vals[h] < 0:
             neg_export.append({"h": h, "export_kwh": round(r["ge"], 2),
                                "export_price": round(exp_vals[h], 2)})
     switches = reg_switches
@@ -135,9 +166,11 @@ def analyze(path):
         "strategy_switches": switches,
         "register_switches": reg_switches,
         "label_switches": label_switches,
+        "safety_violations": rows[-1].get("safety_violations", 0) if rows else 0,
         "missed_discharge_hours": missed_discharge,
         "neg_export_hours": neg_export,
-        "trace": [{"h": r["h"], "strat": r["strat"], "soc": r["soc"],
+        "trace": [{"h": r["h"], "minute": r.get("minute", 0),
+                   "strat": r["strat"], "soc": r["soc"],
                    "imp": round(r["gi"], 2), "exp": round(r["ge"], 2),
                    "price": round(imp_prices[r["h"]], 2)} for r in rows],
     }
@@ -159,11 +192,25 @@ def main(paths):
     if ok:
         worse_than_reactive = [r for r in ok if r["plan_vs_reactive"] < -0.05]
         missed_discharge = [r for r in ok if r["missed_discharge_hours"]]
+        total_plan_savings = sum(r["plan_vs_nobattery"] for r in ok)
+        total_oracle_savings = sum(
+            r["cost"]["no_battery"] - r["cost"]["oracle_honest"] for r in ok
+        )
+        weighted_efficiency = (
+            total_plan_savings / total_oracle_savings * 100.0
+            if abs(total_oracle_savings) > 1e-9 else 100.0
+        )
+        regrets = sorted(r["headroom_to_honest_oracle"] for r in ok)
+        p95_index = max(0, min(len(regrets) - 1, int(0.95 * len(regrets)) - 1))
         out["aggregate"] = {
             "n": len(ok),
             "n_errors": len(results) - len(ok),
             "total_headroom": round(sum(r["headroom_to_honest_oracle"] for r in ok), 2),
             "mean_efficiency_pct": round(sum(r["efficiency_pct"] for r in ok) / len(ok), 1),
+            "weighted_efficiency_pct": round(weighted_efficiency, 1),
+            "p95_daily_regret": round(regrets[p95_index], 2),
+            "physical_setpoint_changes": sum(r["register_switches"] for r in ok),
+            "safety_violations": sum(r["safety_violations"] for r in ok),
             "days_plan_worse_than_reactive": [r["date"] for r in worse_than_reactive],
             "plan_worse_than_reactive_ratio": round(len(worse_than_reactive) / len(ok), 3),
             "worst_plan_vs_reactive": round(min(r["plan_vs_reactive"] for r in ok), 2),
@@ -184,7 +231,11 @@ def main(paths):
     if "aggregate" in out:
         a = out["aggregate"]
         print(f"  total headroom to honest oracle: {a['total_headroom']:+.2f} kr  "
-              f"(mean eff {a['mean_efficiency_pct']:.0f}%)")
+              f"(mean/weighted eff {a['mean_efficiency_pct']:.1f}%/"
+              f"{a['weighted_efficiency_pct']:.1f}%)")
+        print(f"  p95 regret: {a['p95_daily_regret']:+.2f} kr  |  "
+              f"setpoint changes: {a['physical_setpoint_changes']}  |  "
+              f"safety violations: {a['safety_violations']}")
         print(f"  errors: {a['n_errors']}  |  plan<reactive days: {a['days_plan_worse_than_reactive']}")
         print(f"  worst plan-reactive: {a['worst_plan_vs_reactive']:+.2f} kr  |  "
               f"ratio: {a['plan_worse_than_reactive_ratio']:.0%}")
@@ -201,7 +252,16 @@ def main(paths):
         if agg and agg.get("mean_efficiency_pct", 0.0) < MIN_MEAN_EFFICIENCY_PCT:
             problems.append(
                 f"mean efficiency {agg.get('mean_efficiency_pct')}% < "
-                f"{MIN_MEAN_EFFICIENCY_PCT:.0f}% floor"
+                f"{MIN_MEAN_EFFICIENCY_PCT:.1f}% floor"
+            )
+        if agg and agg.get("weighted_efficiency_pct", 0.0) < MIN_WEIGHTED_EFFICIENCY_PCT:
+            problems.append(
+                f"weighted efficiency {agg.get('weighted_efficiency_pct')}% < "
+                f"{MIN_WEIGHTED_EFFICIENCY_PCT:.1f}% floor"
+            )
+        if agg and agg.get("safety_violations", 0):
+            problems.append(
+                f"{agg.get('safety_violations')} physical safety violation(s)"
             )
         if agg and agg.get("worst_plan_vs_reactive", -999.0) < MIN_WORST_PLAN_VS_REACTIVE_DKK:
             problems.append(

@@ -115,9 +115,65 @@ def build_load_profile(
             out[hour] = selected
         return out
 
+    def _robust_upper_band(
+        source: dict[int, list[tuple[float, float]]],
+        median_by_bucket: dict[int, float],
+    ) -> dict[int, float]:
+        """Calibrate P90 from positive residuals with pooled sparse-data shrinkage.
+
+        A raw slot-wise P90 becomes the maximum with only a handful of matching
+        weekdays and lets one missing EV-statistics row create a multi-kW reserve.
+        Residual pooling keeps real recurring peaks while shrinking one-off slot
+        contamination toward the household's observed day-wide error band.
+        """
+        residuals: dict[int, list[tuple[float, float]]] = {}
+        pooled: list[tuple[float, float]] = []
+        for bucket, pairs in source.items():
+            baseline = median_by_bucket.get(bucket)
+            if baseline is None:
+                continue
+            bucket_residuals = [
+                (max(0.0, value - baseline), weight)
+                for value, weight in pairs
+            ]
+            residuals[bucket] = bucket_residuals
+            pooled.extend(bucket_residuals)
+        pooled_q = _quantile({0: pooled}, 0.9).get(0, 0.0) if pooled else 0.0
+        local_q = _quantile(residuals, 0.9)
+        result: dict[int, float] = {}
+        for bucket, baseline in median_by_bucket.items():
+            pairs = residuals.get(bucket, [])
+            effective_samples = sum(weight for _value, weight in pairs)
+            local_weight = min(0.75, effective_samples / 16.0)
+            uplift = (
+                local_q.get(bucket, pooled_q) * local_weight
+                + pooled_q * (1.0 - local_weight)
+            )
+            # Plausibility cap is relative to the learned household baseline and
+            # still leaves ample room for cooking/heating peaks. Repeated genuine
+            # peaks raise both the median and pooled residual instead of being lost.
+            uplift_cap = min(5000.0, max(1500.0, baseline * 3.0))
+            result[bucket] = baseline + min(max(0.0, uplift), uplift_cap)
+        return result
+
     hourly_w = _quantile(buckets, 0.5)
     weekday_w = _quantile(weekday_buckets, 0.5)
     weekend_w = _quantile(weekend_buckets, 0.5)
+    hourly_p90_w = _robust_upper_band(buckets, hourly_w)
+    weekday_p90_w = _robust_upper_band(weekday_buckets, weekday_w)
+    weekend_p90_w = _robust_upper_band(weekend_buckets, weekend_w)
+    quarter_hourly_w = _quantile(quarter_buckets, 0.5)
+    weekday_quarter_hourly_w = _quantile(weekday_quarter_buckets, 0.5)
+    weekend_quarter_hourly_w = _quantile(weekend_quarter_buckets, 0.5)
+    quarter_hourly_p90_w = _robust_upper_band(
+        quarter_buckets, quarter_hourly_w
+    )
+    weekday_quarter_hourly_p90_w = _robust_upper_band(
+        weekday_quarter_buckets, weekday_quarter_hourly_w
+    )
+    weekend_quarter_hourly_p90_w = _robust_upper_band(
+        weekend_quarter_buckets, weekend_quarter_hourly_w
+    )
 
     seasonal_parsed = _parse(seasonal_samples or hourly_parsed)
     seasonal_groups: dict[datetime, list[float]] = {}
@@ -171,12 +227,21 @@ def build_load_profile(
     seasonal_hourly_w = _nested_quantile(seasonal_buckets, 0.5)
     seasonal_weekday_w = _nested_quantile(seasonal_weekday_buckets, 0.5)
     seasonal_weekend_w = _nested_quantile(seasonal_weekend_buckets, 0.5)
-    seasonal_p90_w = _nested_quantile(seasonal_buckets, 0.9)
-    seasonal_weekday_p90_w = _nested_quantile(
-        seasonal_weekday_buckets, 0.9
+    def _nested_upper_band(
+        source: dict[str, dict[int, list[tuple[float, float]]]],
+        medians: dict[str, dict[int, float]],
+    ) -> dict[str, dict[int, float]]:
+        return {
+            season: _robust_upper_band(season_source, medians.get(season, {}))
+            for season, season_source in source.items()
+        }
+
+    seasonal_p90_w = _nested_upper_band(seasonal_buckets, seasonal_hourly_w)
+    seasonal_weekday_p90_w = _nested_upper_band(
+        seasonal_weekday_buckets, seasonal_weekday_w
     )
-    seasonal_weekend_p90_w = _nested_quantile(
-        seasonal_weekend_buckets, 0.9
+    seasonal_weekend_p90_w = _nested_upper_band(
+        seasonal_weekend_buckets, seasonal_weekend_w
     )
     seasonal_day_counts = {
         season: len(season_dates)
@@ -232,15 +297,15 @@ def build_load_profile(
         hourly_w=hourly_w,
         weekday_hourly_w=weekday_w,
         weekend_hourly_w=weekend_w,
-        hourly_p90_w=_quantile(buckets, 0.9),
-        weekday_p90_w=_quantile(weekday_buckets, 0.9),
-        weekend_p90_w=_quantile(weekend_buckets, 0.9),
-        quarter_hourly_w=_quantile(quarter_buckets, 0.5),
-        weekday_quarter_hourly_w=_quantile(weekday_quarter_buckets, 0.5),
-        weekend_quarter_hourly_w=_quantile(weekend_quarter_buckets, 0.5),
-        quarter_hourly_p90_w=_quantile(quarter_buckets, 0.9),
-        weekday_quarter_hourly_p90_w=_quantile(weekday_quarter_buckets, 0.9),
-        weekend_quarter_hourly_p90_w=_quantile(weekend_quarter_buckets, 0.9),
+        hourly_p90_w=hourly_p90_w,
+        weekday_p90_w=weekday_p90_w,
+        weekend_p90_w=weekend_p90_w,
+        quarter_hourly_w=quarter_hourly_w,
+        weekday_quarter_hourly_w=weekday_quarter_hourly_w,
+        weekend_quarter_hourly_w=weekend_quarter_hourly_w,
+        quarter_hourly_p90_w=quarter_hourly_p90_w,
+        weekday_quarter_hourly_p90_w=weekday_quarter_hourly_p90_w,
+        weekend_quarter_hourly_p90_w=weekend_quarter_hourly_p90_w,
         seasonal_hourly_w=seasonal_hourly_w,
         seasonal_weekday_hourly_w=seasonal_weekday_w,
         seasonal_weekend_hourly_w=seasonal_weekend_w,

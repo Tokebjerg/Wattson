@@ -8538,10 +8538,10 @@ def test_next_level_optimizer():
     learned = battery_model.BatteryModelState()
     for _ in range(4):
         learned = battery_model.observe_pv_charge_rate(
-            learned, 3.2, configured_kwh_h=3.57
+            learned, 3.2, configured_kwh_h=3.57, saturated=True
         )
         learned = battery_model.observe_discharge_rate(
-            learned, 3.0, configured_kwh_h=3.57
+            learned, 3.0, configured_kwh_h=3.57, saturated=True
         )
     checks.append(("physical model learns bounded PV and discharge rates",
                    battery_model.effective_pv_charge_rate_kwh(learned, 3.57) < 3.57
