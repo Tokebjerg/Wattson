@@ -199,6 +199,69 @@ class RobustEconomicsTests(unittest.TestCase):
         self.assertEqual(500.0, causes["avoidable"])
         self.assertEqual(0.0, causes["reserve_hold"])
 
+    def test_sep_22_peak_uses_energy_above_concrete_future_reserve(self) -> None:
+        now = datetime(
+            2026, 9, 22, 18, 5,
+            tzinfo=timezone(timedelta(hours=2)),
+        )
+        start = now.replace(minute=0, second=0, microsecond=0)
+        price_values = [4.10, 6.25] + [1.20] * 22
+        pv_values = [0.710, 0.009] + [0.0] * 22
+        load_values = [1.245, 1.195] + [0.5] * 22
+        prices = [
+            ws.models.PriceSlot(
+                start=start + timedelta(hours=index),
+                spot_price=price,
+                tariff=0.0,
+                total_import_price=price,
+                export_value=0.4,
+            )
+            for index, price in enumerate(price_values)
+        ]
+        solar = [
+            ws.models.SolarSlot(
+                start=start + timedelta(hours=index),
+                pv_estimate_kwh=pv,
+                pv_estimate10_kwh=pv * 0.6,
+                pv_estimate90_kwh=pv * 1.2,
+            )
+            for index, pv in enumerate(pv_values)
+        ]
+        load = {
+            start + timedelta(hours=index): value * 1000.0
+            for index, value in enumerate(load_values)
+        }
+        p90_load = dict(load)
+        p90_load[start + timedelta(hours=1)] = 3500.0
+        state = self._site_state(
+            now,
+            soc=99.0,
+            load_w=2270.0,
+            pv_w=746.0,
+            prices=prices,
+        )
+        state = replace(
+            state,
+            battery_power_w=31.0,
+            solar_slots=solar,
+        )
+        plan = ws.planner.build_day_plan(
+            state,
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            capacity_kwh=8.62,
+            load_hourly_w=load,
+            reserve_load_by_start_w=p90_load,
+            allow_grid_charge=False,
+        )
+        current = plan.tasks[0]
+        self.assertEqual("DISCHARGE", current.action)
+        self.assertLess(current.projected_soc_pct, 99.0)
+        self.assertLessEqual(current.tou_floor_pct, 40.0)
+        self.assertTrue(current.reserve_economically_valid)
+        self.assertEqual(start + timedelta(hours=1), current.reserve_destination_at)
+
     def test_operating_rate_migration_preserves_valid_learning(self) -> None:
         restored = ws.battery_model.BatteryModelState.from_dict({
             "effective_capacity_kwh": 9.6,

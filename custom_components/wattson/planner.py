@@ -2827,21 +2827,50 @@ def build_day_plan(
             )
         energy_backed_live_release = bool(
             energy_backed_live_candidate
-            and not forecast_deficit
             and view.current is not None
             and task.start == view.current.start
             and energy_backed_floor < floor - 0.1
+            and (
+                not forecast_deficit
+                or (
+                    task.start in view.expensive_starts
+                    and task.total_import_price
+                    > view.mean_price + hold_margin
+                    and protected_future_kwh > 0.01
+                    and protected_future_value_kr + 1e-9 >= min_hold_value_kr
+                )
+            )
         )
         if energy_backed_live_release:
-            # This is the complete physical reserve policy for an unexpected
-            # current deficit: P50 future demand plus the bounded energy margin.
-            # Apply it after the uncertainty overlay so an aggregate SOC target
-            # cannot recreate the full-pack hold this path is designed to avoid.
+            # This is the complete physical reserve policy while serving the
+            # current slot: concrete later P50 demand plus a bounded margin.
+            # Apply it after the uncertainty overlay so neither an unexpected
+            # live deficit nor a price-rationed raw IDLE can pin a full pack.
             floor = min(floor, energy_backed_floor)
             physical_reserve_floor = min(
                 physical_reserve_floor,
                 energy_backed_floor,
             )
+            if forecast_deficit:
+                available_now_kwh = (
+                    max(0.0, committed_start_soc - energy_backed_floor)
+                    / 100.0
+                    * max(0.1, capacity_kwh)
+                )
+                current_drain_kwh = min(
+                    battery_deficit_kwh,
+                    discharge_rate,
+                    available_now_kwh,
+                )
+                current_end_soc = committed_start_soc - (
+                    current_drain_kwh / max(0.1, capacity_kwh) * 100.0
+                )
+                committed_projected = min(
+                    float(committed_projected)
+                    if committed_projected is not None
+                    else committed_start_soc,
+                    current_end_soc,
+                )
         scarcity_entry = scarcity_bridge_by_start.get(task.start)
         scarcity_bridge_kwh = (
             scarcity_entry.protected_kwh

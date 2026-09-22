@@ -50,6 +50,11 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
+Version 0.28.2 lets a current top-priced deficit consume battery energy above
+its concrete later reserve instead of letting the uncertainty trajectory pin a
+nearly full battery. The release applies only when the current slot is materially
+above the horizon mean and a value-backed future reserve remains fully protected.
+
 Version 0.28.1 reprices every battery-reserve obligation on each rolling replan.
 Only energy tied to a concrete, materially dearer future deficit remains held;
 conservative solar refill and elapsed demand continuously reduce that ledger.
