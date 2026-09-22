@@ -50,6 +50,16 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
+Version 0.28.1 reprices every battery-reserve obligation on each rolling replan.
+Only energy tied to a concrete, materially dearer future deficit remains held;
+conservative solar refill and elapsed demand continuously reduce that ledger.
+An independent 90-second import watchdog can release one native 5% SOC step when
+the remaining raw deficits do not justify the hold. Grid charging now stops at
+its explicit SOC target and switches to a named reserve hold only while the
+reserve is still economically valid. Site and plan diagnostics expose hard,
+learned, economic and uncertainty floors together with destination, price,
+confidence, marginal value and watchdog reason.
+
 Version 0.28.0 makes the economic model physically auditable: saturated-only
 battery-rate learning, completed-session EV clearing, bounded native-step
 discharge release, robust residual P90 load bands, exact setpoint shadow scoring,

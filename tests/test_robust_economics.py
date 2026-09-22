@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import sys
 import unittest
@@ -12,6 +13,192 @@ import wattson_sim as ws  # noqa: E402
 
 
 class RobustEconomicsTests(unittest.TestCase):
+    @staticmethod
+    def _site_state(
+        now: datetime,
+        *,
+        soc: float,
+        load_w: float = 1000.0,
+        pv_w: float = 0.0,
+        prices: list | None = None,
+    ):
+        return ws.models.SiteState(
+            timestamp=now,
+            pv_power_w=pv_w,
+            load_power_w=load_w,
+            load_includes_ev=False,
+            grid_power_w=max(0.0, load_w - pv_w),
+            grid_import_power_w=max(0.0, load_w - pv_w),
+            grid_export_power_w=max(0.0, pv_w - load_w),
+            battery_soc_pct=soc,
+            battery_power_w=0.0,
+            inverter_online=True,
+            inverter_status="normal",
+            easee_online=True,
+            easee_status="disconnected",
+            easee_power_w=0.0,
+            easee_session_kwh=0.0,
+            easee_phase_mode="auto",
+            current_buy_price=(prices[0].total_import_price if prices else 1.0),
+            current_sell_price=0.4,
+            forecast_today_kwh=0.0,
+            price_slots=prices or [],
+            solar_slots=[],
+        )
+
+    @staticmethod
+    def _scarcity_ledger(day: int, prices: list[float]):
+        start = datetime(2026, 9, day, 4, tzinfo=timezone.utc)
+        price_slots = [
+            ws.models.PriceSlot(
+                start=start + timedelta(hours=index),
+                spot_price=price,
+                tariff=0.0,
+                total_import_price=price,
+                export_value=0.4,
+            )
+            for index, price in enumerate(prices)
+        ]
+        tasks = [
+            ws.models.PlanTask(
+                start=slot.start,
+                action="DISCHARGE",
+                total_import_price=slot.total_import_price,
+                pv_estimate_kwh=0.0,
+                load_estimate_kwh=0.5,
+                projected_soc_pct=max(15.0, 60.0 - index * 5.0),
+            )
+            for index, slot in enumerate(price_slots)
+        ]
+        p90 = {task.start: 1500.0 for task in tasks}
+        return start, ws.planner.scarcity_bridge_reserve_by_start(
+            tasks,
+            price_slots=price_slots,
+            solar_slots=[],
+            reserve_load_by_start_w=p90,
+            ev_battery_protected=True,
+            hold_margin=0.15,
+            discharge_rate_kwh_h=3.57,
+            local_timezone=timezone.utc,
+            diagnostics=True,
+        )
+
+    def test_sep_17_18_19_21_high_price_hours_release_stale_bridge(self) -> None:
+        for day, current_price in ((17, 1.97), (18, 1.57), (19, 1.31), (21, 1.85)):
+            with self.subTest(day=day):
+                start, ledger = self._scarcity_ledger(
+                    day,
+                    [0.55, 0.60, current_price, 1.20, 1.25],
+                )
+                self.assertIn(start + timedelta(hours=1), ledger)
+                self.assertNotIn(start + timedelta(hours=2), ledger)
+
+    def test_sep_19_20_cheap_morning_and_sep_17_evening_keep_real_peak(self) -> None:
+        for day, prices in (
+            (19, [0.50, 0.55, 0.60, 2.00, 2.20]),
+            (20, [0.45, 0.50, 0.55, 1.90, 2.10]),
+            (17, [0.70, 0.75, 0.80, 2.40, 2.60]),
+        ):
+            with self.subTest(day=day):
+                start, ledger = self._scarcity_ledger(day, prices)
+                entry = ledger[start + timedelta(hours=2)]
+                self.assertTrue(entry.marginal_value_kr >= 0.30)
+                self.assertEqual(start + timedelta(hours=3), entry.destination_at)
+                self.assertGreater(entry.destination_price, prices[2] + 0.15)
+
+    def test_grid_charge_stops_at_target_and_uses_explicit_reserve_hold(self) -> None:
+        now = datetime(2026, 9, 22, 2, tzinfo=timezone.utc)
+        state = self._site_state(now, soc=40.0)
+        common = dict(
+            start=now,
+            intent="GRID_CHARGE",
+            sell=False,
+            grid_charge=True,
+            tou_floor_pct=40.0,
+            charge_current_a=None,
+            total_import_price=0.50,
+            grid_charge_target_soc_pct=40.0,
+        )
+        released, _ = ws.planner.execute_slot(
+            ws.models.SlotPlan(**common),
+            state,
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            allow_grid_charge=True,
+            allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        held, _ = ws.planner.execute_slot(
+            ws.models.SlotPlan(
+                **common,
+                reserve_economically_valid=True,
+                reserve_destination_at=now + timedelta(hours=4),
+                reserve_destination_price=2.0,
+            ),
+            state,
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            allow_grid_charge=True,
+            allow_negative_export=False,
+            export_limit_default_w=6000.0,
+        )
+        self.assertFalse(released.desired_grid_charge)
+        self.assertEqual("RESERVE_HOLD", held.strategy)
+        self.assertFalse(held.desired_grid_charge)
+
+    def test_live_counterfactual_does_not_trust_planner_reserve_value(self) -> None:
+        now = datetime(2026, 9, 22, 6, tzinfo=timezone.utc)
+        coordinator = ws._coordinator_module()
+        cheap_later = ws.models.PlanTask(
+            start=now + timedelta(hours=1),
+            action="DISCHARGE",
+            total_import_price=1.20,
+            pv_estimate_kwh=0.0,
+            load_estimate_kwh=1.0,
+        )
+        keep, value, _at, _price = coordinator._live_reserve_step_counterfactual(
+            [cheap_later],
+            now=now,
+            current_price=1.97,
+            hold_margin=0.15,
+            step_kwh=0.5,
+        )
+        self.assertFalse(keep)
+        self.assertEqual(0.0, value)
+        dear_later = replace(cheap_later, total_import_price=2.80)
+        keep, value, at, price = coordinator._live_reserve_step_counterfactual(
+            [dear_later],
+            now=now,
+            current_price=1.00,
+            hold_margin=0.15,
+            step_kwh=0.5,
+        )
+        self.assertTrue(keep)
+        self.assertGreaterEqual(value, 0.30)
+        self.assertEqual(dear_later.start, at)
+        self.assertEqual(2.80, price)
+
+    def test_import_at_invalid_reserve_is_classified_avoidable(self) -> None:
+        causes = ws.telemetry.classify_grid_import_power(
+            grid_import_w=500.0,
+            battery_power_w=0.0,
+            battery_soc_pct=50.0,
+            ev_power_w=0.0,
+            max_discharge_w=3570.0,
+            battery_strategy="IDLE",
+            desired_grid_charge=False,
+            safe_mode=False,
+            desired_floor_pct=50.0,
+            base_floor_pct=15.0,
+            recovery_floor_pct=50.0,
+            reserve_value_kr=9.0,
+            reserve_economically_valid=False,
+        )
+        self.assertEqual(500.0, causes["avoidable"])
+        self.assertEqual(0.0, causes["reserve_hold"])
+
     def test_operating_rate_migration_preserves_valid_learning(self) -> None:
         restored = ws.battery_model.BatteryModelState.from_dict({
             "effective_capacity_kwh": 9.6,

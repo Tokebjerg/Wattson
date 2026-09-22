@@ -1,7 +1,7 @@
 """Planning logic for Wattson."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 import math
 
@@ -127,6 +127,25 @@ SCARCITY_BRIDGE_MAX_PROTECTED_KWH = 3.00
 SCARCITY_BRIDGE_LIVE_UPLIFT_MAX_W = 1500.0
 SCARCITY_BRIDGE_UPLIFT_FULL_HOURS = 2.0
 SCARCITY_BRIDGE_UPLIFT_END_HOURS = 6.0
+
+
+@dataclass(frozen=True)
+class ReserveLedgerEntry:
+    """One independently auditable rolling reserve obligation."""
+
+    protected_kwh: float
+    marginal_value_kr: float
+    destination_at: datetime | None
+    destination_price: float | None
+    confidence: str = "p90_load_p10_solar"
+    destination_count: int = 0
+
+    def __iter__(self):
+        yield self.protected_kwh
+        yield self.marginal_value_kr
+
+    def __getitem__(self, index: int) -> float:
+        return (self.protected_kwh, self.marginal_value_kr)[index]
 
 # Compatibility alias used by coordinator diagnostics and older simulations.
 MORNING_BRIDGE_LIVE_UPLIFT_MAX_W = SCARCITY_BRIDGE_LIVE_UPLIFT_MAX_W
@@ -370,7 +389,8 @@ def scarcity_bridge_reserve_by_start(
     local_timezone,
     live_load_uplift_w: float = 0.0,
     observed_at: datetime | None = None,
-) -> dict[datetime, tuple[float, float]]:
+    diagnostics: bool = False,
+) -> dict[datetime, tuple[float, float] | ReserveLedgerEntry]:
     """Return protected energy and risk value for each scarcity bridge slot.
 
     Every real-price deficit chooses the cheapest preceding real-price valley on
@@ -519,6 +539,8 @@ def scarcity_bridge_reserve_by_start(
 
     result_energy: dict[datetime, float] = {}
     result_value: dict[datetime, float] = {}
+    result_destination: dict[datetime, tuple[datetime, float]] = {}
+    result_destination_count: dict[datetime, int] = {}
     for bridge_start, destinations in episodes.items():
         # Credit each deadline only with conservative refill physically arriving
         # before it.  Prefix accounting prevents one sunny slot from refilling
@@ -583,22 +605,22 @@ def scarcity_bridge_reserve_by_start(
                     premium,
                     source_price,
                 ))
-        destinations = adjusted_destinations
+        valley_destinations = adjusted_destinations
         # A single isolated spike is already covered by the optimizer's finite
         # P90/P10 reserve.  The bridge exists for a sustained scarcity window;
         # overlaying it on one slot would double-count the same uncertainty and
         # could also trigger an unnecessary last-opportunity grid charge.
-        if len(destinations) < 2:
+        if len(valley_destinations) < 2:
             continue
         episode_value_kr = sum(
             deficit_kwh * premium
-            for _candidate, deficit_kwh, premium, _source_price in destinations
+            for _candidate, deficit_kwh, premium, _source_price in valley_destinations
         )
         if episode_value_kr + 1e-9 < SCARCITY_BRIDGE_MIN_VALUE_KR:
             continue
-        first_destination = min(candidate.start for candidate, *_rest in destinations)
+        first_destination = min(candidate.start for candidate, *_rest in valley_destinations)
         first_task = min(
-            (candidate for candidate, *_rest in destinations),
+            (candidate for candidate, *_rest in valley_destinations),
             key=lambda candidate: candidate.start,
         )
         buffer_release = first_destination + timedelta(
@@ -606,17 +628,84 @@ def scarcity_bridge_reserve_by_start(
         )
         for task in tasks:
             if task.start < bridge_start or task.start >= max(
-                candidate.start for candidate, *_rest in destinations
+                candidate.start for candidate, *_rest in valley_destinations
             ):
                 continue
-            # The current destination consumes its own allocation. Only later
-            # obligations remain behind the physical floor.
-            protected_kwh = sum(
-                deficit_kwh
+            current_price_slot = _containing_price_slot(task.start)
+            if current_price_slot is None or current_price_slot.estimated:
+                continue
+            current_price = current_price_slot.total_import_price
+            # Reprice every still-open obligation against THIS slot. This is the
+            # rolling marginal ledger: a kWh bought or held in an earlier valley
+            # is no longer protected once the current hour is dearer than every
+            # remaining destination. Refill is also recomputed from this point,
+            # so elapsed solar and demand cannot remain in the obligation twice.
+            eligible_destinations = [
+                (destination, deficit_kwh)
                 for destination, deficit_kwh, _premium, _source_price in destinations
                 if destination.start > task.start
+                and destination.total_import_price > current_price + hold_margin + 1e-9
+            ]
+            if not eligible_destinations:
+                continue
+            cumulative_demand_kwh = 0.0
+            previous_required_kwh = 0.0
+            remaining: list[tuple[PlanTask, float]] = []
+            for destination, deficit_kwh in sorted(
+                eligible_destinations,
+                key=lambda item: item[0].start,
+            ):
+                cumulative_demand_kwh += deficit_kwh
+                refill_kwh = 0.0
+                for refill_task in tasks:
+                    if not task.start < refill_task.start < destination.start:
+                        continue
+                    duration_h = max(1, refill_task.duration_minutes) / 60.0
+                    fallback_house_w = (
+                        max(
+                            0.0,
+                            (refill_task.load_estimate_kwh or 0.0)
+                            - (refill_task.ev_load_estimate_kwh or 0.0),
+                        )
+                        / duration_h
+                        * 1000.0
+                    )
+                    p90_house_kwh = (
+                        load_forecast_w(
+                            reserve_load_by_start_w,
+                            refill_task.start,
+                            fallback_house_w,
+                        )
+                        + uplift_w * _uplift_factor(refill_task.start)
+                    ) / 1000.0 * duration_h
+                    ev_kwh = (
+                        0.0
+                        if ev_battery_protected
+                        else max(0.0, refill_task.ev_load_estimate_kwh or 0.0)
+                    )
+                    refill_kwh += min(
+                        max(0.0, discharge_rate_kwh_h) * duration_h,
+                        max(0.0, _p10_solar_kwh(refill_task) - p90_house_kwh - ev_kwh),
+                    )
+                required_kwh = max(0.0, cumulative_demand_kwh - refill_kwh)
+                incremental_required_kwh = max(
+                    0.0,
+                    required_kwh - previous_required_kwh,
+                )
+                previous_required_kwh = required_kwh
+                if incremental_required_kwh > 0.01:
+                    remaining.append((destination, incremental_required_kwh))
+            protected_kwh = sum(kwh for _destination, kwh in remaining)
+            marginal_value_kr = sum(
+                kwh * (destination.total_import_price - current_price)
+                for destination, kwh in remaining
             )
-            if len(destinations) >= 2 and task.start < buffer_release:
+            if (
+                protected_kwh <= 0.01
+                or marginal_value_kr + 1e-9 < SCARCITY_BRIDGE_MIN_VALUE_KR
+            ):
+                continue
+            if len(valley_destinations) >= 2 and task.start < buffer_release:
                 if task.start < first_destination:
                     remaining_fraction = 1.0
                 else:
@@ -638,9 +727,34 @@ def scarcity_bridge_reserve_by_start(
                 result_energy.get(task.start, 0.0) + protected_kwh
             )
             result_value[task.start] = (
-                result_value.get(task.start, 0.0) + episode_value_kr
+                result_value.get(task.start, 0.0) + marginal_value_kr
+            )
+            next_destination, _next_kwh = min(
+                remaining,
+                key=lambda item: item[0].start,
+            )
+            current_next = result_destination.get(task.start)
+            if current_next is None or next_destination.start < current_next[0]:
+                result_destination[task.start] = (
+                    next_destination.start,
+                    next_destination.total_import_price,
+                )
+            result_destination_count[task.start] = (
+                result_destination_count.get(task.start, 0) + len(remaining)
             )
 
+    if diagnostics:
+        return {
+            start: ReserveLedgerEntry(
+                protected_kwh=min(SCARCITY_BRIDGE_MAX_PROTECTED_KWH, protected_kwh),
+                marginal_value_kr=result_value.get(start, 0.0),
+                destination_at=result_destination.get(start, (None, None))[0],
+                destination_price=result_destination.get(start, (None, None))[1],
+                destination_count=result_destination_count.get(start, 0),
+            )
+            for start, protected_kwh in result_energy.items()
+            if protected_kwh > 0.01
+        }
     return {
         start: (
             min(SCARCITY_BRIDGE_MAX_PROTECTED_KWH, protected_kwh),
@@ -663,7 +777,9 @@ def apply_last_opportunity_grid_charge(
     tasks: list[PlanTask],
     *,
     state: SiteState,
-    scarcity_bridge_by_start: dict[datetime, tuple[float, float]],
+    scarcity_bridge_by_start: dict[
+        datetime, tuple[float, float] | ReserveLedgerEntry
+    ],
     profile: ProfileWeights,
     base_floor_pct: float,
     capacity_kwh: float,
@@ -1699,6 +1815,7 @@ def build_day_plan(
         local_timezone=state.timestamp.tzinfo,
         live_load_uplift_w=morning_load_uplift_w,
         observed_at=state.timestamp,
+        diagnostics=True,
     )
     tasks = apply_last_opportunity_grid_charge(
         tasks,
@@ -2611,6 +2728,7 @@ def build_day_plan(
             )
             energy_backed_live_candidate = True
         uncertainty_pct = 0.0
+        uncertainty_floor_target = base_floor
         if (
             committed_projected is not None
             and (
@@ -2724,8 +2842,16 @@ def build_day_plan(
                 physical_reserve_floor,
                 energy_backed_floor,
             )
-        scarcity_bridge_kwh, scarcity_bridge_value_kr = (
-            scarcity_bridge_by_start.get(task.start, (0.0, 0.0))
+        scarcity_entry = scarcity_bridge_by_start.get(task.start)
+        scarcity_bridge_kwh = (
+            scarcity_entry.protected_kwh
+            if isinstance(scarcity_entry, ReserveLedgerEntry)
+            else (scarcity_entry or (0.0, 0.0))[0]
+        )
+        scarcity_bridge_value_kr = (
+            scarcity_entry.marginal_value_kr
+            if isinstance(scarcity_entry, ReserveLedgerEntry)
+            else (scarcity_entry or (0.0, 0.0))[1]
         )
         scarcity_bridge_floor = base_floor
         scarcity_bridge_candidate = bool(
@@ -2971,6 +3097,62 @@ def build_day_plan(
                 float(reserve_floor_cap or min_soc),
             ) + 0.1
         )
+        fallback_destination = (
+            max(
+                future_peaks,
+                key=lambda candidate: (
+                    candidate.total_import_price,
+                    -candidate.start.timestamp(),
+                ),
+            )
+            if protected_future_kwh > 0.01 and future_peaks
+            else None
+        )
+        reserve_destination_at = (
+            scarcity_entry.destination_at
+            if isinstance(scarcity_entry, ReserveLedgerEntry)
+            and scarcity_entry.destination_at is not None
+            else (fallback_destination.start if fallback_destination else None)
+        )
+        reserve_destination_price = (
+            scarcity_entry.destination_price
+            if isinstance(scarcity_entry, ReserveLedgerEntry)
+            and scarcity_entry.destination_price is not None
+            else (
+                fallback_destination.total_import_price
+                if fallback_destination
+                else None
+            )
+        )
+        reserve_confidence = (
+            scarcity_entry.confidence
+            if isinstance(scarcity_entry, ReserveLedgerEntry)
+            else (
+                "p90_load_p10_solar"
+                if scarcity_bridge_active or protected_future_kwh > 0.01
+                else None
+            )
+        )
+        reserve_economically_valid = bool(
+            (
+                scarcity_bridge_active
+                and scarcity_bridge_value_kr + 1e-9 >= min_hold_value_kr
+                and reserve_destination_at is not None
+                and reserve_destination_at > task.start
+                and reserve_destination_price is not None
+                and reserve_destination_price
+                > task.total_import_price + hold_margin + 1e-9
+            )
+            or (
+                protected_future_kwh > 0.01
+                and protected_future_value_kr + 1e-9 >= min_hold_value_kr
+            )
+        )
+        reserve_economic_floor = max(
+            base_floor,
+            energy_backed_floor if protected_future_kwh > 0.01 else base_floor,
+            scarcity_bridge_floor if scarcity_bridge_active else base_floor,
+        )
         committed_tasks.append(replace(
             task,
             action=committed_action,
@@ -2981,6 +3163,18 @@ def build_day_plan(
             sell=sell,
             charge_current_a=charge_a,
             reserve_floor_cap_pct=reserve_floor_cap,
+            reserve_hard_floor_pct=float(min_soc),
+            reserve_learned_floor_pct=float(base_floor),
+            reserve_economic_floor_pct=float(reserve_economic_floor),
+            reserve_uncertainty_floor_pct=float(uncertainty_floor_target),
+            reserve_destination_at=reserve_destination_at,
+            reserve_destination_price=reserve_destination_price,
+            reserve_marginal_value_kr=max(
+                protected_future_value_kr,
+                scarcity_bridge_value_kr,
+            ),
+            reserve_confidence=reserve_confidence,
+            reserve_economically_valid=reserve_economically_valid,
             discharge_budget_kwh=round(discharge_budget_kwh, 3),
             discharge_extension_allowed=discharge_extension_allowed,
             reason=committed_reason,
@@ -3008,6 +3202,18 @@ def build_day_plan(
                 scarcity_bridge_value_kr,
             ),
             reserve_buffer_kwh=live_deficit_buffer_kwh,
+            reserve_hard_floor_pct=float(min_soc),
+            reserve_learned_floor_pct=float(base_floor),
+            reserve_economic_floor_pct=float(reserve_economic_floor),
+            reserve_uncertainty_floor_pct=float(uncertainty_floor_target),
+            reserve_destination_at=reserve_destination_at,
+            reserve_destination_price=reserve_destination_price,
+            reserve_marginal_value_kr=max(
+                protected_future_value_kr,
+                scarcity_bridge_value_kr,
+            ),
+            reserve_confidence=reserve_confidence,
+            reserve_economically_valid=reserve_economically_valid,
             discharge_budget_kwh=round(discharge_budget_kwh, 3),
             discharge_extension_allowed=discharge_extension_allowed,
             duration_minutes=task.duration_minutes,
@@ -3119,6 +3325,12 @@ def execute_slot(
 
     intent = slot.intent
     demoted_sell = False
+    _grid_charge_target = slot.grid_charge_target_soc_pct
+    _grid_charge_target_reached = bool(
+        intent == "GRID_CHARGE"
+        and _grid_charge_target is not None
+        and state.battery_soc_pct >= float(_grid_charge_target) - 0.5
+    )
     # S1 (2026-06-21): a FULL pack in a charge slot must HOLD, not cover the house
     # from the battery. SELF_CONSUME leaves the discharge open, so the pack covers a
     # hair of the house load, SOC drops below max_soc, the charge slot re-promotes,
@@ -3142,8 +3354,19 @@ def execute_slot(
             intent = "HOLD_FULL"
         else:
             intent = "BLOCK_EXPORT" if (window and not demoted_sell) else "SELF_CONSUME"
-    if intent == "GRID_CHARGE" and (not allow_grid_charge or _at_ceiling):
-        intent = "HOLD_FULL" if (_at_ceiling and _house_deficit) else "SELF_CONSUME"
+    if intent == "GRID_CHARGE" and (
+        not allow_grid_charge or _at_ceiling or _grid_charge_target_reached
+    ):
+        if _at_ceiling and _house_deficit:
+            intent = "HOLD_FULL"
+        elif (
+            _grid_charge_target_reached
+            and slot.reserve_economically_valid
+            and slot.tou_floor_pct > min_soc + 0.1
+        ):
+            intent = "RESERVE_HOLD"
+        else:
+            intent = "SELF_CONSUME"
     if intent == "SELL_SURPLUS":
         # A sell slot live in a sustained house DEFICIT (a cloud dropped PV below
         # the house) demotes to SELF_CONSUME — but since 2026-06-12 that is a pure
@@ -3164,7 +3387,11 @@ def execute_slot(
     # HOLD_FULL already blocks export (sell off, discharge 0, grid_charge off) AND
     # holds the pack; letting BLOCK_NEGATIVE_EXPORT (open discharge) override it would
     # re-open the overnight ceiling flap on negative-price nights. So exclude it too.
-    if negative_export_active and not allow_negative_export and intent not in ("ABSORB_NEGATIVE", "HOLD_FULL"):
+    if negative_export_active and not allow_negative_export and intent not in (
+        "ABSORB_NEGATIVE",
+        "HOLD_FULL",
+        "RESERVE_HOLD",
+    ):
         return (
             BatteryPlan(
                 strategy="BLOCK_NEGATIVE_EXPORT",
@@ -3219,6 +3446,24 @@ def execute_slot(
                 desired_export_limit_w=export_limit_default_w,
                 desired_discharge_current_a=0.0,
                 charge_target_soc_pct=min(float(battery_care_soc), max(float(plan_target), min_soc)),
+            ),
+            negative_export_active,
+        )
+
+    if intent == "RESERVE_HOLD":
+        return (
+            BatteryPlan(
+                strategy="RESERVE_HOLD",
+                reason=(
+                    "[plan] grid-charge target reached; grid charging stopped and "
+                    "the marginally valuable reserve is held explicitly"
+                ),
+                desired_grid_charge=False,
+                desired_solar_sell=False,
+                desired_energy_priority="Load first",
+                desired_limit_control_mode="Zero export to CT",
+                desired_export_limit_w=export_limit_default_w,
+                desired_discharge_current_a=0.0,
             ),
             negative_export_active,
         )

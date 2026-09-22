@@ -335,6 +335,18 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "projected_soc_pct": task.projected_soc_pct,
                     "grid_charge_target_soc_pct": task.grid_charge_target_soc_pct,
                     "tou_floor_pct": task.tou_floor_pct,
+                    "reserve_hard_floor_pct": task.reserve_hard_floor_pct,
+                    "reserve_learned_floor_pct": task.reserve_learned_floor_pct,
+                    "reserve_economic_floor_pct": task.reserve_economic_floor_pct,
+                    "reserve_uncertainty_floor_pct": task.reserve_uncertainty_floor_pct,
+                    "reserve_destination_at": (
+                        task.reserve_destination_at.isoformat()
+                        if task.reserve_destination_at else None
+                    ),
+                    "reserve_destination_price": task.reserve_destination_price,
+                    "reserve_marginal_value_kr": task.reserve_marginal_value_kr,
+                    "reserve_confidence": task.reserve_confidence,
+                    "reserve_economically_valid": task.reserve_economically_valid,
                     "reason": task.reason,
                 }
                 for task in c.control_plan.schedule
@@ -460,6 +472,28 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     )
                     else None
                 ),
+                "avoidable_import_watchdog_reason": getattr(
+                    self.coordinator,
+                    "_avoidable_import_watchdog_reason",
+                    "inactive",
+                ),
+                "avoidable_import_watchdog_counterfactual_value_kr": round(
+                    getattr(
+                        self.coordinator,
+                        "_avoidable_import_watchdog_counterfactual_value_kr",
+                        0.0,
+                    ),
+                    3,
+                ),
+                "avoidable_import_watchdog_destination_at": (
+                    self.coordinator._avoidable_import_watchdog_destination_at.isoformat()
+                    if getattr(
+                        self.coordinator,
+                        "_avoidable_import_watchdog_destination_at",
+                        None,
+                    )
+                    else None
+                ),
                 "grid_import_causes_today_kwh": {
                     cause: round(value, 3)
                     for cause, value in getattr(
@@ -477,6 +511,37 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     "protected_kwh": round(
                         getattr(current_day_slot, "reserve_protected_kwh", 0.0),
                         3,
+                    ),
+                    "hard_floor_pct": getattr(
+                        current_day_slot, "reserve_hard_floor_pct", None
+                    ),
+                    "learned_floor_pct": getattr(
+                        current_day_slot, "reserve_learned_floor_pct", None
+                    ),
+                    "economic_floor_pct": getattr(
+                        current_day_slot, "reserve_economic_floor_pct", None
+                    ),
+                    "uncertainty_floor_pct": getattr(
+                        current_day_slot, "reserve_uncertainty_floor_pct", None
+                    ),
+                    "destination_at": (
+                        current_day_slot.reserve_destination_at.isoformat()
+                        if current_day_slot is not None
+                        and current_day_slot.reserve_destination_at is not None
+                        else None
+                    ),
+                    "destination_price": getattr(
+                        current_day_slot, "reserve_destination_price", None
+                    ),
+                    "marginal_value_kr": round(
+                        getattr(current_day_slot, "reserve_marginal_value_kr", 0.0),
+                        3,
+                    ),
+                    "confidence": getattr(
+                        current_day_slot, "reserve_confidence", None
+                    ),
+                    "economically_valid": getattr(
+                        current_day_slot, "reserve_economically_valid", False
                     ),
                     "floor_pct": getattr(
                         current_day_slot,

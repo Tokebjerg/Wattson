@@ -223,6 +223,7 @@ from .planner import (
     MORNING_BRIDGE_LIVE_UPLIFT_MAX_W,
     NEGATIVE_IMPORT_ABSORB_THRESHOLD,
     RESERVE_HOLD_MARGIN,
+    RESERVE_HOLD_MIN_VALUE_KR,
     SELL_SAFE_CHARGE_A,
     apply_mode_dwell,
     battery_rate_kwh,
@@ -253,6 +254,61 @@ from .planner import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _live_reserve_step_counterfactual(
+    tasks: tuple[PlanTask, ...] | list[PlanTask],
+    *,
+    now: datetime,
+    current_price: float,
+    hold_margin: float,
+    step_kwh: float,
+    estimated_starts: set[datetime] | None = None,
+) -> tuple[bool, float, datetime | None, float | None]:
+    """Value one native SOC step from raw future deficits, not reserve output."""
+    obligations: list[tuple[float, float, datetime, float]] = []
+    estimated_starts = estimated_starts or set()
+    for task in tasks:
+        if task.start <= now or task.start in estimated_starts:
+            continue
+        premium = float(task.total_import_price) - float(current_price)
+        if premium <= hold_margin + 1e-9:
+            continue
+        house_load_kwh = max(
+            0.0,
+            float(task.load_estimate_kwh or 0.0)
+            - float(task.ev_load_estimate_kwh or 0.0),
+        )
+        deficit_kwh = max(
+            0.0,
+            house_load_kwh - float(task.pv_estimate_kwh or 0.0),
+        )
+        if deficit_kwh > 0.01:
+            obligations.append((premium, deficit_kwh, task.start, task.total_import_price))
+    remaining = max(0.0, float(step_kwh))
+    value_kr = 0.0
+    selected_at = None
+    selected_price = None
+    for premium, deficit_kwh, destination_at, destination_price in sorted(
+        obligations,
+        key=lambda item: (-item[0], item[2]),
+    ):
+        allocated = min(remaining, deficit_kwh)
+        if allocated <= 0.0:
+            continue
+        value_kr += allocated * premium
+        remaining -= allocated
+        if selected_at is None or destination_at < selected_at:
+            selected_at = destination_at
+            selected_price = destination_price
+        if remaining <= 0.01:
+            break
+    return (
+        value_kr + 1e-9 >= RESERVE_HOLD_MIN_VALUE_KR,
+        value_kr,
+        selected_at,
+        selected_price,
+    )
 
 
 def _canonical_load_forecast(
@@ -757,6 +813,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._avoidable_import_watchdog_since: datetime | None = None
         self._avoidable_import_watchdog_active_until: datetime | None = None
         self._avoidable_import_watchdog_active: bool = False
+        self._avoidable_import_watchdog_reason: str = "inactive"
+        self._avoidable_import_watchdog_counterfactual_value_kr: float = 0.0
+        self._avoidable_import_watchdog_destination_at: datetime | None = None
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -2468,9 +2527,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         safe_reasons: list[str],
         now: datetime,
     ) -> float | None:
-        """Release only the part of a TOU floor lacking an energy justification."""
+        """Independently release one native step when holding is not valuable."""
         recovery_floor = getattr(slot, "reserve_floor_cap_pct", None)
         planned_floor = getattr(slot, "tou_floor_pct", None)
+        hard_floor = getattr(slot, "reserve_hard_floor_pct", None)
+        learned_floor = getattr(slot, "reserve_learned_floor_pct", None)
+        base_floor = max(
+            float(hard_floor or 0.0),
+            float(learned_floor or recovery_floor or hard_floor or 0.0),
+        )
         excluded_strategies = {
             "GRID_CHARGE",
             "ABSORB_NEGATIVE",
@@ -2484,29 +2549,62 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         excluded = bool(
             slot is None
             or self.site_state is None
-            or recovery_floor is None
             or planned_floor is None
             or safe_reasons
             or float(getattr(slot, "total_import_price", 0.0) or 0.0) <= 0.0
             or max(0.0, self.site_state.easee_power_w or 0.0) >= 200.0
             or battery_plan.strategy in excluded_strategies
         )
-        unbacked = bool(
-            not excluded
-            and float(planned_floor) > float(recovery_floor) + 0.1
+        estimated_starts = {
+            price_slot.start
+            for price_slot in (self.site_state.price_slots if self.site_state else [])
+            if price_slot.estimated
+        }
+        step_kwh = (
+            max(0.1, float(self.effective_battery_capacity_kwh)) * 0.05
+            if hasattr(self, "_battery_model")
+            else 0.5
         )
-        if not unbacked:
+        keep_step, counterfactual_value_kr, destination_at, _destination_price = (
+            _live_reserve_step_counterfactual(
+                tuple(self._day_plan.tasks) if getattr(self, "_day_plan", None) else (),
+                now=now,
+                current_price=float(getattr(slot, "total_import_price", 0.0) or 0.0),
+                hold_margin=float(getattr(self, "reserve_hold_margin", RESERVE_HOLD_MARGIN)),
+                step_kwh=step_kwh,
+                estimated_starts=estimated_starts,
+            )
+            if not excluded
+            else (False, 0.0, None, None)
+        )
+        self._avoidable_import_watchdog_counterfactual_value_kr = counterfactual_value_kr
+        self._avoidable_import_watchdog_destination_at = destination_at
+        release_candidate = bool(
+            not excluded
+            and float(planned_floor) > base_floor + 0.1
+            and not keep_step
+        )
+        if not release_candidate:
             self._avoidable_import_watchdog_since = None
             self._avoidable_import_watchdog_active_until = None
             self._avoidable_import_watchdog_active = False
+            self._avoidable_import_watchdog_reason = (
+                "economically_valid_future_deficit" if keep_step else "inactive"
+            )
             return None
+
+        release_floor = max(
+            base_floor,
+            float(planned_floor) - 5.0,
+        )
 
         if (
             self._avoidable_import_watchdog_active_until is not None
             and now < self._avoidable_import_watchdog_active_until
         ):
             self._avoidable_import_watchdog_active = True
-            return float(recovery_floor)
+            self._avoidable_import_watchdog_reason = "released_one_native_step"
+            return release_floor
 
         # Never restore a released floor above the SOC already reached. Doing
         # so would recreate the import merely to "catch up" to the old reserve.
@@ -2519,7 +2617,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 seconds=AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS
             )
             self._avoidable_import_watchdog_active = True
-            return float(recovery_floor)
+            self._avoidable_import_watchdog_reason = "released_one_native_step_no_catchup"
+            return release_floor
 
         self._avoidable_import_watchdog_active_until = None
         self._avoidable_import_watchdog_active = False
@@ -2528,13 +2627,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and abs(self.site_state.battery_power_w or 0.0)
             < AVOIDABLE_IMPORT_WATCHDOG_BATTERY_IDLE_W
             and self.site_state.battery_soc_pct
-            >= float(planned_floor) - AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT
+            > base_floor + AVOIDABLE_IMPORT_WATCHDOG_SOC_TOLERANCE_PCT
         )
         if not stalled:
             self._avoidable_import_watchdog_since = None
+            self._avoidable_import_watchdog_reason = "waiting_for_import_stall"
             return None
         if self._avoidable_import_watchdog_since is None:
             self._avoidable_import_watchdog_since = now
+            self._avoidable_import_watchdog_reason = "timing_import_stall"
             return None
         if (
             now - self._avoidable_import_watchdog_since
@@ -2544,7 +2645,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._avoidable_import_watchdog_active_until = now + timedelta(
             seconds=AVOIDABLE_IMPORT_WATCHDOG_HOLD_SECONDS
         )
-        return float(recovery_floor)
+        self._avoidable_import_watchdog_reason = "released_one_native_step"
+        return release_floor
 
     def _update_discharge_budget_floor(
         self,
@@ -3441,6 +3543,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if slot.start >= _now_local.replace(minute=0, second=0, microsecond=0)
         )
         _slot = self._day_plan.slot_for(_now_local) if self._day_plan else None
+        _grid_charge_target_reached = bool(
+            _slot is not None
+            and _slot.grid_charge
+            and _slot.grid_charge_target_soc_pct is not None
+            and self.site_state.battery_soc_pct
+            >= float(_slot.grid_charge_target_soc_pct) - 0.5
+        )
+        if (
+            _grid_charge_target_reached
+            and self._pending_replan_reason is None
+            and self._last_replan_reason != "grid_charge_target_reached"
+        ):
+            self._pending_replan_reason = "grid_charge_target_reached"
         _expected_soc = self._day_plan.expected_soc_at(_now_local) if self._day_plan else None
         _soc_deviation = (
             self.site_state.battery_soc_pct - _expected_soc
@@ -4268,6 +4383,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             discharge_floor = min(discharge_floor, avoidable_import_floor)
             battery_plan = replace(
                 battery_plan,
+                desired_discharge_current_a=(
+                    self.battery_discharge_current
+                    if battery_plan.strategy == "RESERVE_HOLD"
+                    else battery_plan.desired_discharge_current_a
+                ),
                 reason=(
                     f"{battery_plan.reason} | import-vagt: frigiver ubeskyttet "
                     f"TOU-reserve til {avoidable_import_floor:.0f}%"

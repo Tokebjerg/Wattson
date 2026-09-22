@@ -83,6 +83,7 @@ def classify_grid_import_power(
     base_floor_pct: float,
     recovery_floor_pct: float | None,
     reserve_value_kr: float,
+    reserve_economically_valid: bool | None = None,
     min_reserve_value_kr: float = RESERVE_HOLD_MIN_VALUE_KR,
 ) -> dict[str, float]:
     """Split measured import into mutually exclusive physical/control causes."""
@@ -127,7 +128,11 @@ def classify_grid_import_power(
                 not unbacked_floor
                 and (
                     float(desired_floor_pct) <= float(base_floor_pct) + 0.1
-                    or float(reserve_value_kr) + 1e-9 >= float(min_reserve_value_kr)
+                    or (
+                        reserve_economically_valid
+                        if reserve_economically_valid is not None
+                        else float(reserve_value_kr) + 1e-9 >= float(min_reserve_value_kr)
+                    )
                 )
             )
             take("reserve_hold" if valid_reserve else "avoidable", remaining)
@@ -1092,6 +1097,11 @@ class TelemetryMixin:
             recovery_floor_pct=getattr(slot, "reserve_floor_cap_pct", None),
             reserve_value_kr=float(
                 getattr(slot, "reserve_protected_value_kr", 0.0) or 0.0
+            ),
+            reserve_economically_valid=(
+                getattr(slot, "reserve_economically_valid", None)
+                if slot is not None
+                else None
             ),
         )
         for cause, watts in causes_w.items():

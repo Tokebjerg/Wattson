@@ -356,6 +356,15 @@ class PlanTask:
     sell: bool | None = None
     charge_current_a: float | None = None
     reserve_floor_cap_pct: float | None = None
+    reserve_hard_floor_pct: float | None = None
+    reserve_learned_floor_pct: float | None = None
+    reserve_economic_floor_pct: float | None = None
+    reserve_uncertainty_floor_pct: float | None = None
+    reserve_destination_at: datetime | None = None
+    reserve_destination_price: float | None = None
+    reserve_marginal_value_kr: float = 0.0
+    reserve_confidence: str | None = None
+    reserve_economically_valid: bool = False
     discharge_budget_kwh: float = 0.0
     discharge_extension_allowed: bool = False
     duration_minutes: int = 60
@@ -393,6 +402,15 @@ class SlotPlan:
     reserve_protected_kwh: float = 0.0
     reserve_protected_value_kr: float = 0.0
     reserve_buffer_kwh: float = 0.0
+    reserve_hard_floor_pct: float | None = None
+    reserve_learned_floor_pct: float | None = None
+    reserve_economic_floor_pct: float | None = None
+    reserve_uncertainty_floor_pct: float | None = None
+    reserve_destination_at: datetime | None = None
+    reserve_destination_price: float | None = None
+    reserve_marginal_value_kr: float = 0.0
+    reserve_confidence: str | None = None
+    reserve_economically_valid: bool = False
     # Live controller may spend at most one additional native 5%-SOC step when
     # measured demand exhausts this plan budget and no dearer reserve is at risk.
     discharge_budget_kwh: float = 0.0

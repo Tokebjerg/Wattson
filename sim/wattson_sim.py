@@ -5172,7 +5172,9 @@ def test_control_stability_regressions():
         load_power_w=500.0,
         grid_power_w=500.0,
         grid_import_power_w=500.0,
-        battery_soc_pct=55.0,
+        # Already below the stale 55% register target, but still safely above
+        # the 35% energy-backed floor: the watchdog must not wait for 55% SOC.
+        battery_soc_pct=50.0,
         battery_power_w=0.0,
     )
     import_watchdog._avoidable_import_watchdog_since = None
@@ -5221,10 +5223,10 @@ def test_control_stability_regressions():
         safe_reasons=[],
         now=base + timedelta(minutes=13),
     )
-    checks.append(("unbacked TOU reserve releases after 90s and stays stable for five minutes",
+    checks.append(("unbacked TOU reserve releases one native step after 90s and stays stable for five minutes",
                    import_first is None and import_early is None
-                   and import_trip == 35.0 and import_latched == 35.0
-                   and import_no_catchup == 35.0 and import_expired is None,
+                   and import_trip == 50.0 and import_latched == 50.0
+                   and import_no_catchup == 50.0 and import_expired is None,
                    f"{import_first}/{import_early}/{import_trip}/{import_latched}/"
                    f"no_catchup={import_no_catchup}/{import_expired}"))
 
@@ -7531,11 +7533,12 @@ def test_rolling_planner_upgrade():
         discharge_rate_kwh_h=3.57,
         local_timezone=timezone.utc,
     )
-    checks.append(("scarcity bridge starts in the cheapest night valley and releases at the final peak",
+    checks.append(("scarcity bridge reprices every slot and releases before a cheaper final peak",
                    bridge_base not in bridge_reserve
                    and bridge_base + timedelta(hours=1) not in bridge_reserve
                    and 1.5 < bridge_reserve[bridge_base + timedelta(hours=2)][0] < 2.0
-                   and 0.9 < bridge_reserve[bridge_base + timedelta(hours=6)][0] < 1.3
+                   and bridge_base + timedelta(hours=5) in bridge_reserve
+                   and bridge_base + timedelta(hours=6) not in bridge_reserve
                    and bridge_base + timedelta(hours=7) not in bridge_reserve,
                    str(bridge_reserve)))
     flat_prices = [replace(slot, total_import_price=1.75, spot_price=1.75)
@@ -7583,10 +7586,11 @@ def test_rolling_planner_upgrade():
         discharge_rate_kwh_h=3.57,
         local_timezone=timezone.utc,
     )
-    checks.append(("scarcity bridge also spans a sustained expensive evening window",
+    checks.append(("scarcity bridge spans the evening scarcity and releases once no material premium remains",
                    evening_base + timedelta(hours=2) in evening_bridge
                    and evening_bridge[evening_base + timedelta(hours=2)][0] >= 2.0
-                   and evening_base + timedelta(hours=6) in evening_bridge
+                   and evening_base + timedelta(hours=5) in evening_bridge
+                   and evening_base + timedelta(hours=6) not in evening_bridge
                    and evening_base + timedelta(hours=7) not in evening_bridge,
                    str(evening_bridge)))
     single_peak_p90 = dict(evening_p90)
@@ -7615,8 +7619,8 @@ def test_rolling_planner_upgrade():
         live_load_uplift_w=750.0,
     )
     checks.append(("sustained morning P90 miss increases the remaining protected energy",
-                   uplifted_bridge[bridge_base + timedelta(hours=6)][0]
-                   > bridge_reserve[bridge_base + timedelta(hours=6)][0],
+                   uplifted_bridge[bridge_base + timedelta(hours=5)][0]
+                   > bridge_reserve[bridge_base + timedelta(hours=5)][0],
                    f"base={bridge_reserve} uplifted={uplifted_bridge}"))
 
     uplift_samples = []
