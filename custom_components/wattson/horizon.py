@@ -182,7 +182,7 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
 
     tariffs_attr = buy_attrs.get("tariffs")
     prices_include_tariffs = _raw_prices_include_tariffs(buy_attrs)
-    flat_total = 0.0 if prices_include_tariffs else _flat_tariff_total(tariffs_attr)
+    flat_total = _flat_tariff_total(tariffs_attr)
     export_index = _export_value_index(_attrs(hass, sell_entity))
 
     slots: list[PriceSlot] = []
@@ -191,7 +191,7 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
         if start is None:
             continue
         try:
-            spot = float(item["price"])
+            provider_price = float(item["price"])
         except (TypeError, ValueError, KeyError):
             continue
         # float("nan")/float("inf") do NOT raise, so a price entity publishing a
@@ -200,9 +200,15 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
         # collapses to 0%) with no error and no log. Drop the slot like an
         # unavailable one. Use isfinite, never "spot < 0" — that would wrongly
         # discard legitimate negative (ABSORB) prices.
-        if not math.isfinite(spot):
+        if not math.isfinite(provider_price):
             continue
-        tariff = 0.0 if prices_include_tariffs else _hourly_tariff(tariffs_attr, start.hour) + flat_total
+        tariff = _hourly_tariff(tariffs_attr, start.hour) + flat_total
+        if prices_include_tariffs:
+            total_import_price = provider_price
+            spot = provider_price - tariff
+        else:
+            spot = provider_price
+            total_import_price = spot + tariff
         export_value = export_index.get(start)
         if export_value is not None and not math.isfinite(export_value):
             export_value = None
@@ -211,7 +217,7 @@ def build_price_slots(hass: Any, buy_entity: str | None, sell_entity: str | None
                 start=start,
                 spot_price=spot,
                 tariff=tariff,
-                total_import_price=spot + tariff,
+                total_import_price=total_import_price,
                 export_value=export_value,
             )
         )

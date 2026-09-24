@@ -118,6 +118,12 @@ RESERVE_HOLD_MARGIN = 0.15
 # without fragmenting a material multi-source episode into sub-threshold hours.
 RESERVE_HOLD_MIN_VALUE_KR = 0.30
 
+# Reserve energy before a peak, then spend it through the peak.  Forecast and
+# uncertainty floors must not make the house import while the battery still has
+# usable energy in the expensive local morning/evening windows.
+PEAK_DISCHARGE_MORNING_HOURS = range(6, 10)
+PEAK_DISCHARGE_EVENING_HOURS = range(16, 22)
+
 # Dynamic low-price-to-scarcity bridge.  The ordinary optimizer may use the
 # battery before a cheap valley, but once the valley starts this overlay carries
 # conservative demand into every materially dearer deficit window later that
@@ -346,6 +352,28 @@ class _HorizonView:
     def max_price_after(self, start: datetime) -> float | None:
         future = [s.total_import_price for s in self.slots if s.start > start]
         return max(future) if future else None
+
+
+def _is_expensive_local_peak_slot(task: PlanTask, view: _HorizonView) -> bool:
+    """True when reserve overlays must yield to continuous self-consumption."""
+    hour = task.start.hour
+    if (
+        hour not in PEAK_DISCHARGE_MORNING_HOURS
+        and hour not in PEAK_DISCHARGE_EVENING_HOURS
+    ):
+        return False
+    same_day_slots = [
+        slot for slot in view.slots
+        if slot.start.date() == task.start.date()
+    ]
+    current = next((slot for slot in same_day_slots if slot.start == task.start), None)
+    if current is None or not same_day_slots:
+        return False
+    same_day_prices = sorted(slot.total_import_price for slot in same_day_slots)
+    day_median = same_day_prices[len(same_day_prices) // 2]
+    minimum_tariff = min(slot.tariff for slot in same_day_slots)
+    tariff_peak = current.tariff >= minimum_tariff + 0.03
+    return tariff_peak and task.total_import_price >= day_median
 
 
 def _horizon_view(state: SiteState, profile: ProfileWeights) -> _HorizonView | None:
@@ -2910,6 +2938,39 @@ def build_day_plan(
                     physical_reserve_floor,
                     scarcity_bridge_floor,
                 )
+        peak_discharge_release = bool(
+            battery_mode != BATTERY_MODE_PROTECT
+            and task.action != "GRID_CHARGE"
+            and forecast_deficit
+            and task.total_import_price > 0.0
+            and _is_expensive_local_peak_slot(task, view)
+        )
+        if peak_discharge_release:
+            # The reserve has reached its destination: use it continuously
+            # through the expensive window. P50/P90, learned and scarcity
+            # floors may shape the approach, but cannot force grid import here.
+            floor = float(min_soc)
+            physical_reserve_floor = float(min_soc)
+            uncertainty_floor_target = float(min_soc)
+            available_now_kwh = (
+                max(0.0, committed_start_soc - float(min_soc))
+                / 100.0
+                * max(0.1, capacity_kwh)
+            )
+            current_drain_kwh = min(
+                battery_deficit_kwh,
+                discharge_rate,
+                available_now_kwh,
+            )
+            peak_end_soc = committed_start_soc - (
+                current_drain_kwh / max(0.1, capacity_kwh) * 100.0
+            )
+            committed_projected = min(
+                float(committed_projected)
+                if committed_projected is not None
+                else committed_start_soc,
+                peak_end_soc,
+            )
         # Estimated lookahead slots (today's price shape copied forward until the
         # real day-ahead prices publish ~13:00) inform ranking/reserve maths but
         # are never COMMITTED to buying decisions — if EDS stays down so long
@@ -3057,6 +3118,10 @@ def build_day_plan(
                 f"{scarcity_bridge_kwh:.2f} kWh for later expensive "
                 "P90-load/P10-solar "
                 f"({scarcity_bridge_value_kr:.2f} kr risk value)"
+            )
+        if peak_discharge_release:
+            reserve_notes.append(
+                "peak window releases forecast reserves to the hard SOC floor"
             )
         if non_grid_floor_capped:
             reserve_notes.append(

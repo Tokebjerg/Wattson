@@ -667,8 +667,11 @@ def test_horizon():
         "EDS all-in raw price is not charged tariffs twice",
         len(eds_slots) == 1
         and abs(eds_slots[0].total_import_price - 0.74) < 1e-9
-        and eds_slots[0].tariff == 0.0,
-        f"got total={eds_slots[0].total_import_price if eds_slots else None} tariff={eds_slots[0].tariff if eds_slots else None}",
+        and abs(eds_slots[0].tariff - 0.27) < 1e-9
+        and abs(eds_slots[0].spot_price - 0.47) < 1e-9,
+        f"got total={eds_slots[0].total_import_price if eds_slots else None} "
+        f"tariff={eds_slots[0].tariff if eds_slots else None} "
+        f"spot={eds_slots[0].spot_price if eds_slots else None}",
     ))
 
     # Real HA stores the per-hour timestamps as datetime objects, not ISO

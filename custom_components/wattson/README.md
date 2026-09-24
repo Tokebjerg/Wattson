@@ -50,6 +50,14 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
+Version 0.29.1 treats an expensive local morning/evening window as the
+destination of the battery reserve. Once such a window begins, P50/P90,
+learned and scarcity floors cannot force grid import while usable battery
+remains; the configured hard SOC floor, Protect/manual modes and physical
+limits still apply. Energi Data Service all-in prices are also normalized into
+their spot and tariff components without changing the all-in value, allowing
+the planner to distinguish a real tariff peak from an arbitrary clock hour.
+
 Version 0.29.0 hardens winter operation without changing the 15% hard SOC floor,
 the 70 A ceiling, manual modes or solar-EV dip support. The planner now uses the
 full 48-hour price horizon, accounts for protected EV energy consistently in its

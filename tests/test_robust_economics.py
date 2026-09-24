@@ -211,8 +211,16 @@ class RobustEconomicsTests(unittest.TestCase):
         prices = [
             ws.models.PriceSlot(
                 start=start + timedelta(hours=index),
-                spot_price=price,
-                tariff=0.0,
+                spot_price=price - (
+                    0.47
+                    if 17 <= (start + timedelta(hours=index)).hour <= 20
+                    else 0.27
+                ),
+                tariff=(
+                    0.47
+                    if 17 <= (start + timedelta(hours=index)).hour <= 20
+                    else 0.27
+                ),
                 total_import_price=price,
                 export_value=0.4,
             )
@@ -258,9 +266,59 @@ class RobustEconomicsTests(unittest.TestCase):
         current = plan.tasks[0]
         self.assertEqual("DISCHARGE", current.action)
         self.assertLess(current.projected_soc_pct, 99.0)
-        self.assertLessEqual(current.tou_floor_pct, 40.0)
+        self.assertEqual(15.0, current.tou_floor_pct)
         self.assertTrue(current.reserve_economically_valid)
         self.assertEqual(start + timedelta(hours=1), current.reserve_destination_at)
+        self.assertIn("peak window releases", current.reason)
+
+    def test_sep_24_evening_peak_cannot_hold_85_percent_for_next_hour(self) -> None:
+        now = datetime(
+            2026, 9, 24, 18, 15,
+            tzinfo=timezone(timedelta(hours=2)),
+        )
+        start = now.replace(minute=0, second=0, microsecond=0)
+        price_values = [2.64, 3.05, 2.98, 2.46, 2.26, 2.11] + [1.80] * 18
+        load_values = [1.631, 1.445, 1.601, 0.886, 0.603, 0.527] + [0.5] * 18
+        prices = [
+            ws.models.PriceSlot(
+                start=start + timedelta(hours=index),
+                spot_price=price - (
+                    0.47
+                    if 17 <= (start + timedelta(hours=index)).hour <= 20
+                    else 0.27
+                ),
+                tariff=(
+                    0.47
+                    if 17 <= (start + timedelta(hours=index)).hour <= 20
+                    else 0.27
+                ),
+                total_import_price=price,
+                export_value=0.4,
+            )
+            for index, price in enumerate(price_values)
+        ]
+        load = {
+            start + timedelta(hours=index): value * 1000.0
+            for index, value in enumerate(load_values)
+        }
+        p90_load = {instant: watts * 1.35 for instant, watts in load.items()}
+        state = self._site_state(now, soc=85.0, load_w=1184.0, pv_w=49.0, prices=prices)
+        plan = ws.planner.build_day_plan(
+            state,
+            battery_mode="blue",
+            min_soc=15.0,
+            max_soc=100.0,
+            capacity_kwh=8.56,
+            load_hourly_w=load,
+            reserve_load_by_start_w=p90_load,
+            learned_reserve_pct=15.0,
+            allow_grid_charge=False,
+        )
+        current = plan.tasks[0]
+        self.assertEqual("DISCHARGE", current.action)
+        self.assertEqual(15.0, current.tou_floor_pct)
+        self.assertLess(current.projected_soc_pct, 85.0)
+        self.assertIn("peak window releases", current.reason)
 
     def test_operating_rate_migration_preserves_valid_learning(self) -> None:
         restored = ws.battery_model.BatteryModelState.from_dict({
