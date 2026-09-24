@@ -287,6 +287,10 @@ class SiteState:
     price_slots: list[PriceSlot] = field(default_factory=list)
     solar_slots: list[SolarSlot] = field(default_factory=list)
     outdoor_temperature_c: float | None = None
+    # Optional hourly weather forecast, keyed by the provider's timestamp.  The
+    # current temperature remains the safe fallback when a sensor exposes no
+    # forecast attribute.
+    outdoor_temperature_by_start_c: dict[datetime, float] = field(default_factory=dict)
     # Coordinator-debounced completion evidence. Raw ``completed`` alone can be
     # transient while Easee closes a session and must not clear a live EV budget.
     easee_completed_stable: bool = False

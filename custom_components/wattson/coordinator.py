@@ -263,6 +263,8 @@ def _live_reserve_step_counterfactual(
     current_price: float,
     hold_margin: float,
     step_kwh: float,
+    available_above_base_kwh: float = 0.0,
+    protected_reserve_kwh: float = 0.0,
     estimated_starts: set[datetime] | None = None,
 ) -> tuple[bool, float, datetime | None, float | None]:
     """Value one native SOC step from raw future deficits, not reserve output."""
@@ -285,7 +287,14 @@ def _live_reserve_step_counterfactual(
         )
         if deficit_kwh > 0.01:
             obligations.append((premium, deficit_kwh, task.start, task.total_import_price))
-    remaining = max(0.0, float(step_kwh))
+    # A valuable future deficit is not enough reason to hold this step when
+    # the measured pack already contains that reserve plus the step.  This is
+    # intentionally independent of the planner's action label: it compares
+    # the physical energy alternatives the watchdog can actually choose.
+    spare = max(0.0, float(available_above_base_kwh) - float(protected_reserve_kwh))
+    if spare + 1e-9 >= float(step_kwh):
+        return False, 0.0, None, None
+    remaining = max(0.0, float(step_kwh) - spare)
     value_kr = 0.0
     selected_at = None
     selected_price = None
@@ -316,6 +325,7 @@ def _canonical_load_forecast(
     instants: tuple[datetime, ...],
     *,
     outdoor_temperature_c: float | None,
+    outdoor_temperature_by_start_c: dict[datetime, float] | None = None,
     conservative: bool,
     quarter_hour: bool = False,
 ) -> dict[str, float] | None:
@@ -326,7 +336,9 @@ def _canonical_load_forecast(
         instant.isoformat(): forecast_load_w(
             profile,
             dt_util.as_local(instant),
-            outdoor_temperature_c=outdoor_temperature_c,
+            outdoor_temperature_c=(outdoor_temperature_by_start_c or {}).get(
+                utc_instant(instant), outdoor_temperature_c
+            ),
             conservative=conservative,
             quarter_hour=quarter_hour,
         )
@@ -2565,6 +2577,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if hasattr(self, "_battery_model")
             else 0.5
         )
+        watchdog_capacity_kwh = (
+            float(self.effective_battery_capacity_kwh)
+            if hasattr(self, "_battery_model")
+            else 10.0
+        )
         keep_step, counterfactual_value_kr, destination_at, _destination_price = (
             _live_reserve_step_counterfactual(
                 tuple(self._day_plan.tasks) if getattr(self, "_day_plan", None) else (),
@@ -2572,6 +2589,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 current_price=float(getattr(slot, "total_import_price", 0.0) or 0.0),
                 hold_margin=float(getattr(self, "reserve_hold_margin", RESERVE_HOLD_MARGIN)),
                 step_kwh=step_kwh,
+                available_above_base_kwh=max(
+                    0.0,
+                    (float(self.site_state.battery_soc_pct) - base_floor)
+                    / 100.0 * watchdog_capacity_kwh,
+                ),
+                protected_reserve_kwh=max(
+                    0.0,
+                    (float(planned_floor) - base_floor)
+                    / 100.0 * watchdog_capacity_kwh,
+                ),
                 estimated_starts=estimated_starts,
             )
             if not excluded
@@ -3293,18 +3320,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.load_profile,
             _forecast_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            outdoor_temperature_by_start_c=self.site_state.outdoor_temperature_by_start_c,
             conservative=False,
         )
         _reserve_load = _canonical_load_forecast(
             self.load_profile,
             _forecast_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            outdoor_temperature_by_start_c=self.site_state.outdoor_temperature_by_start_c,
             conservative=True,
         )
         _scenario_load = _canonical_load_forecast(
             self.load_profile,
             _scenario_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            outdoor_temperature_by_start_c=self.site_state.outdoor_temperature_by_start_c,
             conservative=False,
             quarter_hour=True,
         )
@@ -3312,6 +3342,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.load_profile,
             _scenario_instants,
             outdoor_temperature_c=self.site_state.outdoor_temperature_c,
+            outdoor_temperature_by_start_c=self.site_state.outdoor_temperature_by_start_c,
             conservative=True,
             quarter_hour=True,
         )
@@ -3692,6 +3723,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     discharge_rate_kwh_h=self.effective_discharge_rate_kwh,
                     grid_charge_rate_kwh_h=_grid_charge_rate,
                     battery_care_soc=self.battery_care_soc,
+                    ev_battery_protected=_ev_battery_protected,
                 )
                 _candidate_score = (
                     score_schedule(
@@ -3707,6 +3739,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         discharge_rate_kwh_h=self.effective_discharge_rate_kwh,
                         grid_charge_rate_kwh_h=_grid_charge_rate,
                         battery_care_soc=self.battery_care_soc,
+                        ev_battery_protected=_ev_battery_protected,
                     )
                     if _candidate_day_plan is not None
                     else None

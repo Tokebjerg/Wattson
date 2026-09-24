@@ -6,7 +6,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
-from .horizon import build_price_slots, build_solar_slots
+from .horizon import build_price_slots, build_solar_slots, build_temperature_forecast
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, EntityMapping, PriceSlot, SiteState, SolarSlot
 
@@ -22,6 +22,7 @@ class SnapshotBuilder:
         self._horizon_fingerprint: tuple[Any, ...] | None = None
         self._price_slots: list[PriceSlot] = []
         self._solar_slots: list[SolarSlot] = []
+        self._temperature_by_start_c: dict = {}
 
     @staticmethod
     def _config_fp(config: dict[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -59,6 +60,7 @@ class SnapshotBuilder:
             self._entity_fp(mapping.buy_price_entity),
             self._entity_fp(mapping.sell_price_entity),
             self._entity_fp(mapping.forecast_today_entity),
+            self._entity_fp(mapping.outdoor_temperature_entity),
         )
         if horizon_fp != self._horizon_fingerprint:
             self._price_slots = build_price_slots(
@@ -66,6 +68,9 @@ class SnapshotBuilder:
             )
             self._solar_slots = build_solar_slots(
                 self.hass, mapping.forecast_today_entity
+            )
+            self._temperature_by_start_c = build_temperature_forecast(
+                self.hass, mapping.outdoor_temperature_entity
             )
             self._horizon_fingerprint = horizon_fp
         state = build_site_state(
@@ -76,5 +81,6 @@ class SnapshotBuilder:
             invert_battery_power_sign=invert_battery_power_sign,
             price_slots=self._price_slots,
             solar_slots=self._solar_slots,
+            outdoor_temperature_by_start_c=self._temperature_by_start_c,
         )
         return mapping, capabilities, state

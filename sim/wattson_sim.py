@@ -630,6 +630,15 @@ def test_horizon():
     checks.append(("slots sorted ascending", price_slots == sorted(price_slots, key=lambda s: s.start), "order"))
     checks.append(("solar slots parsed", len(solar_slots) == 2 and abs(solar_slots[0].pv_estimate_kwh - 7.0) < 1e-6, f"got {len(solar_slots)}"))
     checks.append(("solar 10/90 bands parsed", solar_slots[0].pv_estimate10_kwh == 5.7 and solar_slots[0].pv_estimate90_kwh == 7.9, "bands"))
+    weather_hass = FakeHass({
+        "sensor.outdoor": {"state": 8.0, "attributes": {"forecast": [
+            {"datetime": "2026-06-07T18:00:00+02:00", "temperature": 4.0},
+            {"datetime": "2026-06-07T19:00:00+02:00", "temperature": 2.0},
+        ]}},
+    })
+    weather_forecast = horizon.build_temperature_forecast(weather_hass, "sensor.outdoor")
+    checks.append(("hourly weather forecast accepts standard forecast attributes",
+                   sorted(weather_forecast.values()) == [2.0, 4.0], str(weather_forecast)))
 
     # Energi Data Service calculates raw_today/raw_tomorrow with its configured
     # tariffs and VAT already included. Its tariff attributes are metadata, not
@@ -883,7 +892,8 @@ def test_a2_planning():
         allow_negative_export=False, export_limit_default_w=6000.0,
     )
     cp = planner.build_control_plan(st, battery_plan=bp, ev_plan=models.EvPlan(mode="scheduled_periods", reason=""), safe_reasons=[], negative_price_active=neg, load_hourly_w={h: 1500 for h in range(24)})
-    checks.append(("schedule built (24 tasks)", len(cp.schedule) == 24, f"got {len(cp.schedule)}"))
+    checks.append(("schedule uses every available horizon slot (up to 48 hours)",
+                   len(cp.schedule) == len(day), f"got {len(cp.schedule)}"))
     checks.append(("next_expensive_window set", cp.next_expensive_window is not None, f"{cp.next_expensive_window}"))
     h12 = next((t for t in cp.schedule if t.start == at(12)), None)
     checks.append(("schedule carries solar estimate @12", h12 is not None and h12.pv_estimate_kwh == 7.0, f"{getattr(h12, 'pv_estimate_kwh', None)}"))
@@ -2479,6 +2489,19 @@ def test_tou_management():
         w_write = asyncio.run(fctrl._set_number_best_effort("number.fid", beyond))
         checks.append((f"mock fidelity step={step}: within-half-step skips, full-step writes [{len(w_skip)},{len(w_write)}]",
                        len(w_skip) == 0 and len(w_write) == 1, f"skip={w_skip} write={w_write}"))
+
+    # A rejected TOU field is isolated and backed off after two retries.  Normal
+    # inverter writes still run, but one bad bridge field cannot create the
+    # thousands-of-writes limit cycle observed in September.
+    rejected_states = _States({"number.reject": "15"}, step=5.0)
+    rejected_services = _Services(rejected_states, step=5.0)
+    rejected_ctrl = control.KlatremisController(_Hass(rejected_states, rejected_services))
+    rejected_services.async_call = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("rejected"))
+    rejected = [asyncio.run(rejected_ctrl._set_number_best_effort("number.reject", 55.0)) for _ in range(4)]
+    checks.append(("rejected TOU register backs off after bounded retries",
+                   "number.reject" in rejected_ctrl.degraded_entities
+                   and sum(bool(item) for item in rejected) == 3,
+                   str(rejected)))
 
     return checks
 
@@ -8515,6 +8538,33 @@ def test_next_level_optimizer():
     checks.append(("realized 15-minute replay prices the measured interval",
                    realized_discharge.cost_kr < realized_hold.cost_kr,
                    f"{realized_discharge.cost_kr}/{realized_hold.cost_kr}"))
+    no_fabricated_soc = optimizer.score_realized_interval(
+        action="IDLE", start_soc_pct=40.0, pv_kwh=0.0, load_kwh=0.0,
+        ev_kwh=0.0, duration_hours=0.25, import_price=2.0,
+        export_price=0.5, replacement_price=0.5, capacity_kwh=10.0,
+        min_soc=15.0, max_soc=100.0, battery_care_soc=98.0,
+        charge_rate_kwh_h=3.57, discharge_rate_kwh_h=3.57,
+        grid_charge_rate_kwh_h=1.15, tou_floor_pct=80.0,
+    )
+    checks.append(("replay never fabricates SOC to satisfy a raised TOU floor",
+                   no_fabricated_soc.end_soc_pct == 40.0,
+                   str(no_fabricated_soc.end_soc_pct)))
+    co_mod = _coordinator_module()
+    protected_step = co_mod._live_reserve_step_counterfactual(
+        (models.PlanTask(now + timedelta(hours=1), "DISCHARGE", 3.0,
+                         pv_estimate_kwh=0.0, load_estimate_kwh=1.0),),
+        now=now, current_price=1.0, hold_margin=0.15, step_kwh=0.5,
+        available_above_base_kwh=1.5, protected_reserve_kwh=0.5,
+    )
+    scarce_step = co_mod._live_reserve_step_counterfactual(
+        (models.PlanTask(now + timedelta(hours=1), "DISCHARGE", 3.0,
+                         pv_estimate_kwh=0.0, load_estimate_kwh=1.0),),
+        now=now, current_price=1.0, hold_margin=0.15, step_kwh=0.5,
+        available_above_base_kwh=0.5, protected_reserve_kwh=0.5,
+    )
+    checks.append(("import watchdog releases a spare SOC step but retains a scarce valuable one",
+                   not protected_step[0] and scarce_step[0],
+                   f"spare={protected_step}/scarce={scarce_step}"))
 
     lifecycle = decision_ledger.OptimizerLifecycle()
     for day in range(7):

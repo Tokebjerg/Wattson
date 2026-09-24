@@ -50,6 +50,16 @@ copy the complete `custom_components/wattson` directory, validate Home Assistant
 configuration, restart Home Assistant and verify `sensor.wattson_site_status`,
 execution results, tick duration and logs.
 
+Version 0.29.0 hardens winter operation without changing the 15% hard SOC floor,
+the 70 A ceiling, manual modes or solar-EV dip support. The planner now uses the
+full 48-hour price horizon, accounts for protected EV energy consistently in its
+candidate and replay scoring, and applies forecast-hour outdoor temperatures to
+the dated load model. A reserve watchdog releases a native SOC step only when
+the measured pack has energy beyond both the base floor and the protected reserve.
+TOU belt-register failures retry at most three times before a five-minute backoff,
+and the optimizer ledger keeps a calendar 90-day replay window with daily rather
+than falsely-independent 15-minute confidence statistics.
+
 Version 0.28.2 lets a current top-priced deficit consume battery energy above
 its concrete later reserve instead of letting the uncertainty trajectory pin a
 nearly full battery. The release applies only when the current slot is materially

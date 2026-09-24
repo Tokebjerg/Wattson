@@ -386,7 +386,7 @@ class RobustEconomicsTests(unittest.TestCase):
         start = datetime(2026, 8, 1, tzinfo=timezone.utc)
         for index in range(96):
             lifecycle.observe(
-                now=start + timedelta(hours=index * 2),
+                now=start + timedelta(minutes=index * 5),
                 version="test-v2",
                 advantage_kr=0.1 if index < 16 else 0.0,
                 valid=True,
@@ -394,14 +394,15 @@ class RobustEconomicsTests(unittest.TestCase):
             )
         self.assertEqual("shadow", lifecycle.phase)
         self.assertEqual(16, lifecycle.status["decisive_evaluations"])
-        for index in range(8):
-            lifecycle.observe(
-                now=start + timedelta(days=8, hours=index),
-                version="test-v2",
-                advantage_kr=0.1,
-                valid=True,
-                live_fault=None,
-            )
+        for day in range(1, 9):
+            for index in range(16):
+                lifecycle.observe(
+                    now=start + timedelta(days=day, minutes=index * 5),
+                    version="test-v2",
+                    advantage_kr=0.1,
+                    valid=True,
+                    live_fault=None,
+                )
         self.assertEqual("canary", lifecycle.phase)
         self.assertEqual(1.0, lifecycle.status["win_rate"])
 

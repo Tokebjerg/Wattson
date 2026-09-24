@@ -240,6 +240,7 @@ def build_site_state(
     invert_battery_power_sign: bool,
     price_slots=None,
     solar_slots=None,
+    outdoor_temperature_by_start_c=None,
 ) -> SiteState:
     missing: list[str] = []
     issues: list[str] = []
@@ -441,4 +442,5 @@ def build_site_state(
         ev_issues=ev_issues,
         price_slots=price_slots,
         solar_slots=solar_slots,
+        outdoor_temperature_by_start_c=outdoor_temperature_by_start_c or {},
     )

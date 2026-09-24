@@ -45,7 +45,10 @@ from .models import (
 
 # Stable incumbent horizon. The scenario candidate extends this to 48 hours via
 # ``dp_schedule(horizon_hours=48)`` and must earn promotion through replay first.
-SCHEDULE_MAX_HOURS = 24
+# The execution plan needs the same two-day visibility as the MPC candidate.
+# Real day-ahead data is always preferred; synthetic lookahead stays explicitly
+# estimated and cannot itself cause a paid grid-charge commitment.
+SCHEDULE_MAX_HOURS = 48
 
 # Don't grid-charge when solar already covers charging. Live: suppress grid
 # charge above this instantaneous surplus. Schedule: an hour with at least this

@@ -41,6 +41,9 @@ class KlatremisController:
         # a real competing controller shows up as the SAME value being re-asserted
         # again and again because something keeps reverting it.
         self._write_history: dict[tuple[str, str], list[datetime]] = {}
+        # TOU capacity registers are a belt on top of the normal command path.
+        # A bridge that rejects them must not be hammered every ten seconds.
+        self._best_effort_retry_after: dict[str, datetime] = {}
 
     def _count_write(self, key: str) -> None:
         self.write_counts[key] = self.write_counts.get(key, 0) + 1
@@ -90,6 +93,7 @@ class KlatremisController:
     def _mark_converged(self, entity_id: str) -> None:
         self._write_attempts.pop(entity_id, None)
         self.degraded_entities.discard(entity_id)
+        self._best_effort_retry_after.pop(entity_id, None)
 
     def _mark_attempt(self, entity_id: str) -> bool:
         """Record a write attempt; return True if the entity is now degraded."""
@@ -238,10 +242,25 @@ class KlatremisController:
                 step = current.attributes.get("step")
                 tol = max(0.1, float(step) / 2.0) if step else 0.1
                 if abs(float(current.state) - value) < tol:
+                    self._mark_converged(entity_id)
                     return []
             except (TypeError, ValueError):
                 pass
-        await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        now = datetime.now().astimezone()
+        retry_after = self._best_effort_retry_after.get(entity_id)
+        if retry_after is not None and now < retry_after:
+            return []
+        degraded = self._mark_attempt(entity_id)
+        if degraded:
+            self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
+            return [self._action(entity_id, value, True)]
+        try:
+            await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        except Exception:  # noqa: BLE001 - keep normal battery control alive
+            if degraded:
+                self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
+                _LOGGER.warning("Wattson TOU write failed for %s; backing off for five minutes", entity_id)
+            return [self._action(entity_id, value, True)]
         self._count_write(entity_id)
         return [f"{entity_id}={value} (best-effort)"]
 
@@ -253,9 +272,24 @@ class KlatremisController:
             return []
         target_state = "on" if enabled else "off"
         if current is not None and current.state == target_state:
+            self._mark_converged(entity_id)
             return []
+        now = datetime.now().astimezone()
+        retry_after = self._best_effort_retry_after.get(entity_id)
+        if retry_after is not None and now < retry_after:
+            return []
+        degraded = self._mark_attempt(entity_id)
+        if degraded:
+            self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
+            return [self._action(entity_id, target_state, True)]
         service = "turn_on" if enabled else "turn_off"
-        await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        try:
+            await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        except Exception:  # noqa: BLE001
+            if degraded:
+                self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
+                _LOGGER.warning("Wattson TOU write failed for %s; backing off for five minutes", entity_id)
+            return [self._action(entity_id, target_state, True)]
         self._count_write(entity_id)
         return [f"{entity_id}={target_state} (best-effort)"]
 

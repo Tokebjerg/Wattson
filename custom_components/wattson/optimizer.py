@@ -151,10 +151,16 @@ def score_schedule(
     discharge_rate_kwh_h: float,
     grid_charge_rate_kwh_h: float,
     battery_care_soc: float,
+    ev_battery_protected: bool = True,
     charge_efficiency: float | None = None,
     discharge_efficiency: float | None = None,
 ) -> ScheduleScore:
-    """Evaluate an hourly policy under three forecasts at 15-minute cadence."""
+    """Evaluate an hourly policy under its actual physical constraints.
+
+    The scheduler and the scorer must agree on whether the house battery is
+    allowed to serve the EV.  Otherwise a candidate can appear cheaper simply
+    by spending energy that the live controller will deliberately protect.
+    """
     violations = _validate_tasks(tasks, min_soc=min_soc, max_soc=max_soc)
     if not tasks:
         return ScheduleScore(0.0, 0.0, 0.0, (), False, ("empty_schedule",))
@@ -209,18 +215,32 @@ def score_schedule(
                     task_charge_rate,
                     battery_rate_kwh(task.charge_current_a),
                 )
-            for quarter in range(4):
+            duration_minutes = max(1, int(task.duration_minutes or 60))
+            steps = max(1, math.ceil(duration_minutes / MPC_STEP_MINUTES))
+            for quarter in range(steps):
+                remaining_minutes = duration_minutes - quarter * MPC_STEP_MINUTES
+                interval_minutes = min(MPC_STEP_MINUTES, remaining_minutes)
+                if interval_minutes <= 0:
+                    break
+                interval_h = interval_minutes / 60.0
                 quarter_start = task.start + quarter * timedelta(minutes=MPC_STEP_MINUTES)
                 house_kwh = _load_w(load_map, quarter_start, fallback_house_w) / 1000.0 * step_h
-                load_kwh = house_kwh + ev_hour * step_h
-                solar_kwh = solar_hour * step_h
-                direct = min(load_kwh, solar_kwh)
-                deficit = max(0.0, load_kwh - direct)
-                surplus = max(0.0, solar_kwh - direct)
+                house_kwh *= interval_h / step_h
+                ev_kwh = ev_hour * interval_h
+                solar_kwh = solar_hour * interval_h
+                solar_to_house = min(house_kwh, solar_kwh)
+                solar_left = max(0.0, solar_kwh - solar_to_house)
+                solar_to_ev = min(ev_kwh, solar_left)
+                solar_left -= solar_to_ev
+                protected_ev_grid = max(0.0, ev_kwh - solar_to_ev) if ev_battery_protected else 0.0
+                deficit = max(0.0, house_kwh - solar_to_house)
+                if not ev_battery_protected:
+                    deficit += max(0.0, ev_kwh - solar_to_ev)
+                surplus = solar_left
 
                 pv_input = min(
                     surplus,
-                    task_charge_rate * step_h,
+                    task_charge_rate * interval_h,
                     max(0.0, max_kwh - soc) / charge_eff,
                 )
                 soc += pv_input * charge_eff
@@ -243,23 +263,23 @@ def score_schedule(
                             ),
                         )
                     grid_input = min(
-                        grid_charge_rate_kwh_h * step_h,
-                        max(0.0, task_charge_rate * step_h - pv_input),
+                        grid_charge_rate_kwh_h * interval_h,
+                        max(0.0, task_charge_rate * interval_h - pv_input),
                         max(0.0, target - soc) / charge_eff,
                     )
                     soc += grid_input * charge_eff
-                    imported += deficit + grid_input
-                    cost += (deficit + grid_input) * price.total_import_price
+                    imported += protected_ev_grid + deficit + grid_input
+                    cost += (protected_ev_grid + deficit + grid_input) * price.total_import_price
                 else:
                     max_deliver = min(
                         deficit,
-                        discharge_rate_kwh_h * step_h,
+                        discharge_rate_kwh_h * interval_h,
                         max(0.0, soc - task_floor_kwh) * discharge_eff,
                     )
                     soc_draw = max_deliver / discharge_eff
                     soc -= soc_draw
-                    imported += deficit - max_deliver
-                    cost += (deficit - max_deliver) * price.total_import_price
+                    imported += protected_ev_grid + deficit - max_deliver
+                    cost += (protected_ev_grid + deficit - max_deliver) * price.total_import_price
                     cost += soc_draw * BATTERY_WEAR_COST
 
                 sellable = (
@@ -368,6 +388,7 @@ def build_scenario_plan(
             discharge_rate_kwh_h=discharge_rate_kwh_h,
             grid_charge_rate_kwh_h=grid_charge_rate_kwh_h,
             battery_care_soc=battery_care_soc,
+            ev_battery_protected=ev_battery_protected,
         )
         for name, tasks in candidates.items()
     }
@@ -458,7 +479,10 @@ def score_realized_interval(
     )
     ceiling = max_soc / 100.0 * capacity
     care = min(ceiling, battery_care_soc / 100.0 * capacity)
-    soc = max(floor, min(ceiling, start_soc_pct / 100.0 * capacity))
+    # A TOU floor constrains *future discharge*, not the measured starting SOC.
+    # Clamping up here fabricated stored energy in the replay whenever the
+    # inverter already sat below a newly raised floor.
+    soc = max(0.0, min(ceiling, start_soc_pct / 100.0 * capacity))
     eta = math.sqrt(max(0.5, min(1.0, BATTERY_ROUND_TRIP_EFFICIENCY)))
     house = max(0.0, load_kwh - max(0.0, ev_kwh))
     solar_to_house = min(max(0.0, pv_kwh), house)

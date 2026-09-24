@@ -11,7 +11,11 @@ from .models import PlanTask, SiteState
 from .optimizer import ScheduleScore
 
 
-LEDGER_MAX_RECORDS = 7 * 24 * 4
+# A fixed record count silently becomes less than a week when forecast/SOC
+# events cause extra replans.  Keep a real time window instead, with a generous
+# hard cap as protection against corrupt persisted data.
+LEDGER_RETENTION_DAYS = 90
+LEDGER_MAX_RECORDS = LEDGER_RETENTION_DAYS * 24 * 12
 PROMOTION_MIN_EVALUATIONS = 96
 PROMOTION_MIN_DAYS = 7
 PROMOTION_MIN_MEAN_ADVANTAGE_KR = 0.05
@@ -36,6 +40,23 @@ def _parse_time(value: str | None) -> datetime | None:
         return None
 
 
+def _retain_recent(rows: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    """Retain a calendar window even when replan frequency changes."""
+    timestamps = [
+        timestamp
+        for row in rows
+        if (timestamp := _parse_time(str(row.get("at", "")))) is not None
+    ]
+    reference = now or max(timestamps, default=None)
+    if reference is None:
+        return rows[-LEDGER_MAX_RECORDS:]
+    cutoff = reference - timedelta(days=LEDGER_RETENTION_DAYS)
+    return [
+        row for row in rows
+        if (_parse_time(str(row.get("at", ""))) or reference) >= cutoff
+    ][-LEDGER_MAX_RECORDS:]
+
+
 def _promotion_statistics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
     advantages = [float(row.get("advantage_kr", 0.0)) for row in rows]
     decisive = [
@@ -48,9 +69,13 @@ def _promotion_statistics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
         if day:
             daily[day] = daily.get(day, 0.0) + value
     decisive_mean = mean(decisive) if decisive else 0.0
+    # Fifteen-minute intervals on the same day are strongly correlated.  A
+    # confidence bound based on them as independent observations promotes a
+    # noisy candidate too early; calculate uncertainty from daily outcomes.
+    daily_values = list(daily.values())
     standard_error = (
-        pstdev(decisive) / math.sqrt(len(decisive))
-        if len(decisive) > 1
+        pstdev(daily_values) / math.sqrt(len(daily_values))
+        if len(daily_values) > 1
         else 0.0
     )
     return {
@@ -87,7 +112,7 @@ class OptimizerLifecycle:
             phase=phase,
             phase_started_at=raw.get("phase_started_at"),
             candidate_version=str(raw.get("candidate_version", "")),
-            comparisons=list(raw.get("comparisons", []))[-LEDGER_MAX_RECORDS:],
+            comparisons=_retain_recent(list(raw.get("comparisons", []))),
             canary_uses=max(0, int(raw.get("canary_uses", 0))),
             rollback_reason=raw.get("rollback_reason"),
         )
@@ -97,7 +122,7 @@ class OptimizerLifecycle:
             "phase": self.phase,
             "phase_started_at": self.phase_started_at,
             "candidate_version": self.candidate_version,
-            "comparisons": self.comparisons[-LEDGER_MAX_RECORDS:],
+            "comparisons": _retain_recent(self.comparisons),
             "canary_uses": self.canary_uses,
             "rollback_reason": self.rollback_reason,
         }
@@ -137,7 +162,7 @@ class OptimizerLifecycle:
                 "live_fault": live_fault,
             }
         )
-        self.comparisons = self.comparisons[-LEDGER_MAX_RECORDS:]
+        self.comparisons = _retain_recent(self.comparisons, now)
 
         if self.phase in {"canary", "active"}:
             if live_fault:
@@ -219,20 +244,20 @@ class DecisionLedger:
         if not isinstance(raw, dict):
             return cls()
         return cls(
-            records=list(raw.get("records", []))[-LEDGER_MAX_RECORDS:],
+            records=_retain_recent(list(raw.get("records", []))),
             lifecycle=OptimizerLifecycle.from_dict(raw.get("lifecycle")),
         )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema": 1,
-            "records": self.records[-LEDGER_MAX_RECORDS:],
+            "records": _retain_recent(self.records),
             "lifecycle": self.lifecycle.as_dict(),
         }
 
     def append(self, record: dict[str, Any]) -> None:
         self.records.append(record)
-        self.records = self.records[-LEDGER_MAX_RECORDS:]
+        self.records = _retain_recent(self.records)
 
     def attach_outcome(self, outcome: dict[str, Any]) -> None:
         if self.records:

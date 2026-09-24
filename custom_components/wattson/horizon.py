@@ -65,6 +65,35 @@ def _attrs(hass: Any, entity_id: str | None) -> dict[str, Any]:
     return dict(getattr(state, "attributes", None) or {})
 
 
+def build_temperature_forecast(hass: Any, entity_id: str | None) -> dict[datetime, float]:
+    """Read an optional hourly temperature forecast from the configured sensor.
+
+    Weather integrations use slightly different names, so this deliberately
+    accepts the common list and timestamp/value spellings.  An absent or
+    malformed forecast is harmless: callers retain the current-temperature
+    model rather than inventing weather data.
+    """
+    attrs = _attrs(hass, entity_id)
+    rows = next(
+        (attrs[key] for key in ("forecast", "hourly_forecast", "forecast_hourly")
+         if isinstance(attrs.get(key), list)),
+        [],
+    )
+    result: dict[datetime, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        start = _parse_dt(row.get("datetime") or row.get("time") or row.get("start"))
+        value = row.get("temperature", row.get("temp", row.get("temperature_c")))
+        try:
+            temperature = float(value)
+        except (TypeError, ValueError):
+            continue
+        if start is not None and math.isfinite(temperature):
+            result[utc_instant(start)] = temperature
+    return result
+
+
 def _flat_tariff_total(tariffs_attr: Any) -> float:
     """Sum of the flat additional tariffs (transmission, system, tax)."""
     if not isinstance(tariffs_attr, dict):
