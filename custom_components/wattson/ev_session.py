@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from math import isfinite
 from typing import Any
 
 from .ev_energy import EvEnergyMeter
@@ -37,6 +38,8 @@ class EvSessionContext:
     deadline_at: datetime | None = None
     deadline_hour: int = -1
     energy: EvEnergyMeter = field(default_factory=EvEnergyMeter)
+    full_goal_limit_kwh: float | None = None
+    full_goal_anchor_at: str | None = None
     notifications: list[str] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
     dirty: bool = False
@@ -78,6 +81,8 @@ class EvSessionContext:
                 self.deadline_at = None
                 self.deadline_hour = -1
                 self.energy = EvEnergyMeter()
+                self.full_goal_limit_kwh = None
+                self.full_goal_anchor_at = None
                 self.notifications = []
                 self.updated_at = now
                 self.dirty = True
@@ -89,6 +94,8 @@ class EvSessionContext:
             self.connected = True
             self.started_at = now
             self.energy = EvEnergyMeter(counter_last_kwh=session_kwh)
+            self.full_goal_limit_kwh = None
+            self.full_goal_anchor_at = None
             self.phase_capability = EvPhaseCapability.UNKNOWN
             self.updated_at = now
             self.dirty = True
@@ -128,6 +135,25 @@ class EvSessionContext:
             self.deadline_at = next_deadline(now, hour)
             self.dirty = True
 
+    def update_full_goal(self, *, enabled: bool, soc: float | None,
+                         nominal_kw: float) -> None:
+        """Bound confirmation energy per session, not per planner invocation."""
+        anchor = self.energy.anchor_at if soc is not None else None
+        if not enabled:
+            if self.full_goal_limit_kwh is not None:
+                self.full_goal_limit_kwh = None
+                self.full_goal_anchor_at = None
+                self.dirty = True
+            return
+        if self.full_goal_limit_kwh is None or (anchor and anchor != self.full_goal_anchor_at):
+            gap = (100 - soc) if soc is not None else 100
+            baseline = self.energy.delivered_kwh if soc is not None else 0.0
+            # Reserve one extra 15-minute full-power offer for taper/completion.
+            # Only a new vehicle observation can revise this persistent ceiling.
+            self.full_goal_limit_kwh = baseline + max(0.0, gap) * self.energy.ac_kwh_per_pct * 1.1 + nominal_kw * 0.25
+            self.full_goal_anchor_at = anchor
+            self.dirty = True
+
     def to_storage_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -140,6 +166,8 @@ class EvSessionContext:
             "deadline_at": self.deadline_at.isoformat() if self.deadline_at else None,
             "deadline_hour": self.deadline_hour,
             "energy": self.energy.as_dict(),
+            "full_goal_limit_kwh": self.full_goal_limit_kwh,
+            "full_goal_anchor_at": self.full_goal_anchor_at,
             "notifications": self.notifications,
             "history": self.history[-20:],
         }
@@ -174,6 +202,13 @@ class EvSessionContext:
         )
         context._last_persisted_kwh = last_kwh
         context.energy = EvEnergyMeter.restore(raw.get("energy"))
+        try:
+            limit = float(raw["full_goal_limit_kwh"])
+            if isfinite(limit) and limit >= 0:
+                context.full_goal_limit_kwh = limit
+                context.full_goal_anchor_at = raw.get("full_goal_anchor_at")
+        except (KeyError, TypeError, ValueError):
+            pass
         if "energy" not in raw and last_kwh is not None:
             # Old sessions already delivered the charger's session energy. An
             # upgrade must not request the entire unknown-car budget a second time.

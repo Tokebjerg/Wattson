@@ -276,6 +276,8 @@ class SiteState:
     ev_full_power_kw: float | None = None
     ev_session_delivered_kwh: float = 0.0
     ev_unknown_budget_kwh: float | None = None
+    ev_full_goal_limit_kwh: float | None = None
+    ev_full_goal_confirmed: bool = False
     ev_deadline: datetime | None = None
     # #5: battery pack temperature (°C) if the inverter exposes it — used ONLY as a
     # cold-charge safety guard. None (not available) leaves every decision unchanged.

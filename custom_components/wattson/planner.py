@@ -4867,12 +4867,17 @@ def build_ev_plan(
             ev_min_soc=ev_min_soc, ev_charge_until_complete=ev_charge_until_complete,
             ev_minimum_recovery_complete=ev_minimum_recovery_complete, ev_max_amps=ev_max_amps)
         if overview["overdue"] or overview["required_kwh"] <= 0.001:
-            return EvPlan(mode=ev_mode, reason="Deadline elapsed" if overview["overdue"] else f"target {ev_target_soc:.0f}% reached",
+            reason = "Deadline elapsed" if overview["overdue"] else (
+                overview["note"] if overview["full_goal"] else f"target {ev_target_soc:.0f}% reached")
+            return EvPlan(mode=ev_mode, reason=reason,
                           desired_enabled=False, desired_action="pause")
         if overview["active"]:
             return EvPlan(mode=ev_mode, reason=f"{overview['note']}; energy-based cheapest interval; {overview['required_kwh']:.2f} kWh remaining",
                           desired_enabled=True, desired_action="resume", desired_amps=int(ev_max_amps),
                           desired_circuit_currents=(int(ev_max_amps),) * 3, desired_phase_mode="auto_phase")
+        if overview["full_goal"]:
+            return EvPlan(mode=ev_mode, reason=f"{overview['note']}; waiting for cheapest interval",
+                          desired_enabled=False, desired_action="pause")
         # Opportunistic solar shares the pure-solar electrical and battery-first
         # policy, but may never borrow battery energy to bridge a cloud.
         solar = build_ev_plan(

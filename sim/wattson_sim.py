@@ -2097,11 +2097,8 @@ def test_phase_gaps():
                    f"{p_s1.desired_action} vs {p_s2.desired_action}"))
 
     # ---- "Lad til fuld" / charge-until-complete (scheduled_cheapest only) ---- #
-    # The escape hatch for the wrong-car-SOC problem: the Niro is the ONLY car
-    # with a SOC sensor, so when a different car is plugged in the sensor reads
-    # the parked Niro (e.g. 100%) and the target-SOC logic would refuse to charge
-    # the empty car. The toggle ignores the SOC and charges EVERY cheap hour up to
-    # the deadline; no-SOC + deadline auto-uses the same car-agnostic path.
+    # Full-charge goals use trusted SOC or a conservative capacity estimate,
+    # never the manual unknown-SOC budget as proof of a full vehicle battery.
     def sched_full(now_h, soc=None, ready_hour=6, complete=False, target=80.0, hours=2):
         st = ev_state(at(now_h))
         if soc is not None:
@@ -2140,13 +2137,16 @@ def test_phase_gaps():
                    p_nosoc_fixed.desired_action == "pause", f"{p_nosoc_fixed.desired_action}/{p_nosoc_fixed.reason[:50]}"))
     # Toggle works WITHOUT a deadline too: spans the whole remaining horizon.
     p_full_nodl = sched_full(7, soc=None, complete=True, ready_hour=-1)
-    checks.append(("charge-until-full: unknown SOC without deadline still avoids costly hours",
-                   p_full_nodl.desired_action == "pause", f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:50]}"))
-    # The dashboard overview MUST mirror the live selection: every pre-deadline hour charges.
+    checks.append(("charge-until-full: unknown SOC without deadline uses capacity, not fixed hours",
+                   "conservative capacity estimate" in p_full_nodl.reason,
+                   f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:70]}"))
+    # An empty-to-full estimate cannot fit in six hours: show the shortfall,
+    # rather than declaring a fixed two-hour request sufficient for 100%.
     ov_full = planner.ev_cheapest_charge_hours(
         ev_state(at(0)), ev_required_hours=2, ev_ready_hour=6, ev_target_soc=80.0, ev_charge_until_complete=True)
-    checks.append(("ev_charge_plan overview: unknown SOC never expands to every pre-deadline hour",
-                   not all(h["charge"] for h in ov_full["hours"]) and ov_full["wanted_hours"] < len(ov_full["hours"]),
+    checks.append(("ev_charge_plan overview: uncertain full goal reports capacity shortfall honestly",
+                   not ov_full["feasible"] and ov_full["remaining_unserved_kwh"] > 0
+                   and not ov_full["goal_confirmed"] and ov_full["goal_status"] == "capacity_estimate",
                    f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #

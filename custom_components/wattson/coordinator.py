@@ -3152,6 +3152,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             from .ev_energy import EvEnergyMeter
             session.energy = EvEnergyMeter(counter_last_kwh=state.easee_session_kwh)
             session.vehicle = "unknown"
+            session.full_goal_limit_kwh = None
+            session.full_goal_anchor_at = None
             session.notifications = []
             session.dirty = True
             self._ev_minimum_recovery = None
@@ -3211,13 +3213,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if session.energy.as_dict() != before:
             session.dirty = True
         estimate = session.energy.conservative_soc if trusted else None
+        session.update_full_goal(
+            enabled=self.ev_target_soc >= 100 or self.ev_charge_until_complete,
+            soc=estimate, nominal_kw=max_amps * 0.69)
         phases = 1 if session.single_phase_locked else 3
         self.site_state = replace(state, ev_soc_pct=estimate,
-            ev_soc_source=("metered" if estimate is not None else "energy_budget"),
+            ev_soc_source=("metered" if estimate is not None else
+                           "capacity_estimate" if self.ev_target_soc >= 100 or self.ev_charge_until_complete else "energy_budget"),
             ev_ac_kwh_per_pct=session.energy.ac_kwh_per_pct,
             ev_full_power_kw=min(session.energy.full_power_kw, max_amps * 230 * phases / 1000),
             ev_session_delivered_kwh=session.energy.delivered_kwh,
             ev_unknown_budget_kwh=self.ev_energy_request_kwh,
+            ev_full_goal_limit_kwh=session.full_goal_limit_kwh,
+            ev_full_goal_confirmed=bool(trusted and session.energy.anchor_soc == 100),
             ev_deadline=session.deadline_at)
 
     @property
@@ -3246,7 +3254,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         failure = self._ev_start_status == "start_failed" and not actual
         state = "complete" if self.site_state and self.site_state.easee_completed_stable else "charging" if actual else (
             "start_failed" if failure else "blocked" if blocked else "waiting")
-        return {"state": state, "problem": bool(failure or blocked or overview.get("feasible") is False),
+        return {"state": state, "problem": bool(failure or blocked or overview.get("feasible") is False or overview.get("goal_unverified")),
                 "blocked_reason": blocked, "session_id": self._ev_session.session_id,
                 "vehicle": self._ev_session.vehicle,
                 "soc_source": self.site_state.ev_soc_source if self.site_state else "unavailable",
@@ -3256,6 +3264,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 "deadline": overview.get("deadline"), "feasible": overview.get("feasible"),
                 "expected_departure_soc": overview.get("expected_departure_soc"),
                 "remaining_unserved_kwh": overview.get("remaining_unserved_kwh"),
+                "goal_status": overview.get("goal_status"),
+                "goal_label": overview.get("goal_label"),
+                "goal_confirmed": overview.get("goal_confirmed"),
                 "start": self.ev_start_status}
 
     async def _async_ev_alert(self, code: str, message: str) -> None:
@@ -4722,6 +4733,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 and self._ev_session.started_at
                 and tick.now.timestamp() - self._ev_session.started_at.timestamp() > 120):
             overview = self.ev_charge_schedule
+            if overview.get("goal_unverified"):
+                await self._async_ev_alert("full_goal_unverified",
+                    "Wattson kan ikke bekræfte 100 %. Bilen har meldt færdig, eller den sikre energi-grænse er nået. "
+                    "Kontroller bilens SOC og dens egen AC-ladegrænse. Wattson kalder ikke et beregnet estimat for et fuldt batteri.")
             if not overview["feasible"]:
                 await self._async_ev_alert("deadline_shortfall",
                     ("Bilen melder opladning færdig før Wattsons beregnede SOC-mål. Kontroller bilens egen ladegrænse og SOC-data."
@@ -4733,8 +4748,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 left = self._ev_session.deadline_at.timestamp() - tick.now.timestamp()
                 if left < 4 * 3600:
                     await self._async_ev_alert("unknown_soc",
-                        "Wattson kan ikke bekræfte bilens SOC/identitet. Der bruges et begrænset energibudget, "
-                        "ikke opladning i alle timer. Vælg Niro hvis den er tilsluttet, eller indstil energibudgettet for en anden bil. Et bestemt SOC-mål kan ikke garanteres uden bilens data.")
+                        ("Wattson planlægger mod 100 % med en konservativ kapacitetsberegning, ikke det manuelle kWh-budget. "
+                         if overview.get("full_goal") else "Wattson bruger et begrænset energibudget. ") +
+                        "Bilens SOC/identitet er ukendt. Opdater bilens data, eller vælg Niro hvis den er tilsluttet. "
+                        "Et bestemt SOC-mål kan ikke garanteres uden bilens data.")
             if self._ev_control_blocked_reason and self._ev_session.deadline_at:
                 left = self._ev_session.deadline_at.timestamp() - tick.now.timestamp()
                 if left < 3600 and overview["required_kwh"] > 0.1:

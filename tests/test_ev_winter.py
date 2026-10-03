@@ -166,12 +166,145 @@ class EvWinterTests(unittest.TestCase):
         now = datetime(2026, 10, 2, 20, 30, tzinfo=TZ)
         state = site(now, price_slots=prices(now), ev_unknown_budget_kwh=22,
                      ev_deadline=now.replace(day=3, hour=16, minute=0))
-        plan = schedule.energy_schedule(state, ev_target_soc=100)
+        plan = schedule.energy_schedule(state, ev_target_soc=80)
         self.assertFalse(plan["active"])
         self.assertLess(sum(h["charge"] for h in plan["hours"]), 4)
         self.assertAlmostEqual(22, sum(h["planned_kwh"] for h in plan["hours"]), delta=.01)
-        done = schedule.energy_schedule(replace(state, ev_session_delivered_kwh=22), ev_target_soc=100)
+        done = schedule.energy_schedule(replace(state, ev_session_delivered_kwh=22), ev_target_soc=80)
         self.assertEqual(0, done["required_kwh"])
+
+    def test_full_goal_ignores_exhausted_manual_budget(self):
+        now = datetime(2026, 10, 3, 10, tzinfo=TZ)
+        state = site(now, ev_unknown_budget_kwh=44.16, ev_session_delivered_kwh=44.848,
+                     price_slots=prices(now), ev_deadline=now.replace(hour=15))
+        plan = schedule.energy_schedule(state, ev_target_soc=100)
+        self.assertGreater(plan["required_kwh"], 30)
+        self.assertTrue(any(h["charge"] for h in plan["hours"]))
+        self.assertEqual("capacity_estimate", plan["goal_status"])
+        self.assertFalse(plan["goal_confirmed"])
+        self.assertIsNone(plan["expected_departure_soc"])
+
+    def test_full_toggle_and_100_target_use_same_goal(self):
+        now = datetime(2026, 12, 1, 20, tzinfo=TZ)
+        state = site(now, ev_soc_pct=87, price_slots=prices(now),
+                     ev_deadline=now.replace(day=2, hour=15))
+        plain = schedule.energy_schedule(state, ev_target_soc=100)
+        toggle = schedule.energy_schedule(state, ev_target_soc=80, ev_charge_until_complete=True)
+        self.assertEqual(plain, toggle)
+        self.assertFalse(plain["active"])
+        self.assertTrue(plain["feasible"])
+        self.assertTrue(all(.65 == h["price"] for h in plain["hours"] if h["charge"]))
+
+    def test_estimated_full_is_not_vehicle_confirmed_full(self):
+        now = datetime(2026, 12, 1, 2, tzinfo=TZ)
+        state = site(now, ev_soc_pct=100, ev_session_delivered_kwh=16,
+                     ev_full_goal_limit_kwh=18.76, price_slots=prices(now),
+                     ev_deadline=now.replace(hour=7))
+        plan = schedule.energy_schedule(state, ev_target_soc=100)
+        self.assertGreater(plan["required_kwh"], 2)
+        self.assertFalse(plan["goal_confirmed"])
+        self.assertEqual("awaiting_completion", plan["goal_status"])
+        exhausted = schedule.energy_schedule(replace(state, ev_session_delivered_kwh=18.76), ev_target_soc=100)
+        self.assertEqual(0, exhausted["required_kwh"])
+        self.assertTrue(exhausted["goal_unverified"])
+        self.assertFalse(exhausted["goal_confirmed"])
+        self.assertEqual("energy_guard_unverified", exhausted["goal_status"])
+
+    def test_vehicle_soc_100_stops_without_more_energy(self):
+        now = datetime(2026, 12, 1, 2, tzinfo=TZ)
+        plan = schedule.energy_schedule(site(now, ev_soc_pct=100,
+            ev_full_goal_confirmed=True, price_slots=prices(now)), ev_target_soc=100)
+        self.assertEqual(0, plan["required_kwh"])
+        self.assertTrue(plan["goal_confirmed"])
+        self.assertFalse(plan["active"])
+
+    def test_unknown_full_capacity_guard_never_renews(self):
+        now = datetime(2026, 12, 1, tzinfo=TZ)
+        ctx = session_module.EvSessionContext(connected=True, session_id="unknown")
+        ctx.update_full_goal(enabled=True, soc=None, nominal_kw=11.04)
+        limit = ctx.full_goal_limit_kwh
+        ctx.energy.delivered_kwh = limit
+        restored = session_module.EvSessionContext.from_storage_dict(ctx.to_storage_dict())
+        restored.update_full_goal(enabled=True, soc=None, nominal_kw=11.04)
+        self.assertEqual(limit, restored.full_goal_limit_kwh)
+        plan = schedule.energy_schedule(site(now, ev_full_goal_limit_kwh=limit,
+            ev_session_delivered_kwh=limit, price_slots=prices(now)), ev_target_soc=100)
+        self.assertEqual(0, plan["required_kwh"])
+        self.assertTrue(plan["goal_unverified"])
+        restored.observe(status="disconnected", session_kwh=0, power_w=0,
+                         now=now, one_phase_ceiling_w=4300)
+        self.assertIsNone(restored.full_goal_limit_kwh)
+
+    def test_new_vehicle_observation_revises_limit_not_replanning(self):
+        ctx = session_module.EvSessionContext()
+        ctx.energy.anchor_at = "2026-12-01T00:00:00+01:00"
+        ctx.energy.delivered_kwh = 4
+        ctx.update_full_goal(enabled=True, soc=87, nominal_kw=11.04)
+        limit = ctx.full_goal_limit_kwh
+        ctx.energy.delivered_kwh = 10
+        for _ in range(100):
+            ctx.update_full_goal(enabled=True, soc=94, nominal_kw=11.04)
+        self.assertEqual(limit, ctx.full_goal_limit_kwh)
+        ctx.energy.anchor_at = "2026-12-01T01:00:00+01:00"
+        ctx.update_full_goal(enabled=True, soc=90, nominal_kw=11.04)
+        self.assertGreater(ctx.full_goal_limit_kwh, limit)
+        ctx.update_full_goal(enabled=False, soc=90, nominal_kw=11.04)
+        self.assertIsNone(ctx.full_goal_limit_kwh)
+
+    def test_full_goal_unknown_charger_complete_is_unverified(self):
+        now = datetime(2026, 12, 1, tzinfo=TZ)
+        plan = schedule.energy_schedule(site(now, easee_completed_stable=True,
+            price_slots=prices(now)), ev_target_soc=100)
+        self.assertTrue(plan["goal_unverified"])
+        self.assertFalse(plan["goal_confirmed"])
+        self.assertFalse(plan["active"])
+
+    def test_full_goal_waits_outside_cheapest_even_with_solar(self):
+        now = datetime(2026, 12, 1, 12, tzinfo=TZ)
+        state = site(now, ev_soc_pct=87, price_slots=prices(now), pv_power_w=14000,
+                     ev_deadline=now.replace(day=2, hour=7))
+        plan = ws.planner.build_ev_plan(state, ev_mode="scheduled_cheapest",
+                                      ev_target_soc=100, ev_min_soc=30,
+                                      ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="")
+        self.assertEqual("pause", plan.desired_action)
+        self.assertFalse(plan.solar_opportunity)
+        below = ws.planner.build_ev_plan(replace(state, ev_soc_pct=20),
+                        ev_mode="scheduled_cheapest", ev_target_soc=100, ev_min_soc=30,
+                        ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="")
+        self.assertEqual("resume", below.desired_action)
+
+    def test_twenty_full_charge_nights_with_delayed_soc_and_restarts(self):
+        for day in range(20):
+            start = datetime(2026, 12, 1, 20, tzinfo=TZ) + timedelta(days=day)
+            ctx = session_module.EvSessionContext(connected=True, session_id=str(day),
+                                                started_at=start)
+            initial = 35 + day * 3
+            ctx.energy.anchor_soc = initial
+            ctx.energy.anchor_at = start.isoformat()
+            ctx.update_full_goal(enabled=True, soc=initial, nominal_kw=11.04)
+            physical_soc = initial
+            deadline = (start + timedelta(days=1)).replace(hour=15)
+            for minute in range(19 * 60):
+                now = start + timedelta(minutes=minute)
+                # Deliberately keep the API anchor stale throughout the night.
+                state = site(now, ev_soc_pct=ctx.energy.conservative_soc,
+                    ev_session_delivered_kwh=ctx.energy.delivered_kwh,
+                    ev_full_goal_limit_kwh=ctx.full_goal_limit_kwh,
+                    easee_completed_stable=physical_soc >= 100,
+                    price_slots=prices(now), ev_deadline=deadline)
+                plan = schedule.energy_schedule(state, ev_target_soc=100, ev_min_soc=30)
+                if plan["active"]:
+                    # Deeply depleted cars need more than the five cheap hours;
+                    # medium-price hours are then necessary, never the peaks.
+                    self.assertLessEqual(state.price_slots[0].total_import_price, 2)
+                    if initial >= 52:
+                        self.assertEqual(.65, state.price_slots[0].total_import_price)
+                    ac = 10.8 / 60
+                    ctx.energy.delivered_kwh += ac
+                    physical_soc = min(100, physical_soc + ac / (.736 * 1.05))
+                if minute % 180 == 0:
+                    ctx = session_module.EvSessionContext.from_storage_dict(ctx.to_storage_dict())
+            self.assertEqual(100, physical_soc, f"day {day}")
 
     def test_expired_session_deadline_never_rolls_to_tomorrow(self):
         now = datetime(2026, 10, 3, 16, tzinfo=TZ)
@@ -350,6 +483,8 @@ class EvWinterTests(unittest.TestCase):
         co._ev_session.observe(status="awaiting_start", session_kwh=0, power_w=0,
             now=now, one_phase_ceiling_w=4300)
         co.ev_ready_hour = 7
+        co.ev_target_soc = 100
+        co.ev_charge_until_complete = False
         co.ev_mode = "scheduled_cheapest"
         co._last_ev_amps = co._last_ev_currents = None
         co.control_plan = None
