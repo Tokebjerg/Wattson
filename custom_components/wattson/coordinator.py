@@ -4724,9 +4724,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             overview = self.ev_charge_schedule
             if not overview["feasible"]:
                 await self._async_ev_alert("deadline_shortfall",
-                    f"Lademålet kan ikke nås inden fristen {overview['deadline']}. "
-                    f"Der mangler plads til {overview['remaining_unserved_kwh']:.1f} kWh. "
-                    "Tilpas frist eller mål, og kontroller at bilen accepterer ladning.")
+                    ("Bilen melder opladning færdig før Wattsons beregnede SOC-mål. Kontroller bilens egen ladegrænse og SOC-data."
+                     if overview["completed_before_goal"] else
+                     f"Lademålet kan ikke nås inden fristen {overview['deadline']}. "
+                     f"Der mangler plads til {overview['remaining_unserved_kwh']:.1f} kWh. "
+                     "Tilpas frist eller mål, og kontroller at bilen accepterer ladning."))
             if self.site_state.ev_soc_pct is None and self._ev_session.deadline_at:
                 left = self._ev_session.deadline_at.timestamp() - tick.now.timestamp()
                 if left < 4 * 3600:

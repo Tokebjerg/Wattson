@@ -188,6 +188,15 @@ class EvWinterTests(unittest.TestCase):
         self.assertEqual(0, plan["required_kwh"])
         self.assertFalse(plan["active"])
 
+    def test_vehicle_completion_does_not_claim_an_unreached_goal(self):
+        now = datetime(2026, 12, 1, 6, tzinfo=TZ)
+        plan = schedule.energy_schedule(site(now, ev_soc_pct=70, easee_completed_stable=True,
+            price_slots=prices(now), ev_deadline=now.replace(hour=7)), ev_target_soc=100)
+        self.assertFalse(plan["feasible"])
+        self.assertTrue(plan["completed_before_goal"])
+        self.assertGreater(plan["remaining_unserved_kwh"], 20)
+        self.assertFalse(any(h["charge"] for h in plan["hours"]))
+
     def test_legacy_session_migration_does_not_buy_the_same_budget_again(self):
         now = datetime(2026, 10, 3, tzinfo=TZ)
         context = session_module.EvSessionContext.from_storage_dict({

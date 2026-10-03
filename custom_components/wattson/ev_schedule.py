@@ -46,9 +46,10 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
     if ev_minimum_recovery_complete:
         note += "; minimum already recovered by metered energy"
     complete = state.easee_completed_stable
+    completion_shortfall = required if complete and soc is not None and target > soc + 2 else 0.0
     if complete:
         required = 0.0
-        note = "Charging session complete"
+        note = "Charging session complete" if not completion_shortfall else "Car reports completion before the estimated SOC goal; check vehicle charge limit"
     overdue = deadline is not None and now.timestamp() >= deadline.timestamp()
     power_kw = min(nominal_kw, state.ev_full_power_kw or nominal_kw) * 0.9
     if soc is not None and max(soc, target) > 85:
@@ -107,8 +108,9 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
             "wanted_hours": round(sum(h["minutes"] for h in hours) / 60, 2),
             "note": note, "hours": hours, "intervals": intervals,
             "active": active and not overdue, "overdue": overdue,
-            "required_kwh": round(required, 3), "remaining_unserved_kwh": round(max(0.0, remaining), 3),
-            "feasible": remaining < 0.05 and not (overdue and required > 0.05),
+            "required_kwh": round(required, 3), "remaining_unserved_kwh": round(max(0.0, remaining, completion_shortfall), 3),
+            "feasible": max(remaining, completion_shortfall) < 0.05 and not (overdue and required > 0.05),
+            "completed_before_goal": completion_shortfall > 0.05,
             "expected_departure_soc": round(projected, 1) if projected is not None else None,
             "soc_source": state.ev_soc_source, "power_kw": round(power_kw, 3),
             "selected_hours": math.ceil(sum(h["minutes"] for h in hours) / 60)}
