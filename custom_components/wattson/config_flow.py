@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+import math
 
 import voluptuous as vol
 
@@ -13,6 +14,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    ObjectSelector,
     SelectSelector,
     SelectSelectorConfig,
     TextSelector,
@@ -338,6 +340,56 @@ def _merge(defaults: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _validate_runtime_snapshot(snapshot: Any) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise ValueError("Expected an exported runtime snapshot")
+    ranges = {"battery_discharge_current_a": (0, 70), "ev_ready_hour": (-1, 23),
+              "ev_solar_battery_threshold": (0, 100), "ev_target_soc": (0, 100),
+              "ev_window_end": (0, 23), "ev_window_start": (0, 23), "override_minutes": (5, 1440)}
+    allowed = set(ranges) | {"ev_solar_battery_priority", "solar_bias_history",
+        "solar_bias_bucket_history", "solar_bias_intraday", "battery_override_persist",
+        "ev_override_persist", "pause_until_persist"}
+    if set(snapshot) - allowed:
+        raise ValueError("Snapshot contains unsupported or connection settings")
+    for key, value in snapshot.items():
+        if key in ranges:
+            low, high = ranges[key]
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError("Invalid runtime limit")
+            if key in {"ev_ready_hour", "ev_window_start", "ev_window_end"} and int(value) != value:
+                raise ValueError("Hour must be an integer")
+        elif key == "ev_solar_battery_priority" and not isinstance(value, bool):
+            raise ValueError("Expected a boolean")
+        elif key in {"battery_override_persist", "ev_override_persist", "pause_until_persist"} and value is not None:
+            raise ValueError("Active overrides cannot be imported")
+        elif key == "solar_bias_history":
+            if not isinstance(value, list) or len(value) > 60 or any(
+                not isinstance(x, (int, float)) or not math.isfinite(x) or not 0 < x < 20 for x in value):
+                raise ValueError("Invalid forecast history")
+        elif key == "solar_bias_bucket_history":
+            if not isinstance(value, dict) or set(value) - {"morning", "midday", "evening"}:
+                raise ValueError("Invalid forecast buckets")
+            for history in value.values():
+                _validate_runtime_snapshot({"solar_bias_history": history})
+        elif key == "solar_bias_intraday":
+            # Reject arbitrary nested fields and non-finite energy counters.
+            if not isinstance(value, dict):
+                raise ValueError("Invalid running-day data")
+            from datetime import date
+            date.fromisoformat(value.get("date", ""))
+            if set(value) - {"date", "actual_wh", "forecast_wh", "tod_actual_wh", "tod_forecast_wh"}:
+                raise ValueError("Unknown running-day field")
+            samples = [value.get("actual_wh", 0), value.get("forecast_wh", 0)]
+            for name in ("tod_actual_wh", "tod_forecast_wh"):
+                buckets = value.get(name, {})
+                if not isinstance(buckets, dict) or set(buckets) - {"morning", "midday", "evening"}:
+                    raise ValueError("Invalid running-day buckets")
+                samples.extend(buckets.values())
+            if any(not isinstance(x, (int, float)) or not math.isfinite(x) or not 0 <= x <= 1e9 for x in samples):
+                raise ValueError("Invalid running-day energy")
+    return dict(snapshot)
+
+
 class WattsonConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Wattson config flow."""
 
@@ -464,6 +516,8 @@ class WattsonOptionsFlow(OptionsFlow):
 
     def _defaults(self) -> dict[str, Any]:
         return {
+            # Dashboard controls and learned history also live in options.
+            **dict(self.config_entry.options),
             CONF_SHADOW_MODE: entry_value(self.config_entry, CONF_SHADOW_MODE, DEFAULT_SHADOW_MODE),
             CONF_STALE_SECONDS: entry_value(self.config_entry, CONF_STALE_SECONDS, DEFAULT_STALE_SECONDS),
             CONF_INVERT_GRID_POWER_SIGN: entry_value(self.config_entry, CONF_INVERT_GRID_POWER_SIGN, DEFAULT_INVERT_GRID_POWER_SIGN),
@@ -526,8 +580,24 @@ class WattsonOptionsFlow(OptionsFlow):
         """Show the options menu."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["runtime", "battery", "ev_settings", "mapping"],
+            menu_options=["runtime", "battery", "ev_settings", "mapping", "restore_runtime"],
         )
+
+    async def async_step_restore_runtime(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Restore only non-connection runtime/learning settings from diagnostics."""
+        errors = {}
+        if user_input is not None:
+            try:
+                snapshot = _validate_runtime_snapshot(user_input.get("snapshot"))
+                if not user_input.get("confirm_restore"):
+                    raise ValueError("Restore must be confirmed")
+            except (TypeError, ValueError):
+                errors["base"] = "invalid_runtime_snapshot"
+            else:
+                return self.async_create_entry(title="", data=_merge(self._defaults(), snapshot))
+        return self.async_show_form(step_id="restore_runtime", errors=errors,
+            data_schema=vol.Schema({vol.Required("snapshot"): ObjectSelector(),
+                                    vol.Required("confirm_restore", default=False): BooleanSelector()}))
 
     async def async_step_runtime(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Configure runtime and sign handling."""

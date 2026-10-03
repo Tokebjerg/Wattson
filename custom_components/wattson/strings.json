@@ -138,6 +138,9 @@
     }
   },
   "options": {
+    "error": {
+      "invalid_runtime_snapshot": "Ugyldigt snapshot. Kun drift og læringsdata kan gendannes; aktive overrides er ikke tilladt."
+    },
     "step": {
       "init": {
         "title": "Wattson indstillinger",
@@ -145,7 +148,16 @@
           "runtime": "Drift",
           "battery": "Batteri",
           "ev_settings": "Elbil",
-          "mapping": "Mapping"
+          "mapping": "Mapping",
+          "restore_runtime": "Gendan driftssnapshot"
+        }
+      },
+      "restore_runtime": {
+        "title": "Gendan driftssnapshot",
+        "description": "Gendan gemte dashboardvalg og Solcast-læring fra et tidligere diagnostiksnapshot. Forbindelser og aktive overrides ændres ikke.",
+        "data": {
+          "snapshot": "Driftsfelter fra snapshot",
+          "confirm_restore": "Jeg bekræfter gendannelsen"
         }
       },
       "runtime": {

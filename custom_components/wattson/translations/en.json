@@ -138,6 +138,9 @@
     }
   },
   "options": {
+    "error": {
+      "invalid_runtime_snapshot": "Invalid snapshot. Only runtime and learning data can be restored; active overrides are not allowed."
+    },
     "step": {
       "init": {
         "title": "Wattson options",
@@ -145,7 +148,16 @@
           "runtime": "Runtime",
           "battery": "Battery",
           "ev_settings": "EV",
-          "mapping": "Mapping"
+          "mapping": "Mapping",
+          "restore_runtime": "Restore runtime snapshot"
+        }
+      },
+      "restore_runtime": {
+        "title": "Restore runtime snapshot",
+        "description": "Restore saved dashboard choices and Solcast learning from a previous diagnostic snapshot. Connections and active overrides are unchanged.",
+        "data": {
+          "snapshot": "Runtime fields from snapshot",
+          "confirm_restore": "I confirm the restoration"
         }
       },
       "runtime": {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
 import unittest
 from pathlib import Path
@@ -12,6 +13,53 @@ COMPONENT = ROOT / "custom_components/wattson"
 
 
 class PublicContractTests(unittest.TestCase):
+    def test_runtime_snapshot_rejects_connections_and_unsafe_limits(self) -> None:
+        tree = ast.parse((COMPONENT / "config_flow.py").read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_validate_runtime_snapshot")
+        namespace = {"Any": object, "math": math}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "snapshot validator", "exec"), namespace)
+        validate = namespace["_validate_runtime_snapshot"]
+        snapshot = {"ev_ready_hour": 15, "solar_bias_history": [0.8, 0.9],
+                    "battery_discharge_current_a": 70, "battery_override_persist": None}
+        self.assertEqual(snapshot, validate(snapshot))
+        for invalid in ({"easee_device_id": "x"}, {"battery_discharge_current_a": 71},
+                        {"ev_ready_hour": 7.5}, {"ev_target_soc": float("nan")},
+                        {"battery_override_persist": {"mode": "charge"}},
+                        {"solar_bias_history": [-1]}, {"solar_bias_bucket_history": {"wrong": []}},
+                        {"solar_bias_intraday": {"date": "not-a-date"}}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate(invalid)
+
+    def test_options_forms_preserve_unlisted_runtime_and_learning_fields(self) -> None:
+        tree = ast.parse((COMPONENT / "config_flow.py").read_text())
+        flow = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                    and node.name == "WattsonOptionsFlow")
+        defaults = next(node for node in flow.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_defaults")
+        expression = defaults.body[0].value
+        constants = (COMPONENT / "const.py").read_text()
+        namespace = {"entry_value": lambda entry, key, default: entry.options.get(key, default),
+                     "self": type("Flow", (), {"config_entry": type("Entry", (), {"options": {
+                         "ev_ready_hour": 7, "ev_target_soc": 80,
+                         "ev_solar_battery_threshold": 25, "solar_bias_history": [0.8, 0.9]}})()})()}
+        for node in ast.walk(ast.parse(constants)):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        try:
+                            namespace[target.id] = ast.literal_eval(node.value)
+                        except (ValueError, TypeError):
+                            namespace[target.id] = 1
+        for node in ast.walk(expression):
+            if isinstance(node, ast.Name) and node.id.isupper():
+                namespace.setdefault(node.id, 1)
+        result = eval(compile(ast.Expression(expression), "options defaults", "eval"), namespace)
+        self.assertEqual(7, result["ev_ready_hour"])
+        self.assertEqual(80, result["ev_target_soc"])
+        self.assertEqual(25, result["ev_solar_battery_threshold"])
+        self.assertEqual([0.8, 0.9], result["solar_bias_history"])
+
     @staticmethod
     def _sensor_description_keywords(key: str) -> dict[str, ast.expr]:
         tree = ast.parse((COMPONENT / "sensor.py").read_text())

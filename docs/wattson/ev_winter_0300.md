@@ -53,6 +53,10 @@ This release implements the ten recommendations from the two-week EV review.
 - Ready By: changing/reselecting explicitly arms the next occurrence.
 - EV options: `ev_notify_service` accepts a configured `notify.*` phone service.
   It is blank by default; this installation uses the owner's mobile-app service.
+- Options edits preserve dashboard selections and learned history even when
+  those fields are not shown in the form. A confirmed runtime-snapshot restore
+  can recover non-connection settings from diagnostics; active overrides and
+  unsafe limits cannot be imported.
 
 ## Limits
 
