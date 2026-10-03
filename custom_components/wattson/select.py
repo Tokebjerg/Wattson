@@ -42,6 +42,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     async_add_entities(
         [
             WattsonEVModeSelect(coordinator, entry),
+            WattsonEVVehicleSelect(coordinator, entry),
             WattsonBatteryModeSelect(coordinator, entry),
             WattsonEVWindowStartSelect(coordinator, entry),
             WattsonEVWindowEndSelect(coordinator, entry),
@@ -84,6 +85,23 @@ class WattsonEVModeSelect(_BaseSelect):
         if option in EV_MODES:
             await self._coordinator.async_set_ev_mode(option)
             self.async_write_ha_state()
+
+
+class WattsonEVVehicleSelect(_BaseSelect):
+    _attr_options = ["auto", "niro", "other"]
+    _attr_icon = "mdi:car-electric"
+    _attr_translation_key = "ev_vehicle_profile"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "EV Vehicle Profile", "ev_vehicle_profile")
+
+    @property
+    def current_option(self) -> str:
+        return self._coordinator.ev_vehicle_profile
+
+    async def async_select_option(self, option: str) -> None:
+        await self._coordinator.async_set_ev_vehicle_profile(option)
+        self.async_write_ha_state()
 
 
 class WattsonBatteryModeSelect(_BaseSelect):

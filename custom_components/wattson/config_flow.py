@@ -294,6 +294,9 @@ def _options_ev_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(CONF_EV_SOLAR_MIN_SURPLUS_W, default=defaults[CONF_EV_SOLAR_MIN_SURPLUS_W]): _number(500, 20000, 100),
             vol.Required(CONF_EV_REQUIRED_HOURS, default=defaults[CONF_EV_REQUIRED_HOURS]): _number(1, 12, 1),
             vol.Optional(CONF_EV_SOC_ENTITY, default=defaults.get(CONF_EV_SOC_ENTITY, "")): _entity("sensor"),
+            vol.Optional("ev_vehicle_profile", default=defaults.get("ev_vehicle_profile", "auto")): _select(["auto", "niro", "other"]),
+            vol.Optional("ev_energy_request_kwh", default=defaults.get("ev_energy_request_kwh", 44.16)): _number(0, 100, 0.5),
+            vol.Optional("ev_notify_service", default=defaults.get("ev_notify_service", "")): _text(),
             vol.Required(CONF_EV_CHARGE_SPEED_PCT_H, default=defaults.get(CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)): _number(5, 60, 0.5),
             vol.Required(CONF_EV_WINDOWS, default=defaults[CONF_EV_WINDOWS]): _text(),
         }
@@ -483,6 +486,11 @@ class WattsonOptionsFlow(OptionsFlow):
             CONF_GRID_CHARGE_RATE_KWH: entry_value(self.config_entry, CONF_GRID_CHARGE_RATE_KWH, SCHEDULE_GRID_CHARGE_RATE_KWH),
             CONF_EV_REQUIRED_HOURS: entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS),
             CONF_EV_SOC_ENTITY: entry_value(self.config_entry, CONF_EV_SOC_ENTITY, DEFAULT_EV_SOC_ENTITY),
+            "ev_vehicle_profile": entry_value(self.config_entry, "ev_vehicle_profile", "auto"),
+            "ev_energy_request_kwh": entry_value(self.config_entry, "ev_energy_request_kwh",
+                int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)) * 0.69
+                * int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS))),
+            "ev_notify_service": entry_value(self.config_entry, "ev_notify_service", ""),
             CONF_EV_CHARGE_SPEED_PCT_H: entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H),
             CONF_EV_CONTROL_ENABLED: entry_value(self.config_entry, CONF_EV_CONTROL_ENABLED, DEFAULT_EV_CONTROL_ENABLED),
             CONF_EV_MODE_DEFAULT: entry_value(self.config_entry, CONF_EV_MODE_DEFAULT, DEFAULT_EV_MODE),

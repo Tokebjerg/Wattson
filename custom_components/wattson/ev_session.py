@@ -6,10 +6,13 @@ prevents a value from one car being applied to another car on the same Easee.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+
+from .ev_energy import EvEnergyMeter
+from .ev_schedule import next_deadline
 
 
 class EvPhaseCapability(StrEnum):
@@ -29,6 +32,13 @@ class EvSessionContext:
     phase_capability: EvPhaseCapability = EvPhaseCapability.UNKNOWN
     last_session_kwh: float | None = None
     updated_at: datetime | None = None
+    started_at: datetime | None = None
+    vehicle: str = "unknown"
+    deadline_at: datetime | None = None
+    deadline_hour: int = -1
+    energy: EvEnergyMeter = field(default_factory=EvEnergyMeter)
+    notifications: list[str] = field(default_factory=list)
+    history: list[dict[str, Any]] = field(default_factory=list)
     dirty: bool = False
     _last_persisted_kwh: float | None = None
 
@@ -47,28 +57,38 @@ class EvSessionContext:
     ) -> bool:
         """Observe charger telemetry and return True when a new session starts."""
         normalized = (status or "").strip().lower()
-        is_connected = normalized not in {"", "disconnected", "unknown", "unavailable"}
-        counter_reset = bool(
-            is_connected
-            and session_kwh is not None
-            and self.last_session_kwh is not None
-            and float(session_kwh) + 0.01 < self.last_session_kwh
-        )
+        if normalized in {"", "unknown", "unavailable"}:
+            return False
+        is_connected = normalized != "disconnected"
 
         if not is_connected:
             if self.connected or self.session_id is not None:
+                self.history = (self.history + [{"session": self.session_id,
+                    "vehicle": self.vehicle, "started": self.started_at.isoformat() if self.started_at else None,
+                    "ended": now.isoformat(), "kwh": round(self.energy.delivered_kwh, 3),
+                    "estimated_soc": self.energy.estimated_soc,
+                    "deadline": self.deadline_at.isoformat() if self.deadline_at else None,
+                    "alerts": list(self.notifications)}])[-20:]
                 self.session_id = None
                 self.connected = False
                 self.phase_capability = EvPhaseCapability.UNKNOWN
                 self.last_session_kwh = None
+                self.started_at = None
+                self.vehicle = "unknown"
+                self.deadline_at = None
+                self.deadline_hour = -1
+                self.energy = EvEnergyMeter()
+                self.notifications = []
                 self.updated_at = now
                 self.dirty = True
             return False
 
-        new_session = not self.connected or self.session_id is None or counter_reset
+        new_session = not self.connected or self.session_id is None
         if new_session:
             self.session_id = f"{int(now.timestamp())}:{max(0.0, float(session_kwh or 0.0)):.3f}"
             self.connected = True
+            self.started_at = now
+            self.energy = EvEnergyMeter(counter_last_kwh=session_kwh)
             self.phase_capability = EvPhaseCapability.UNKNOWN
             self.updated_at = now
             self.dirty = True
@@ -96,17 +116,17 @@ class EvSessionContext:
             self.dirty = True
 
     def allows_vehicle_soc(self, entity_id: str | None, default_vehicle_entity: str) -> bool:
-        """Use a vehicle-specific default only after this session matches its capability.
-
-        Explicitly configured non-default SOC entities remain trusted.  Wattson's
-        historical Niro default is three-phase specific and is therefore ignored for
-        unknown/single-phase sessions instead of controlling another connected car.
-        """
+        """Phase count proves electrical capability, never vehicle identity."""
         if not entity_id:
             return False
-        if entity_id != default_vehicle_entity:
-            return True
-        return self.phase_capability == EvPhaseCapability.THREE_PHASE
+        return self.vehicle == "niro" if entity_id == default_vehicle_entity else self.vehicle == "configured"
+
+    def set_deadline(self, now: datetime, hour: int, *, rearm: bool = False) -> None:
+        if self.connected and (rearm or self.deadline_hour != hour or self.started_at is None):
+            self.started_at = self.started_at or now
+            self.deadline_hour = hour
+            self.deadline_at = next_deadline(now, hour)
+            self.dirty = True
 
     def to_storage_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +135,13 @@ class EvSessionContext:
             "phase_capability": self.phase_capability.value,
             "last_session_kwh": self.last_session_kwh,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "vehicle": self.vehicle,
+            "deadline_at": self.deadline_at.isoformat() if self.deadline_at else None,
+            "deadline_hour": self.deadline_hour,
+            "energy": self.energy.as_dict(),
+            "notifications": self.notifications,
+            "history": self.history[-20:],
         }
 
     @classmethod
@@ -146,6 +173,24 @@ class EvSessionContext:
             updated_at=updated_at,
         )
         context._last_persisted_kwh = last_kwh
+        context.energy = EvEnergyMeter.restore(raw.get("energy"))
+        if "energy" not in raw and last_kwh is not None:
+            # Old sessions already delivered the charger's session energy. An
+            # upgrade must not request the entire unknown-car budget a second time.
+            context.energy.counter_last_kwh = last_kwh
+            context.energy.counter_total_kwh = last_kwh
+            context.energy.delivered_kwh = last_kwh
+        context.vehicle = str(raw.get("vehicle", "unknown"))
+        context.notifications = list(raw.get("notifications", []))[-10:]
+        context.history = list(raw.get("history", []))[-20:]
+        try:
+            context.started_at = datetime.fromisoformat(raw["started_at"]) if raw.get("started_at") else None
+            context.deadline_at = datetime.fromisoformat(raw["deadline_at"]) if raw.get("deadline_at") else None
+            context.deadline_hour = int(raw.get("deadline_hour", -1))
+        except (TypeError, ValueError):
+            context.started_at = None
+            context.deadline_at = None
+            context.deadline_hour = -1
         return context
 
     def mark_persisted(self) -> None:
@@ -153,4 +198,7 @@ class EvSessionContext:
         self.dirty = False
 
     def as_dict(self) -> dict[str, Any]:
-        return self.to_storage_dict() | {"single_phase_locked": self.single_phase_locked}
+        data = self.to_storage_dict()
+        data["energy"] = self.energy.summary()
+        data["history"] = self.history[-5:]
+        return data | {"single_phase_locked": self.single_phase_locked}

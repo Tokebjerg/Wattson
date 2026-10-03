@@ -2,6 +2,10 @@
   "title": "Wattson",
   "entity": {
     "select": {
+      "ev_vehicle_profile": {
+        "name": "Connected vehicle",
+        "state": {"auto": "Automatic identification", "niro": "Niro / configured SOC", "other": "Other vehicle (energy budget)"}
+      },
       "battery_mode": {
         "name": "Battery profile",
         "state": {
@@ -178,6 +182,11 @@
         "title": "EV",
         "description": "Adjust EV defaults and solar-only behavior.",
         "data": {
+          "ev_vehicle_profile": "Connected vehicle",
+          "ev_energy_request_kwh": "AC energy budget without known vehicle SOC (kWh)",
+          "ev_notify_service": "Phone notification service (notify.mobile_app_...)",
+          "ev_soc_entity": "Vehicle SOC sensor",
+          "ev_charge_speed_pct_h": "Nominal SOC gain at full charging power (%/hour)",
           "ev_control_enabled": "Enable EV control",
           "ev_mode_default": "Default EV mode",
           "ev_max_amps": "Maximum EV amps",

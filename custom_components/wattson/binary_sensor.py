@@ -25,6 +25,10 @@ class WattsonBinarySensorDescription(BinarySensorEntityDescription):
 
 BINARY_SENSORS: tuple[WattsonBinarySensorDescription, ...] = (
     WattsonBinarySensorDescription(
+        key="ev_charging_problem", name="EV Charging Problem", device_class=BinarySensorDeviceClass.PROBLEM,
+        icon="mdi:car-electric-outline", value_fn=lambda c: c.ev_health["problem"],
+    ),
+    WattsonBinarySensorDescription(
         key="safe_mode",
         name="Safe Mode",
         icon="mdi:shield-alert-outline",
@@ -90,6 +94,8 @@ class WattsonBinarySensor(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.key == "ev_charging_problem":
+            return self.coordinator.ev_health
         if self.entity_description.key == "control_contended":
             until = getattr(self.coordinator, "_battery_contended_until", None)
             return {

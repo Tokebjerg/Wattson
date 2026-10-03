@@ -77,6 +77,8 @@ class PublicContractTests(unittest.TestCase):
                 "battery_soc",
                 "battery_strategy",
                 "ev_strategy",
+                "ev_estimated_soc",
+                "ev_charging_status",
                 "current_buy_price",
                 "forecast_today",
                 "predicted_load_today",

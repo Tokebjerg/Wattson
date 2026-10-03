@@ -339,6 +339,11 @@ def build_site_state(
     easee_power = _normalize_power_to_watts(hass, mapping.easee_power_entity, easee_power)
     easee_session = _read_float(hass, mapping.easee_session_entity, missing=ev_missing, issues=ev_issues, stale=ev_stale, stale_seconds=stale_seconds)
     easee_phase_mode = _read_string(hass, mapping.easee_phase_mode_entity, missing=ev_missing, stale=ev_stale, stale_seconds=stale_seconds)
+    # A steady value is not stale when the integration keeps reporting it.
+    ev_stale = [entity_id for entity_id in ev_stale
+                if (entity_state := hass.states.get(entity_id)) is None
+                or dt_util.utcnow() - getattr(entity_state, "last_reported", entity_state.last_updated)
+                > timedelta(seconds=stale_seconds)]
 
     load_includes_ev = False
     load_power = raw_load_power
@@ -364,6 +369,9 @@ def build_site_state(
         stale=ev_soc_stale,
         stale_seconds=stale_seconds * 20,
     )
+    ev_raw_soc = ev_soc
+    ev_soc_state = hass.states.get(mapping.ev_soc_entity) if mapping.ev_soc_entity else None
+    ev_soc_sample_at = ev_soc_state.last_updated if ev_soc_state else None
     if ev_soc_stale:
         ev_soc = None
     if ev_soc is not None and not (0.0 <= ev_soc <= 100.0):
@@ -430,6 +438,8 @@ def build_site_state(
         easee_session_kwh=easee_session,
         easee_phase_mode=easee_phase_mode,
         ev_soc_pct=ev_soc,
+        ev_raw_soc_pct=ev_raw_soc if ev_raw_soc is not None and 0 <= ev_raw_soc <= 100 else None,
+        ev_soc_sample_at=ev_soc_sample_at,
         current_buy_price=buy_price,
         current_sell_price=sell_price,
         forecast_today_kwh=forecast_today,

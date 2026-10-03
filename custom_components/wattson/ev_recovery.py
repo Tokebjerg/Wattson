@@ -160,17 +160,8 @@ def advance_minimum_recovery(
             max_amps=max_amps,
             session_kwh=session,
         )
-    elif soc is not None and abs(soc - recovery.anchor_soc_pct) >= 0.5:
-        # A changed numeric SOC is authoritative. A new timestamp with the same
-        # stale value is deliberately ignored, including across an HA restart.
-        recovery = _new_recovery(
-            now=now,
-            soc_pct=soc,
-            minimum_soc_pct=minimum,
-            charge_speed_pct_h=charge_speed_pct_h,
-            max_amps=max_amps,
-            session_kwh=session,
-        )
+    # A slow API can report an older/lower SOC during charging. The session meter
+    # remains the reference; numeric changes must never erase delivered energy.
     elif (
         abs(minimum - recovery.target_soc_pct) >= 0.01
         or abs(float(charge_speed_pct_h) - recovery.charge_speed_pct_h) >= 0.01

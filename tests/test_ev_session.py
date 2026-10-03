@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +21,10 @@ def _load_module(name: str, relative: str):
     return module
 
 
-ev_session = _load_module("wattson_test_ev_session", "custom_components/wattson/ev_session.py")
+package = types.ModuleType("wattson_test_session")
+package.__path__ = [str(ROOT / "custom_components/wattson")]
+sys.modules[package.__name__] = package
+ev_session = _load_module("wattson_test_session.ev_session", "custom_components/wattson/ev_session.py")
 EvPhaseCapability = ev_session.EvPhaseCapability
 EvSessionContext = ev_session.EvSessionContext
 
@@ -58,13 +62,13 @@ class EvSessionTests(unittest.TestCase):
         self.assertEqual(EvPhaseCapability.UNKNOWN, context.phase_capability)
         self.assertFalse(context.single_phase_locked)
 
-    def test_session_counter_reset_starts_new_session(self) -> None:
+    def test_session_counter_reset_preserves_physical_session(self) -> None:
         context = EvSessionContext()
         self.observe(context, kwh=2.4)
         context.mark_single_phase(self.now)
 
-        self.assertTrue(self.observe(context, kwh=0.1, offset=60))
-        self.assertEqual(EvPhaseCapability.UNKNOWN, context.phase_capability)
+        self.assertFalse(self.observe(context, kwh=0.1, offset=60))
+        self.assertEqual(EvPhaseCapability.SINGLE_PHASE, context.phase_capability)
 
     def test_default_niro_soc_is_not_used_for_unknown_or_kuga_session(self) -> None:
         context = EvSessionContext(connected=True)
@@ -72,9 +76,11 @@ class EvSessionTests(unittest.TestCase):
         self.assertFalse(context.allows_vehicle_soc(default_soc, default_soc))
         context.mark_single_phase(self.now)
         self.assertFalse(context.allows_vehicle_soc(default_soc, default_soc))
+        self.assertFalse(context.allows_vehicle_soc("sensor.user_selected_car_soc", default_soc))
+        context.vehicle = "configured"
         self.assertTrue(context.allows_vehicle_soc("sensor.user_selected_car_soc", default_soc))
 
-    def test_three_phase_trace_enables_default_niro_soc(self) -> None:
+    def test_three_phase_trace_does_not_prove_vehicle_identity(self) -> None:
         traces = json.loads((ROOT / "tests/fixtures/ev_sessions.json").read_text())
         context = EvSessionContext()
         for sample in traces["niro_three_phase"]:
@@ -86,11 +92,25 @@ class EvSessionTests(unittest.TestCase):
                 offset=sample["offset_s"],
             )
         self.assertEqual(EvPhaseCapability.THREE_PHASE, context.phase_capability)
-        self.assertTrue(
+        self.assertFalse(
             context.allows_vehicle_soc(
                 "sensor.niro_ev_battery_level", "sensor.niro_ev_battery_level"
             )
         )
+        context.vehicle = "niro"
+        self.assertTrue(context.allows_vehicle_soc("sensor.niro_ev_battery_level", "sensor.niro_ev_battery_level"))
+
+    def test_unavailable_keeps_meter_deadline_and_identity(self) -> None:
+        context = EvSessionContext()
+        self.observe(context)
+        context.vehicle = "niro"
+        context.energy.anchor_soc = 40.0
+        context.set_deadline(self.now, 16)
+        saved = context.to_storage_dict()
+        self.assertFalse(self.observe(context, status="unavailable", power=0, kwh=None, offset=60))
+        self.assertEqual(saved, context.to_storage_dict())
+        restored = EvSessionContext.from_storage_dict(saved)
+        self.assertEqual(saved, restored.to_storage_dict())
 
 
 if __name__ == "__main__":

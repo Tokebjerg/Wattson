@@ -32,6 +32,7 @@ from .const import (
 from .learning import forecast_load_w
 from .models import ControlPlan, SiteState
 from .planner import display_plan_action, ev_cheapest_charge_hours
+from .ev_observability import recordable_attributes
 from .telemetry import GRID_IMPORT_CAUSES
 
 
@@ -91,7 +92,18 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         key="site_status",
         name="Site Status",
         icon="mdi:home-lightning-bolt-outline",
-        value_fn=lambda c: "safe_mode" if c.control_plan and c.control_plan.safe_mode else "ready",
+        value_fn=lambda c: "safe_mode" if c.control_plan and c.control_plan.safe_mode else ("ev_degraded" if c.ev_health["problem"] else "ready"),
+    ),
+    WattsonSensorDescription(
+        key="ev_charging_status", name="EV Charging Status", icon="mdi:ev-station",
+        value_fn=lambda c: c.ev_health["state"], attrs_fn=lambda c: c.ev_health,
+    ),
+    WattsonSensorDescription(
+        key="ev_estimated_soc", name="EV Estimated SOC", icon="mdi:car-battery",
+        native_unit_of_measurement="%", state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda c: round(c._ev_session.energy.estimated_soc, 1) if c._ev_session.energy.estimated_soc is not None else None,
+        attrs_fn=lambda c: {"source": c.ev_health.get("soc_source"), "vehicle": c._ev_session.vehicle,
+                            "conservative_soc": c._ev_session.energy.conservative_soc},
     ),
     WattsonSensorDescription(
         key="last_decision_reason",
@@ -416,7 +428,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any] | None:
         attrs = self.entity_description.attrs_fn(self.coordinator)
         if attrs is not None:
-            return attrs
+            return recordable_attributes(attrs)
         site_state: SiteState | None = getattr(self.coordinator, "site_state", None)
         control_plan: ControlPlan | None = getattr(self.coordinator, "control_plan", None)
         if self.entity_description.key == "site_status" and site_state is not None:
@@ -426,7 +438,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 if day_plan is not None
                 else None
             )
-            return {
+            return recordable_attributes({
                 "stale_entities": site_state.stale_entities,
                 "missing_entities": site_state.missing_entities,
                 "issues": site_state.issues,
@@ -610,6 +622,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 ),
                 "ev_control_blocked_reason": getattr(self.coordinator, "_ev_control_blocked_reason", None),
                 "ev_start": getattr(self.coordinator, "ev_start_status", {"state": "idle"}),
+                "ev_health": self.coordinator.ev_health,
                 "ev_transport_recovery": getattr(
                     self.coordinator, "ev_transport_recovery_status", {"state": "idle"}
                 ),
@@ -641,7 +654,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     ),
                     "battery_temp": "ok" if site_state.battery_temperature_c is not None else "n/a",
                 },
-            }
+            })
         return None
 
 
@@ -1785,35 +1798,30 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
         coord = self.coordinator
         if coord.site_state is None or coord.ev_mode != EV_MODE_SCHEDULED_CHEAPEST:
             return None
-        return ev_cheapest_charge_hours(
-            coord.site_state,
-            ev_required_hours=int(entry_value(self._entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
-            ev_ready_hour=coord.ev_ready_hour,
-            ev_target_soc=coord.ev_target_soc,
-            ev_charge_speed_pct_h=float(entry_value(self._entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
-            ev_min_soc=coord.ev_min_soc,
-            ev_charge_until_complete=coord.ev_charge_until_complete,
-            ev_minimum_recovery_complete=coord.ev_minimum_recovery_complete,
-        )
+        return coord.ev_charge_schedule
 
     @property
     def native_value(self) -> Any:
         plan = self._plan()
-        if plan is None:
-            return "n/a"
-        return sum(1 for h in plan["hours"] if h["charge"])
+        return sum(1 for h in plan["hours"] if h["charge"]) if plan else "n/a"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         plan = self._plan()
         if plan is None:
-            return {"hours": [], "note": "Kun aktiv i 'Planlagt billigste timer'"}
-        return {
-            "deadline": plan["deadline"],
-            "wanted_hours": plan["wanted_hours"],
-            "note": plan["note"],
-            "hours": plan["hours"],
-        }
+            return {"hours": [], "note": "Only active in scheduled-cheapest mode"}
+        health = self.coordinator.ev_health
+        return recordable_attributes(plan | {
+            "charging_status": health["state"],
+            "blocked_reason": health.get("blocked_reason"),
+            "session_id": self.coordinator._ev_session.session_id,
+            "delivered_kwh": health.get("delivered_kwh"),
+            "estimated_soc": health.get("estimated_soc"),
+            "conservative_soc": health.get("conservative_soc"),
+            "vehicle": health.get("vehicle"),
+            "actual": [{"at": item[0], "kwh": round(item[1], 3)}
+                       for item in self.coordinator._ev_session.energy.readings[::10][-30:]],
+        })
 
 
 class WattsonEvSolarShadowSensor(CoordinatorEntity, SensorEntity):

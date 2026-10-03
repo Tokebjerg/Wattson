@@ -2,6 +2,10 @@
   "title": "Wattson",
   "entity": {
     "select": {
+      "ev_vehicle_profile": {
+        "name": "Tilsluttet bil",
+        "state": {"auto": "Automatisk identifikation", "niro": "Niro / konfigureret SOC", "other": "Anden bil (energibudget)"}
+      },
       "battery_mode": {
         "name": "Batteri-profil",
         "state": {
@@ -178,6 +182,11 @@
         "title": "Elbil",
         "description": "Juster EV-standarder og solar-only adfærd.",
         "data": {
+          "ev_vehicle_profile": "Tilsluttet bil",
+          "ev_energy_request_kwh": "AC-energibudget uden kendt bil-SOC (kWh)",
+          "ev_notify_service": "Telefonnotifikation (notify.mobile_app_...)",
+          "ev_soc_entity": "Bilens SOC-sensor",
+          "ev_charge_speed_pct_h": "Nominel SOC-stigning ved fuld ladeeffekt (%/time)",
           "ev_control_enabled": "Aktivér EV-styring",
           "ev_mode_default": "Standard EV-mode",
           "ev_max_amps": "Maks EV ampere",

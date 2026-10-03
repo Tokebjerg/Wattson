@@ -1183,7 +1183,7 @@ def test_c_smartcharge():
         ev_state(at(2), slots=[]), ev_mode=const.EV_MODE_SCHEDULED_CHEAPEST,
         ev_max_amps=16, ev_solar_min_surplus_w=1400, ev_windows="00:00-06:00", ev_required_hours=2,
     )
-    checks.append(("scheduled_cheapest falls back to window when no horizon", nohorizon.desired_action == "resume", nohorizon.reason))
+    checks.append(("scheduled_cheapest never buys blindly without a price horizon", nohorizon.desired_action == "pause", nohorizon.reason))
 
     # --- EV charge-plan overview (dashboard sensor) matches the live selection ---
     overview = planner.ev_cheapest_charge_hours(
@@ -1191,10 +1191,11 @@ def test_c_smartcharge():
     charge_hours = [h for h in overview["hours"] if h["charge"]]
     # The two cheapest before the 06:00 deadline are 03:00 (0.10) and 02:00 (0.20).
     charge_set = {h["hour"][11:13] for h in charge_hours}
-    checks.append(("ev_charge_plan: marks exactly the 2 cheapest hours before the deadline",
-                   len(charge_hours) == 2 and charge_set == {"02", "03"}, f"{charge_set}"))
+    checks.append(("ev_charge_plan: energy budget includes capacity margin and a partial third hour",
+                   len(charge_hours) == 3 and charge_set == {"01", "02", "03"}
+                   and abs(sum(h["planned_kwh"] for h in charge_hours) - 22.08) < 0.01, f"{charge_set}"))
     checks.append(("ev_charge_plan: every horizon hour carries a price + charge flag",
-                   all("price" in h and "charge" in h for h in overview["hours"]) and overview["wanted_hours"] == 2,
+                   all("price" in h and "charge" in h for h in overview["hours"]) and overview["wanted_hours"] == 2.22,
                    f"{len(overview['hours'])} hours"))
     # Live plan and overview agree: the cheapest hour resumes AND is flagged charge.
     checks.append(("ev_charge_plan agrees with build_ev_plan at the cheapest hour",
@@ -1992,9 +1993,10 @@ def test_phase_gaps():
             ev_solar_min_surplus_w=1400, ev_windows="", ev_required_hours=2, ev_ready_hour=ready_hour)
 
     checks.append(("ready-by: charges at the cheapest pre-deadline hour", sched(3, 5).desired_action == "resume", sched(3, 5).reason))
-    checks.append(("ready-by: forces an hour the global plan skips (be ready by 05:00)",
-                   sched(4, 5).desired_action == "resume" and sched(4, -1).desired_action == "pause",
-                   f"{sched(4, 5).desired_action}/{sched(4, -1).desired_action}"))
+    checks.append(("ready-by: earlier deadline places more energy before 05:00",
+                   planner.ev_cheapest_charge_hours(ev_state(at(0)), ev_required_hours=2, ev_ready_hour=5)["hours"][2]["planned_kwh"]
+                   > planner.ev_cheapest_charge_hours(ev_state(at(0)), ev_required_hours=2)["hours"][2]["planned_kwh"],
+                   "deadline reshapes energy allocation"))
     checks.append(("no deadline: picks the globally cheapest hour", sched(10, -1).desired_action == "resume", sched(10, -1).reason))
     checks.append(("ready-by: reason names the deadline", "before 05:00" in sched(3, 5).reason, sched(3, 5).reason))
 
@@ -2071,10 +2073,10 @@ def test_phase_gaps():
     # soc 50 -> 80 at 15%/h = 2 hours -> only the 2 globally cheapest (10, 11) charge
     p_t1 = sched_soc(10, 50.0)
     checks.append(("target-SOC: dynamic hours -> charges in a top-2 cheapest hour (reason names target)",
-                   p_t1.desired_action == "resume" and "50% -> 80%" in p_t1.reason, f"{p_t1.desired_action}/{p_t1.reason[:60]}"))
+                   p_t1.desired_action == "resume" and "50.0% -> 80%" in p_t1.reason, f"{p_t1.desired_action}/{p_t1.reason[:60]}"))
     p_t2 = sched_soc(3, 50.0)  # 3rd-cheapest hour: fixed hours=5 would charge; dynamic 2 must NOT
-    checks.append(("target-SOC: dynamic hours SHRINK the plan (3rd-cheapest hour pauses)",
-                   p_t2.desired_action == "pause", f"{p_t2.desired_action}/{p_t2.reason[:50]}"))
+    checks.append(("target-SOC: a partial third hour covers cold and charging losses",
+                   p_t2.desired_action == "resume", f"{p_t2.desired_action}/{p_t2.reason[:50]}"))
     p_t3 = sched_soc(3, None)  # no car-SOC sensor -> fixed 5 hours -> hour 3 charges (any car works)
     checks.append(("target-SOC: NO car-SOC sensor -> fixed required-hours fallback (any car)",
                    p_t3.desired_action == "resume", f"{p_t3.desired_action}/{p_t3.reason[:50]}"))
@@ -2115,22 +2117,22 @@ def test_phase_gaps():
     # >= target 80%, which would normally pause — but the toggle charges anyway.
     p_esc_on = sched_full(0, soc=82.0, complete=True)
     p_esc_off = sched_full(0, soc=82.0, complete=False)
-    checks.append(("charge-until-full: toggle ON ignores a satisfied car SOC and charges",
-                   p_esc_on.desired_action == "resume" and "charging until full" in p_esc_on.reason,
+    checks.append(("charge-until-full: a known SOC plans the cheapest energy needed to 100%",
+                   p_esc_on.desired_action == "pause" and "82.0% -> 100%" in p_esc_on.reason,
                    f"{p_esc_on.desired_action}/{p_esc_on.reason[:55]}"))
     checks.append(("charge-until-full: toggle OFF still honours target-reached (pause)",
                    p_esc_off.desired_action == "pause" and "target 80% reached" in p_esc_off.reason,
                    f"{p_esc_off.desired_action}/{p_esc_off.reason[:50]}"))
     # Toggle charges an EXPENSIVE pre-deadline hour (0.50) that the fixed 2-cheapest
     # plan would skip -> proves it allocates every horizon hour, not just N.
-    checks.append(("charge-until-full: toggle charges a costly hour the fixed plan skips",
-                   sched_full(0, soc=82.0, complete=True).desired_action == "resume"
+    checks.append(("charge-until-full: toggle no longer opens costly hours unnecessarily",
+                   sched_full(0, soc=82.0, complete=True).desired_action == "pause"
                    and sched_full(0, soc=None, complete=False, target=0.0).desired_action == "pause",
                    "toggle resume / fixed pause"))
     # No car SOC + deadline + target -> auto charge-until-full WITHOUT the toggle.
     p_nosoc_full = sched_full(0, soc=None, complete=False, target=80.0)
-    checks.append(("charge-until-full: no car SOC + deadline auto-charges until full",
-                   p_nosoc_full.desired_action == "resume" and "no car SOC" in p_nosoc_full.reason,
+    checks.append(("charge-until-full: unknown SOC uses a bounded cheap energy budget",
+                   p_nosoc_full.desired_action == "pause" and "bounded energy request" in p_nosoc_full.reason,
                    f"{p_nosoc_full.desired_action}/{p_nosoc_full.reason[:55]}"))
     # Contrast: no SOC + NO target -> the fixed required-hours fallback (hour 0 pauses).
     p_nosoc_fixed = sched_full(0, soc=None, complete=False, target=0.0)
@@ -2138,13 +2140,13 @@ def test_phase_gaps():
                    p_nosoc_fixed.desired_action == "pause", f"{p_nosoc_fixed.desired_action}/{p_nosoc_fixed.reason[:50]}"))
     # Toggle works WITHOUT a deadline too: spans the whole remaining horizon.
     p_full_nodl = sched_full(7, soc=None, complete=True, ready_hour=-1)
-    checks.append(("charge-until-full: toggle without deadline spans the full horizon",
-                   p_full_nodl.desired_action == "resume", f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:50]}"))
+    checks.append(("charge-until-full: unknown SOC without deadline still avoids costly hours",
+                   p_full_nodl.desired_action == "pause", f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:50]}"))
     # The dashboard overview MUST mirror the live selection: every pre-deadline hour charges.
     ov_full = planner.ev_cheapest_charge_hours(
         ev_state(at(0)), ev_required_hours=2, ev_ready_hour=6, ev_target_soc=80.0, ev_charge_until_complete=True)
-    checks.append(("ev_charge_plan overview: charge-until-full marks EVERY pre-deadline hour",
-                   all(h["charge"] for h in ov_full["hours"]) and ov_full["wanted_hours"] == len(ov_full["hours"]),
+    checks.append(("ev_charge_plan overview: unknown SOC never expands to every pre-deadline hour",
+                   not all(h["charge"] for h in ov_full["hours"]) and ov_full["wanted_hours"] < len(ov_full["hours"]),
                    f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
@@ -2182,11 +2184,11 @@ def test_phase_gaps():
                    f"{p_m5.desired_action}/{p_m5.desired_circuit_currents}/{p_m5.desired_phase_mode}"))
     p_m6 = sched_min(4, 20.0, ready_hour=5, minute=45)
     checks.append(("min-SOC near deadline: same immediate metered recovery rule applies",
-                   p_m6.desired_action == "resume" and "metered recovery" in p_m6.reason,
+                   p_m6.desired_action == "resume" and "metered minimum recovery" in p_m6.reason,
                    f"{p_m6.desired_action}/{p_m6.reason[:70]}"))
     p_m7 = sched_min(0, 20.0, ready_hour=5, recovery_complete=True)
     checks.append(("min-SOC stale value: metered completion releases immediate charging latch",
-                   p_m7.desired_action == "pause" and "already recovered" in p_m7.reason,
+                   "already recovered" in p_m7.reason and "Immediate metered" not in p_m7.reason,
                    f"{p_m7.desired_action}/{p_m7.reason[:80]}"))
 
     # Live regression, 2026-07-18: car 25%, floor 30%, target 100%, deadline
@@ -2272,13 +2274,13 @@ def test_phase_gaps():
                    live_ev.desired_action == "resume"
                    and live_after_protect.desired_discharge_current_a == 0.0,
                    f"{live_ev.desired_action}/{live_after_protect.desired_discharge_current_a}A"))
-    checks.append(("live minimum recovery: metered completion pauses and reopens house battery",
-                   live_recovered_ev.desired_action == "pause"
-                   and live_recovered_battery.desired_discharge_current_a == 70.0,
+    checks.append(("live minimum recovery: completion returns to the energy-based plan",
+                   "Immediate metered" not in live_recovered_ev.reason
+                   and "already recovered" in live_recovered_ev.reason,
                    f"{live_recovered_ev.desired_action}/{live_recovered_battery.desired_discharge_current_a}A"))
-    checks.append(("live regression: tomorrow plan remains five cheapest hours 10-14 before 16:00",
-                   selected_live_hours == [10, 11, 12, 13, 14]
-                   and live_overview["wanted_hours"] == 5,
+    checks.append(("live regression: 25->100% includes losses, taper and immediate minimum recovery",
+                   all(h in selected_live_hours for h in [10, 11, 12, 13, 14])
+                   and live_overview["wanted_hours"] > 5 and live_overview["feasible"],
                    f"wanted={live_overview['wanted_hours']}, hours={selected_live_hours}"))
     tomorrow_ten = replace_state(live_state, timestamp=datetime(2026, 7, 19, 10, 0, tzinfo=TZ))
     tomorrow_ev = planner.build_ev_plan(
@@ -3311,9 +3313,9 @@ def test_coordinator_ev_harness():
     co.site_state = replace(co.site_state, easee_power_w=0.0,
                             ev_stale_entities=["sensor.easee_power"])
     stale_pause = asyncio.run(co._async_apply_ev(ev(10, action="pause", enabled=False), at(0)))
-    checks.append(("harness stale-zero bootstrap is resume-only; pause-shaped plan cannot open it",
-                   stale_pause == [] and co._easee.calls == []
-                   and co._ev_control_blocked_reason == "ev_power_stale",
+    checks.append(("harness stale-zero telemetry never blocks a safety pause",
+                   bool(stale_pause) and co._easee.calls[-1][0] == "pause"
+                   and co._ev_control_blocked_reason is None,
                    f"actions={stale_pause}, blocked={co._ev_control_blocked_reason}"))
 
     # (b) Asymmetric re-tune: ramp-ups still wait 90 s; reductions apply immediately.
@@ -8348,10 +8350,10 @@ def test_ev_minimum_recovery():
         charge_speed_pct_h=15.0, max_amps=16, power_w=0.0,
         session_kwh=13.68,
     )
-    checks.append(("changed below-floor SOC starts only the remaining top-up",
-                   refreshed_low is not None and not refreshed_low.complete
-                   and refreshed_low.anchor_soc_pct == 26.0
-                   and abs(refreshed_low.required_kwh - 2.944) < 1e-9,
+    checks.append(("delayed below-floor SOC cannot erase completed metered recovery",
+                   refreshed_low is not None and refreshed_low.complete
+                   and refreshed_low.anchor_soc_pct == 25.0
+                   and abs(refreshed_low.delivered_kwh - 3.68) < 0.01,
                    str(refreshed_low.required_kwh if refreshed_low else None)))
 
     disconnected = ev_recovery.advance_minimum_recovery(

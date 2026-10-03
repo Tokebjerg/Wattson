@@ -444,7 +444,7 @@ class EaseeController:
             status = (state.easee_status or "").lower()
             if plan.desired_action == "pause" and status == "awaiting_start":
                 pass
-            elif plan.desired_action == "resume" and status == "charging":
+            elif plan.desired_action == "resume" and status == "charging" and not force_enable:
                 pass
             else:
                 actions.extend(await self._action(mapping.easee_device_id, plan.desired_action))

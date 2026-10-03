@@ -269,6 +269,14 @@ class SiteState:
     current_sell_price: float | None
     forecast_today_kwh: float | None
     ev_soc_pct: float | None = None
+    ev_raw_soc_pct: float | None = None
+    ev_soc_sample_at: datetime | None = None
+    ev_soc_source: str = "unavailable"
+    ev_ac_kwh_per_pct: float | None = None
+    ev_full_power_kw: float | None = None
+    ev_session_delivered_kwh: float = 0.0
+    ev_unknown_budget_kwh: float | None = None
+    ev_deadline: datetime | None = None
     # #5: battery pack temperature (°C) if the inverter exposes it — used ONLY as a
     # cold-charge safety guard. None (not available) leaves every decision unchanged.
     battery_temperature_c: float | None = None
@@ -336,6 +344,7 @@ class EvPlan:
     desired_phase_mode: str | None = None
     desired_action: str | None = None
     battery_first_spillover: bool = False
+    solar_opportunity: bool = False
 
 
 @dataclass(frozen=True)

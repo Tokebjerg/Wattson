@@ -19,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             WattsonEVSolarBatteryThresholdNumber(coordinator, entry),
             WattsonEvTargetSocNumber(coordinator, entry),
             WattsonEvMinSocNumber(coordinator, entry),
+            WattsonEvEnergyRequestNumber(coordinator, entry),
             WattsonOverrideMinutesNumber(coordinator, entry),
             WattsonBatteryMinSocNumber(coordinator, entry),
             WattsonBatteryMaxSocNumber(coordinator, entry),
@@ -134,6 +135,33 @@ class WattsonEvMinSocNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._coordinator.async_set_ev_min_soc(float(value))
+        self.async_write_ha_state()
+
+
+class WattsonEvEnergyRequestNumber(WattsonEvTargetSocNumber):
+    """Finite AC energy budget for a vehicle without trustworthy SOC."""
+
+    _attr_icon = "mdi:lightning-bolt"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 0.5
+    _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator: Any, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_name = "EV Energy Request"
+        self._attr_unique_id = f"{entry.entry_id}_ev_energy_request"
+
+    @property
+    def native_min_value(self) -> float:
+        return 0.0
+
+    @property
+    def native_value(self) -> float:
+        return self._coordinator.ev_energy_request_kwh
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.async_set_ev_energy_request_kwh(value)
         self.async_write_ha_state()
 
 

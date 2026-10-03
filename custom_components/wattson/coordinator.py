@@ -118,6 +118,8 @@ from .const import (
     DOMAIN,
     INTEGRATION_VERSION,
     EV_MODE_SOLAR_ONLY,
+    EV_MODE_FULL_SPEED,
+    EV_MODE_SCHEDULED,
     EV_MODE_SCHEDULED_CHEAPEST,
     EV_MODES,
     BATTERY_MODES,
@@ -175,6 +177,7 @@ from .battery_model import (
 from .control import EaseeController, KlatremisController
 from .deye_contract import floor_sell_safe, force_discharge_register_open
 from .ev_session import EvPhaseCapability, EvSessionContext
+from .ev_schedule import energy_schedule
 from .execution import ExecutionResult, capture_execution
 from .ev_recovery import (
     MINIMUM_RECOVERY_PERSIST_STEP_KWH,
@@ -617,6 +620,8 @@ def _ev_staleness_blocks_control(
     )
     if not power_stale:
         return False
+    if ev_plan.desired_action == "pause" or ev_plan.desired_enabled is False:
+        return False
     has_offer = bool(
         ev_plan.desired_amps is not None
         and ev_plan.desired_amps >= EV_STALE_POWER_BOOTSTRAP_A
@@ -624,7 +629,8 @@ def _ev_staleness_blocks_control(
         and any(current >= EV_STALE_POWER_BOOTSTRAP_A for current in ev_plan.desired_circuit_currents)
     )
     bootstrap_allowed = bool(
-        easee_status in EV_WAITING_TO_START_STATUSES
+        (easee_status in EV_WAITING_TO_START_STATUSES or (
+            easee_status == "charging" and ev_plan.mode != EV_MODE_SOLAR_ONLY and not ev_plan.solar_opportunity))
         and ev_plan.desired_enabled is True
         and ev_plan.desired_action == "resume"
         and has_offer
@@ -776,6 +782,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_control_blocked_reason: str | None = None
         self._ev_start_wait_since: datetime | None = None
         self._last_ev_start_recovery_at: datetime | None = None
+        self._last_ev_offer_repair_at: datetime | None = None
+        self._ev_offer_repair_attempts = 0
         self._ev_start_recovery_attempts: int = 0
         self._ev_start_status: str = "idle"
         self._last_ev_transport_reload_at: datetime | None = None
@@ -790,6 +798,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_single_phase_session_locked: bool = False
         self._ev_phase_session_last_kwh: float | None = None
         self._ev_session = EvSessionContext()
+        self._ev_applied_vehicle_profile = self.ev_vehicle_profile
+        self._ev_applied_energy_request_kwh = self.ev_energy_request_kwh
         # Phase E part 2: per-device write cooldowns + master-controller lock.
         self._last_battery_write_at: datetime | None = None
         self._last_ev_write_at: datetime | None = None
@@ -923,6 +933,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # and the solar-bias history. ----
 
     async def async_startup(self) -> None:
+        self.config_entry.async_on_unload(self.hass.bus.async_listen_once("homeassistant_stop", self.async_save_ev_state))
         try:
             self._ev_session = EvSessionContext.from_storage_dict(
                 await self._ev_session_store.async_load()
@@ -1027,6 +1038,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             return
         await self._ev_session_store.async_save(self._ev_session.to_storage_dict())
         self._ev_session.mark_persisted()
+
+    async def async_save_ev_state(self, _event=None) -> None:
+        """Flush the meter and absolute deadline before reload/shutdown."""
+        try:
+            await self._ev_session_store.async_save(self._ev_session.to_storage_dict())
+            if self._ev_minimum_recovery is not None:
+                await self._ev_minimum_recovery_store.async_save(self._ev_minimum_recovery.as_storage_dict())
+            else:
+                await self._ev_minimum_recovery_store.async_remove()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson could not flush EV state: %s", err)
 
     async def _async_update_load_profile(self) -> None:
         """Build 15-minute and hourly house-load profiles from Recorder history.
@@ -1623,11 +1645,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         current = advance_minimum_recovery(
             previous,
             now=dt_util.utcnow(),
-            connected=ev_runtime != "disconnected",
+            connected=self._ev_session.connected,
             minimum_mode_enabled=self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST,
             soc_pct=self.site_state.ev_soc_pct,
             minimum_soc_pct=self.ev_min_soc,
-            charge_speed_pct_h=ev_charge_speed_pct_h,
+            charge_speed_pct_h=(ev_max_amps * 0.69 / (self.site_state.ev_ac_kwh_per_pct * 1.1)
+                                if self.site_state.ev_ac_kwh_per_pct else ev_charge_speed_pct_h),
             max_amps=ev_max_amps,
             power_w=self.site_state.easee_power_w,
             session_kwh=self.site_state.easee_session_kwh,
@@ -1678,7 +1701,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and recovery.complete
             and soc is not None
             and soc < self.ev_min_soc
-            and abs(soc - recovery.anchor_soc_pct) < 0.5
             and abs(self.ev_min_soc - recovery.target_soc_pct) < 0.01
         )
 
@@ -1692,7 +1714,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         elif self._ev_start_status in {"pending_start", "recovering", "start_failed"}:
             recovery_state = self._ev_start_status
         else:
-            recovery_state = "charging"
+            recovery_state = "charging" if self.site_state and (self.site_state.easee_power_w or 0) >= EV_START_CONFIRMED_POWER_W else "waiting"
         return {
             "state": recovery_state,
             "anchor_soc_pct": round(recovery.anchor_soc_pct, 2),
@@ -1719,6 +1741,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         )
         return {
             "state": self._ev_start_status,
+            "observed_offer": self._ev_observed_offer(now),
             "wait_seconds": round(wait_seconds),
             "recovery_attempts": self._ev_start_recovery_attempts,
             "last_recovery_at": (
@@ -2235,7 +2258,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and ev_plan.desired_action == "resume"
             and ev_plan.desired_circuit_currents is not None
         )
-        if ev_plan.mode != EV_MODE_SOLAR_ONLY:
+        if ev_plan.mode != EV_MODE_SOLAR_ONLY and not ev_plan.solar_opportunity:
             self._ev_phase_transition_state = "idle"
             self._ev_phase_transition_started_at = None
             self._ev_phase_transition_pause_at = None
@@ -2398,7 +2421,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         grid_budget_exhausted: bool,
     ) -> EvPlan:
         """Keep cloud dips, stop sustained support, and require stable restart sun."""
-        if self.ev_mode != EV_MODE_SOLAR_ONLY:
+        if self.ev_mode != EV_MODE_SOLAR_ONLY and not ev_plan.solar_opportunity:
             self._ev_solar_surplus_since = None
             self._ev_solar_deficit_since = None
             return ev_plan
@@ -2449,6 +2472,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             surplus_elapsed_seconds=surplus_elapsed,
             grid_budget_exhausted=grid_budget_exhausted,
         )
+        if ev_plan.solar_opportunity and action == "hold":
+            # Opportunistic charging must back off without borrowing the house
+            # battery; cloud bridging remains exclusive to pure-solar mode.
+            action = "pause"
         if action == "resume":
             return ev_plan
         if action == "hold":
@@ -3072,9 +3099,181 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     async def async_set_ev_ready_hour(self, hour: int) -> None:
         self.ev_ready_hour = int(hour)
+        self._ev_session.set_deadline(dt_util.now(), int(hour), rearm=True)
         self._last_ev_fp = None
         update_entry_options(self.hass, self.config_entry, **{CONF_EV_READY_HOUR: int(hour)})
         await self.async_request_refresh()
+
+    @property
+    def ev_vehicle_profile(self) -> str:
+        return str(entry_value(self.config_entry, "ev_vehicle_profile", "auto"))
+
+    async def async_set_ev_vehicle_profile(self, profile: str) -> None:
+        if profile not in {"auto", "niro", "other"}:
+            return
+        if profile != self.ev_vehicle_profile:
+            from .ev_energy import EvEnergyMeter
+            self._ev_session.energy = EvEnergyMeter(counter_last_kwh=self.site_state.easee_session_kwh if self.site_state else None)
+            self._ev_session.vehicle = "unknown"
+            self._ev_minimum_recovery = None
+            await self._ev_minimum_recovery_store.async_remove()
+            self._ev_session.notifications = []
+            self._ev_session.dirty = True
+        self._ev_applied_vehicle_profile = profile
+        update_entry_options(self.hass, self.config_entry, ev_vehicle_profile=profile)
+        self._last_ev_fp = None
+        await self.async_request_refresh()
+
+    @property
+    def ev_energy_request_kwh(self) -> float:
+        nominal = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)) * 0.69
+        hours = int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS))
+        return float(entry_value(self.config_entry, "ev_energy_request_kwh", nominal * hours))
+
+    async def async_set_ev_energy_request_kwh(self, value: float) -> None:
+        update_entry_options(self.hass, self.config_entry, ev_energy_request_kwh=max(0.0, min(100.0, value)))
+        await self.async_request_refresh()
+
+    def _update_ev_energy_state(self, now: datetime) -> None:
+        session, state = self._ev_session, self.site_state
+        session.set_deadline(now, self.ev_ready_hour)
+        sample_at = state.ev_soc_sample_at
+        if self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY:
+            # The backend timestamp describes the car observation; HA's entity
+            # timestamp can merely describe restoration or attribute changes.
+            backend = self.hass.states.get("sensor.niro_last_updated_at")
+            sample_at = None
+            if backend and backend.state not in {"unknown", "unavailable"}:
+                parsed = dt_util.parse_datetime(backend.state)
+                if parsed is not None:
+                    sample_at = parsed
+        profile = self.ev_vehicle_profile
+        if profile != getattr(self, "_ev_applied_vehicle_profile", profile):
+            from .ev_energy import EvEnergyMeter
+            session.energy = EvEnergyMeter(counter_last_kwh=state.easee_session_kwh)
+            session.vehicle = "unknown"
+            session.notifications = []
+            session.dirty = True
+            self._ev_minimum_recovery = None
+            self._last_ev_fp = None
+            self._pending_replan_reason = "ev_vehicle_changed"
+        self._ev_applied_vehicle_profile = profile
+        requested_energy = self.ev_energy_request_kwh
+        if requested_energy != getattr(self, "_ev_applied_energy_request_kwh", requested_energy):
+            self._pending_replan_reason = "ev_energy_request_changed"
+        self._ev_applied_energy_request_kwh = requested_energy
+        fresh_sample = sample_at is not None and 0 <= now.timestamp() - sample_at.timestamp() <= 12000
+        plug = self.hass.states.get("binary_sensor.niro_ev_battery_plug")
+        location = self.hass.states.get("device_tracker.niro_location")
+        if (profile == "auto" and session.vehicle == "niro" and fresh_sample
+                and session.energy.anchor_at and sample_at.timestamp() > datetime.fromisoformat(session.energy.anchor_at).timestamp()
+                and ((plug and plug.state == "off") or (location and location.state not in {"home", "unknown", "unavailable"}))):
+            # Fresh vehicle evidence can reveal a fast car swap that happened
+            # entirely between two charger polls.
+            session.observe(status="disconnected", session_kwh=None, power_w=0,
+                now=now, one_phase_ceiling_w=EV_SINGLE_PHASE_OBSERVED_CEILING_W)
+            session.observe(status=state.easee_status, session_kwh=state.easee_session_kwh,
+                power_w=state.easee_power_w, now=now, one_phase_ceiling_w=EV_SINGLE_PHASE_OBSERVED_CEILING_W)
+            session.set_deadline(now, self.ev_ready_hour, rearm=True)
+            self._ev_minimum_recovery = None
+        if profile == "niro":
+            session.vehicle = "niro" if self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY else "configured"
+        elif profile == "other":
+            session.vehicle = "other"
+        elif session.vehicle == "unknown" and session.connected:
+            if (plug and plug.state == "on" and location and location.state == "home"
+                    and sample_at and session.started_at
+                    and sample_at.timestamp() >= session.started_at.timestamp() - 120
+                    and 0 <= now.timestamp() - sample_at.timestamp() <= 12000):
+                session.vehicle = "niro"
+        trusted = session.connected and session.allows_vehicle_soc(self.mapping.ev_soc_entity, DEFAULT_EV_SOC_ENTITY)
+        # An old sample may remain an anchor once identified, but must not become
+        # a fresh anchor merely because HA restarted.
+        max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
+        speed = float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H))
+        power_fresh = bool(state.easee_online and not state.ev_issues and
+                           self.mapping.easee_power_entity not in state.ev_stale_entities)
+        counter_fresh = bool(state.easee_online and not state.ev_issues and
+                             self.mapping.easee_session_entity not in state.ev_stale_entities)
+        before = session.energy.as_dict()
+        session.energy.observe(now=now, counter_kwh=state.easee_session_kwh,
+            power_w=state.easee_power_w, telemetry_fresh=power_fresh,
+            counter_fresh=counter_fresh,
+            soc=state.ev_raw_soc_pct, soc_at=sample_at, soc_trusted=trusted and fresh_sample,
+            nominal_kwh_per_pct=max_amps * 0.69 / max(1.0, speed),
+            full_offer=(self.ev_mode in {EV_MODE_FULL_SPEED, EV_MODE_SCHEDULED_CHEAPEST, EV_MODE_SCHEDULED}
+                        and self._last_ev_amps == max_amps
+                        and self._last_ev_currents == (max_amps,) * 3
+                        and self.control_plan is not None
+                        and self.control_plan.ev.desired_action == "resume"
+                        and not self.control_plan.ev.solar_opportunity
+                        and (session.energy.estimated_soc or 0) < 85))
+        if session.energy.as_dict() != before:
+            session.dirty = True
+        estimate = session.energy.conservative_soc if trusted else None
+        phases = 1 if session.single_phase_locked else 3
+        self.site_state = replace(state, ev_soc_pct=estimate,
+            ev_soc_source=("metered" if estimate is not None else "energy_budget"),
+            ev_ac_kwh_per_pct=session.energy.ac_kwh_per_pct,
+            ev_full_power_kw=min(session.energy.full_power_kw, max_amps * 230 * phases / 1000),
+            ev_session_delivered_kwh=session.energy.delivered_kwh,
+            ev_unknown_budget_kwh=self.ev_energy_request_kwh,
+            ev_deadline=session.deadline_at)
+
+    @property
+    def ev_charge_schedule(self) -> dict[str, Any]:
+        if self.site_state is None:
+            return {"hours": [], "intervals": [], "feasible": True}
+        return energy_schedule(self.site_state,
+            ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
+            ev_ready_hour=self.ev_ready_hour, ev_target_soc=self.ev_target_soc,
+            ev_charge_speed_pct_h=float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
+            ev_min_soc=self.ev_min_soc, ev_charge_until_complete=self.ev_charge_until_complete,
+            ev_minimum_recovery_complete=self.ev_minimum_recovery_complete,
+            ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)))
+
+    @property
+    def ev_health(self) -> dict[str, Any]:
+        if not self.ev_control_enabled:
+            return {"state": "disabled", "problem": False}
+        if not self._ev_session.connected:
+            return {"state": "disconnected", "problem": False}
+        blocked = self._ev_control_blocked_reason
+        overview = self.ev_charge_schedule if self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST else {}
+        actual = bool(self.site_state and self.site_state.easee_power_w and
+                      self.site_state.easee_power_w >= EV_START_CONFIRMED_POWER_W and
+                      self.mapping.easee_power_entity not in self.site_state.ev_stale_entities)
+        failure = self._ev_start_status == "start_failed" and not actual
+        state = "complete" if self.site_state and self.site_state.easee_completed_stable else "charging" if actual else (
+            "start_failed" if failure else "blocked" if blocked else "waiting")
+        return {"state": state, "problem": bool(failure or blocked or overview.get("feasible") is False),
+                "blocked_reason": blocked, "session_id": self._ev_session.session_id,
+                "vehicle": self._ev_session.vehicle,
+                "soc_source": self.site_state.ev_soc_source if self.site_state else "unavailable",
+                "estimated_soc": self._ev_session.energy.estimated_soc,
+                "conservative_soc": self._ev_session.energy.conservative_soc,
+                "delivered_kwh": round(self._ev_session.energy.delivered_kwh, 3),
+                "deadline": overview.get("deadline"), "feasible": overview.get("feasible"),
+                "expected_departure_soc": overview.get("expected_departure_soc"),
+                "remaining_unserved_kwh": overview.get("remaining_unserved_kwh"),
+                "start": self.ev_start_status}
+
+    async def _async_ev_alert(self, code: str, message: str) -> None:
+        session = getattr(self, "_ev_session", None)
+        if session is None or code in session.notifications or not session.connected:
+            return
+        service = str(entry_value(self.config_entry, "ev_notify_service", ""))
+        try:
+            await self.hass.services.async_call("persistent_notification", "create",
+                {"notification_id": f"wattson_ev_{code}", "title": "Wattson: EV-opladning", "message": message}, blocking=True)
+            if service.startswith("notify.") and self.hass.services.has_service("notify", service[7:]):
+                await self.hass.services.async_call("notify", service[7:],
+                    {"title": "Wattson: EV-opladning", "message": message,
+                     "data": {"tag": f"wattson_ev_{code}"}}, blocking=True)
+            session.notifications.append(code)
+            session.dirty = True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson EV notification failed: %s", err)
 
     async def async_set_ev_solar_battery_priority(self, enabled: bool) -> None:
         self.ev_solar_battery_priority = bool(enabled)
@@ -3249,11 +3448,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         )
         if new_ev_session:
             self._reset_ev_phase_transition_state()
-        if not self._ev_session.allows_vehicle_soc(
-            self.mapping.ev_soc_entity,
-            DEFAULT_EV_SOC_ENTITY,
-        ):
-            self.site_state = replace(self.site_state, ev_soc_pct=None)
+            self._ev_offer_repair_attempts = 0
+            self._ev_minimum_recovery = None
+        self._update_ev_energy_state(tick.local_now)
 
         # Telemetry/price corrections before anything consumes the state.
         self._despike_derived_load()
@@ -4460,7 +4657,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # MANUAL EV OVERRIDE never reached its protection and the pack drained into the car.
         # This GLOBAL guard runs on the FINAL battery plan (AI or override), so every EV path
         # is covered. ``ev_covers_dips_from_battery`` is True only for solar_only.
-        _ev_wants_charge = ev_plan.desired_enabled is True and ev_plan.desired_action == "resume"
+        _ev_wants_charge = bool(
+            (self.site_state.easee_power_w or 0.0) >= EV_START_CONFIRMED_POWER_W
+            and self.mapping.easee_power_entity not in self.site_state.ev_stale_entities
+        )
         _ev_covers_dips = (
             ev_covers_dips_from_battery(ev_plan.mode)
             and not getattr(ev_plan, "battery_first_spillover", False)
@@ -4517,6 +4717,27 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         else:
             self.last_actions = []
             self._execution_results = {}
+        if (accounting_due and self._ev_session.connected and self.ev_control_enabled
+                and self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
+                and self._ev_session.started_at
+                and tick.now.timestamp() - self._ev_session.started_at.timestamp() > 120):
+            overview = self.ev_charge_schedule
+            if not overview["feasible"]:
+                await self._async_ev_alert("deadline_shortfall",
+                    f"Lademålet kan ikke nås inden fristen {overview['deadline']}. "
+                    f"Der mangler plads til {overview['remaining_unserved_kwh']:.1f} kWh. "
+                    "Tilpas frist eller mål, og kontroller at bilen accepterer ladning.")
+            if self.site_state.ev_soc_pct is None and self._ev_session.deadline_at:
+                left = self._ev_session.deadline_at.timestamp() - tick.now.timestamp()
+                if left < 4 * 3600:
+                    await self._async_ev_alert("unknown_soc",
+                        "Wattson kan ikke bekræfte bilens SOC/identitet. Der bruges et begrænset energibudget, "
+                        "ikke opladning i alle timer. Vælg Niro hvis den er tilsluttet, eller indstil energibudgettet for en anden bil. Et bestemt SOC-mål kan ikke garanteres uden bilens data.")
+            if self._ev_control_blocked_reason and self._ev_session.deadline_at:
+                left = self._ev_session.deadline_at.timestamp() - tick.now.timestamp()
+                if left < 3600 and overview["required_kwh"] > 0.1:
+                    await self._async_ev_alert("deadline_blocked",
+                        f"EV-opladning er blokeret ({self._ev_control_blocked_reason}), og fristen nærmer sig. Kontroller bilen og Easee.")
         self._sync_repairs()
         # Self-diagnosis runs AFTER control is applied and must NEVER be able to break the
         # control loop — it is pure observability. Swallow + log any error here.
@@ -4721,6 +4942,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # EV is an independent fault domain: skip only Easee writes. Healthy
             # battery control continues and the manual override exposes "blocked".
             self._last_ev_fp = None
+            self._ev_start_status = "blocked"
             return []
         power_stale = bool(
             self.mapping
@@ -4736,7 +4958,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # fixed, installation-safe max offer.  Clamping it to 6 A because an idle
         # 0 W sensor has not changed can deadlock cars that need a stronger pilot
         # signal to wake up.
-        if power_stale and not minimum_recovery_active:
+        if power_stale and not minimum_recovery_active and (ev.mode == EV_MODE_SOLAR_ONLY or ev.solar_opportunity):
             ev = _ev_stale_power_bootstrap_plan(ev)
         # Structural changes (mode / enable / phase / start-stop) always apply.
         structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
@@ -4763,10 +4985,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # verified recovery after the response timeout. This avoids a second,
         # independent nudge loop resending the same tuple during transitions.
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
-        not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES
+        not_yet_charging = easee_status in EV_WAITING_TO_START_STATUSES or easee_status == "charging"
         physically_charging = bool(
-            easee_status == "charging"
-            or (self.site_state.easee_power_w or 0.0) >= EV_START_CONFIRMED_POWER_W
+            not power_stale and (self.site_state.easee_power_w or 0.0) >= EV_START_CONFIRMED_POWER_W
         )
         if physically_charging:
             self._ev_start_wait_since = None
@@ -4801,14 +5022,23 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         start_recovery_due = bool(
             wants_charging
             and not_yet_charging
-            and self._ev_start_recovery_attempts < EV_START_FAILED_ATTEMPTS
+            and self._ev_start_recovery_attempts < 12
             and start_wait_seconds >= EV_START_VERIFY_SECONDS
             and write_allowed(
                 self._last_ev_start_recovery_at,
-                EV_START_RECOVERY_RETRY_SECONDS,
+                min(1800, EV_START_RECOVERY_RETRY_SECONDS * 2 ** max(0, self._ev_start_recovery_attempts - 1)),
                 now,
             )
         )
+        observed_offer = self._ev_observed_offer(now)
+        offer_mismatch = bool(wants_charging and ev.desired_amps is not None
+            and observed_offer.get("effective_amps") is not None
+            and abs(observed_offer["effective_amps"] - ev.desired_amps) > EV_CURRENT_DEADBAND_A)
+        offer_repair_due = bool(offer_mismatch and physically_charging
+            and getattr(self, "_ev_offer_repair_attempts", 0) < 3
+            and write_allowed(getattr(self, "_last_ev_offer_repair_at", None), 180, now))
+        if offer_repair_due:
+            structural_changed = True
         if start_recovery_due:
             # A recovery attempt must use the requested offer, not the stale-power
             # 6 A bootstrap that failed to establish a physical session.
@@ -4851,7 +5081,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.site_state,
             ev,
             force_enable=start_recovery_due,
-            override_schedule=start_recovery_due and minimum_recovery_active,
+            override_schedule=start_recovery_due,
         )
         if acts:
             self._last_ev_write_at = now
@@ -4863,10 +5093,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if self._ev_start_recovery_attempts >= EV_START_FAILED_ATTEMPTS:
                 self._ev_start_status = "start_failed"
                 self._ev_control_blocked_reason = "easee_start_failed"
+                await self._async_ev_alert("start_failed", "Laderen reagerer ikke på Wattsons startforsøg. Der forsøges igen med længere mellemrum. Kontroller bilens og laderens egne tidsplaner og ladetilladelse.")
             else:
                 self._ev_start_status = "recovering"
                 self._ev_control_blocked_reason = "easee_start_recovery"
         self._last_ev_fp = structural
+        if offer_repair_due and acts:
+            self._last_ev_offer_repair_at = now
+            self._ev_offer_repair_attempts = getattr(self, "_ev_offer_repair_attempts", 0) + 1
         if not within_deadband:
             self._last_ev_amps = ev.desired_amps
             self._last_ev_currents = ev.desired_circuit_currents
@@ -4874,6 +5108,28 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if transport_reload_candidate:
             acts.extend(await self._async_recover_easee_transport(now))
         return acts
+
+    def _ev_observed_offer(self, now: datetime) -> dict[str, Any]:
+        mapping = self.mapping
+        entity = mapping.easee_power_entity if mapping else None
+        if not entity or not entity.endswith("_power") or not hasattr(self.hass, "states"):
+            return {}
+        prefix = entity[:-6]
+        result = {}
+        for name in ("dynamic_charger_limit", "dynamic_circuit_limit", "reason_for_no_current"):
+            state = self.hass.states.get(f"{prefix}_{name}")
+            if state is None or state.state in {"unknown", "unavailable"}:
+                continue
+            result[name] = state.state
+            if name != "reason_for_no_current":
+                reported = getattr(state, "last_reported", state.last_updated)
+                if 0 <= now.timestamp() - reported.timestamp() <= 180:
+                    try:
+                        amps = float(state.state)
+                        result["effective_amps"] = min(result.get("effective_amps", amps), amps)
+                    except ValueError:
+                        pass
+        return result
 
     def _grid_power_sign_should_be_inverted(self) -> bool:
         configured = bool(entry_value(self.config_entry, CONF_INVERT_GRID_POWER_SIGN, DEFAULT_INVERT_GRID_POWER_SIGN))
