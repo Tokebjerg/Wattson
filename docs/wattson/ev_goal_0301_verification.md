@@ -43,3 +43,18 @@
 - Wattson log search showed no implementation exception, only HA's standard
   custom-integration warning. Actual vehicle charging/full completion cannot
   be certified while charger telemetry and vehicle identity are unavailable.
+
+## Recovered Connection
+
+At 10:52 local, after the second bounded Easee reload, the stream was connected,
+the charger online sensor was on, and Wattson reported ready with no EV problem.
+Fresh Easee status was **disconnected**, agreeing with the refreshed Niro plug
+status. The previous awaiting-start/44.848 kWh was restored charger telemetry,
+not evidence that a vehicle was physically connected. The old physical session
+was correctly cleared only after fresh disconnected telemetry arrived.
+
+The chart's unknown-SOC allocation is consequently a conservative preview,
+not a charging authorization for an attached car. A new connection resets
+session energy and supplies the final deadline/SOC plan. No real EV charging
+or 100% completion was forced or verified. Goal-status dashboard row reads
+the plan sensor so it remains populated while health reports disconnected.
