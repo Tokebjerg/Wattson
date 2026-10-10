@@ -46,6 +46,7 @@ from .const import (
 )
 from .horizon import build_price_slots, build_solar_slots
 from .models import Capabilities, EntityMapping, SiteState
+from .observations import finite_number, observe_numeric, power_factor
 
 
 def _preferred_grid_entity(hass: HomeAssistant, mapping: EntityMapping) -> str:
@@ -105,6 +106,7 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
             CONF_OUTDOOR_TEMPERATURE_ENTITY,
             DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
         ) or None,
+        raw_load_includes_ev=config.get("raw_load_includes_ev", False) is True,
     )
 
 
@@ -164,11 +166,11 @@ def _read_float(
         return None
     if _is_stale(state, stale_seconds):
         stale.append(entity_id)
-    try:
-        return float(state.state)
-    except (TypeError, ValueError):
+    value = finite_number(state.state)
+    if value is None:
         issues.append(f"Non-numeric state for {entity_id}: {state.state}")
         return None
+    return value
 
 
 def _read_bool(
@@ -221,14 +223,15 @@ def _normalize_power_to_watts(hass: HomeAssistant, entity_id: str | None, value:
         return value
     state = hass.states.get(entity_id)
     unit = str(state.attributes.get("unit_of_measurement", "")).lower() if state else ""
-    if unit == "kw":
-        return value * 1000.0
-    return value
+    return value * power_factor(unit)
 
 
 def _is_stale(state: State, stale_seconds: int) -> bool:
-    age = dt_util.utcnow() - state.last_updated
-    return age > timedelta(seconds=stale_seconds)
+    reported = getattr(state, "last_reported", None) or state.last_updated
+    if reported.tzinfo is None:
+        return True
+    age = dt_util.utcnow() - reported
+    return age < timedelta(seconds=-60) or age > timedelta(seconds=stale_seconds)
 
 
 def build_site_state(
@@ -242,6 +245,7 @@ def build_site_state(
     solar_slots=None,
     outdoor_temperature_by_start_c=None,
 ) -> SiteState:
+    now = dt_util.now()
     missing: list[str] = []
     issues: list[str] = []
     stale: list[str] = []
@@ -279,6 +283,8 @@ def build_site_state(
         )
         for entity_id in mapping.pv_power_entities
     ]
+    pv_values = [_normalize_power_to_watts(hass, entity_id, value)
+                 for entity_id, value in zip(mapping.pv_power_entities, pv_values)]
     pv_power = sum(value for value in pv_values if value is not None)
 
     raw_load_power = _read_float(
@@ -298,7 +304,13 @@ def build_site_state(
         stale_seconds=stale_seconds,
     ) or 0.0
     battery_soc = _read_float(hass, mapping.battery_soc_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
+    if not 0.0 <= battery_soc <= 100.0:
+        issues.append(f"Out-of-range battery SOC: {mapping.battery_soc_entity}")
+        battery_soc = 0.0
     battery_power = _read_float(hass, mapping.battery_power_entity, missing=missing, issues=issues, stale=stale, stale_seconds=stale_seconds) or 0.0
+    raw_load_power = _normalize_power_to_watts(hass, mapping.load_power_entity, raw_load_power) or 0.0
+    grid_power = _normalize_power_to_watts(hass, grid_power_entity, grid_power) or 0.0
+    battery_power = _normalize_power_to_watts(hass, mapping.battery_power_entity, battery_power) or 0.0
     # #5: battery pack temperature for the cold-charge guard — fully OPTIONAL. Derived
     # from the battery-power entity's prefix (klatremis: ..._battery_output_power ->
     # ..._battery_temperature); any other naming simply yields None and disables the
@@ -345,7 +357,7 @@ def build_site_state(
                 or dt_util.utcnow() - getattr(entity_state, "last_reported", entity_state.last_updated)
                 > timedelta(seconds=stale_seconds)]
 
-    load_includes_ev = False
+    load_includes_ev = mapping.raw_load_includes_ev
     load_power = raw_load_power
     if (
         grid_power_entity == "sensor.klatremishw_deye_out_of_grid_total_power"
@@ -376,9 +388,14 @@ def build_site_state(
         ev_soc = None
     if ev_soc is not None and not (0.0 <= ev_soc <= 100.0):
         ev_soc = None
-    buy_price = _read_float(hass, mapping.buy_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
-    sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
-    forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=issues, stale=[], stale_seconds=stale_seconds)
+    # Price/forecast faults remove economic evidence, not physical battery control.
+    buy_price = _read_float(hass, mapping.buy_price_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds)
+    sell_price = _read_float(hass, mapping.sell_price_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds)
+    if mapping.buy_price_entity and (price_state := hass.states.get(mapping.buy_price_entity)) is not None and _is_stale(price_state, stale_seconds):
+        buy_price = None
+    if mapping.sell_price_entity and (price_state := hass.states.get(mapping.sell_price_entity)) is not None and _is_stale(price_state, stale_seconds):
+        sell_price = None
+    forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds)
 
     # Phase A trin A1: ingest the hourly planning horizon. Defensive — returns
     # empty lists when the entities do not expose hourly attributes.
@@ -419,7 +436,7 @@ def build_site_state(
         # a local tz-aware value is equally correct there. zoneinfo arithmetic also
         # makes `deadline + timedelta(days=1)` land on the right wall-clock hour
         # across a DST transition.
-        timestamp=dt_util.now(),
+        timestamp=now,
         pv_power_w=pv_power,
         load_power_w=load_power,
         load_includes_ev=load_includes_ev,
@@ -453,4 +470,17 @@ def build_site_state(
         price_slots=price_slots,
         solar_slots=solar_slots,
         outdoor_temperature_by_start_c=outdoor_temperature_by_start_c or {},
+        observations={entity_id: observe_numeric(
+            hass.states.get(entity_id), entity_id, now, stale_seconds,
+            power=entity_id in {mapping.load_power_entity, grid_power_entity,
+                               mapping.battery_power_entity, mapping.easee_power_entity,
+                               *mapping.pv_power_entities},
+            minimum=0 if entity_id == mapping.battery_soc_entity else None,
+            maximum=100 if entity_id == mapping.battery_soc_entity else None,
+        ).as_dict() for entity_id in [*mapping.pv_power_entities, mapping.load_power_entity,
+                                     grid_power_entity, mapping.battery_power_entity,
+                                     mapping.battery_soc_entity, mapping.easee_power_entity,
+                                     mapping.buy_price_entity, mapping.sell_price_entity,
+                                     mapping.forecast_today_entity]
+        if entity_id},
     )

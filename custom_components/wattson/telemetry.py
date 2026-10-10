@@ -39,6 +39,7 @@ from .const import (
     VALUE_MAX_TICK_SECONDS,
 )
 from .deye_contract import TRICKLE_CHARGE_A
+from .accounting import AccountingState, FAMILIES, PERIODS, accounting_field
 from .horizon import current_price_slot
 from .learning import forecast_confidence, solar_bias_factor
 from .planner import (
@@ -159,6 +160,27 @@ def classify_grid_import_power(
 
 class TelemetryMixin:
     """Accumulator state + per-tick methods, mixed into the coordinator."""
+
+    @property
+    def accounting(self) -> AccountingState:
+        if "_accounting_state" not in self.__dict__:
+            self.__dict__["_accounting_state"] = AccountingState()
+        return self.__dict__["_accounting_state"]
+
+    def restore_accounting_sensor(self, family: str, period: str, values: dict,
+                                  *, priority: int = 1) -> None:
+        now = dt_util.now()
+        marker = "day" if period == "today" else period
+        token = {"today": now.date(), "week": now.date().isocalendar()[:2],
+                 "month": (now.year, now.month), "year": now.year}.get(period)
+        if family == "ev_solar":
+            key = {"today": "_evsh_day", "week": "_ev_solar_savings_week",
+                   "month": "_ev_solar_savings_month", "year": "_ev_solar_savings_year"}.get(period)
+        else:
+            key = f"_{family}_{marker}" if period != "total" else None
+        if key:
+            values = {**values, key: token}
+        self.accounting.restore_candidate(values, priority=priority)
 
     def _telemetry_init(self, entry) -> None:
         self.value_today_kr: float = 0.0
@@ -348,6 +370,8 @@ class TelemetryMixin:
         """(import_price, export_price) for the current tick, slot-first."""
         state = self.site_state
         slot = current_price_slot(state.price_slots, state.timestamp) if state.price_slots else None
+        if slot and slot.estimated:
+            slot = None
         import_price = slot.total_import_price if slot else state.current_buy_price
         export_price = slot.export_value if (slot and slot.export_value is not None) else state.current_sell_price
         return import_price, export_price
@@ -361,6 +385,7 @@ class TelemetryMixin:
         their historical continuity.
         """
         now = dt_util.utcnow()
+        self.accounting.pending.clear()
         today = dt_util.now().date()
         iso_week = today.isocalendar()[:2]
         month = (today.year, today.month)
@@ -457,203 +482,40 @@ class TelemetryMixin:
     # Actual import savings
     # ------------------------------------------------------------------ #
     def _accumulate_import_savings(self) -> None:
-        """Accumulate avoided grid-import cost, period-bucketed.
-
-        This is the clean "sparet" number: load that was not bought from the
-        grid, valued with the buy-price horizon. Negative import prices are
-        clamped to 0 because avoiding paid import is not a saving.
-        """
         state = self.site_state
         if state is None:
             return
-        now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._import_savings_day != today:
-            self._import_savings_day = today
-            self.import_savings_today_kr = 0.0
-            self.import_savings_kwh_today = 0.0
-        iso_week = today.isocalendar()[:2]
-        if self._import_savings_week != iso_week:
-            self._import_savings_week = iso_week
-            self.import_savings_week_kr = 0.0
-            self.import_savings_kwh_week = 0.0
-        month = (today.year, today.month)
-        if self._import_savings_month != month:
-            self._import_savings_month = month
-            self.import_savings_month_kr = 0.0
-            self.import_savings_kwh_month = 0.0
-        if self._import_savings_year != today.year:
-            self._import_savings_year = today.year
-            self.import_savings_year_kr = 0.0
-            self.import_savings_kwh_year = 0.0
-        # A newly added yearly sensor has no restore state yet. Keep the
-        # inclusive period invariant true: year must never be lower than the
-        # already-restored current day/week/month buckets.
-        if self._import_savings_day == today:
-            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_today_kr)
-            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_today)
-        if self._import_savings_week == iso_week:
-            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_week_kr)
-            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_week)
-        if self._import_savings_month == month:
-            self.import_savings_year_kr = max(self.import_savings_year_kr, self.import_savings_month_kr)
-            self.import_savings_kwh_year = max(self.import_savings_kwh_year, self.import_savings_kwh_month)
-
-        last = self._import_savings_last_tick
-        self._import_savings_last_tick = now
-        if last is None:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return
-        import_price, _ = self._tick_prices()
-        if import_price is None:
-            return
-        saved_kwh = max(0.0, state.load_power_w - state.grid_import_power_w) / 1000.0 * dt_hours
-        if saved_kwh <= 0.0:
-            return
-        savings = saved_kwh * max(0.0, import_price)
-        self.import_savings_today_kr += savings
-        self.import_savings_week_kr += savings
-        self.import_savings_month_kr += savings
-        self.import_savings_year_kr += savings
-        self.import_savings_total_kr += savings
-        self.import_savings_kwh_today += saved_kwh
-        self.import_savings_kwh_week += saved_kwh
-        self.import_savings_kwh_month += saved_kwh
-        self.import_savings_kwh_year += saved_kwh
-        self.import_savings_kwh_total += saved_kwh
+        self.accounting.advance(
+            "import_savings", now=dt_util.now(), watts=max(0.0, state.load_power_w-state.grid_import_power_w),
+            price=self._tick_prices()[0], slots=state.price_slots,
+            max_gap_seconds=VALUE_MAX_TICK_SECONDS,
+        )
 
     # ------------------------------------------------------------------ #
     # Actual grid import and all-in cost
     # ------------------------------------------------------------------ #
     def _accumulate_grid_import(self) -> None:
-        """Accumulate measured grid import and its all-in buy cost.
-
-        The buy price is slot-first, exactly like Wattson's planner. Negative
-        prices remain signed: being paid to consume reduces the cost sensor.
-        """
         state = self.site_state
         if state is None:
             return
-        now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._grid_import_day != today:
-            self._grid_import_day = today
-            self.grid_import_kwh_today = 0.0
-            self.grid_import_cost_today_kr = 0.0
-        iso_week = today.isocalendar()[:2]
-        if self._grid_import_week != iso_week:
-            self._grid_import_week = iso_week
-            self.grid_import_kwh_week = 0.0
-            self.grid_import_cost_week_kr = 0.0
-        month = (today.year, today.month)
-        if self._grid_import_month != month:
-            self._grid_import_month = month
-            self.grid_import_kwh_month = 0.0
-            self.grid_import_cost_month_kr = 0.0
-        if self._grid_import_year != today.year:
-            self._grid_import_year = today.year
-            self.grid_import_kwh_year = 0.0
-            self.grid_import_cost_year_kr = 0.0
-
-        last = self._grid_import_last_tick
-        self._grid_import_last_tick = now
-        if last is None:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return
-        import_price, _ = self._tick_prices()
-        if import_price is None:
-            return
-        imported_kwh = max(0.0, state.grid_import_power_w) / 1000.0 * dt_hours
-        if imported_kwh <= 0.0:
-            return
-        cost = imported_kwh * import_price
-        for period in GRID_IMPORT_PERIODS:
-            setattr(
-                self,
-                f"grid_import_kwh_{period}",
-                getattr(self, f"grid_import_kwh_{period}") + imported_kwh,
-            )
-            setattr(
-                self,
-                f"grid_import_cost_{period}_kr",
-                getattr(self, f"grid_import_cost_{period}_kr") + cost,
-            )
+        self.accounting.advance(
+            "grid_import", now=dt_util.now(), watts=state.grid_import_power_w,
+            price=self._tick_prices()[0], slots=state.price_slots,
+            max_gap_seconds=VALUE_MAX_TICK_SECONDS,
+        )
 
     # ------------------------------------------------------------------ #
     # Actual export revenue
     # ------------------------------------------------------------------ #
     def _accumulate_export_revenue(self) -> None:
-        """Accumulate actual grid-export revenue, period-bucketed.
-
-        This is deliberately narrower than ``value_today_kr``: only measured
-        net export is counted, and it is priced with the current tick's export
-        value from the sell-price horizon. Negative export prices stay negative
-        so the sensor reflects the real cash effect of exporting in that hour.
-        """
         state = self.site_state
         if state is None:
             return
-        now = dt_util.utcnow()
-        today = dt_util.now().date()
-        if self._export_revenue_day != today:
-            self._export_revenue_day = today
-            self.export_revenue_today_kr = 0.0
-            self.export_revenue_kwh_today = 0.0
-        iso_week = today.isocalendar()[:2]
-        if self._export_revenue_week != iso_week:
-            self._export_revenue_week = iso_week
-            self.export_revenue_week_kr = 0.0
-            self.export_revenue_kwh_week = 0.0
-        month = (today.year, today.month)
-        if self._export_revenue_month != month:
-            self._export_revenue_month = month
-            self.export_revenue_month_kr = 0.0
-            self.export_revenue_kwh_month = 0.0
-        if self._export_revenue_year != today.year:
-            self._export_revenue_year = today.year
-            self.export_revenue_year_kr = 0.0
-            self.export_revenue_kwh_year = 0.0
-        # A newly added yearly sensor has no restore state yet. Keep the
-        # inclusive period invariant true: year must never be lower than the
-        # already-restored current day/week/month buckets.
-        if self._export_revenue_day == today:
-            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_today_kr)
-            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_today)
-        if self._export_revenue_week == iso_week:
-            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_week_kr)
-            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_week)
-        if self._export_revenue_month == month:
-            self.export_revenue_year_kr = max(self.export_revenue_year_kr, self.export_revenue_month_kr)
-            self.export_revenue_kwh_year = max(self.export_revenue_kwh_year, self.export_revenue_kwh_month)
-
-        last = self._export_revenue_last_tick
-        self._export_revenue_last_tick = now
-        if last is None:
-            return
-        dt_hours = (now - last).total_seconds() / 3600.0
-        if dt_hours <= 0 or dt_hours > (VALUE_MAX_TICK_SECONDS / 3600.0):
-            return
-        _, export_price = self._tick_prices()
-        if export_price is None:
-            return
-        export_kwh = max(0.0, state.grid_export_power_w) / 1000.0 * dt_hours
-        if export_kwh <= 0.0:
-            return
-        revenue = export_kwh * export_price
-        self.export_revenue_today_kr += revenue
-        self.export_revenue_week_kr += revenue
-        self.export_revenue_month_kr += revenue
-        self.export_revenue_year_kr += revenue
-        self.export_revenue_total_kr += revenue
-        self.export_revenue_kwh_today += export_kwh
-        self.export_revenue_kwh_week += export_kwh
-        self.export_revenue_kwh_month += export_kwh
-        self.export_revenue_kwh_year += export_kwh
-        self.export_revenue_kwh_total += export_kwh
+        self.accounting.advance(
+            "export_revenue", now=dt_util.now(), watts=state.grid_export_power_w,
+            price=self._tick_prices()[1], slots=state.price_slots,
+            max_gap_seconds=VALUE_MAX_TICK_SECONDS,
+        )
 
     # ------------------------------------------------------------------ #
     # #5: counterfactual savings vs NO battery
@@ -1207,3 +1069,22 @@ class TelemetryMixin:
         for metric, increment in increments.items():
             attr = EV_SOLAR_VALUE_ATTRS[metric].format(period=period)
             setattr(self, attr, float(getattr(self, attr, 0.0) or 0.0) + increment)
+
+
+# Existing entity readers retain their attribute contract. These properties all
+# address one ledger; neither sensors nor the coordinator own duplicate totals.
+for _family, _templates in FAMILIES.items():
+    for _period in PERIODS:
+        for _template in _templates:
+            _name = _template.format(period=_period)
+            setattr(TelemetryMixin, _name, accounting_field(_name))
+    for _marker in ("day", "week", "month", "year", "last_tick"):
+        _name = f"_{_family}_{_marker}"
+        setattr(TelemetryMixin, _name, accounting_field(_name, None))
+for _template in EV_SOLAR_VALUE_ATTRS.values():
+    for _period in PERIODS:
+        _name = _template.format(period=_period)
+        setattr(TelemetryMixin, _name, accounting_field(_name))
+for _name in ("_evsh_day", "_evsh_last_tick", "_ev_solar_savings_week",
+              "_ev_solar_savings_month", "_ev_solar_savings_year"):
+    setattr(TelemetryMixin, _name, accounting_field(_name, None))

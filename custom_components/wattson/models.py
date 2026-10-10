@@ -44,6 +44,7 @@ class EntityMapping:
     # Optional outdoor temperature used to weather-normalise the learned house
     # load. Missing/unavailable keeps the existing history-only forecast.
     outdoor_temperature_entity: str | None = None
+    raw_load_includes_ev: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,7 @@ class PriceSlot:
     # grid-charge/absorb actions — by the time such an hour executes, the real
     # day-ahead price has long replaced the estimate.
     estimated: bool = False
+    duration_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -272,6 +274,7 @@ class SiteState:
     ev_raw_soc_pct: float | None = None
     ev_soc_sample_at: datetime | None = None
     ev_soc_source: str = "unavailable"
+    ev_soc_data_reason: str | None = None
     ev_ac_kwh_per_pct: float | None = None
     ev_full_power_kw: float | None = None
     ev_session_delivered_kwh: float = 0.0
@@ -304,6 +307,7 @@ class SiteState:
     # Coordinator-debounced completion evidence. Raw ``completed`` alone can be
     # transient while Easee closes a session and must not clear a live EV budget.
     easee_completed_stable: bool = False
+    observations: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def solar_surplus_w(self) -> float:
@@ -334,6 +338,15 @@ class BatteryPlan:
     # this firmware — see deye_contract.py: "Load first" fills the pack before
     # any export, and a low charge register stalls the sell path.)
     charge_target_soc_pct: float | None = None
+    discharge_intent: str = "allow"
+
+    def __post_init__(self) -> None:
+        if self.discharge_intent not in {"allow", "hold"}:
+            raise ValueError("invalid battery discharge intent")
+        # Older callers use 0 A as an intent. Preserve that input contract while
+        # new planning code uses a field that cannot be confused with hardware.
+        if self.desired_discharge_current_a == 0.0 and not self.desired_solar_sell:
+            object.__setattr__(self, "discharge_intent", "hold")
 
 
 @dataclass(frozen=True)
@@ -383,6 +396,7 @@ class PlanTask:
     discharge_budget_kwh: float = 0.0
     discharge_extension_allowed: bool = False
     duration_minutes: int = 60
+    allocation_soc_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -431,6 +445,7 @@ class SlotPlan:
     discharge_budget_kwh: float = 0.0
     discharge_extension_allowed: bool = False
     duration_minutes: int = 60
+    allocation_soc_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -444,15 +459,14 @@ class DayPlan:
     initial_soc_pct: float | None = None
 
     def slot_for(self, now: datetime) -> SlotPlan | None:
+        instant = now.timestamp()
         current = None
         for slot in self.slots:
-            if slot.start <= now:
+            if slot.start.timestamp() <= instant:
                 current = slot
             else:
                 break
-        if current is not None and (
-            now - current.start
-        ).total_seconds() < max(1, current.duration_minutes) * 60:
+        if current is not None and instant - current.start.timestamp() < max(1, current.duration_minutes) * 60:
             return current
         return None
 
@@ -461,8 +475,8 @@ class DayPlan:
         if self.initial_soc_pct is None or not self.slots:
             return None
         for index, slot in enumerate(self.slots):
-            slot_end = slot.start + timedelta(minutes=max(1, slot.duration_minutes))
-            if not (slot.start <= now < slot_end):
+            slot_end = slot.start.timestamp() + max(1, slot.duration_minutes) * 60
+            if not (slot.start.timestamp() <= now.timestamp() < slot_end):
                 continue
             end_soc = slot.projected_soc_pct
             if end_soc is None:
@@ -474,9 +488,9 @@ class DayPlan:
             )
             if start_soc is None:
                 return None
-            effective_start = max(slot.start, self.built_at) if index == 0 else slot.start
-            duration = max(1.0, (slot_end - effective_start).total_seconds())
-            progress = max(0.0, min(1.0, (now - effective_start).total_seconds() / duration))
+            effective_start = max(slot.start.timestamp(), self.built_at.timestamp()) if index == 0 else slot.start.timestamp()
+            duration = max(1.0, slot_end - effective_start)
+            progress = max(0.0, min(1.0, (now.timestamp() - effective_start) / duration))
             return float(start_soc) + (float(end_soc) - float(start_soc)) * progress
         return None
 

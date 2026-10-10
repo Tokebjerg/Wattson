@@ -60,7 +60,7 @@ class EvSessionContext:
     ) -> bool:
         """Observe charger telemetry and return True when a new session starts."""
         normalized = (status or "").strip().lower()
-        if normalized in {"", "unknown", "unavailable"}:
+        if normalized in {"", "unavailable"} or normalized.startswith("unknown"):
             return False
         is_connected = normalized != "disconnected"
 
@@ -93,7 +93,7 @@ class EvSessionContext:
             self.session_id = f"{int(now.timestamp())}:{max(0.0, float(session_kwh or 0.0)):.3f}"
             self.connected = True
             self.started_at = now
-            self.energy = EvEnergyMeter(counter_last_kwh=session_kwh)
+            self.energy = EvEnergyMeter(counter_last_kwh=session_kwh, counter_last_at=now.isoformat())
             self.full_goal_limit_kwh = None
             self.full_goal_anchor_at = None
             self.phase_capability = EvPhaseCapability.UNKNOWN
@@ -127,6 +127,15 @@ class EvSessionContext:
         if not entity_id:
             return False
         return self.vehicle == "niro" if entity_id == default_vehicle_entity else self.vehicle == "configured"
+
+    def reset_vehicle_energy(self, *, counter_kwh: float | None, now: datetime) -> None:
+        """Change vehicle evidence without inheriting the previous energy goal."""
+        self.energy = EvEnergyMeter(counter_last_kwh=counter_kwh, counter_last_at=now.isoformat())
+        self.vehicle = "unknown"
+        self.full_goal_limit_kwh = None
+        self.full_goal_anchor_at = None
+        self.notifications = []
+        self.dirty = True
 
     def set_deadline(self, now: datetime, hour: int, *, rearm: bool = False) -> None:
         if self.connected and (rearm or self.deadline_hour != hour or self.started_at is None):

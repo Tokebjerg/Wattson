@@ -7,14 +7,15 @@ from homeassistant.core import HomeAssistant
 
 from .config import merged_entry_config
 from .const import CONF_EASEE_DEVICE_ID, DOMAIN
+from .serialization import json_safe
 
-TO_REDACT = {CONF_EASEE_DEVICE_ID}
+TO_REDACT = {CONF_EASEE_DEVICE_ID, "device_id"}
 
 
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry) -> dict:
     coordinator = hass.data[DOMAIN][entry.entry_id]
     return async_redact_data(
-        {
+        json_safe({
             "config": merged_entry_config(entry),
             "site_state": coordinator.site_state,
             "control_plan": coordinator.control_plan,
@@ -31,6 +32,12 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
             "tick_metrics": coordinator.tick_metrics,
             "decision_traces": coordinator._decision_traces.as_list(),
             "optimizer": coordinator._decision_ledger.as_dict(),
-        },
+            "replay_archive": coordinator._decision_archive.as_dict(),
+            "background": coordinator.background.as_dict(),
+            "accounting": coordinator.accounting.status(),
+            "reserve": getattr(coordinator, "_reserve_decision", None),
+            "command_paths": {"deye": coordinator._klatremis.commands.as_dict(),
+                              "easee": coordinator._easee.commands.as_dict()},
+        }),
         TO_REDACT,
     )

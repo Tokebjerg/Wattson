@@ -1,6 +1,7 @@
 """Wattson integration entrypoints."""
 from __future__ import annotations
 
+import asyncio
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
@@ -92,11 +93,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .coordinator import WattsonCoordinator
 
     coordinator = WattsonCoordinator(hass, entry)
-    await coordinator.async_startup()
-    await coordinator.async_config_entry_first_refresh()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await coordinator.async_startup()
+        await coordinator.async_config_entry_first_refresh()
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except (Exception, asyncio.CancelledError):
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        await coordinator.async_shutdown()
+        raise
     return True
 
 
@@ -117,10 +123,9 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if coordinator is not None:
-        await coordinator.async_save_ev_state()
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        coordinator = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        if coordinator is not None:
+            await coordinator.async_shutdown()
     return unloaded

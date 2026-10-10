@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import math
 from statistics import mean, pstdev
 from typing import Any
+from .serialization import json_safe
+from .physics import DEFAULT_PHYSICS
 
 from .models import PlanTask, SiteState
 from .optimizer import ScheduleScore
@@ -16,6 +18,7 @@ from .optimizer import ScheduleScore
 # hard cap as protection against corrupt persisted data.
 LEDGER_RETENTION_DAYS = 90
 LEDGER_MAX_RECORDS = LEDGER_RETENTION_DAYS * 24 * 12
+HOT_REPLAY_RECORDS = 96
 PROMOTION_MIN_EVALUATIONS = 96
 PROMOTION_MIN_DAYS = 7
 PROMOTION_MIN_MEAN_ADVANTAGE_KR = 0.05
@@ -244,20 +247,20 @@ class DecisionLedger:
         if not isinstance(raw, dict):
             return cls()
         return cls(
-            records=_retain_recent(list(raw.get("records", []))),
+            records=_retain_recent(list(raw.get("records", [])))[-HOT_REPLAY_RECORDS:],
             lifecycle=OptimizerLifecycle.from_dict(raw.get("lifecycle")),
         )
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema": 1,
-            "records": _retain_recent(self.records),
+            "schema": 2,
+            "records": _retain_recent(self.records)[-HOT_REPLAY_RECORDS:],
             "lifecycle": self.lifecycle.as_dict(),
         }
 
     def append(self, record: dict[str, Any]) -> None:
         self.records.append(record)
-        self.records = _retain_recent(self.records)
+        self.records = _retain_recent(self.records)[-HOT_REPLAY_RECORDS:]
 
     def attach_outcome(self, outcome: dict[str, Any]) -> None:
         if self.records:
@@ -275,7 +278,9 @@ class DecisionLedger:
         ]
         realized = [float(row.get("advantage_kr", 0.0)) for row in outcomes]
         return {
-            "exact_records": len(self.records),
+            "exact_records": sum(record.get("schema") == 2 for record in self.records),
+            "incomplete_legacy_records": sum(record.get("schema") != 2 for record in self.records),
+            "full_replay_archive": "daily_partitions_90_days",
             "oldest_record": self.records[0].get("at") if self.records else None,
             "newest_record": self.records[-1].get("at") if self.records else None,
             "replay_mean_advantage_kr": round(mean(advantages), 4) if advantages else 0.0,
@@ -288,19 +293,8 @@ class DecisionLedger:
         }
 
 
-def _tasks(tasks: tuple[PlanTask, ...] | list[PlanTask]) -> list[list[Any]]:
-    return [
-        [
-            task.start.isoformat(),
-            task.action,
-            task.projected_soc_pct,
-            task.pv_estimate_kwh,
-            task.load_estimate_kwh,
-            task.ev_load_estimate_kwh,
-            task.duration_minutes,
-        ]
-        for task in tasks
-    ]
+def _tasks(tasks: tuple[PlanTask, ...] | list[PlanTask]) -> list[dict[str, Any]]:
+    return json_safe(tasks)
 
 
 def _score(score: ScheduleScore) -> dict[str, Any]:
@@ -343,6 +337,10 @@ def build_decision_record(
 ) -> dict[str, Any]:
     """Compact exact input/output snapshot for deterministic replay."""
     return {
+        "schema": 2,
+        "local_timezone": getattr(state.timestamp.tzinfo, "key", None),
+        "physics": json_safe(DEFAULT_PHYSICS),
+        "normalized_input": json_safe(state),
         "at": now.isoformat(),
         "version": version,
         "replan_reason": replan_reason,
@@ -377,7 +375,7 @@ def build_decision_record(
         "load_p50": [[str(key), value] for key, value in load_p50_by_start.items()],
         "load_p90": [[str(key), value] for key, value in load_p90_by_start.items()],
         "ev_load": [[key.isoformat(), value] for key, value in ev_load_by_start.items()],
-        "config": config,
+        "config": json_safe(config),
         "active_tasks": _tasks(active_tasks),
         "candidate_tasks": _tasks(candidate_tasks),
         "comparison": {

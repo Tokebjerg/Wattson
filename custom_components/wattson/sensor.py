@@ -36,6 +36,13 @@ from .ev_observability import recordable_attributes
 from .telemetry import GRID_IMPORT_CAUSES
 
 
+def pricing_attributes(coordinator, family: str, period: str) -> dict:
+    quality = coordinator.accounting.period_status(family, period, dt_util.now())
+    if not quality["pricing_complete"]:
+        quality["avg_sell_price_kr_kwh" if family == "export_revenue" else "avg_buy_price_kr_kwh"] = None
+    return quality
+
+
 @dataclass(frozen=True)
 class WattsonSensorDescription(SensorEntityDescription):
     value_fn: Callable[[Any], Any] = lambda coordinator: None
@@ -636,6 +643,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                     self.coordinator, "ev_minimum_recovery_status", {"state": "idle"}
                 ),
                 "execution": getattr(self.coordinator, "execution_status", {}),
+                "decision_view": self.coordinator.decision_view,
                 "tick_metrics": getattr(self.coordinator, "tick_metrics", {}),
                 "recent_decisions": getattr(
                     self.coordinator, "_decision_traces", None
@@ -712,9 +720,9 @@ class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
         if not self._last_state_matches_period(last_state.last_updated):
             return
         try:
-            setattr(self.coordinator, self._savings_attr, float(last_state.state))
-            setattr(self.coordinator, self._kwh_attr, float(last_state.attributes.get("saved_kwh") or 0.0))
-            self._mark_restored_period()
+            self.coordinator.restore_accounting_sensor(
+                "import_savings", self._period, {self._savings_attr: float(last_state.state), self._kwh_attr: float(last_state.attributes.get("saved_kwh") or 0)}, priority=1,
+            )
         except (TypeError, ValueError):
             return
 
@@ -761,6 +769,7 @@ class WattsonImportSavingsSensor(CoordinatorEntity, RestoreSensor):
         return {
             "saved_kwh": round(kwh, 3),
             "avg_buy_price_kr_kwh": round(savings / kwh, 3) if kwh > 0.001 else None,
+            **pricing_attributes(self.coordinator, "import_savings", self._period),
             "price_source": entry_value(self._entry, CONF_BUY_PRICE_ENTITY, None),
             "note": "Faktisk besparelse: undgået net-import × Wattsons buy-price pr. tick. Salg og betalt negativpris-import er ikke med; negative købspriser tæller som 0 kr.",
         }
@@ -814,14 +823,9 @@ class WattsonGridImportCostSensor(CoordinatorEntity, RestoreSensor):
         if not self._last_state_matches_period(last_state.last_updated):
             return
         try:
-            precise_cost = last_state.attributes.get("cost_kr_precise", last_state.state)
-            setattr(self.coordinator, self._cost_attr, float(precise_cost))
-            setattr(
-                self.coordinator,
-                self._kwh_attr,
-                float(last_state.attributes.get("imported_kwh") or 0.0),
+            self.coordinator.restore_accounting_sensor(
+                "grid_import", self._period, {self._cost_attr: float(last_state.attributes.get("cost_kr_precise", last_state.state)), self._kwh_attr: float(last_state.attributes.get("imported_kwh") or 0)}, priority=2,
             )
-            self._mark_restored_period()
         except (TypeError, ValueError):
             return
 
@@ -861,6 +865,7 @@ class WattsonGridImportCostSensor(CoordinatorEntity, RestoreSensor):
             "imported_kwh": round(kwh, 6),
             "cost_kr_precise": round(cost, 6),
             "avg_buy_price_kr_kwh": round(cost / kwh, 3) if kwh > 0.001 else None,
+            **pricing_attributes(self.coordinator, "grid_import", self._period),
             "price_source": entry_value(self._entry, CONF_BUY_PRICE_ENTITY, None),
             "note": "Faktisk omkostning: målt net-import × Wattsons samlede buy-price pr. tick. Tariffer er med, og negative købspriser reducerer omkostningen.",
         }
@@ -905,14 +910,9 @@ class WattsonGridImportEnergySensor(CoordinatorEntity, RestoreSensor):
         if not self._last_state_matches_period(last_state.last_updated):
             return
         try:
-            precise_kwh = last_state.attributes.get("imported_kwh_precise", last_state.state)
-            setattr(self.coordinator, f"grid_import_kwh_{self._period}", float(precise_kwh))
-            setattr(
-                self.coordinator,
-                f"grid_import_cost_{self._period}_kr",
-                float(last_state.attributes.get("cost_kr_precise") or 0.0),
+            self.coordinator.restore_accounting_sensor(
+                "grid_import", self._period, {f"grid_import_kwh_{self._period}": float(last_state.attributes.get("imported_kwh_precise", last_state.state)), **({f"grid_import_cost_{self._period}_kr": float(last_state.attributes["cost_kr_precise"])} if "cost_kr_precise" in last_state.attributes else {})}, priority=3,
             )
-            self._mark_restored_period()
         except (TypeError, ValueError):
             return
 
@@ -956,6 +956,7 @@ class WattsonGridImportEnergySensor(CoordinatorEntity, RestoreSensor):
             "cost_kr_precise": round(cost, 6),
             "imported_kwh_precise": round(kwh, 6),
             "avg_buy_price_kr_kwh": round(cost / kwh, 3) if kwh > 0.001 else None,
+            **pricing_attributes(self.coordinator, "grid_import", self._period),
             "note": "Målt energi købt fra nettet. Samme tick og periodegrænser som den tilsvarende importomkostning.",
         }
 
@@ -1103,9 +1104,9 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
         if not self._last_state_matches_period(last_state.last_updated):
             return
         try:
-            setattr(self.coordinator, self._revenue_attr, float(last_state.state))
-            setattr(self.coordinator, self._kwh_attr, float(last_state.attributes.get("export_kwh") or 0.0))
-            self._mark_restored_period()
+            self.coordinator.restore_accounting_sensor(
+                "export_revenue", self._period, {self._revenue_attr: float(last_state.state), self._kwh_attr: float(last_state.attributes.get("export_kwh") or 0)}, priority=1,
+            )
         except (TypeError, ValueError):
             return
 
@@ -1152,6 +1153,7 @@ class WattsonExportRevenueSensor(CoordinatorEntity, RestoreSensor):
         return {
             "export_kwh": round(kwh, 3),
             "avg_sell_price_kr_kwh": round(revenue / kwh, 3) if kwh > 0.001 else None,
+            **pricing_attributes(self.coordinator, "export_revenue", self._period),
             "price_source": entry_value(self._entry, CONF_SELL_PRICE_ENTITY, None),
             "note": "Faktisk salgsindtægt: målt net-eksport × Wattsons sell-price/EDS2 pris pr. tick. Negative eksportpriser trækker fra.",
         }
@@ -1229,11 +1231,16 @@ class WattsonNetValueSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         import_savings, export_revenue = self._parts()
+        qualities = [self.coordinator.accounting.period_status(family, self._period, dt_util.now())
+                     for family in ("import_savings", "export_revenue")]
         return {
             "import_savings_kr": round(import_savings, 2),
             "export_revenue_kr": round(export_revenue, 2),
             "saved_kwh": round(float(getattr(self.coordinator, self._IMPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
             "export_kwh": round(float(getattr(self.coordinator, self._EXPORT_KWH_ATTRS[self._period], 0.0) or 0.0), 3),
+            "pricing_complete": all(quality["pricing_complete"] for quality in qualities),
+            "unpriced_kwh": round(sum(quality["unpriced_kwh"] for quality in qualities), 6),
+            "accounting_gap_seconds": self.coordinator.accounting.gap_seconds,
             "note": "Ny hoved-KPI: faktisk besparelse fra undgået net-import + faktisk salgsindtægt fra net-eksport. Erstatter legacy Savings Today som daglig headline.",
         }
 
@@ -1320,13 +1327,9 @@ class WattsonEvSolarSavingsSensor(CoordinatorEntity, RestoreSensor):
         if not self._last_state_matches_period(last_state.last_updated):
             return
         try:
-            setattr(self.coordinator, self._value_attr, float(last_state.state))
-            setattr(self.coordinator, self._gross_attr, float(last_state.attributes.get("gross_avoided_import_kr") or 0.0))
-            setattr(self.coordinator, self._forgone_attr, float(last_state.attributes.get("forgone_export_kr") or 0.0))
-            setattr(self.coordinator, self._pure_kwh_attr, float(last_state.attributes.get("pure_solar_ev_kwh") or 0.0))
-            setattr(self.coordinator, self._grid_kwh_attr, float(last_state.attributes.get("grid_backed_ev_kwh") or 0.0))
-            setattr(self.coordinator, self._ev_kwh_attr, float(last_state.attributes.get("ev_kwh_solar_mode") or 0.0))
-            self._mark_restored_period()
+            self.coordinator.restore_accounting_sensor(
+                "ev_solar", self._period, {self._value_attr: float(last_state.state), self._gross_attr: float(last_state.attributes.get("gross_avoided_import_kr") or 0), self._forgone_attr: float(last_state.attributes.get("forgone_export_kr") or 0), self._pure_kwh_attr: float(last_state.attributes.get("pure_solar_ev_kwh") or 0), self._grid_kwh_attr: float(last_state.attributes.get("grid_backed_ev_kwh") or 0), self._ev_kwh_attr: float(last_state.attributes.get("ev_kwh_solar_mode") or 0)}, priority=1,
+            )
         except (TypeError, ValueError):
             return
 
@@ -1812,6 +1815,7 @@ class WattsonEvChargePlanSensor(CoordinatorEntity, SensorEntity):
             return {"hours": [], "note": "Only active in scheduled-cheapest mode"}
         health = self.coordinator.ev_health
         return recordable_attributes(plan | {
+            "decision_view": self.coordinator.decision_view,
             "charging_status": health["state"],
             "blocked_reason": health.get("blocked_reason"),
             "session_id": self.coordinator._ev_session.session_id,

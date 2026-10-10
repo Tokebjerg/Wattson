@@ -173,14 +173,17 @@ class EvWinterTests(unittest.TestCase):
         done = schedule.energy_schedule(replace(state, ev_session_delivered_kwh=22), ev_target_soc=80)
         self.assertEqual(0, done["required_kwh"])
 
-    def test_full_goal_ignores_exhausted_manual_budget(self):
+    def test_unknown_full_goal_waits_instead_of_assuming_empty_battery(self):
         now = datetime(2026, 10, 3, 10, tzinfo=TZ)
         state = site(now, ev_unknown_budget_kwh=44.16, ev_session_delivered_kwh=44.848,
                      price_slots=prices(now), ev_deadline=now.replace(hour=15))
         plan = schedule.energy_schedule(state, ev_target_soc=100)
-        self.assertGreater(plan["required_kwh"], 30)
-        self.assertTrue(any(h["charge"] for h in plan["hours"]))
-        self.assertEqual("capacity_estimate", plan["goal_status"])
+        self.assertEqual(0, plan["required_kwh"])
+        self.assertFalse(any(h["charge"] for h in plan["hours"]))
+        self.assertEqual("awaiting_vehicle_data", plan["goal_status"])
+        self.assertTrue(plan["waiting_for_vehicle_data"])
+        self.assertFalse(plan["feasible"])
+        self.assertIsNone(plan["remaining_unserved_kwh"])
         self.assertFalse(plan["goal_confirmed"])
         self.assertIsNone(plan["expected_departure_soc"])
 
@@ -442,7 +445,8 @@ class EvWinterTests(unittest.TestCase):
             return ["ttl"]
         co.hass = SimpleNamespace(services=SimpleNamespace(async_call=service, has_service=lambda *args: True))
         co.mapping = None
-        co._easee = SimpleNamespace(apply_ev_plan=apply, refresh_circuit_limit=refresh)
+        co._easee = SimpleNamespace(apply_ev_plan=apply, refresh_circuit_limit=refresh,
+                                   commands=SimpleNamespace(confirm_action=lambda _a: None))
         for key in ("_last_ev_fp", "_last_ev_amps", "_last_ev_currents", "_last_ev_current_change_at",
                     "_last_ev_circuit_refresh_at", "_last_ev_write_at", "_ev_start_wait_since",
                     "_last_ev_start_recovery_at", "_ev_transport_reload_grace_until",

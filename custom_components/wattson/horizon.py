@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import PriceSlot, SolarSlot
+from .observations import finite_number
 
 
 def utc_instant(value: datetime) -> datetime:
@@ -47,10 +48,11 @@ def _parse_dt(value: Any) -> datetime | None:
     # datetime object in the in-memory state (it only looks like an ISO string
     # once serialized to JSON), so accept both forms.
     if isinstance(value, datetime):
-        return value
+        return value if value.tzinfo is not None and value.utcoffset() is not None else None
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(value)
+            return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
         except ValueError:
             return None
     return None
@@ -104,7 +106,7 @@ def _flat_tariff_total(tariffs_attr: Any) -> float:
     total = 0.0
     for value in additional.values():
         try:
-            total += float(value)
+            total += finite_number(value) or 0.0
         except (TypeError, ValueError):
             continue
     return total
@@ -118,7 +120,7 @@ def _hourly_tariff(tariffs_attr: Any, hour: int) -> float:
         return 0.0
     value = hourly.get(str(hour))
     try:
-        return float(value)
+        return finite_number(value) or 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -279,14 +281,14 @@ def _solar_slots_from(hass: Any, entity_id: str | None) -> list[SolarSlot]:
         start = _parse_dt(item.get("period_start"))
         if start is None:
             continue
-        try:
-            estimate = float(item.get("pv_estimate"))
-        except (TypeError, ValueError):
+        estimate = finite_number(item.get("pv_estimate"))
+        if estimate is None or estimate < 0:
             continue
 
         def _opt(key: str) -> float | None:
             try:
-                return float(item[key])
+                value = finite_number(item[key])
+                return value if value is not None and value >= 0 else None
             except (TypeError, ValueError, KeyError):
                 return None
 
@@ -316,13 +318,13 @@ def build_solar_slots(hass: Any, forecast_entity: str | None) -> list[SolarSlot]
 
 
 def current_price_slot(slots: list[PriceSlot], now: datetime) -> PriceSlot | None:
-    """Return the price slot whose hour contains ``now`` (or the latest past one)."""
+    """Only a containing interval is a current price; expired prices are unknown."""
     candidate: PriceSlot | None = None
     for slot in slots:
-        if slot.start <= now:
+        if utc_instant(slot.start) <= utc_instant(now) < (
+            utc_instant(slot.start) + timedelta(minutes=slot.duration_minutes)
+        ):
             candidate = slot
-        else:
-            break
     return candidate
 
 

@@ -11,6 +11,9 @@ from typing import Any
 class EvEnergyMeter:
     delivered_kwh: float = 0.0
     counter_last_kwh: float | None = None
+    counter_last_at: str | None = None
+    counter_progress_at: str | None = None
+    counter_rejected_samples: int = 0
     counter_total_kwh: float = 0.0
     integral_kwh: float = 0.0
     last_tick: str | None = None
@@ -31,7 +34,8 @@ class EvEnergyMeter:
                 power_w: float | None, telemetry_fresh: bool,
                 soc: float | None, soc_at: datetime | None,
                 soc_trusted: bool, nominal_kwh_per_pct: float,
-                full_offer: bool = False, counter_fresh: bool | None = None) -> None:
+                full_offer: bool = False, counter_fresh: bool | None = None,
+                max_power_kw: float = 11.04) -> None:
         if not self.learned:
             self.ac_kwh_per_pct = max(0.1, nominal_kwh_per_pct)
         previous = datetime.fromisoformat(self.last_tick) if self.last_tick else now
@@ -43,13 +47,33 @@ class EvEnergyMeter:
             self.integral_kwh += min(self.last_power_w, power) * elapsed / 3600000.0
         if (telemetry_fresh if counter_fresh is None else counter_fresh) and counter_kwh is not None and isfinite(counter_kwh):
             counter = max(0.0, counter_kwh)
-            if self.counter_last_kwh is not None:
+            if self.counter_last_kwh is None:
+                self.counter_last_kwh = counter
+                self.counter_last_at = now.isoformat()
+            else:
                 change = counter - self.counter_last_kwh
-                # A reset is a new baseline, not a new car. Never count its value
-                # twice; subsequent increments resume metering normally.
-                if 0 <= change <= max(1.0, self.full_power_kw * max(elapsed, 60) / 3600 * 1.5):
+                # Cached identical values must not move the observation baseline.
+                # The counter can arrive in bursts after many controller ticks.
+                counter_at = datetime.fromisoformat(self.counter_last_at) if self.counter_last_at else previous
+                counter_elapsed = max(0.0, now.timestamp() - counter_at.timestamp())
+                ceiling = max(0.0, max_power_kw, self.full_power_kw)
+                possible = max(0.05, ceiling * max(counter_elapsed, 60) / 3600 * 1.5)
+                if change < 0:
+                    self.counter_total_kwh = max(self.counter_total_kwh, self.delivered_kwh, self.integral_kwh)
+                    self.counter_last_kwh = counter
+                    self.counter_last_at = now.isoformat()
+                elif 0 < change <= possible:
                     self.counter_total_kwh += change
-            self.counter_last_kwh = counter
+                    self.counter_last_kwh = counter
+                    self.counter_last_at = now.isoformat()
+                    if change >= 0.01:
+                        self.counter_progress_at = now.isoformat()
+                elif change > possible:
+                    # Keep the last accepted baseline: an invalid sample must
+                    # not erase energy that a later valid reading can recover.
+                    self.counter_rejected_samples += 1
+                if self.counter_last_at is None:
+                    self.counter_last_at = previous.isoformat()
         self.delivered_kwh = max(self.delivered_kwh, self.integral_kwh, self.counter_total_kwh)
         self.last_tick = now.isoformat()
         previous_power = self.last_power_w
@@ -136,7 +160,14 @@ class EvEnergyMeter:
                 datetime.fromisoformat(meter.last_tick)
             if meter.anchor_at:
                 datetime.fromisoformat(meter.anchor_at)
-            if not 0.1 <= meter.ac_kwh_per_pct <= 2 or meter.delivered_kwh < 0:
+            for stamp in (meter.counter_last_at, meter.counter_progress_at):
+                if stamp:
+                    parsed = datetime.fromisoformat(stamp)
+                    if parsed.tzinfo is None:
+                        return cls()
+            numbers = (meter.delivered_kwh, meter.counter_total_kwh, meter.integral_kwh,
+                       meter.ac_kwh_per_pct, meter.full_power_kw)
+            if not all(isfinite(value) and value >= 0 for value in numbers) or not 0.1 <= meter.ac_kwh_per_pct <= 2:
                 return cls()
             return meter
         except (TypeError, ValueError):

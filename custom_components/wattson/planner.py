@@ -1,6 +1,10 @@
 """Planning logic for Wattson."""
 from __future__ import annotations
 
+from .deye_compiler import TOU_CAPACITY_STEP_PCT, _snap_tou_capacity, _non_grid_hold_ceiling, tou_setpoint
+from .physics import BATTERY_NOMINAL_VOLTAGE, DEFAULT_PHYSICS, battery_rate_kwh
+from .reserve import resolve_reserve
+
 from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 import math
@@ -74,14 +78,6 @@ SCHEDULE_GRID_CHARGE_RATE_KWH = 1.15
 # play): the SOC projection schedules ENOUGH cheap charge hours instead of
 # over-promising (the old flat 5.0 kWh/h under-charged winter nights), and the
 # peak reserve never holds back more than the pack can physically deliver.
-BATTERY_NOMINAL_VOLTAGE = 51.0
-
-
-def battery_rate_kwh(current_a: float) -> float:
-    """Energy rate (kWh per hour) for a configured battery current limit."""
-    return max(0.1, float(current_a)) * BATTERY_NOMINAL_VOLTAGE / 1000.0
-
-
 def ev_runtime_state(state: SiteState) -> str:
     """Classify Easee into disconnected, connected, waiting, charging, or complete."""
     status = (state.easee_status or "").strip().lower()
@@ -1237,12 +1233,11 @@ def apply_ev_battery_protect(plan, *, ev_charging: bool, ev_covers_dips: bool):
         return plan
     if plan.strategy == "OVERRIDE_DISCHARGE":  # explicit battery-drain intent — respect it
         return plan
-    dis = getattr(plan, "desired_discharge_current_a", None)
-    if dis == 0.0 and not getattr(plan, "desired_solar_sell", False):
+    if plan.discharge_intent == "hold" and not getattr(plan, "desired_solar_sell", False):
         return plan  # already not discharging and not selling -> not feeding the car
     return replace(
         plan,
-        desired_discharge_current_a=0.0,
+        discharge_intent="hold",
         desired_solar_sell=False,
         reason=(plan.reason + " | EV-beskyt: batteriet lader ikke bilen"),
     )
@@ -1511,7 +1506,6 @@ def peak_reserve_pct(
     return max(0.0, base_reserve_pct - refill_credit_pct)
 
 
-TOU_CAPACITY_STEP_PCT = 5.0  # the Deye quantizes each TOU time-point's capacity SOC% to
 # this step on read-back (verified live: number.*_time_point_N_capacity step=5.0). A
 # FRACTIONAL setpoint (e.g. 50.6) can never equal the 5%-quantized read-back, so the 6 TOU
 # registers rewrite EVERY tick — a limit cycle that was ~95% of the daily register writes
@@ -1525,36 +1519,8 @@ LIVE_DIP_BUFFER_PCT = 2.0 * TOU_CAPACITY_STEP_PCT
 LIVE_DEFICIT_RESERVE_BUFFER_KWH = 1.0
 
 
-def _snap_tou_capacity(pct: float, *, up: bool) -> float:
-    """Snap a TOU capacity SOC% to the inverter's native 5% step. ``up=True`` (discharge
-    FLOORS) rounds UP so the enforced reserve never drops below the intended floor;
-    ``up=False`` (charge TARGETS) rounds DOWN so the pack never charges above the intended
-    cap (LFP calendar-aging care). Both round toward the SAFE direction."""
-    step = TOU_CAPACITY_STEP_PCT
-    q = (math.ceil(pct / step) if up else math.floor(pct / step)) * step
-    return float(q)
 
 
-def _non_grid_hold_ceiling(
-    soc_pct: float,
-    *,
-    min_soc: float,
-    max_soc: float,
-) -> float:
-    """Lowest native TOU step that does not implicitly release live energy.
-
-    A floor far above the energy that is actually present cannot describe a
-    physical reserve; on Deye it instead acts as an implicit hold. Keep the cap
-    in the safe hold direction: rounding projected/live SOC down would silently
-    open up to 4.9 percentage points and can spend energy in a cheap hour. An
-    intentional self-consumption envelope is opened separately by the planner.
-    """
-    minimum_floor = _snap_tou_capacity(float(min_soc), up=True)
-    available_floor = _snap_tou_capacity(
-        float(min(max_soc, max(0.0, soc_pct))),
-        up=True,
-    )
-    return min(float(max_soc), max(minimum_floor, available_floor))
 
 
 def energy_backed_reserve_floor_pct(
@@ -1586,89 +1552,6 @@ def energy_backed_reserve_floor_pct(
     )
 
 
-def tou_setpoint(
-    plan: BatteryPlan,
-    *,
-    soc_pct: float,
-    min_soc: float,
-    discharge_floor: float,
-    max_soc: float,
-) -> tuple[float | None, bool | None]:
-    """Deye TOU time-point setpoint (capacity SOC%, grid-charge-enable) for a plan.
-
-    The Deye treats each TOU time-point's "capacity" as the SOC it may discharge
-    DOWN TO in that slot — i.e. a hard discharge floor that otherwise silently
-    overrides Wattson. Self-consumption first: Wattson keeps the floor at its own
-    discharge floor for every non-charging strategy, so the inverter can ALWAYS
-    cover the house from the battery down to that floor (incl. a sudden,
-    unexpected load) instead of importing — no waiting for Wattson's next tick.
-      - covering the house / holding / idle / sell-solar / EV-solar -> the
-        discharge floor (min_soc + reserve);
-      - grid-charging / force-charge -> the charge target (max_soc) + enable;
-      - force-discharge -> min_soc (drain fully);
-      - protect -> max SOC as a hard floor with grid charge disabled;
-      - hold -> current SOC (explicitly hold, never inherit an older slot);
-      - block negative export -> the calculated discharge floor, so export is
-        blocked without disabling self-consumption.
-    ``soc_pct`` supplies the explicit hold target.
-    """
-    if plan.strategy == "PROTECT":
-        return (_snap_tou_capacity(float(max_soc), up=True), False)
-    if plan.strategy == "HOLD":
-        return (
-            min(
-                _snap_tou_capacity(float(min(max_soc, max(min_soc, soc_pct))), up=True),
-                float(max_soc),
-            ),
-            False,
-        )
-    if plan.desired_grid_charge or plan.strategy == "OVERRIDE_CHARGE":
-        # Battery care: a plan may cap its own grid-charge target below max_soc
-        # (LFP calendar aging at 100 %); absorb/force-charge plans leave it None.
-        target = plan.charge_target_soc_pct if plan.charge_target_soc_pct is not None else max_soc
-        # Round the charge target DOWN to the step so it never charges above the care cap.
-        return (_snap_tou_capacity(float(min(max_soc, target)), up=False), True)
-    if plan.strategy == "OVERRIDE_DISCHARGE":
-        return (_snap_tou_capacity(float(min_soc), up=True), False)
-    # A semantic 0 A means "do not let the battery discharge in this plan". The
-    # physical max-discharge register is a hard 70 A constant (v0.25.11), so carry
-    # the same intent through Deye's native TOU floor instead. This covers full-
-    # speed/scheduled EV protection, HOLD_FULL and solar-charge/hold overrides.
-    if (
-        getattr(plan, "desired_discharge_current_a", None) == 0.0
-        and not getattr(plan, "desired_solar_sell", False)
-        and plan.strategy != "SELL_SOLAR_PEAK"
-    ):
-        return (
-            min(
-                _snap_tou_capacity(float(min(max_soc, max(min_soc, soc_pct))), up=True),
-                float(max_soc),
-            ),
-            False,
-        )
-    live_hold_ceiling = _non_grid_hold_ceiling(
-        soc_pct,
-        min_soc=min_soc,
-        max_soc=max_soc,
-    )
-    if plan.strategy == "BLOCK_NEGATIVE_EXPORT":
-        return (
-            min(
-                _snap_tou_capacity(float(discharge_floor), up=True),
-                live_hold_ceiling,
-            ),
-            False,
-        )
-    # Every other state covers the house down to the discharge floor. Round the floor UP
-    # to the step (never let the inverter discharge below the intended reserve), clamped
-    # to max_soc, so the setpoint is a clean 5-multiple that converges (no limit cycle).
-    return (
-        min(
-            _snap_tou_capacity(float(discharge_floor), up=True),
-            live_hold_ceiling,
-        ),
-        False,
-    )
 
 
 # Strategies that bypass the anti-hunt dwell — they apply immediately, never held:
@@ -3316,13 +3199,67 @@ def build_day_plan(
             discharge_extension_allowed=discharge_extension_allowed,
             duration_minutes=task.duration_minutes,
         ))
-    return DayPlan(
+    result = DayPlan(
         built_at=state.timestamp,
         day=plan_slots[0].start.date(),
         slots=tuple(plan_slots),
         tasks=tuple(committed_tasks),
         initial_soc_pct=state.battery_soc_pct,
     )
+    return reproject_day_plan(result, state, capacity_kwh=capacity_kwh, min_soc=min_soc,
+        max_soc=max_soc, charge_current_a=charge_current_a, discharge_current_a=discharge_current_a,
+        grid_charge_rate_kwh=grid_charge_rate_kwh, battery_care_soc=battery_care_soc,
+        ev_battery_protected=ev_battery_protected, load_hourly_w=load_hourly_w)
+
+
+def reproject_day_plan(plan: DayPlan, state: SiteState, *, capacity_kwh: float,
+                       min_soc: float, max_soc: float, charge_current_a: float = 70,
+                       discharge_current_a: float = 70, grid_charge_rate_kwh: float | None = None,
+                       battery_care_soc: float = 100, ev_battery_protected: bool = False,
+                       load_hourly_w: dict | None = None, **_unused) -> DayPlan:
+    """Project final register policy, not an unconstrained optimizer proposal."""
+    capacity = max(0.1, capacity_kwh)
+    stored = min(capacity * max_soc / 100, max(0.0, state.battery_soc_pct * capacity / 100))
+    tasks, slots = [], []
+    for task, slot in zip(plan.tasks, plan.slots):
+        duration = max(1, task.duration_minutes) / 60
+        remaining = max(0.0, min(duration,
+            (task.start.timestamp() + duration * 3600 - state.timestamp.timestamp()) / 3600))
+        fraction = remaining / duration
+        reserve = resolve_reserve(hard_floor=min_soc, max_soc=max_soc,
+            committed_floor=slot.tou_floor_pct, fallback_floor=min_soc)
+        charge_a = slot.charge_current_a if slot.charge_current_a is not None else charge_current_a
+        if (slot.sell and not slot.grid_charge and (task.pv_estimate_kwh or 0) > (task.load_estimate_kwh or 0)
+                and sell_throttle_active(price_slots=state.price_slots, solar_slots=state.solar_slots,
+                    load_hourly_w=load_hourly_w, now=task.start, soc_pct=stored/capacity*100,
+                    max_soc_pct=max_soc, capacity_kwh=capacity_kwh)[0]):
+            charge_a = min(charge_a, SELL_THROTTLE_CHARGE_A)
+        target_pct = max_soc if task.total_import_price < 0 else min(max_soc, battery_care_soc)
+        if task.grid_charge_target_soc_pct is not None:
+            target_pct = min(target_pct, task.grid_charge_target_soc_pct)
+        flow = DEFAULT_PHYSICS.flow(stored_kwh=stored,
+            pv_kwh=max(0, task.pv_estimate_kwh or 0) * fraction,
+            load_kwh=max(0, task.load_estimate_kwh or 0) * fraction,
+            ev_kwh=max(0, task.ev_load_estimate_kwh or 0) * fraction,
+            protect_ev=ev_battery_protected, floor_kwh=reserve.floor_pct * capacity / 100,
+            ceiling_kwh=max_soc * capacity / 100,
+            charge_rate_kw=battery_rate_kwh(charge_a),
+            discharge_rate_kw=battery_rate_kwh(discharge_current_a),
+            grid_charge_rate_kw=(grid_charge_rate_kwh if grid_charge_rate_kwh is not None
+                                 else SCHEDULE_GRID_CHARGE_RATE_KWH),
+            duration_hours=remaining, grid_charge=slot.grid_charge,
+            charge_target_kwh=target_pct * capacity / 100, sell=slot.sell)
+        stored = flow.stored_kwh
+        projected = round(stored / capacity * 100, 3)
+        tasks.append(replace(task, projected_soc_pct=projected, tou_floor_pct=reserve.floor_pct,
+                             charge_current_a=charge_a,
+                             allocation_soc_pct=(task.allocation_soc_pct if task.allocation_soc_pct is not None
+                                                 else task.projected_soc_pct)))
+        slots.append(replace(slot, projected_soc_pct=projected, tou_floor_pct=reserve.floor_pct,
+                             charge_current_a=charge_a,
+                             allocation_soc_pct=(slot.allocation_soc_pct if slot.allocation_soc_pct is not None
+                                                 else slot.projected_soc_pct)))
+    return replace(plan, tasks=tuple(tasks), slots=tuple(slots), initial_soc_pct=state.battery_soc_pct)
 
 
 def preserve_routine_discharge_commitments(
@@ -3542,7 +3479,7 @@ def execute_slot(
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
-                desired_discharge_current_a=0.0,
+                discharge_intent="hold",
                 charge_target_soc_pct=min(float(battery_care_soc), max(float(plan_target), min_soc)),
             ),
             negative_export_active,
@@ -3561,7 +3498,7 @@ def execute_slot(
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
-                desired_discharge_current_a=0.0,
+                discharge_intent="hold",
             ),
             negative_export_active,
         )
@@ -3595,7 +3532,7 @@ def execute_slot(
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
-                desired_discharge_current_a=0.0,
+                discharge_intent="hold",
             ),
             negative_export_active,
         )
@@ -3857,7 +3794,7 @@ def _horizon_battery_plan(
             # mode, or it hunts between charging and exporting.
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
-            desired_discharge_current_a=0.0,
+            discharge_intent="hold",
             charge_target_soc_pct=battery_care_soc,
         )
 
@@ -4221,8 +4158,9 @@ def dp_schedule(
             # FORCED PV charge: Load first absorbs the surplus before anything
             # exports, capped by rate and headroom — not a decision on this
             # firmware.
-            pv_charge = min(surplus, rate, max(0.0, max_kwh - s))
-            leftover = surplus - pv_charge
+            pv_input = DEFAULT_PHYSICS.charge_input(surplus, rate, max_kwh - s)
+            pv_charge = DEFAULT_PHYSICS.stored(pv_input)
+            leftover = surplus - pv_input
             export = leftover if (sellable and exp_p >= 0.0) else 0.0
             base_revenue = export * exp_p
             best = INF
@@ -4230,13 +4168,13 @@ def dp_schedule(
             if deficit > _DP_EPS:
                 # Deficit hour: choose discharge in [0 .. min(deficit, rate, s-floor)]
                 # or grid-charge upward. (No surplus -> no PV charge.)
-                max_dis = min(deficit, dis_rate, max(0.0, s - floor_kwh))
+                max_dis = DEFAULT_PHYSICS.delivered(deficit, dis_rate, s - floor_kwh)
                 for j, s2 in enumerate(levels):
                     d = s2 - s
                     if d > 0:  # grid charge
                         if not allow_grid_charge:
                             continue
-                        if d > grid_rate + 1e-9:
+                        if d > DEFAULT_PHYSICS.stored(grid_rate) + 1e-9:
                             continue
                         if s2 > care_kwh + 1e-9 and imp_p >= 0:
                             continue  # battery care: plain grid charge stops at care SOC
@@ -4245,13 +4183,13 @@ def dp_schedule(
                         # ``d`` is stored battery energy. Buying it requires more
                         # grid energy after conversion losses; this makes the DP
                         # use the same round-trip economics as the heuristic gate.
-                        bought = d / max(0.01, BATTERY_ROUND_TRIP_EFFICIENCY)
+                        bought = d / DEFAULT_PHYSICS.charge_efficiency
                         cost = protected_grid_cost + (deficit + bought) * imp_p + d * margin
                     else:
-                        dis = -d
+                        dis = -d * DEFAULT_PHYSICS.discharge_efficiency
                         if dis > max_dis + 1e-9:
                             continue
-                        cost = protected_grid_cost + (deficit - dis) * imp_p + dis * wear
+                        cost = protected_grid_cost + (deficit - dis) * imp_p + (-d) * wear
                     tot = cost + value[j]
                     if tot < best:
                         best, best_j = tot, j
@@ -4276,9 +4214,9 @@ def dp_schedule(
                         # Paid (negative-price) grid top-up ON TOP of forced PV charge:
                         # the grid part is throttled to grid_rate, and total intake
                         # (PV + grid) still can't exceed the pack's full rate.
-                        if d2 > grid_rate + 1e-9 or pv_charge + d2 > rate + 1e-9:
+                        if d2 > DEFAULT_PHYSICS.stored(grid_rate) + 1e-9 or pv_charge + d2 > DEFAULT_PHYSICS.stored(rate) + 1e-9:
                             continue
-                        bought = d2 / max(0.01, BATTERY_ROUND_TRIP_EFFICIENCY)
+                        bought = d2 / DEFAULT_PHYSICS.charge_efficiency
                         cost = protected_grid_cost + bought * imp_p + d2 * margin - base_revenue
                     else:
                         continue  # no discharge against a surplus; no paid top-up
@@ -4302,7 +4240,8 @@ def dp_schedule(
         s2 = levels[sj]
         surplus = max(0.0, solar_kwh - load_kwh)
         sellable = (slot.export_value is None) or (slot.export_value > 0)
-        pv_charge = min(surplus, rate, max(0.0, max_kwh - s))
+        pv_input = DEFAULT_PHYSICS.charge_input(surplus, rate, max_kwh - s)
+        pv_charge = DEFAULT_PHYSICS.stored(pv_input)
         if deficit > 0:
             d = s2 - s
             grid_part = max(0.0, d)
@@ -4314,7 +4253,7 @@ def dp_schedule(
             if grid_part <= step / 2 + 1e-9:
                 grid_part = 0.0  # nearest-bucket rounding, not a real top-up
             dis = 0.0
-            leftover = surplus - pv_charge
+            leftover = surplus - pv_input
         export = leftover if sellable else 0.0
         # Labels keep the profile personality (the registers barely differ):
         # export-friendly profiles headline the sale; self-sufficiency (green)
@@ -4400,20 +4339,22 @@ def _schedule_expected_cost(
         exp_p = max(0.0, slot.export_value or 0.0)
         cost += protected_grid * slot.total_import_price
         if surplus > 0:
-            pv_charge = min(surplus, rate, max(0.0, max_kwh - soc))
+            pv_input = DEFAULT_PHYSICS.charge_input(surplus, rate, max_kwh - soc)
+            pv_charge = DEFAULT_PHYSICS.stored(pv_input)
             grid_part = max(0.0, d - pv_charge)
-            leftover = max(0.0, surplus - max(0.0, min(d, pv_charge) if d > 0 else pv_charge))
+            leftover = max(0.0, surplus - max(0.0, min(d, pv_charge) if d > 0 else pv_charge)
+                           / DEFAULT_PHYSICS.charge_efficiency)
             cost += (
-                grid_part / max(0.01, BATTERY_ROUND_TRIP_EFFICIENCY)
+                grid_part / DEFAULT_PHYSICS.charge_efficiency
             ) * slot.total_import_price
             cost -= (leftover if sellable else 0.0) * exp_p
         else:
             if d >= 0:
-                bought = d / max(0.01, BATTERY_ROUND_TRIP_EFFICIENCY)
+                bought = d / DEFAULT_PHYSICS.charge_efficiency
                 cost += (deficit + bought) * slot.total_import_price
             else:
-                dis = min(-d, deficit)
-                cost += (deficit - dis) * slot.total_import_price + dis * BATTERY_WEAR_COST
+                dis = min(-d * DEFAULT_PHYSICS.discharge_efficiency, deficit)
+                cost += (deficit - dis) * slot.total_import_price + (-d) * BATTERY_WEAR_COST
         soc = end
     cost -= max(0.0, soc - floor_kwh) * end_value
     return cost
@@ -4556,7 +4497,7 @@ def build_battery_plan(
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
                 desired_export_limit_w=export_limit_default_w,
-                desired_discharge_current_a=0.0,
+                discharge_intent="hold",
             ),
             False,
         )
@@ -4866,6 +4807,9 @@ def build_ev_plan(
             ev_target_soc=ev_target_soc, ev_charge_speed_pct_h=ev_charge_speed_pct_h,
             ev_min_soc=ev_min_soc, ev_charge_until_complete=ev_charge_until_complete,
             ev_minimum_recovery_complete=ev_minimum_recovery_complete, ev_max_amps=ev_max_amps)
+        if overview.get("waiting_for_vehicle_data"):
+            return EvPlan(mode=ev_mode, reason=overview["note"],
+                          desired_enabled=False, desired_action="pause")
         if overview["overdue"] or overview["required_kwh"] <= 0.001:
             reason = "Deadline elapsed" if overview["overdue"] else (
                 overview["note"] if overview["full_goal"] else f"target {ev_target_soc:.0f}% reached")
@@ -5074,7 +5018,8 @@ def build_override_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=default_charge_current_a,
-            desired_discharge_current_a=(default_discharge_current_a if _sell else 0.0),
+            desired_discharge_current_a=default_discharge_current_a,
+            discharge_intent="allow" if _sell else "hold",
         )
     if action == BATTERY_OVERRIDE_SOLAR_CHARGE:
         # Like force-charge, but NEVER buys from the grid — the pack fills ONLY from the PV
@@ -5099,7 +5044,8 @@ def build_override_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=default_charge_current_a,
-            desired_discharge_current_a=(default_discharge_current_a if _sell else 0.0),
+            desired_discharge_current_a=default_discharge_current_a,
+            discharge_intent="allow" if _sell else "hold",
         )
     if action == BATTERY_OVERRIDE_DISCHARGE:
         return BatteryPlan(
@@ -5122,7 +5068,7 @@ def build_override_battery_plan(
             desired_limit_control_mode="Zero export to CT",
             desired_export_limit_w=export_limit_default_w,
             desired_max_charge_current_a=0.0,
-            desired_discharge_current_a=0.0,
+            discharge_intent="hold",
         )
     return None
 
@@ -5141,7 +5087,9 @@ def ev_current_within_deadband(
     always applied.
     """
     if prev_amps is None and prev_currents is None:
-        return False
+        # A pause has no current offer. Structural state owns the initial write;
+        # an absent offer must not create an independent, unlimited pause loop.
+        return new_amps is None and new_currents is None
     if (prev_currents is None) != (new_currents is None):
         return False
     if prev_currents is not None and new_currents is not None:

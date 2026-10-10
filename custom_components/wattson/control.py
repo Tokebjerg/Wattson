@@ -16,6 +16,7 @@ from .const import (
 )
 from .models import BatteryPlan, EntityMapping, EvPlan, SiteState
 from .safety import is_contended, prune_history
+from .commands import CommandActions, DeviceCommandPath, command_batch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ MAX_WRITE_ATTEMPTS = 3
 class KlatremisController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
+        self.commands = DeviceCommandPath(hass, "deye")
         # entity_id -> consecutive unconverged write attempts
         self._write_attempts: dict[str, int] = {}
         self.degraded_entities: set[str] = set()
@@ -91,6 +93,7 @@ class KlatremisController:
         self.degraded_entities.clear()
 
     def _mark_converged(self, entity_id: str) -> None:
+        self.commands.confirm(entity_id)
         self._write_attempts.pop(entity_id, None)
         self.degraded_entities.discard(entity_id)
         self._best_effort_retry_after.pop(entity_id, None)
@@ -134,7 +137,7 @@ class KlatremisController:
             self._mark_converged(entity_id)
             return []
         service = "turn_on" if enabled else "turn_off"
-        await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        await self.commands.call("switch", service, {"entity_id": entity_id}, blocking=True)
         self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, target_state, degraded)]
@@ -148,7 +151,7 @@ class KlatremisController:
         if current is not None and current.state == option:
             self._mark_converged(entity_id)
             return []
-        await self.hass.services.async_call("select", "select_option", {"entity_id": entity_id, "option": option}, blocking=True)
+        await self.commands.call("select", "select_option", {"entity_id": entity_id, "option": option}, blocking=True)
         self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, option, degraded)]
@@ -166,11 +169,12 @@ class KlatremisController:
                     return []
             except (TypeError, ValueError):
                 pass
-        await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+        await self.commands.call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
         self._count_write(entity_id)
         degraded = self._mark_attempt(entity_id)
         return [self._action(entity_id, value, degraded)]
 
+    @command_batch
     async def apply_battery_plan(
         self, mapping: EntityMapping, plan: BatteryPlan, now: datetime | None = None
     ) -> list[str]:
@@ -224,7 +228,48 @@ class KlatremisController:
         if plan.desired_tou_charge_enable is not None:
             for entity_id in mapping.tou_charge_enable_switches:
                 actions.extend(await self._set_switch_best_effort(entity_id, plan.desired_tou_charge_enable))
-        return actions
+        return CommandActions(actions, verified=not actions and self.battery_plan_converged(mapping, plan))
+
+    def battery_plan_converged(self, mapping: EntityMapping, plan: BatteryPlan) -> bool:
+        """No-write is only convergence when every requested register reads back."""
+        targets = [
+            (mapping.grid_charge_switch, plan.desired_grid_charge, False),
+            (mapping.solar_sell_switch, plan.desired_solar_sell, False),
+            (mapping.energy_priority_select, plan.desired_energy_priority, False),
+            (mapping.limit_control_mode_select, plan.desired_limit_control_mode, False),
+            (mapping.export_limit_number, plan.desired_export_limit_w, False),
+            (mapping.battery_grid_charge_current_number, plan.desired_charge_current_a, False),
+            (mapping.battery_charge_current_number, plan.desired_max_charge_current_a, False),
+            (mapping.battery_discharge_current_number, float(BATTERY_DISCHARGE_CURRENT_MAX), False),
+        ]
+        if plan.desired_tou_capacity_pct is not None:
+            if not mapping.tou_capacity_numbers:
+                return False
+            targets.extend((entity, plan.desired_tou_capacity_pct, True) for entity in mapping.tou_capacity_numbers)
+        if plan.desired_tou_charge_enable is not None:
+            if not mapping.tou_charge_enable_switches:
+                return False
+            targets.extend((entity, plan.desired_tou_charge_enable, False) for entity in mapping.tou_charge_enable_switches)
+        for entity, value, native_step in targets:
+            if value is None:
+                continue
+            state = self.hass.states.get(entity) if entity else None
+            if state is None or self._blip(state) or state.attributes.get("restored"):
+                return False
+            if isinstance(value, bool):
+                if state.state != ("on" if value else "off"):
+                    return False
+            elif isinstance(value, str):
+                if state.state != value:
+                    return False
+            else:
+                try:
+                    step = float(state.attributes.get("step") or 0) if native_step else 0
+                    if not abs(float(state.state)-value) < max(.1, step/2):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        return True
 
     async def _set_number_best_effort(self, entity_id: str | None, value: float | None) -> list[str]:
         """Write a number without convergence/contention accounting (belt registers)."""
@@ -255,7 +300,7 @@ class KlatremisController:
             self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
             return [self._action(entity_id, value, True)]
         try:
-            await self.hass.services.async_call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
+            await self.commands.call("number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True)
         except Exception:  # noqa: BLE001 - keep normal battery control alive
             if degraded:
                 self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
@@ -284,7 +329,7 @@ class KlatremisController:
             return [self._action(entity_id, target_state, True)]
         service = "turn_on" if enabled else "turn_off"
         try:
-            await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+            await self.commands.call("switch", service, {"entity_id": entity_id}, blocking=True)
         except Exception:  # noqa: BLE001
             if degraded:
                 self._best_effort_retry_after[entity_id] = now + timedelta(minutes=5)
@@ -297,6 +342,7 @@ class KlatremisController:
 class EaseeController:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
+        self.commands = DeviceCommandPath(hass, "easee")
         self._last_phase_change_at = None  # datetime of the last 1<->3 phase switch
         self.write_counts: dict[str, int] = {}
 
@@ -334,21 +380,21 @@ class EaseeController:
         if not force and current is not None and current.state == target_state:
             return []
         service = "turn_on" if enabled else "turn_off"
-        await self.hass.services.async_call("switch", service, {"entity_id": entity_id}, blocking=True)
+        await self.commands.call("switch", service, {"entity_id": entity_id}, blocking=True)
         self._count_write("easee.enable")
         return [f"{entity_id}={target_state}"]
 
     async def _action(self, device_id: str | None, action: str | None) -> list[str]:
         if not device_id or not action:
             return []
-        await self.hass.services.async_call("easee", "action_command", {"device_id": device_id, "action_command": action}, blocking=True)
+        await self.commands.call("easee", "action_command", {"device_id": device_id, "action_command": action}, blocking=True)
         self._count_write("easee.action")
         return [f"easee.action_command={action}"]
 
     async def _set_dynamic_limit(self, device_id: str | None, amps: int | None) -> list[str]:
         if not device_id or amps is None:
             return []
-        await self.hass.services.async_call("easee", "set_charger_dynamic_limit", {"device_id": device_id, "current": amps}, blocking=True)
+        await self.commands.call("easee", "set_charger_dynamic_limit", {"device_id": device_id, "current": amps}, blocking=True)
         self._count_write("easee.charger_limit")
         return [f"easee.dynamic_limit={amps}A"]
 
@@ -360,7 +406,7 @@ class EaseeController:
         if not device_id or currents is None:
             return []
         p1, p2, p3 = currents
-        await self.hass.services.async_call(
+        await self.commands.call(
             "easee",
             "set_circuit_dynamic_limit",
             {
@@ -375,6 +421,7 @@ class EaseeController:
         self._count_write("easee.circuit_limit")
         return [f"easee.circuit_dynamic_limit=({p1},{p2},{p3})A"]
 
+    @command_batch
     async def refresh_circuit_limit(
         self,
         mapping: EntityMapping,
@@ -386,10 +433,11 @@ class EaseeController:
     async def _set_phase_mode(self, device_id: str | None, phase_mode: str | None) -> list[str]:
         if not device_id or not phase_mode:
             return []
-        await self.hass.services.async_call("easee", "set_charger_phase_mode", {"device_id": device_id, "phase_mode": phase_mode}, blocking=True)
+        await self.commands.call("easee", "set_charger_phase_mode", {"device_id": device_id, "phase_mode": phase_mode}, blocking=True)
         self._count_write("easee.phase_mode")
         return [f"easee.phase_mode={phase_mode}"]
 
+    @command_batch
     async def apply_ev_plan(
         self,
         mapping: EntityMapping,

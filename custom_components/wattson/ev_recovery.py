@@ -42,6 +42,7 @@ class EvMinimumRecovery:
     last_tick_at: datetime
     complete: bool = False
     completed_at: datetime | None = None
+    meter_source: str = "easee_session"
 
     @property
     def session_delivered_kwh(self) -> float:

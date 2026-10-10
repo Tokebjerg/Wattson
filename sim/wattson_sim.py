@@ -1645,18 +1645,9 @@ def test_f_savings():
         coord._accumulate_import_savings()
         coord.site_state = importstate(current, 3000.0)
         coord._accumulate_grid_import()
-        # Simulate the first deploy of a new yearly sensor: day/week/month
-        # restored, but year is still at 0. The accumulator should floor the
-        # inclusive yearly bucket to the current shorter period before adding
-        # future ticks.
-        coord.export_revenue_year_kr = 0.0
-        coord.export_revenue_kwh_year = 0.0
-        coord.import_savings_year_kr = 0.0
-        coord.import_savings_kwh_year = 0.0
-        coord._export_revenue_year = current.date().year
-        coord._import_savings_year = current.date().year
-        coord._export_revenue_last_tick = None
-        coord._import_savings_last_tick = None
+        # A restored sensor is a view; it cannot erase a running ledger year.
+        coord.accounting.restore_candidate({"export_revenue_year_kr": 0.0,
+                                            "import_savings_year_kr": 0.0}, priority=10)
         current = at(13, 4)
         coord.site_state = estate(current, 0.0)
         coord._accumulate_export_revenue()
@@ -1706,7 +1697,7 @@ def test_f_savings():
                        coord.import_savings_total_kr,
                    )), str((coord.import_savings_today_kr, coord.import_savings_week_kr, coord.import_savings_month_kr, coord.import_savings_year_kr, coord.import_savings_total_kr))))
     checks.append(("import savings telemetry tracks self-supplied kWh beside DKK",
-                   abs(coord.import_savings_kwh_today - (2.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
+                   abs(coord.import_savings_kwh_today - (3.0 / 30.0)) < 1e-6, str(coord.import_savings_kwh_today)))
     # 2 kW for 2 min @ 2.0 = +0.1333 kr, then 3 kW for 2 min @ -0.5
     # = -0.05 kr. The hour-long gap between them must not be counted.
     expected_import_kwh = (2.0 + 3.0) * (2.0 / 60.0)
@@ -1729,7 +1720,7 @@ def test_f_savings():
     checks.append(("net value yearly parts are import savings year + export revenue year",
                    abs(expected_net_value - (coord.import_savings_year_kr + coord.export_revenue_year_kr)) < 1e-6,
                    str((coord.import_savings_year_kr, coord.export_revenue_year_kr))))
-    checks.append(("new yearly buckets are floored to restored current month values",
+    checks.append(("running yearly buckets cannot be erased by a sensor restore",
                    coord.export_revenue_year_kr >= coord.export_revenue_month_kr
                    and coord.import_savings_year_kr >= coord.import_savings_month_kr,
                    str((coord.export_revenue_year_kr, coord.export_revenue_month_kr,
@@ -2137,16 +2128,16 @@ def test_phase_gaps():
                    p_nosoc_fixed.desired_action == "pause", f"{p_nosoc_fixed.desired_action}/{p_nosoc_fixed.reason[:50]}"))
     # Toggle works WITHOUT a deadline too: spans the whole remaining horizon.
     p_full_nodl = sched_full(7, soc=None, complete=True, ready_hour=-1)
-    checks.append(("charge-until-full: unknown SOC without deadline uses capacity, not fixed hours",
-                   "conservative capacity estimate" in p_full_nodl.reason,
+    checks.append(("charge-until-full: unknown SOC without deadline waits for verified data",
+                   p_full_nodl.desired_action == "pause" and "verified vehicle SOC" in p_full_nodl.reason,
                    f"{p_full_nodl.desired_action}/{p_full_nodl.reason[:70]}"))
     # An empty-to-full estimate cannot fit in six hours: show the shortfall,
     # rather than declaring a fixed two-hour request sufficient for 100%.
     ov_full = planner.ev_cheapest_charge_hours(
         ev_state(at(0)), ev_required_hours=2, ev_ready_hour=6, ev_target_soc=80.0, ev_charge_until_complete=True)
-    checks.append(("ev_charge_plan overview: uncertain full goal reports capacity shortfall honestly",
-                   not ov_full["feasible"] and ov_full["remaining_unserved_kwh"] > 0
-                   and not ov_full["goal_confirmed"] and ov_full["goal_status"] == "capacity_estimate",
+    checks.append(("ev_charge_plan overview: uncertain full goal waits without inventing an energy need",
+                   not ov_full["feasible"] and ov_full["remaining_unserved_kwh"] is None
+                   and not ov_full["goal_confirmed"] and ov_full["goal_status"] == "awaiting_vehicle_data",
                    f"wanted={ov_full['wanted_hours']} of {len(ov_full['hours'])}"))
 
     # ---- Minimum-SOC ("aldrig strandet") + vindue-ignorering ----------------- #
@@ -2272,7 +2263,7 @@ def test_phase_gaps():
     ]
     checks.append(("live minimum recovery: starts now and protects the house battery",
                    live_ev.desired_action == "resume"
-                   and live_after_protect.desired_discharge_current_a == 0.0,
+                   and live_after_protect.discharge_intent == "hold",
                    f"{live_ev.desired_action}/{live_after_protect.desired_discharge_current_a}A"))
     checks.append(("live minimum recovery: completion returns to the energy-based plan",
                    "Immediate metered" not in live_recovered_ev.reason
@@ -2565,9 +2556,9 @@ def test_robustness_hardening():
     def BP(strategy="DISCHARGE_TO_LOAD", dis=70.0, sell=False):
         return models.BatteryPlan(strategy=strategy, reason="r", desired_discharge_current_a=dis, desired_solar_sell=sell)
     checks.append(("EV-protect: non-solar EV charging + open discharge -> forced to 0 (car takes grid)",
-                   prot(BP(dis=70.0), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 0.0, "0"))
+                   prot(BP(dis=70.0), ev_charging=True, ev_covers_dips=False).discharge_intent == "hold", "0"))
     checks.append(("EV-protect: non-solar EV charging + discharge=None (default 70A) -> forced to 0",
-                   prot(BP(dis=None), ev_charging=True, ev_covers_dips=False).desired_discharge_current_a == 0.0, "0"))
+                   prot(BP(dis=None), ev_charging=True, ev_covers_dips=False).discharge_intent == "hold", "0"))
     checks.append(("EV-protect: solar_only KEEPS the open discharge (covers dips)",
                    prot(BP(dis=70.0), ev_charging=True, ev_covers_dips=True).desired_discharge_current_a == 70.0, "70"))
     checks.append(("EV-protect: EV not charging -> battery untouched (covers house normally)",
@@ -2896,6 +2887,8 @@ def test_coordinator_ev_harness():
         co.hass = _Hass()
         co.mapping = None
         co._easee = _Easee()
+        from wattson.commands import DeviceCommandPath
+        co._easee.commands = DeviceCommandPath(co.hass, "easee")
         co._last_ev_fp = None
         co._last_ev_amps = None
         co._last_ev_currents = None
@@ -3202,10 +3195,15 @@ def test_coordinator_ev_harness():
     co._ev_minimum_recovery = types.SimpleNamespace(complete=False)
     minimum_start = asyncio.run(co._async_apply_ev(ev(16), at(0)))
     minimum_initial_call = co._easee.calls[-1]
+    checks.append(("harness minimum recovery: stale zero alone does not prove a failed start",
+                   co._ev_start_status == "telemetry_unknown"
+                   and co._ev_start_recovery_attempts == 0, co._ev_start_status))
+    co.site_state = replace(co.site_state, ev_stale_entities=[])
+    asyncio.run(co._async_apply_ev(ev(16), at(0)))
     asyncio.run(co._async_apply_ev(ev(16), at(const.EV_START_VERIFY_SECONDS)))
     recovery_call = co._easee.calls[-1]
     recovery_flags = co._easee.start_recoveries[-1]
-    checks.append(("harness minimum recovery: stale 0W gets full offer and verified recovery",
+    checks.append(("harness minimum recovery: full offer, then fresh zero verifies recovery",
                    bool(minimum_start)
                    and minimum_initial_call == ("resume", 16, (16, 16, 16))
                    and recovery_call == ("resume", 16, (16, 16, 16))
@@ -3252,7 +3250,7 @@ def test_coordinator_ev_harness():
     co.site_state = replace(
         co.site_state,
         easee_power_w=0.0,
-        ev_stale_entities=["sensor.easee_power", "binary_sensor.easee_online"],
+        ev_stale_entities=["binary_sensor.easee_online"],
     )
     asyncio.run(co._async_apply_ev(ev(16), at(0)))
     transport_recovery = asyncio.run(
@@ -3416,7 +3414,7 @@ def test_e_override():
     checks.append(("force_charge grid-charges", chg.desired_grid_charge is True, str(chg.desired_grid_charge)))
     checks.append(("force_charge does not sell", chg.desired_solar_sell is False, str(chg.desired_solar_sell)))
     checks.append(("force_charge uses default charge current", chg.desired_max_charge_current_a == 40.0, str(chg.desired_max_charge_current_a)))
-    checks.append(("force_charge blocks discharge (0A)", chg.desired_discharge_current_a == 0.0, str(chg.desired_discharge_current_a)))
+    checks.append(("force_charge holds discharge via TOU intent", chg.discharge_intent == "hold", str(chg.desired_discharge_current_a)))
 
     # When export pays, force_charge ALSO sells the PV surplus the charge can't absorb
     # (instead of curtailing it) — with the discharge OPEN so sell never rides with
@@ -3440,7 +3438,7 @@ def test_e_override():
     checks.append(("force_charge_solar -> OVERRIDE_SOLAR_CHARGE", sol.strategy == "OVERRIDE_SOLAR_CHARGE", sol.strategy))
     checks.append(("solar-charge NEVER grid-charges (the whole point vs force_charge)", sol.desired_grid_charge is False, str(sol.desired_grid_charge)))
     checks.append(("solar-charge absorbs at the default charge current", sol.desired_max_charge_current_a == 40.0, str(sol.desired_max_charge_current_a)))
-    checks.append(("solar-charge (no export pay) holds+fills: sell OFF + discharge 0", sol.desired_solar_sell is False and sol.desired_discharge_current_a == 0.0, f"{sol.desired_solar_sell}/{sol.desired_discharge_current_a}"))
+    checks.append(("solar-charge (no export pay) holds+fills: sell OFF + discharge hold", sol.desired_solar_sell is False and sol.discharge_intent == "hold", f"{sol.desired_solar_sell}/{sol.desired_discharge_current_a}"))
     checks.append(("solar-charge keeps Load first + Zero export to CT (house first, no battery->grid)", sol.desired_energy_priority == "Load first" and sol.desired_limit_control_mode == "Zero export to CT", f"{sol.desired_energy_priority}/{sol.desired_limit_control_mode}"))
     # The TOU grid-charge enable MUST stay OFF for solar-charge (else it grid-buys); contrast
     # force_charge which returns enable=True.
@@ -3470,7 +3468,7 @@ def test_e_override():
     checks.append(("force_hold -> OVERRIDE_HOLD", hold.strategy == "OVERRIDE_HOLD", hold.strategy))
     checks.append(("force_hold neither charges nor sells", hold.desired_grid_charge is False and hold.desired_solar_sell is False, f"{hold.desired_grid_charge}/{hold.desired_solar_sell}"))
     checks.append(("force_hold blocks solar charging (0A)", hold.desired_max_charge_current_a == 0.0, str(hold.desired_max_charge_current_a)))
-    checks.append(("force_hold blocks discharge (0A)", hold.desired_discharge_current_a == 0.0, str(hold.desired_discharge_current_a)))
+    checks.append(("force_hold holds discharge via TOU intent", hold.discharge_intent == "hold", str(hold.desired_discharge_current_a)))
 
     # --- EV override plans ---
     ev_none = planner.build_override_ev_plan(const.EV_OVERRIDE_AUTO, ev_max_amps=16)
@@ -3708,7 +3706,7 @@ def test_mode_coherence():
     checks.append(("IDLE (not full) no sell + zero export", idle.strategy == "IDLE" and idle.desired_solar_sell is False and idle.desired_limit_control_mode == "Zero export to CT", f"{idle.strategy}/{idle.desired_solar_sell}/{idle.desired_limit_control_mode}"))
 
     # GRID_CHARGE must not allow battery discharge while charging.
-    checks.append(("GRID_CHARGE blocks battery discharge (0A)", gc.desired_discharge_current_a == 0.0, str(gc.desired_discharge_current_a)))
+    checks.append(("GRID_CHARGE holds battery discharge via TOU intent", gc.discharge_intent == "hold", str(gc.desired_discharge_current_a)))
 
     # IDLE, battery full: surplus may be sold — but ONLY the solar surplus, never
     # the battery (discharge blocked), and DISCHARGE covers the house with no export.
@@ -4265,6 +4263,12 @@ def _plan_engine_day():
     return at, slots, solar, load_hourly, state
 
 
+def allocation_soc(task):
+    # Characterize the reserve allocator separately from the lossy physical model.
+    return (task.allocation_soc_pct if task.allocation_soc_pct is not None
+            else task.projected_soc_pct)
+
+
 def test_day_plan():
     """Fase A: build_day_plan structure — sell whenever export pays, absorb negative
     totals, block negative export, hold a reserve pre-peak and release it AT the peak."""
@@ -4298,14 +4302,14 @@ def test_day_plan():
     base_floor = 20.0
     pre_peak_max = max(by_hour[h].tou_floor_pct for h in range(14, 18))
     checks.append((f"pre-peak afternoon holds a reserve floor > base (got {pre_peak_max:.0f}%)", pre_peak_max > base_floor + 5, f"{pre_peak_max}"))
-    checks.append(("peak TOU floor follows the optimizer end-SOC (multi-peak rationing)",
+    checks.append(("peak TOU floor follows the optimizer allocation SOC (multi-peak rationing)",
                    all(abs(by_hour[h].tou_floor_pct - max(
-                       base_floor, by_hour[h].projected_soc_pct or base_floor
+                       base_floor, allocation_soc(by_hour[h]) or base_floor
                    )) < 0.6 for h in (18, 19, 20)),
                    f"{[by_hour[h].tou_floor_pct for h in (18, 19, 20)]}"))
     sell_slots = [s for s in dp.slots if s.intent == "SELL_SURPLUS"]
-    checks.append(("sell-surplus slots carry the sell-safe charge rate (never trickle with sell on)",
-                   all(s.charge_current_a == planner.SELL_SAFE_CHARGE_A for s in sell_slots), f"{len(sell_slots)} slots"))
+    checks.append(("sell slots use 70A or the deliberate 10A PV sell throttle",
+                   all(s.charge_current_a in (planner.SELL_SAFE_CHARGE_A, planner.SELL_THROTTLE_CHARGE_A) for s in sell_slots), f"{len(sell_slots)} slots"))
     checks.append(("slot_for finds the running slot mid-hour", dp.slot_for(at(13, 30)).start.hour == 13, str(dp.slot_for(at(13, 30)))))
     return checks
 
@@ -4520,7 +4524,7 @@ def test_full_battery_hold():
     p = ex(slot("ABSORB_NEGATIVE", -0.2, -0.05), state(2, soc=100, pv=0, load=2000))
     checks.append(("full+deficit ABSORB_NEGATIVE -> IDLE hold (grid_charge off, discharge 0, sell off)",
                    p.strategy == "IDLE" and p.desired_grid_charge is False
-                   and p.desired_discharge_current_a == 0.0 and p.desired_solar_sell is not True,
+                   and p.discharge_intent == "hold" and p.desired_solar_sell is not True,
                    f"{p.strategy}/{p.desired_grid_charge}/{p.desired_discharge_current_a}/{p.desired_solar_sell}"))
     return checks
 
@@ -4576,7 +4580,7 @@ def test_near_full_buffer_hysteresis():
 
     p = ex(slot("GRID_CHARGE", 0.30, 0.20), state(2, soc=100, pv=0, load=2000))
     checks.append(("full+deficit GRID_CHARGE -> IDLE hold (discharge 0, no register flap)",
-                   p.strategy == "IDLE" and p.desired_discharge_current_a == 0.0 and p.desired_grid_charge is False,
+                   p.strategy == "IDLE" and p.discharge_intent == "hold" and p.desired_grid_charge is False,
                    f"{p.strategy}/{p.desired_discharge_current_a}"))
 
     p = ex(slot("GRID_CHARGE", 0.30, 0.20), state(2, soc=50, pv=0, load=2000))
@@ -4915,9 +4919,9 @@ def test_plan_projection_throttle_aware():
     plan2 = planner.build_day_plan(st2, battery_mode="blue", min_soc=15, max_soc=100, capacity_kwh=10.0,
         load_hourly_w=l2, learned_reserve_pct=0.0, charge_current_a=70, discharge_current_a=70)
     gc_slots = [s for s in plan2.slots if s.grid_charge]
-    gc_mismatch = [(s.start.hour, s.projected_soc_pct, raw_soc.get(s.start)) for s in gc_slots
-                   if raw_soc.get(s.start) is not None and s.projected_soc_pct != raw_soc.get(s.start)]
-    checks.append((f"GRID_CHARGE slots keep the raw DP charge target (deficit cleared) — {len(gc_slots)} grid-charge slots, {len(gc_mismatch)} altered",
+    gc_mismatch = [(s.start.hour, allocation_soc(s), raw_soc.get(s.start)) for s in gc_slots
+                   if raw_soc.get(s.start) is not None and allocation_soc(s) != raw_soc.get(s.start)]
+    checks.append((f"GRID_CHARGE allocation keeps the raw DP target, separate from physical SOC (deficit cleared) — {len(gc_slots)} grid-charge slots, {len(gc_mismatch)} altered",
                    not gc_mismatch, f"mismatches: {gc_mismatch[:4]}"))
     return checks
 
@@ -5642,7 +5646,7 @@ def test_control_stability_regressions():
     checks.append(("2026-08-08 live: allocated 0.25kr value releases 19:00 to cover the house",
                    new_19 is not None
                    and new_19.action == "DISCHARGE"
-                   and new_19.projected_soc_pct == 84.0
+                   and allocation_soc(new_19) == 84.0
                    and new_19.tou_floor_pct == 80.0
                    and (100.0 - new_19.tou_floor_pct) / 100.0 * 9.903 >= 1.625
                    and "upper gain 0.25 kr < 0.30 kr" in new_19.reason,
@@ -5650,7 +5654,7 @@ def test_control_stability_regressions():
     checks.append(("2026-08-08 exact: materiality release leaves the true 20:00 peak trajectory intact",
                    new_20 is not None
                    and new_20.action == "DISCHARGE"
-                   and new_20.projected_soc_pct == 80.0
+                   and allocation_soc(new_20) == 80.0
                    and new_20.tou_floor_pct == 80.0,
                    str(new_20)))
 
@@ -5727,7 +5731,7 @@ def test_control_stability_regressions():
     checks.append(("2026-08-08/09 full live horizon: raw 06:00 discharge survives the 5%-floor quantization",
                    full_live_06 is not None
                    and full_live_06.action == "DISCHARGE"
-                   and full_live_06.projected_soc_pct == 44.0
+                   and allocation_soc(full_live_06) == 44.0
                    and full_live_06.tou_floor_pct == 40.0
                    and "sub-step deficit released above reserve; no materially dearer deficit"
                    in full_live_06.reason,
@@ -5787,7 +5791,7 @@ def test_control_stability_regressions():
                    p90_only_current is not None
                    and p90_only_slot is not None
                    and p90_only_current.action == "IDLE"
-                   and p90_only_current.projected_soc_pct == 25.0
+                   and allocation_soc(p90_only_current) == 25.0
                    and p90_only_current.tou_floor_pct == 25.0
                    and p90_only_slot.reserve_floor_cap_pct == 25.0,
                    f"{p90_only_current}/{p90_only_slot}"))
@@ -5829,13 +5833,13 @@ def test_control_stability_regressions():
                    and p10_rank_destination is not None
                    and p10_rank_after is not None
                    and p10_rank_source.action == "IDLE"
-                   and p10_rank_source.projected_soc_pct == 25.0
+                   and allocation_soc(p10_rank_source) == 25.0
                    and p10_rank_source.tou_floor_pct == 25.0
-                   and p10_rank_bridge.projected_soc_pct == 25.0
+                   and allocation_soc(p10_rank_bridge) == 25.0
                    and p10_rank_bridge.tou_floor_pct == 25.0
-                   and p10_rank_destination.projected_soc_pct == 25.0
+                   and allocation_soc(p10_rank_destination) == 25.0
                    and p10_rank_destination.tou_floor_pct == 15.0
-                   and p10_rank_after.projected_soc_pct == 25.0
+                   and allocation_soc(p10_rank_after) == 25.0
                    and p10_rank_after.tou_floor_pct == 15.0,
                    str(p10_rank_plan.tasks[:4] if p10_rank_plan else None)))
 
@@ -5860,7 +5864,7 @@ def test_control_stability_regressions():
     checks.append(("partial 0.5kWh allocation carries exactly 5pp, not the whole source slot",
                    partial_source is not None
                    and partial_source.action == "DISCHARGE"
-                   and partial_source.projected_soc_pct == 20.0
+                   and allocation_soc(partial_source) == 20.0
                    and partial_source.tou_floor_pct == 20.0,
                    str(partial_source)))
 
@@ -5896,7 +5900,7 @@ def test_control_stability_regressions():
                    same_hour_source is not None
                    and same_hour_destination is not None
                    and same_hour_source.action == "IDLE"
-                   and same_hour_source.projected_soc_pct == 25.0
+                   and allocation_soc(same_hour_source) == 25.0
                    and same_hour_source.tou_floor_pct == 25.0
                    and same_hour_destination.tou_floor_pct == 15.0
                    and "P90 reserve released" not in same_hour_source.reason,
@@ -5943,7 +5947,7 @@ def test_control_stability_regressions():
                    and saturation_refill is not None
                    and saturation_peak is not None
                    and saturation_source.tou_floor_pct < 100.0
-                   and saturation_refill.projected_soc_pct == 100.0
+                   and allocation_soc(saturation_refill) == 100.0
                    and saturation_peak.tou_floor_pct <= 90.0,
                    str(saturation_plan.tasks if saturation_plan else None)))
 
@@ -5975,12 +5979,12 @@ def test_control_stability_regressions():
     checks.append(("aggregate P90 episode keeps a 0.60kr reserve without destination double-counting",
                    len(episode_early) == 3
                    and all(task.action == "IDLE" for task in episode_early)
-                   and all(task.projected_soc_pct == 100.0 for task in episode_early)
+                   and all(allocation_soc(task) == 100.0 for task in episode_early)
                    and all(task.tou_floor_pct == 100.0 for task in episode_early)
                    and all("P90 reserve released" not in task.reason for task in episode_early)
                    and episode_peak is not None
                    and episode_peak.action == "DISCHARGE"
-                   and episode_peak.projected_soc_pct == 70.0
+                   and allocation_soc(episode_peak) == 70.0
                    and episode_peak.tou_floor_pct == 70.0,
                    f"sources={episode_early} peak={episode_peak}"))
 
@@ -6154,12 +6158,12 @@ def test_control_stability_regressions():
                    and carried_dear is not None
                    and carried_peak is not None
                    and carried_cheap.action == "IDLE"
-                   and carried_cheap.projected_soc_pct == 100.0
+                   and allocation_soc(carried_cheap) == 100.0
                    and carried_dear.action == "DISCHARGE"
-                   and carried_dear.projected_soc_pct == 90.0
+                   and allocation_soc(carried_dear) == 90.0
                    and carried_dear.tou_floor_pct == 90.0
                    and "upper gain 0.00 kr < 0.30 kr" in carried_dear.reason
-                   and carried_peak.projected_soc_pct == 80.0,
+                   and allocation_soc(carried_peak) == 80.0,
                    f"cheap={carried_cheap} dear={carried_dear} peak={carried_peak}"))
 
     # Temporal allocation requires residual re-routing, not a greedy best-edge
@@ -6202,7 +6206,7 @@ def test_control_stability_regressions():
                    and reroute_later is not None
                    and reroute_early.action == "IDLE"
                    and reroute_later.action == "IDLE"
-                   and [task.projected_soc_pct for task in reroute_plan.tasks]
+                   and [allocation_soc(task) for task in reroute_plan.tasks]
                    == [100.0, 90.0, 90.0, 80.0]
                    and [task.tou_floor_pct for task in reroute_plan.tasks]
                    == [100.0, 90.0, 90.0, 80.0]
@@ -6244,11 +6248,11 @@ def test_control_stability_regressions():
     overlap_last_peak = overlap_plan.tasks[3] if overlap_plan else None
     checks.append(("first of two destinations releases only its own 1kWh allocation",
                    len(overlap_sources) == 2
-                   and all(task.projected_soc_pct == 100.0 for task in overlap_sources)
+                   and all(allocation_soc(task) == 100.0 for task in overlap_sources)
                    and all(task.tou_floor_pct == 100.0 for task in overlap_sources)
                    and overlap_first_peak is not None
                    and overlap_last_peak is not None
-                   and overlap_first_peak.projected_soc_pct == 90.0
+                   and allocation_soc(overlap_first_peak) == 90.0
                    and overlap_first_peak.tou_floor_pct == 90.0
                    and overlap_last_peak.projected_soc_pct < overlap_first_peak.projected_soc_pct
                    and overlap_last_peak.tou_floor_pct < overlap_first_peak.tou_floor_pct,
@@ -6294,11 +6298,11 @@ def test_control_stability_regressions():
                    and deadline_first_peak is not None
                    and deadline_refill is not None
                    and deadline_last_peak is not None
-                   and deadline_source.projected_soc_pct == 25.0
+                   and allocation_soc(deadline_source) == 25.0
                    and deadline_source.tou_floor_pct == 25.0
-                   and deadline_first_peak.projected_soc_pct == 15.0
+                   and allocation_soc(deadline_first_peak) == 15.0
                    and deadline_first_peak.tou_floor_pct == 15.0
-                   and deadline_refill.projected_soc_pct == 45.0
+                   and allocation_soc(deadline_refill) == 45.0
                    and deadline_last_peak.tou_floor_pct == 35.0,
                    str(deadline_plan.tasks if deadline_plan else None)))
 
@@ -6385,11 +6389,11 @@ def test_control_stability_regressions():
                    and estimated_refill_slot is not None
                    and real_refill_source is not None
                    and estimated_refill_source.action == "IDLE"
-                   and estimated_refill_source.projected_soc_pct == 35.0
+                   and allocation_soc(estimated_refill_source) == 35.0
                    and estimated_refill_source.tou_floor_pct == 35.0
                    and not estimated_refill_slot.grid_charge
                    and estimated_refill_slot.intent == "SELF_CONSUME"
-                   and real_refill_source.projected_soc_pct == 25.0
+                   and allocation_soc(real_refill_source) == 25.0
                    and real_refill_source.tou_floor_pct == 25.0,
                    f"estimated={estimated_refill_plan.tasks if estimated_refill_plan else None} "
                    f"real={real_refill_plan.tasks if real_refill_plan else None}"))
@@ -6564,14 +6568,14 @@ def test_control_stability_regressions():
     checks.append(("2026-08-09 full horizon: 06:00 still discharges to the planned 25%",
                    full_06 is not None
                    and full_06.action == "DISCHARGE"
-                   and full_06.projected_soc_pct == 25.0
+                   and allocation_soc(full_06) == 25.0
                    and full_06.tou_floor_pct == 25.0,
                    str(full_06)))
     checks.append(("2026-08-09 full horizon: 07:00 opens a bounded 10pp dip instead of a 100% floor",
                    full_07 is not None
                    and full_07.action == "IDLE"
                    and planner.display_plan_action(full_07) == "SOLAR_CHARGE"
-                   and full_07.projected_soc_pct == 30.0
+                   and allocation_soc(full_07) == 30.0
                    and full_07.tou_floor_pct == 15.0
                    and "forecast-surplus dip buffer released floor to 15%" in full_07.reason,
                    str(full_07)))
@@ -6630,7 +6634,7 @@ def test_control_stability_regressions():
     checks.append(("sub-bucket 06:00 deficit self-consumes above the learned floor when no dearer peak remains",
                    micro_current is not None
                    and micro_current.action == "DISCHARGE"
-                   and micro_current.projected_soc_pct == 43.0
+                   and allocation_soc(micro_current) == 43.0
                    and micro_current.tou_floor_pct == 40.0,
                    str(micro_current)))
 
@@ -6668,12 +6672,12 @@ def test_control_stability_regressions():
     checks.append(("raw sub-gate deficit is IDLE before physical floor quantization",
                    raw_idle_current is not None
                    and raw_idle_current.action == "IDLE"
-                   and raw_idle_current.projected_soc_pct == 45.0,
+                   and allocation_soc(raw_idle_current) == 45.0,
                    str(raw_idle_current)))
     checks.append(("physical floor quantization never overrides an isolated raw-IDLE decision",
                    idle_current is not None
                    and idle_current.action == "IDLE"
-                   and idle_current.projected_soc_pct == 45.0
+                   and allocation_soc(idle_current) == 45.0
                    and idle_current.tou_floor_pct == 45.0,
                    str(idle_current)))
 
@@ -6700,7 +6704,7 @@ def test_control_stability_regressions():
     checks.append(("raw-IDLE deficit remains held without refill before a slightly dearer deficit",
                    no_refill_current is not None
                    and no_refill_current.action == "IDLE"
-                   and no_refill_current.projected_soc_pct == 45.0
+                   and allocation_soc(no_refill_current) == 45.0
                    and no_refill_current.tou_floor_pct == 45.0,
                    str(no_refill_current)))
 
@@ -6719,7 +6723,7 @@ def test_control_stability_regressions():
     checks.append(("finite P10 refill cannot override raw-IDLE before a slightly dearer deficit",
                    refill_current is not None
                    and refill_current.action == "IDLE"
-                   and refill_current.projected_soc_pct == 45.0
+                   and allocation_soc(refill_current) == 45.0
                    and refill_current.tou_floor_pct == 45.0,
                    str(refill_current)))
 
@@ -6738,7 +6742,7 @@ def test_control_stability_regressions():
     checks.append(("P10 refill after the slightly dearer deficit cannot justify an early release",
                    late_refill_current is not None
                    and late_refill_current.action == "IDLE"
-                   and late_refill_current.projected_soc_pct == 45.0
+                   and allocation_soc(late_refill_current) == 45.0
                    and late_refill_current.tou_floor_pct == 45.0,
                    str(late_refill_current)))
 
@@ -6755,7 +6759,7 @@ def test_control_stability_regressions():
     checks.append(("sub-bucket release stays blocked for a materially dearer protected deficit",
                    protected_current is not None
                    and protected_current.action == "IDLE"
-                   and protected_current.projected_soc_pct == 45.0
+                   and allocation_soc(protected_current) == 45.0
                    and protected_current.tou_floor_pct == 45.0,
                    str(protected_current)))
 
@@ -6827,10 +6831,10 @@ def test_control_stability_regressions():
     checks.append(("fourth-ranked dearer deficit blocks the future sub-step floor release",
                    non_top3_raw_target is not None
                    and non_top3_raw_target.action == "DISCHARGE"
-                   and non_top3_raw_target.projected_soc_pct == 43.0
+                   and allocation_soc(non_top3_raw_target) == 43.0
                    and non_top3_target is not None
                    and non_top3_target.action == "IDLE"
-                   and non_top3_target.projected_soc_pct == 45.0
+                   and allocation_soc(non_top3_target) == 45.0
                    and non_top3_target.tou_floor_pct == 45.0,
                    f"raw={non_top3_raw_target}; committed="
                    f"{non_top3_plan.tasks[:6] if non_top3_plan else None}"))
@@ -6878,10 +6882,10 @@ def test_control_stability_regressions():
     checks.append(("future-only fourth-ranked guard yields to the validated current-slot release",
                    non_top3_raw_current is not None
                    and non_top3_raw_current.action == "DISCHARGE"
-                   and non_top3_raw_current.projected_soc_pct == 43.0
+                   and allocation_soc(non_top3_raw_current) == 43.0
                    and non_top3_current is not None
                    and non_top3_current.action == "DISCHARGE"
-                   and non_top3_current.projected_soc_pct == 43.0
+                   and allocation_soc(non_top3_current) == 43.0
                    and non_top3_current.tou_floor_pct == 40.0,
                    f"raw={non_top3_raw_current}; committed={non_top3_current}"))
 
@@ -6948,11 +6952,11 @@ def test_control_stability_regressions():
                    and delta_raw[1].projected_soc_pct == 39.0
                    and delta_first is not None
                    and delta_first.action == "IDLE"
-                   and delta_first.projected_soc_pct == 45.0
+                   and allocation_soc(delta_first) == 45.0
                    and delta_first.tou_floor_pct == 45.0
                    and delta_second is not None
                    and delta_second.action == "DISCHARGE"
-                   and delta_second.projected_soc_pct == 43.0
+                   and allocation_soc(delta_second) == 43.0
                    and delta_second.tou_floor_pct == 40.0,
                    f"raw={delta_raw[:2]}; committed={delta_plan.tasks[:2] if delta_plan else None}"))
 
@@ -6982,7 +6986,7 @@ def test_control_stability_regressions():
     checks.append(("equal-price future deficit cannot strand the current sub-step release",
                    equal_first is not None
                    and equal_first.action == "DISCHARGE"
-                   and equal_first.projected_soc_pct == 41.0
+                   and allocation_soc(equal_first) == 41.0
                    and equal_first.tou_floor_pct == 40.0,
                    str(equal_plan.tasks[:2] if equal_plan else None)))
 
@@ -7311,7 +7315,7 @@ def test_control_stability_regressions():
     checks.append(("refill offsets only the physically possible P90 reserve, not the unbounded hourly-tail sum",
                    capacity_first is not None
                    and capacity_first.action == "DISCHARGE"
-                   and capacity_first.projected_soc_pct == 95.0
+                   and allocation_soc(capacity_first) == 95.0
                    and capacity_first.tou_floor_pct == 95.0,
                    str(capacity_first)))
 
@@ -7332,7 +7336,7 @@ def test_control_stability_regressions():
     checks.append(("P10 refill subtracts P50 load while P90 remains a separate peak tail",
                    no_double_tail_first is not None
                    and no_double_tail_first.action == "DISCHARGE"
-                   and no_double_tail_first.projected_soc_pct == 94.0
+                   and allocation_soc(no_double_tail_first) == 94.0
                    and no_double_tail_first.tou_floor_pct == 90.0,
                    str(no_double_tail_first)))
 
@@ -7404,8 +7408,8 @@ def test_control_stability_regressions():
         deficit = max(0.0, (task.load_estimate_kwh or 0.0) - (task.pv_estimate_kwh or 0.0))
         available = max(0.0, projected_start - (task.tou_floor_pct or projected_start)) / 100.0 * 10.0
         no_stranded_hour = no_stranded_hour and available + 0.01 >= deficit
-        projected_start = task.projected_soc_pct or projected_start
-    checks.append(("2026-07-31 sunny night has a continuous discharge path instead of 95/90% grid holds",
+        projected_start = allocation_soc(task) or projected_start
+    checks.append(("2026-07-31 sunny night allocation reserves enough AC energy before native conversion losses",
                    len(live_night) == 7
                    and all(task.action == "DISCHARGE" for task in live_night)
                    and all(live_night[i].tou_floor_pct <= live_night[i - 1].tou_floor_pct
@@ -8172,7 +8176,7 @@ def test_rolling_planner_upgrade():
     checks.append(("non-solar EV load is projected but cannot drain the house battery",
                    base_dark is not None and protected_dark is not None
                    and protected_dark.tasks[0].ev_load_estimate_kwh == 11.04
-                   and protected_dark.tasks[0].projected_soc_pct == base_dark.tasks[0].projected_soc_pct,
+                   and protected_dark.tasks[0].projected_soc_pct == dark_state.battery_soc_pct,
                    f"{protected_dark.tasks[0].projected_soc_pct if protected_dark else None}/{base_dark.tasks[0].projected_soc_pct if base_dark else None}"))
 
     audit = planner.build_control_plan(

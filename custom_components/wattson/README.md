@@ -5,14 +5,26 @@ independent fault domains.
 
 ## Runtime design
 
-- `snapshot.py` normalizes Home Assistant state and caches price/solar horizons.
+- `observations.py` normalizes units, finite values, provenance and data quality.
+- `snapshot.py` separates raw house-load semantics from derived whole-site load
+  and caches price/solar horizons, including tomorrow-only forecast changes.
 - `planning_engine.py` is the stable boundary around the pure planner.
 - `optimizer.py` builds and scores the 48-hour P10/P50/P90 candidate.
-- `decision_ledger.py` persists exact replay inputs and staged rollout evidence.
+- `reserve.py` resolves the final live reserve once; `deye_compiler.py` translates
+  hold/allow intent to native TOU setpoints while keeping discharge at 70 A.
+- `physics.py` is the production AC/DC model for projections and economic scoring.
+- `decision_ledger.py` keeps hot replay inputs and staged rollout evidence;
+  `decision_archive.py` stores bounded daily partitions and `replay.py` reconstructs
+  same-version planning without Home Assistant or hardware writes.
 - `ev_session.py` owns physical plug-in session identity and observed phase capability.
-- `execution.py` records independent Deye and Easee command results.
-- `runtime.py` separates the 10-second safety loop from slower accounting/model work.
-- `telemetry.py` owns value, savings and diagnostic accounting.
+- `ev_actuation.py` owns offer convergence and bounded start/stop recovery.
+- `commands.py` serializes supersedable device batches; `execution.py` retains
+  accepted commands, partial failures and separate readback confirmation.
+- `runtime.py` keeps Recorder, planning, storage and both hardware workers out of
+  the 10-second control tick and rejects obsolete planning results.
+- `accounting.py` owns durable monetary/energy totals; `telemetry.py` updates them
+  and computes the established counterfactual/diagnostic measurements. Restored
+  sensor states are migration candidates, never a second accounting authority.
 - `coordinator.py` orchestrates these parts and preserves the public HA entities,
   options and services.
 
@@ -23,26 +35,65 @@ verified transitions fail, Wattson locks that physical plug-in session to one
 phase. The lock is persisted across Home Assistant restarts and is cleared only
 when the cable is disconnected or the Easee session counter starts a new session.
 
-The historical default Niro SOC entity is ignored until the current vehicle has
-been observed as three-phase capable. A deliberately configured alternative SOC
-entity remains trusted. This prevents one car's stale SOC from controlling another
-car connected to the same charger.
+Phase count is not vehicle identity. Niro SOC requires validated vehicle identity
+and the vehicle backend's actual data timestamp, not just a recently restored HA
+entity. A different car never inherits the Niro SOC. Automatic scheduled charging
+waits on unknown/stale data; it does not invent an expensive emergency full-charge
+plan. An explicitly selected other-car energy request stays bounded and cannot
+claim that an unknown SOC has reached 100 percent.
+
+Scheduled-cheapest mode plans necessary energy to the absolute ready-by deadline,
+with a separate preview when disconnected. A reliable SOC below the minimum is
+recovered regardless of price, using accepted measured session energy to stop
+without waiting for another vehicle API update. Counter bursts use elapsed time
+since the last accepted counter change; invalid jumps cannot erase the baseline.
+Solar-only still permits temporary battery-buffer dips, not sustained support.
+
+## Evidence And Accounting
+
+Desired plan, service acceptance and physical feedback are separate states.
+Battery confirmation requires all requested registers to read back; unavailable
+or restored-only values are not proof. A no-write cooldown cannot discard earlier
+accepted/failed evidence for the same intent. Write counts mean accepted service
+calls, not independently verified physical register writes.
+
+Power-derived energy continues through price outages. Unknown-priced energy is
+saved for later reconciliation; period sensors expose `pricing_complete`,
+`unpriced_kwh` and `accounting_gap_seconds`. Missing prices do not become free
+energy or stop otherwise healthy house-battery control. Current quotes are not
+backdated into earlier unknown price intervals. Unobserved restart gaps are
+reported, not filled using the post-restart power measurement.
+
+Full replay schema 2 includes normalized inputs, options, previous commitments,
+setpoints and version. Legacy records without these inputs are explicitly not
+exactly reproducible. The hot ledger holds 96 records; the archive retains 90
+calendar days with a 288-record daily/queue cap and explicit drop counters. This
+is bounded diagnostic evidence, not unlimited lossless history.
 
 ## Verification
 
 ```bash
-python3 -m compileall -q custom_components/wattson tests
+python3 -m compileall -q custom_components/wattson tests sim
 python3 -m unittest discover -s tests -v
 python3 sim/wattson_sim.py
 python3 sim/wattson_backtest.py sim/backtest_data/{winter,spring,summer,autumn}.json
+python3 sim/winter_stress.py
 python3 sim/wattson_analyze.py --check sim/backtest_data/generated/*.json
 ```
 
-The CI workflow runs the same checks on every branch push and pull request. The
+The CI workflow runs these checks on relevant branch pushes/pull requests and can
+be started manually. It contains no deployment steps or live HA credentials. The
 20-day study enforces efficiency, worst-day plan-versus-reactive cost, missed
 discharge frequency and honest-oracle headroom limits.
 
 ## Release and deployment
+
+Local refactor 0.31.0 covers the ten ordered reliability boundaries. Its test
+results and remaining validation limits are recorded in
+[`docs/wattson/refactor_0310.md`](../../docs/wattson/refactor_0310.md).
+No deployment, Git push, live settings change or HA restart was performed for this
+implementation. The real HA framework, Store lifecycle and physical device
+readback still require validation before deployment.
 
 `manifest.json` carries the HACS release version; a public-contract test enforces
 that `INTEGRATION_VERSION` matches it. Before deployment, run all checks above,
@@ -65,7 +116,7 @@ candidate and replay scoring, and applies forecast-hour outdoor temperatures to
 the dated load model. A reserve watchdog releases a native SOC step only when
 the measured pack has energy beyond both the base floor and the protected reserve.
 TOU belt-register failures retry at most three times before a five-minute backoff,
-and the optimizer ledger keeps a calendar 90-day replay window with daily rather
+and the optimizer lifecycle keeps a calendar 90-day evidence window with daily rather
 than falsely-independent 15-minute confidence statistics.
 
 Version 0.28.2 lets a current top-priced deficit consume battery energy above

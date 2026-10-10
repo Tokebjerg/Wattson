@@ -8,12 +8,13 @@ It is deliberately pure: the coordinator owns persistence, rollout and writes.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import math
 
 from .const import BATTERY_ROUND_TRIP_EFFICIENCY, BATTERY_WEAR_COST
 from .models import PlanTask, SiteState, SolarSlot
 from .planner import battery_rate_kwh, dp_schedule, load_forecast_w, profile_for
+from .physics import DEFAULT_PHYSICS
 
 
 MPC_HORIZON_HOURS = 48
@@ -165,9 +166,11 @@ def score_schedule(
     if not tasks:
         return ScheduleScore(0.0, 0.0, 0.0, (), False, ("empty_schedule",))
 
-    eta = math.sqrt(max(0.5, min(1.0, BATTERY_ROUND_TRIP_EFFICIENCY)))
-    charge_eff = max(0.5, min(1.0, charge_efficiency or eta))
-    discharge_eff = max(0.5, min(1.0, discharge_efficiency or eta))
+    from .physics import BatteryPhysics
+    physics = BatteryPhysics(
+        max(0.5, min(1.0, charge_efficiency or DEFAULT_PHYSICS.charge_efficiency)),
+        max(0.5, min(1.0, discharge_efficiency or DEFAULT_PHYSICS.discharge_efficiency)),
+    )
     price_by_start = {slot.start: slot for slot in state.price_slots}
     solar_by_start = {slot.start: slot for slot in state.solar_slots}
     ev_load_by_start = ev_load_by_start or {}
@@ -175,7 +178,7 @@ def score_schedule(
     floor_kwh = max(0.0, min(100.0, min_soc)) / 100.0 * capacity
     max_kwh = max(0.0, min(100.0, max_soc)) / 100.0 * capacity
     care_kwh = max(0.0, min(max_kwh, battery_care_soc / 100.0 * capacity))
-    start_kwh = max(floor_kwh, min(max_kwh, state.battery_soc_pct / 100.0 * capacity))
+    start_kwh = max(0.0, min(max_kwh, state.battery_soc_pct / 100.0 * capacity))
     step_h = MPC_STEP_MINUTES / 60.0
 
     definitions = (
@@ -223,74 +226,39 @@ def score_schedule(
                 if interval_minutes <= 0:
                     break
                 interval_h = interval_minutes / 60.0
-                quarter_start = task.start + quarter * timedelta(minutes=MPC_STEP_MINUTES)
+                quarter_start = datetime.fromtimestamp(task.start.timestamp() + quarter * MPC_STEP_MINUTES * 60,
+                                                       tz=task.start.tzinfo)
+                interval_end = datetime.fromtimestamp(quarter_start.timestamp() + interval_minutes * 60,
+                                                      tz=task.start.tzinfo)
+                if interval_end.timestamp() <= state.timestamp.timestamp():
+                    continue
+                interval_h = (interval_end.timestamp() - max(quarter_start.timestamp(),
+                              state.timestamp.timestamp())) / 3600.0
                 house_kwh = _load_w(load_map, quarter_start, fallback_house_w) / 1000.0 * step_h
                 house_kwh *= interval_h / step_h
                 ev_kwh = ev_hour * interval_h
                 solar_kwh = solar_hour * interval_h
-                solar_to_house = min(house_kwh, solar_kwh)
-                solar_left = max(0.0, solar_kwh - solar_to_house)
-                solar_to_ev = min(ev_kwh, solar_left)
-                solar_left -= solar_to_ev
-                protected_ev_grid = max(0.0, ev_kwh - solar_to_ev) if ev_battery_protected else 0.0
-                deficit = max(0.0, house_kwh - solar_to_house)
-                if not ev_battery_protected:
-                    deficit += max(0.0, ev_kwh - solar_to_ev)
-                surplus = solar_left
-
-                pv_input = min(
-                    surplus,
-                    task_charge_rate * interval_h,
-                    max(0.0, max_kwh - soc) / charge_eff,
+                target = max_kwh if price.total_import_price < 0.0 else care_kwh
+                if task.grid_charge_target_soc_pct is not None:
+                    target = min(target, max(floor_kwh,
+                        task.grid_charge_target_soc_pct / 100.0 * capacity))
+                sellable = (bool(task.sell) if task.sell is not None
+                            else task.action not in {"LIMIT_EXPORT", "GRID_CHARGE"})
+                flow = physics.flow(
+                    stored_kwh=soc, pv_kwh=solar_kwh, load_kwh=house_kwh+ev_kwh,
+                    ev_kwh=ev_kwh, protect_ev=ev_battery_protected,
+                    floor_kwh=task_floor_kwh, ceiling_kwh=max_kwh,
+                    charge_rate_kw=task_charge_rate, discharge_rate_kw=discharge_rate_kwh_h,
+                    grid_charge_rate_kw=grid_charge_rate_kwh_h, duration_hours=interval_h,
+                    grid_charge=task.action == "GRID_CHARGE", charge_target_kwh=target,
+                    sell=sellable and (price.export_value or 0.0) > 0.0,
                 )
-                soc += pv_input * charge_eff
-                surplus -= pv_input
-
-                if task.action == "GRID_CHARGE":
-                    target = (
-                        max_kwh
-                        if price.total_import_price < 0.0
-                        else care_kwh
-                    )
-                    if task.grid_charge_target_soc_pct is not None:
-                        target = min(
-                            target,
-                            max(
-                                floor_kwh,
-                                float(task.grid_charge_target_soc_pct)
-                                / 100.0
-                                * capacity,
-                            ),
-                        )
-                    grid_input = min(
-                        grid_charge_rate_kwh_h * interval_h,
-                        max(0.0, task_charge_rate * interval_h - pv_input),
-                        max(0.0, target - soc) / charge_eff,
-                    )
-                    soc += grid_input * charge_eff
-                    imported += protected_ev_grid + deficit + grid_input
-                    cost += (protected_ev_grid + deficit + grid_input) * price.total_import_price
-                else:
-                    max_deliver = min(
-                        deficit,
-                        discharge_rate_kwh_h * interval_h,
-                        max(0.0, soc - task_floor_kwh) * discharge_eff,
-                    )
-                    soc_draw = max_deliver / discharge_eff
-                    soc -= soc_draw
-                    imported += protected_ev_grid + deficit - max_deliver
-                    cost += (protected_ev_grid + deficit - max_deliver) * price.total_import_price
-                    cost += soc_draw * BATTERY_WEAR_COST
-
-                sellable = (
-                    bool(task.sell)
-                    if task.sell is not None
-                    else task.action not in {"LIMIT_EXPORT", "GRID_CHARGE"}
-                ) and (price.export_value is None or price.export_value > 0.0)
-                if sellable and surplus > 0.0:
-                    export_price = max(0.0, price.export_value or 0.0)
-                    exported += surplus
-                    cost -= surplus * export_price
+                soc = flow.stored_kwh
+                imported += flow.import_kwh
+                exported += flow.export_kwh
+                cost += (flow.import_kwh * price.total_import_price
+                         - flow.export_kwh * max(0.0, price.export_value or 0.0)
+                         + flow.drawn_kwh * BATTERY_WEAR_COST)
                 minimum = min(minimum, soc)
         terminal_price = min(
             (slot.total_import_price for slot in state.price_slots if slot.start >= tasks[-1].start),
@@ -483,70 +451,24 @@ def score_realized_interval(
     # Clamping up here fabricated stored energy in the replay whenever the
     # inverter already sat below a newly raised floor.
     soc = max(0.0, min(ceiling, start_soc_pct / 100.0 * capacity))
-    eta = math.sqrt(max(0.5, min(1.0, BATTERY_ROUND_TRIP_EFFICIENCY)))
-    house = max(0.0, load_kwh - max(0.0, ev_kwh))
-    solar_to_house = min(max(0.0, pv_kwh), house)
-    solar_left = max(0.0, pv_kwh - solar_to_house)
-    house_deficit = max(0.0, house - solar_to_house)
-    solar_to_ev = min(solar_left, max(0.0, ev_kwh))
-    solar_left -= solar_to_ev
-    protected_ev_grid = max(0.0, ev_kwh - solar_to_ev) if ev_battery_protected else 0.0
-    if not ev_battery_protected:
-        house_deficit += max(0.0, ev_kwh - solar_to_ev)
-
     physical_charge_rate = max(0.0, charge_rate_kwh_h)
     if charge_current_a is not None:
-        physical_charge_rate = min(
-            physical_charge_rate,
-            battery_rate_kwh(charge_current_a),
-        )
-    pv_input = min(
-        solar_left,
-        physical_charge_rate * duration_hours,
-        max(0.0, ceiling - soc) / eta,
+        physical_charge_rate = min(physical_charge_rate, battery_rate_kwh(charge_current_a))
+    target = ceiling if import_price < 0.0 else care
+    if grid_charge_target_soc_pct is not None:
+        target = min(target, max(min_soc / 100.0 * capacity,
+                                grid_charge_target_soc_pct / 100.0 * capacity))
+    sell_enabled = bool(sell) if sell is not None else action not in {"LIMIT_EXPORT", "GRID_CHARGE"}
+    flow = DEFAULT_PHYSICS.flow(
+        stored_kwh=soc, pv_kwh=pv_kwh, load_kwh=load_kwh, ev_kwh=ev_kwh,
+        protect_ev=ev_battery_protected, floor_kwh=floor, ceiling_kwh=ceiling,
+        charge_rate_kw=physical_charge_rate, discharge_rate_kw=discharge_rate_kwh_h,
+        grid_charge_rate_kw=grid_charge_rate_kwh_h, duration_hours=duration_hours,
+        grid_charge=action == "GRID_CHARGE", charge_target_kwh=target,
+        sell=sell_enabled and export_price > 0,
     )
-    soc += pv_input * eta
-    solar_left -= pv_input
-    imported = protected_ev_grid
-    cost = protected_ev_grid * import_price
-    if action == "GRID_CHARGE":
-        target = ceiling if import_price < 0.0 else care
-        if grid_charge_target_soc_pct is not None:
-            target = min(
-                target,
-                max(
-                    min_soc / 100.0 * capacity,
-                    float(grid_charge_target_soc_pct) / 100.0 * capacity,
-                ),
-            )
-        grid_input = min(
-            max(0.0, grid_charge_rate_kwh_h) * duration_hours,
-            max(0.0, physical_charge_rate * duration_hours - pv_input),
-            max(0.0, target - soc) / eta,
-        )
-        soc += grid_input * eta
-        imported += house_deficit + grid_input
-        cost += (house_deficit + grid_input) * import_price
-    else:
-        delivered = min(
-            house_deficit,
-            max(0.0, discharge_rate_kwh_h) * duration_hours,
-            max(0.0, soc - floor) * eta,
-        )
-        draw = delivered / eta
-        soc -= draw
-        imported += house_deficit - delivered
-        cost += (house_deficit - delivered) * import_price + draw * BATTERY_WEAR_COST
-
-    exported = 0.0
-    sell_enabled = (
-        bool(sell)
-        if sell is not None
-        else action not in {"LIMIT_EXPORT", "GRID_CHARGE"}
-    )
-    if sell_enabled and export_price > 0.0:
-        exported = solar_left
-        cost -= exported * export_price
+    soc, imported, exported = flow.stored_kwh, flow.import_kwh, flow.export_kwh
+    cost = imported * import_price - exported * export_price + flow.drawn_kwh * BATTERY_WEAR_COST
     # Value remaining stored energy equally for both policies; without a
     # terminal value every discharge looks free and every charge looks harmful.
     cost -= max(0.0, soc - floor) * max(0.0, replacement_price)

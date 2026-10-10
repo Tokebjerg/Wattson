@@ -35,10 +35,29 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
     target = 100.0 if ev_charge_until_complete else ev_target_soc
     full_goal = target >= 100
     metered = state.ev_session_delivered_kwh
+    connected = bool(state.easee_online and (state.easee_status or "").lower()
+                     not in {"", "disconnected", "unknown", "unknown 0", "unavailable"})
+    budget_only = soc is None and state.ev_soc_source == "energy_budget"
+    awaiting_data = soc is None and not state.easee_completed_stable and (
+        state.ev_soc_source == "awaiting_vehicle_data" or (full_goal and not budget_only))
+    if awaiting_data:
+        return {"deadline": deadline.isoformat() if deadline else None,
+                "wanted_hours": 0, "hours": [], "intervals": [],
+                "note": "Waiting for verified vehicle SOC or a valid session anchor; no automatic grid charging",
+                "active": False, "overdue": bool(deadline and now.timestamp() >= deadline.timestamp()),
+                "required_kwh": 0.0, "remaining_unserved_kwh": None, "feasible": False,
+                "completed_before_goal": False, "full_goal": full_goal,
+                "goal_status": "awaiting_vehicle_data", "goal_label": "Afventer valide bildata; netladning er sat på pause",
+                "goal_confirmed": False, "goal_unverified": True,
+                "waiting_for_vehicle_data": True, "expected_departure_soc": None,
+                "soc_source": state.ev_soc_source, "data_reason": state.ev_soc_data_reason,
+                "soc_sample_at": state.ev_soc_sample_at.isoformat() if state.ev_soc_sample_at else None,
+                "power_kw": 0, "selected_hours": 0, "preview": not connected,
+                "plan_kind": "waiting" if connected else "preview"}
     if soc is not None and target > 0:
         required = max(0.0, target - soc) * per_pct * 1.1
         note = f"Metered estimate {soc:.1f}% -> {target:.0f}%"
-    elif full_goal:
+    elif full_goal and not budget_only:
         required = max(0.0, 100 * per_pct * 1.1 - metered)
         note = "100% goal: SOC unavailable, conservative capacity estimate; cheapest first"
     else:
@@ -49,11 +68,13 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
     confirmation_exhausted = False
     if full_goal:
         limit = state.ev_full_goal_limit_kwh
+        if budget_only:
+            limit = state.ev_unknown_budget_kwh if state.ev_unknown_budget_kwh is not None else ev_required_hours * nominal_kw
         if limit is None:
             limit = (metered + required if soc is not None else 100 * per_pct * 1.1) + nominal_kw * 0.25
         available = max(0.0, limit - metered)
         confirmation_exhausted = available <= 0.001 and not goal_confirmed
-        required = 0.0 if goal_confirmed else min(required + nominal_kw * 0.25, available)
+        required = 0.0 if goal_confirmed else min(required + (0 if budget_only else nominal_kw * 0.25), available)
         if goal_confirmed:
             note = "100% confirmed by vehicle SOC"
         elif confirmation_exhausted:
@@ -75,7 +96,7 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
                    "charger_complete_soc_unverified" if complete and goal_unverified else
                    "energy_guard_unverified" if confirmation_exhausted else
                    "awaiting_completion" if full_goal and soc is not None and soc >= 100 else
-                   "capacity_estimate" if full_goal and soc is None else "soc_estimate" if soc is not None else "energy_request")
+                   "soc_estimate" if soc is not None else "energy_request")
     goal_label = {"confirmed_full": "100 % bekræftet af bilen",
                   "completed_before_goal": "Bilen melder færdig før beregnet mål",
                   "charger_complete_soc_unverified": "Ladning færdig; 100 % ikke bekræftet",
@@ -86,8 +107,10 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
                   "energy_request": "Planlagt efter manuelt energimål"}[goal_status]
     overdue = deadline is not None and now.timestamp() >= deadline.timestamp()
     power_kw = min(nominal_kw, state.ev_full_power_kw or nominal_kw) * 0.9
-    if soc is not None and max(soc, target) > 85:
-        power_kw *= 0.85
+    if soc is not None and target > soc and target > 90:
+        # Taper belongs to the final SOC band, not the entire charging session.
+        tail_fraction = max(0.0, target - max(90.0, soc)) / (target - soc)
+        power_kw /= 1 + tail_fraction * (1 / 0.85 - 1)
     slots = sorted(state.price_slots, key=lambda s: s.start.timestamp())
     windows = []
     for index, slot in enumerate(slots):
@@ -141,7 +164,7 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
     return {"deadline": deadline.isoformat() if deadline else None,
             "wanted_hours": round(sum(h["minutes"] for h in hours) / 60, 2),
             "note": note, "hours": hours, "intervals": intervals,
-            "active": active and not overdue, "overdue": overdue,
+            "active": active and not overdue and connected, "overdue": overdue,
             "required_kwh": round(required, 3), "remaining_unserved_kwh": round(max(0.0, remaining, completion_shortfall), 3),
             "feasible": max(remaining, completion_shortfall) < 0.05 and not (overdue and required > 0.05),
             "completed_before_goal": completion_shortfall > 0.05,
@@ -150,4 +173,7 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
             "goal_confirmed": goal_confirmed, "goal_unverified": goal_unverified,
             "expected_departure_soc": round(projected, 1) if projected is not None else None,
             "soc_source": state.ev_soc_source, "power_kw": round(power_kw, 3),
+            "waiting_for_vehicle_data": False, "data_reason": state.ev_soc_data_reason,
+            "soc_sample_at": state.ev_soc_sample_at.isoformat() if state.ev_soc_sample_at else None,
+            "preview": not connected, "plan_kind": "active" if connected else "preview",
             "selected_hours": math.ceil(sum(h["minutes"] for h in hours) / 60)}

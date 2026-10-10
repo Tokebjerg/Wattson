@@ -34,6 +34,7 @@ class SnapshotBuilder:
             entity_id,
             state.state if state is not None else None,
             state.last_updated if state is not None else None,
+            repr(dict(state.attributes)) if state is not None else None,
         )
 
     def mapping_for(self, config: dict[str, Any]) -> tuple[EntityMapping, Capabilities]:
@@ -60,6 +61,9 @@ class SnapshotBuilder:
             self._entity_fp(mapping.buy_price_entity),
             self._entity_fp(mapping.sell_price_entity),
             self._entity_fp(mapping.forecast_today_entity),
+            self._entity_fp(mapping.forecast_today_entity.replace("_today", "_tomorrow")
+                            if mapping.forecast_today_entity and "_today" in mapping.forecast_today_entity
+                            else None),
             self._entity_fp(mapping.outdoor_temperature_entity),
         )
         if horizon_fp != self._horizon_fingerprint:
