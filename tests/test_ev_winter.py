@@ -481,6 +481,8 @@ class EvWinterTests(unittest.TestCase):
         co.config_entry = SimpleNamespace(data={}, options={}, entry_id="winter")
         co.hass = ws.FakeHass({"sensor.niro_last_updated_at": now.isoformat(),
             "binary_sensor.niro_ev_battery_plug": "on", "device_tracker.niro_location": "home"})
+        plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
+        plug_state.last_updated = plug_state.last_reported = now
         co.mapping = SimpleNamespace(ev_soc_entity="sensor.niro_ev_battery_level",
             easee_power_entity="sensor.charger_power", easee_session_entity="sensor.charger_energy")
         co._ev_session = session_module.EvSessionContext()
@@ -506,10 +508,13 @@ class EvWinterTests(unittest.TestCase):
         # three-phase-capable charger session for the next vehicle.
         co.hass = ws.FakeHass({"sensor.niro_last_updated_at": later.isoformat(),
             "binary_sensor.niro_ev_battery_plug": "off", "device_tracker.niro_location": "not_home"})
+        plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
+        plug_state.last_updated = plug_state.last_reported = later
         co.site_state = replace(co.site_state, ev_raw_soc_pct=35)
         co._update_ev_energy_state(later)
-        self.assertEqual("unknown", co._ev_session.vehicle)
+        self.assertEqual("other", co._ev_session.vehicle)
         self.assertIsNone(co.site_state.ev_soc_pct)
+        self.assertEqual("energy_budget", co.site_state.ev_soc_source)
         self.assertEqual(1, len(co._ev_session.history))
 
 

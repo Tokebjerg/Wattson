@@ -76,6 +76,12 @@ Version 0.31.6 treats the Easee enable switch as a user-owned master enable.
 Normal and safety pauses use Easee's pause command and never switch the charger
 off; a charger already disabled by the user remains respected.
 
+Version 0.31.7 uses the latest valid Niro SOC only when a fresh Niro plug sensor
+confirms that the Niro is connected. In automatic vehicle mode, a fresh Niro
+unplugged state identifies a separate charger session as another car and gives
+it a bounded, cheapest-hours energy plan instead of waiting indefinitely for
+Niro SOC. Missing or stale plug evidence still waits safely.
+
 ## Evidence And Accounting
 
 Desired plan, service acceptance and physical feedback are separate states.

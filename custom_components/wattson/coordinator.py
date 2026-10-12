@@ -3342,9 +3342,18 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         fresh_sample = sample_at is not None and 0 <= now.timestamp() - sample_at.timestamp() <= 12000
         plug = self.hass.states.get("binary_sensor.niro_ev_battery_plug")
         location = self.hass.states.get("device_tracker.niro_location")
+        plug_reported_at = (getattr(plug, "last_reported", None)
+                            or getattr(plug, "last_updated", None)) if plug else None
+        plug_fresh = bool(
+            plug and plug.state in {"on", "off"} and plug_reported_at
+            and 0 <= now.timestamp() - plug_reported_at.timestamp() <= 12000
+        )
+        niro_plugged = bool(plug_fresh and plug.state == "on")
+        niro_unplugged = bool(plug_fresh and plug.state == "off")
         if (profile == "auto" and session.vehicle == "niro" and fresh_sample
                 and session.energy.anchor_at and sample_at.timestamp() > datetime.fromisoformat(session.energy.anchor_at).timestamp()
-                and ((plug and plug.state == "off") or (location and location.state not in {"home", "unknown", "unavailable"}))):
+                and (niro_unplugged or (not niro_plugged and location
+                     and location.state not in {"home", "unknown", "unavailable"}))):
             # Fresh vehicle evidence can reveal a fast car swap that happened
             # entirely between two charger polls.
             session.observe(status="disconnected", session_kwh=None, power_w=0,
@@ -3358,11 +3367,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         elif profile == "other":
             session.vehicle = "other"
         elif session.vehicle == "unknown" and session.connected:
-            if (plug and plug.state == "on" and location and location.state == "home"
-                    and sample_at and session.started_at
-                    and sample_at.timestamp() >= session.started_at.timestamp() - 120
-                    and 0 <= now.timestamp() - sample_at.timestamp() <= 12000):
+            if niro_plugged and fresh_sample:
                 session.vehicle = "niro"
+            elif niro_unplugged:
+                # The charger session is connected, but a fresh Niro plug sensor
+                # says the Niro is not. Treat this as another vehicle so auto
+                # mode can use its bounded energy request without borrowing Niro SOC.
+                session.vehicle = "other"
         trusted = session.connected and session.allows_vehicle_soc(self.mapping.ev_soc_entity, DEFAULT_EV_SOC_ENTITY)
         # An old sample may remain an anchor once identified, but must not become
         # a fresh anchor merely because HA restarted.
@@ -3395,7 +3406,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             session.notifications = [code for code in session.notifications if code != "unknown_soc"]
             session.dirty = True
         data_reason = None
-        if estimate is None and profile != "other":
+        other_vehicle = profile == "other" or (profile == "auto" and session.vehicle == "other")
+        if estimate is None and not other_vehicle:
             if sample_at is None:
                 data_reason = "vehicle_sample_missing"
             elif not fresh_sample:
@@ -3411,7 +3423,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.site_state = replace(state, ev_soc_pct=estimate,
             ev_soc_sample_at=sample_at, ev_soc_data_reason=data_reason,
             ev_soc_source=("metered" if estimate is not None else
-                           "energy_budget" if profile == "other" else "awaiting_vehicle_data"),
+                           "energy_budget" if other_vehicle else "awaiting_vehicle_data"),
             ev_ac_kwh_per_pct=session.energy.ac_kwh_per_pct,
             ev_full_power_kw=min(session.energy.full_power_kw, max_amps * 230 * phases / 1000),
             ev_session_delivered_kwh=session.energy.delivered_kwh,

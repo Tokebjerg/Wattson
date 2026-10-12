@@ -1991,6 +1991,23 @@ def test_phase_gaps():
     checks.append(("no deadline: picks the globally cheapest hour", sched(10, -1).desired_action == "resume", sched(10, -1).reason))
     checks.append(("ready-by: reason names the deadline", "before 05:00" in sched(3, 5).reason, sched(3, 5).reason))
 
+    # Auto profile has fresh evidence that the Niro is unplugged while a charger
+    # session exists, so the other car gets a bounded energy plan instead of
+    # waiting forever for the Niro's SOC. This is the night-before-07:00 case.
+    other_car = replace(ev_state(at(0)), ev_soc_pct=None,
+        ev_soc_source="energy_budget", ev_unknown_budget_kwh=10.0,
+        ev_session_delivered_kwh=0.0, ev_deadline=at(7))
+    other_plan = planner.ev_cheapest_charge_hours(
+        other_car, ev_required_hours=2, ev_ready_hour=7, ev_target_soc=100,
+        ev_charge_until_complete=True, ev_max_amps=16)
+    checks.append(("auto other-car: bounded cheap night plan is visible before 07:00",
+                   not other_plan["waiting_for_vehicle_data"]
+                   and bool([h for h in other_plan["hours"] if h["charge"]])
+                   and sum(h["planned_kwh"] for h in other_plan["hours"]) <= 10.0
+                   and all(datetime.fromisoformat(h["hour"]).hour < 7
+                           for h in other_plan["hours"] if h["charge"]),
+                   f"{other_plan['selected_hours']}h / {other_plan['required_kwh']:.1f}kWh"))
+
     # ---- EV-forbedringer (helårs plug & play) ------------------------------- #
     # "Ren sol" is PURE SOLAR (v0.24.44, user 2026-07-02): a ready-by ("Klar senest")
     # deadline must NOT force a grid/battery top-up in solar_only — it used to
