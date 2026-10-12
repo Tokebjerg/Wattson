@@ -43,6 +43,32 @@ class EvActuationState:
     intent_fp: tuple | None = None
     command_failures: int = 0
     command_failed_at: datetime | None = None
+    telemetry_wait_since: datetime | None = None
+    telemetry_reloaded_at: datetime | None = None
+    telemetry_reload_attempts: int = 0
+
+    def telemetry_recovery_due(self, ev: EvPlan, *, now: datetime, status: str,
+                               evidence: str, online: bool) -> bool:
+        """Missing physical feedback needs a probe, not an assumed failed start."""
+        wants = ev.desired_action == "resume" and ev.desired_enabled is True
+        connected = status in EV_WAITING_TO_START_STATUSES or status == "charging"
+        if (evidence in {"charging", "not_charging"} or status == "disconnected"
+                or ev.desired_action == "pause" or ev.desired_enabled is False):
+            self.telemetry_wait_since = None
+            self.telemetry_reloaded_at = None
+            self.telemetry_reload_attempts = 0
+            return False
+        if not (wants and connected and online and evidence == "unknown"):
+            # Config-entry reloads temporarily remove entities. They must not
+            # erase the probe budget or reopen an unverified current offer.
+            return False
+        self.telemetry_wait_since = self.telemetry_wait_since or now
+        return (self.telemetry_reload_attempts < 2
+                and (now - self.telemetry_wait_since).total_seconds() >= EV_START_VERIFY_SECONDS)
+
+    def telemetry_recovery_attempted(self, now: datetime) -> None:
+        self.telemetry_reloaded_at = now
+        self.telemetry_reload_attempts += 1
 
     def decide(self, ev: EvPlan, *, now: datetime, status: str, evidence: str,
                online: bool, retune_seconds: int, effective_amps: float | None) -> EvTransition:

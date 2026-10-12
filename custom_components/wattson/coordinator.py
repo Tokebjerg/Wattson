@@ -651,6 +651,9 @@ def _ev_staleness_blocks_control(
 
 def _ev_stale_power_bootstrap_plan(ev_plan: EvPlan) -> EvPlan:
     """Clamp a stale-power resume to Easee's minimum current offer."""
+    if (ev_plan.desired_action != "resume" or ev_plan.desired_enabled is not True
+            or ev_plan.desired_circuit_currents is None):
+        return ev_plan
     currents = tuple(
         EV_STALE_POWER_BOOTSTRAP_A if current > 0 else 0
         for current in ev_plan.desired_circuit_currents
@@ -1848,6 +1851,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return {
             "state": self._ev_transport_recovery_status,
             "reloads": self._ev_transport_reload_count,
+            "telemetry_wait_since": (
+                self._ev_actuation.telemetry_wait_since.isoformat()
+                if self._ev_actuation.telemetry_wait_since is not None else None
+            ),
+            "telemetry_reload_attempts": self._ev_actuation.telemetry_reload_attempts,
             "last_reload_at": (
                 self._last_ev_transport_reload_at.isoformat()
                 if self._last_ev_transport_reload_at is not None
@@ -5053,7 +5061,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and online_entity in self.site_state.ev_stale_entities
         )
 
-    async def _async_recover_easee_transport(self, now: datetime) -> list[str]:
+    async def _async_recover_easee_transport(
+        self, now: datetime, *, pause_unverified: EvPlan | None = None,
+    ) -> list[str]:
         """Reload a stalled Easee config entry and re-arm EV convergence."""
         if self.mapping is None:
             return []
@@ -5072,8 +5082,25 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_transport_recovery_status = "cooldown"
             return []
 
+        actions = CommandActions()
+        self._last_ev_transport_reload_at = now
+        if pause_unverified is not None:
+            # A stale power reading cannot authorize an open-ended offer while
+            # reconnecting. A failed cloud pause must not block the local reload.
+            try:
+                actions.extend(await self._easee.apply_ev_plan(
+                    self.mapping, self.site_state,
+                    replace(pause_unverified, desired_enabled=None,
+                            desired_action="pause", desired_amps=0,
+                            desired_circuit_currents=(0, 0, 0), desired_phase_mode=None),
+                ))
+            except CommandFailure as err:
+                actions.extend(CommandActions(err.actions, err.events))
+                _LOGGER.warning("Wattson could not pause unverified Easee before reconnecting: %s", err)
+        # The HA reload service is local, not an Easee cloud command. Discard
+        # cloud transport backoff so it cannot prevent its own recovery.
+        self._easee.commands.invalidate()
         try:
-            self._last_ev_transport_reload_at = now
             await self._easee.commands.call(
                 "homeassistant",
                 "reload_config_entry",
@@ -5083,7 +5110,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         except Exception as err:  # noqa: BLE001
             self._ev_transport_recovery_status = "reload_failed"
             _LOGGER.warning("Wattson could not reload stalled Easee transport: %s", err)
-            return []
+            return actions
 
         self._last_ev_transport_reload_at = now
         self._ev_transport_reload_grace_until = now + timedelta(
@@ -5104,7 +5131,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_current_change_at = None
         self._last_ev_circuit_refresh_at = None
         self._last_ev_write_at = None
-        return ["easee config entry reloaded after stale start transport"]
+        actions.append("easee config entry reloaded after stale start transport")
+        return actions
 
     async def _async_apply_ev(self, plan: ControlPlan, now: datetime) -> list[str]:
         try:
@@ -5148,6 +5176,32 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         elif stale_power_blocks:
             blocked_reason = "ev_power_stale"
         self._ev_control_blocked_reason = blocked_reason
+        evidence = self._ev_charging_evidence(now)
+        probe_due = self._ev_actuation.telemetry_recovery_due(
+            ev, now=now, status=easee_status, evidence=evidence,
+            online=bool(self.site_state.easee_online
+                        and not self.site_state.ev_issues
+                        and not self.site_state.ev_missing_entities),
+        )
+        if probe_due and write_allowed(
+            getattr(self, "_last_ev_transport_reload_at", None),
+            EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS, now,
+        ):
+            self._ev_actuation.telemetry_recovery_attempted(now)
+            return await self._async_recover_easee_transport(now, pause_unverified=ev)
+        if evidence == "unknown" and self._ev_actuation.telemetry_reloaded_at is not None:
+            self._ev_control_blocked_reason = "ev_telemetry_unverified"
+            self._ev_start_status = "telemetry_unknown"
+            if ((now - self._ev_actuation.telemetry_reloaded_at).total_seconds()
+                    >= EV_TRANSPORT_RELOAD_GRACE_SECONDS):
+                await self._async_ev_alert(
+                    "telemetry_unverified",
+                    "Wattson vil lade bilen, men Easee giver ingen valide effekt- eller "
+                    "energimålinger efter automatisk genforbindelse. Pause er forsøgt, "
+                    "men kan ikke bekræftes fysisk. Wattson afventer valide data før "
+                    "nye startforsøg. Kontroller Easee-forbindelsen.",
+                )
+            return []
         if blocked_reason:
             # EV is an independent fault domain: skip only Easee writes. Healthy
             # battery control continues and the manual override exposes "blocked".
@@ -5170,7 +5224,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         # signal to wake up.
         if power_stale and not minimum_recovery_active and (ev.mode == EV_MODE_SOLAR_ONLY or ev.solar_opportunity):
             ev = _ev_stale_power_bootstrap_plan(ev)
-        evidence = self._ev_charging_evidence(now)
         physically_charging = evidence == "charging"
         self._easee.commands.confirm_action("resume" if physically_charging else "pause"
                                            if evidence == "not_charging" else None)
@@ -5192,7 +5245,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_control_blocked_reason = "easee_start_recovery"
         if self._ev_actuation.stop_attempts >= 3:
             self._ev_control_blocked_reason = "easee_stop_failed"
-        if physically_charging and self._ev_transport_recovery_status == "reloading":
+        if physically_charging and self._ev_transport_recovery_status in {"reloading", "verifying"}:
             self._ev_transport_recovery_status = "recovered"
             self._ev_transport_reload_grace_until = None
         if start_recovery_due:
@@ -5225,10 +5278,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self.mapping,
             self.site_state,
             ev,
-            force_enable=start_recovery_due,
-            override_schedule=start_recovery_due,
+            force_enable=start_recovery_due or (
+                self._ev_transport_recovery_status == "reloading" and evidence == "not_charging"
+            ),
+            override_schedule=start_recovery_due or (
+                self._ev_transport_recovery_status == "reloading" and evidence == "not_charging"
+            ),
         )
         if acts:
+            if self._ev_transport_recovery_status == "reloading" and evidence == "not_charging":
+                self._ev_transport_recovery_status = "verifying"
             self._last_ev_write_at = now
             if ev.desired_circuit_currents is not None:
                 self._last_ev_circuit_refresh_at = now

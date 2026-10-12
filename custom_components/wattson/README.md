@@ -49,6 +49,14 @@ without waiting for another vehicle API update. Counter bursts use elapsed time
 since the last accepted counter change; invalid jumps cannot erase the baseline.
 Solar-only still permits temporary battery-buffer dips, not sustained support.
 
+Version 0.31.1 probes missing physical Easee feedback independently of its online
+heartbeat. After 90 seconds of requested charging without verifiable power or
+energy, it requests a zero-current pause and reloads only the Easee integration.
+The live offer is restored after feedback returns, never increased on stale data.
+Probes are limited to two per continuous unknown-feedback episode and separated
+by 30 minutes. A failed recovery raises the existing HA/phone EV alert. Normal
+constant readings supported by accepted energy progress do not trigger a probe.
+
 ## Evidence And Accounting
 
 Desired plan, service acceptance and physical feedback are separate states.
@@ -81,19 +89,21 @@ python3 sim/winter_stress.py
 python3 sim/wattson_analyze.py --check sim/backtest_data/generated/*.json
 ```
 
-The CI workflow runs these checks on relevant branch pushes/pull requests and can
-be started manually. It contains no deployment steps or live HA credentials. The
+The local CI workflow defines these checks for branch pushes/pull requests and
+manual runs. It has not been published because GitHub access lacks workflow
+permission. It contains no deployment steps or live HA credentials. The
 20-day study enforces efficiency, worst-day plan-versus-reactive cost, missed
 discharge frequency and honest-oracle headroom limits.
 
 ## Release and deployment
 
-Local refactor 0.31.0 covers the ten ordered reliability boundaries. Its test
+Refactor 0.31.0 covers the ten ordered reliability boundaries. Its test
 results and remaining validation limits are recorded in
 [`docs/wattson/refactor_0310.md`](../../docs/wattson/refactor_0310.md).
-No deployment, Git push, live settings change or HA restart was performed for this
-implementation. The real HA framework, Store lifecycle and physical device
-readback still require validation before deployment.
+It was deployed and startup/readback verified on 2026-10-10. Version 0.31.1 fixes
+solar pause crashes and the missing-feedback recovery deadlock; see
+[`docs/wattson/solar_recovery_0311.md`](../../docs/wattson/solar_recovery_0311.md).
+Offline tests do not replace post-deployment physical feedback checks.
 
 `manifest.json` carries the HACS release version; a public-contract test enforces
 that `INTEGRATION_VERSION` matches it. Before deployment, run all checks above,
