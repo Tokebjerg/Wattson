@@ -72,6 +72,10 @@ before the next clock hour, but only after stable surplus and fresh independent
 measurements prove that net export covers the requested charger offer without
 grid import or house-battery discharge.
 
+Version 0.31.6 treats the Easee enable switch as a user-owned master enable.
+Normal and safety pauses use Easee's pause command and never switch the charger
+off; a charger already disabled by the user remains respected.
+
 ## Evidence And Accounting
 
 Desired plan, service acceptance and physical feedback are separate states.

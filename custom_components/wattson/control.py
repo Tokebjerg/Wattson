@@ -469,11 +469,14 @@ class EaseeController:
                             self._last_phase_change_at = now
                             actions.extend(changed)
 
-        if plan.desired_enabled is not None and mapping.easee_enable_switch:
+        # The enable switch is a user-owned master enable, not the charging
+        # session control. Pause through Easee's action command; never turn the
+        # user's charger off merely because the current plan does not charge.
+        if plan.desired_enabled is True and mapping.easee_enable_switch:
             actions.extend(
                 await self._set_switch(
                     mapping.easee_enable_switch,
-                    plan.desired_enabled,
+                    True,
                     force=force_enable and plan.desired_enabled,
                 )
             )

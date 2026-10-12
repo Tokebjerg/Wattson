@@ -103,6 +103,27 @@ def plant_coordinator(now):
 
 
 class SolarRecoveryTests(unittest.TestCase):
+    def test_pause_stops_session_without_disabling_user_owned_charger(self):
+        now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        plant.stalled = False
+        plant.amps, plant.currents, plant.resumed = 11, (11, 0, 0), True
+        co.site_state = replace(co.site_state, easee_status="charging", easee_power_w=2530)
+        plan = ws.models.EvPlan(
+            "solar_only", "no current solar surplus", desired_enabled=False,
+            desired_action="pause",
+        )
+
+        asyncio.run(co._easee.apply_ev_plan(co.mapping, co.site_state, plan))
+
+        self.assertTrue(plant.enabled)
+        self.assertFalse(plant.resumed)
+        self.assertFalse(any(call[0] == "switch" and call[1] == "turn_off"
+                             for call in plant.calls))
+        self.assertTrue(any(call[1] == "action_command"
+                            and call[2]["action_command"] == "pause"
+                            for call in plant.calls))
+
     def test_exhausted_grid_budget_recovers_after_stable_clean_solar_export(self):
         now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
         co, _plant = plant_coordinator(now)
