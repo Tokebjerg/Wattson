@@ -227,6 +227,7 @@ from .runtime import ActuatorRuntime, BackgroundWork, CadenceGate, TickContext, 
 from .settings import WattsonConfig
 from .snapshot import SnapshotBuilder
 from .ev_actuation import runtime_field
+from .ev_transport import EaseeRestFeedback, REST_POLL_SECONDS
 from .accounting import AccountingState
 from .commands import CommandActions, CommandFailure
 from .decision_archive import DecisionArchive
@@ -802,6 +803,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self.config_entry = entry
         self.settings = WattsonConfig.from_entry(entry)
         self._snapshot_builder = SnapshotBuilder(hass)
+        self._ev_rest_feedback = EaseeRestFeedback(hass)
         self._planning_engine = PlanningEngine()
         self._cadence = CadenceGate()
         self._tick_metrics = TickMetrics()
@@ -1856,6 +1858,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if self._ev_actuation.telemetry_wait_since is not None else None
             ),
             "telemetry_reload_attempts": self._ev_actuation.telemetry_reload_attempts,
+            "feedback": self._ev_rest_feedback.as_dict() if hasattr(self, "_ev_rest_feedback") else {},
             "last_reload_at": (
                 self._last_ev_transport_reload_at.isoformat()
                 if self._last_ev_transport_reload_at is not None
@@ -3593,6 +3596,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             invert_grid_power_sign=self._grid_power_sign_should_be_inverted(),
             invert_battery_power_sign=bool(entry_value(self.config_entry, CONF_INVERT_BATTERY_POWER_SIGN, DEFAULT_INVERT_BATTERY_POWER_SIGN)),
         )
+        rest_feedback = getattr(self, "_ev_rest_feedback", None)
+        if self.ev_control_enabled and rest_feedback and rest_feedback.needs_probe(self.site_state, self.mapping):
+            rest_key = (self.mapping.easee_device_id, self.mapping.easee_power_entity,
+                        self.mapping.easee_status_entity)
+            rest_feedback.accept(self.background.poll("ev_rest_feedback", rest_key), rest_key)
+            if self._cadence.due("ev_rest_feedback", tick.now, timedelta(seconds=REST_POLL_SECONDS)):
+                self.background.submit("ev_rest_feedback", rest_key,
+                    partial(rest_feedback.read, self.mapping, rest_key))
+            self.site_state = rest_feedback.apply(self.site_state, self.mapping, rest_key, tick.now)
+        elif rest_feedback:
+            rest_feedback.used = False
 
         new_ev_session = self._ev_session.observe(
             status=self.site_state.easee_status,
@@ -5158,6 +5172,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         easee_status = (self.site_state.easee_status or "").strip().lower()
         requested_ev = plan.ev
         ev = requested_ev
+        rest = getattr(self, "_ev_rest_feedback", None)
+        if rest is not None and rest.lost(now):
+            self._ev_control_blocked_reason = "ev_rest_feedback_expired"
+            if (self._ev_actuation.stop_attempts < 3
+                    and write_allowed(self._ev_actuation.stop_retried_at, EV_START_RECOVERY_RETRY_SECONDS, now)):
+                self._ev_actuation.stop_attempts += 1
+                self._ev_actuation.stop_retried_at = now
+                self._last_ev_fp = None
+                await self._async_ev_alert("telemetry_unverified",
+                    "Easees REST-tilbagemelding er forældet under opladning. Wattson forsøger "
+                    "pause og starter ikke igen, før valide målinger er tilbage.")
+                return await self._easee.apply_ev_plan(self.mapping, self.site_state,
+                    replace(ev, desired_enabled=None, desired_action="pause", desired_amps=0,
+                            desired_circuit_currents=(0, 0, 0), desired_phase_mode=None))
+            return []
         stale_power_blocks = _ev_staleness_blocks_control(
             self.site_state.ev_stale_entities,
             self.mapping,
@@ -5365,6 +5394,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return "unknown"
 
     def _ev_observed_offer(self, now: datetime) -> dict[str, Any]:
+        rest = getattr(self, "_ev_rest_feedback", None)
+        if rest and rest.used and rest.feedback and rest.feedback.fresh(now):
+            amps = rest.feedback.offer_amps
+            return {"source": "easee_rest", "dynamic_charger_limit": amps,
+                    "effective_amps": amps} if amps is not None else {"source": "easee_rest"}
         mapping = self.mapping
         entity = mapping.easee_power_entity if mapping else None
         if not entity or not entity.endswith("_power") or not hasattr(self.hass, "states"):
