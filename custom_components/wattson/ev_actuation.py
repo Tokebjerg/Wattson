@@ -48,9 +48,10 @@ class EvActuationState:
     telemetry_reload_attempts: int = 0
 
     def telemetry_recovery_due(self, ev: EvPlan, *, now: datetime, status: str,
-                               evidence: str, online: bool) -> bool:
+                               evidence: str, online: bool,
+                               transport_blocked: bool = False) -> bool:
         """Missing physical feedback needs a probe, not an assumed failed start."""
-        wants = ev.desired_action == "resume" and ev.desired_enabled is True
+        wants = transport_blocked or (ev.desired_action == "resume" and ev.desired_enabled is True)
         connected = status in EV_WAITING_TO_START_STATUSES or status == "charging"
         if (evidence in {"charging", "not_charging"} or status == "disconnected"
                 or ev.desired_action == "pause" or ev.desired_enabled is False):

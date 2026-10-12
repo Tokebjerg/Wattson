@@ -162,6 +162,37 @@ class SolarRecoveryTests(unittest.TestCase):
         asyncio.run(co._async_apply_ev(plan, now+timedelta(seconds=100)))
         self.assertGreater(plant.power, 0)
 
+    def test_unknown_online_after_restart_only_probes_never_starts_blind(self):
+        now = datetime(2026, 10, 12, 11, 20, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        empty = SimpleNamespace(ev=ws.models.EvPlan("solar_only", "online unknown"))
+        for second in (0, 90):
+            co.site_state = replace(co.site_state, easee_online=None,
+                ev_missing_entities=["binary_sensor.easee_online"])
+            asyncio.run(co._async_apply_ev(empty, now+timedelta(seconds=second)))
+        self.assertEqual(["reload_config_entry"], [call[1] for call in plant.calls])
+        self.assertIsNone(co.site_state.easee_online)
+        self.assertEqual(0, plant.power)
+        self.assertEqual(1, co._ev_transport_reload_count)
+        plant.observe(now+timedelta(seconds=100))
+        asyncio.run(co._async_apply_ev(SimpleNamespace(ev=solar_offer()), now+timedelta(seconds=100)))
+        self.assertGreater(plant.power, 0)
+
+    def test_persistently_unknown_online_is_bounded_and_alerted(self):
+        now = datetime(2026, 10, 12, 11, 20, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        plant.fail_reload = True
+        empty = SimpleNamespace(ev=ws.models.EvPlan("solar_only", "online unknown"))
+        for second in range(0, 4*3600, 60):
+            plant.observe(now+timedelta(seconds=second))
+            co.site_state = replace(co.site_state, easee_online=None,
+                ev_missing_entities=["binary_sensor.easee_online"])
+            co._easee.commands._retry_after = 0
+            asyncio.run(co._async_apply_ev(empty, now+timedelta(seconds=second)))
+        self.assertEqual(["reload_config_entry"]*2, [call[1] for call in plant.calls])
+        self.assertEqual("telemetry_unverified", co._async_ev_alert.call_args.args[0])
+        self.assertEqual(0, plant.power)
+
     def test_continuous_unknown_episode_has_two_probes_not_a_reload_loop(self):
         now = datetime(2026, 10, 12, 11, tzinfo=TZ)
         co, plant = plant_coordinator(now)

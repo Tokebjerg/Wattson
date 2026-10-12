@@ -56,6 +56,9 @@ The live offer is restored after feedback returns, never increased on stale data
 Probes are limited to two per continuous unknown-feedback episode and separated
 by 30 minutes. A failed recovery raises the existing HA/phone EV alert. Normal
 constant readings supported by accepted energy progress do not trigger a probe.
+Version 0.31.2 also probes a connected session whose online diagnostic stays
+unknown after restart. This is connection recovery only: no current/start command
+is authorized until online status and physical feedback are valid.
 
 ## Evidence And Accounting
 

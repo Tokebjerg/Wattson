@@ -1,4 +1,4 @@
-# Wattson 0.31.1 solar charging recovery
+# Wattson 0.31.1 / 0.31.2 solar charging recovery
 
 ## Documented incident: 2026-10-12
 
@@ -47,7 +47,7 @@ Two code defects are established:
 
 ## Isolated verification
 
-- 127 unit/regression tests passed, including seven new recovery tests.
+- Initial 0.31.1: 127 unit/regression tests passed, including seven new recovery tests.
 - 689 simulation checks passed; compileall and diff whitespace checks passed.
 - Independent charger plant reproduces accepted-but-lost commands, stale zero
   power and fresh online heartbeat. One probe restores actual 2530 W charging;
@@ -70,3 +70,22 @@ Pre-deployment backup `48c0a6bc` completed on 2026-10-12 at 11:12 local time.
 Live deployment and physical results are verified separately after installation.
 No external cloud service outage can be guaranteed repairable by Wattson; failed
 automatic recovery must stay visible and must not authorize blind escalation.
+
+## Live follow-up: 0.31.2
+
+The 0.31.1 deployment commit `5ab9abf` was installed and HA restarted at about
+11:18 local time. Wattson's EV exceptions cleared, but Easee's stream continued
+returning HTTP 404. The separate online diagnostic stayed unknown after restart,
+even as its REST polling reported status/power observations. The installed Easee
+integration is 0.9.74; no third-party dependency, credentials or device settings
+were changed. Its upstream controller populates online status from stream data:
+[Easee controller](https://github.com/nordicopen/easee_hass/blob/master/custom_components/easee/controller.py).
+
+0.31.2 extends the bounded connection probe to this startup case: an established
+connected session with only the online diagnostic missing can request a local
+integration reload and raise an alarm. It cannot publish a positive current offer
+or a start command while online status remains unknown. Explicit offline, other
+missing/invalid data, manual pauses and safe-mode plans remain blocked. Reconnect
+budget/hold survive transient unavailable states; cloud connectivity is not
+invented from cached measurements. Two additional isolated tests exercise recovery
+and persistent failure without any start/current writes.

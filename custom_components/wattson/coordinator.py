@@ -5177,29 +5177,51 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             blocked_reason = "ev_power_stale"
         self._ev_control_blocked_reason = blocked_reason
         evidence = self._ev_charging_evidence(now)
+        online_entity = getattr(self.mapping, "easee_online_entity", None)
+        session = getattr(self, "_ev_session", None)
+        # Easee can poll status/power while its stream-only online entity remains
+        # unknown. Probe that connection, but never turn unknown into "online"
+        # for planning, physical evidence or charger commands.
+        transport_blocked = bool(
+            self.site_state.easee_online is None and online_entity
+            and online_entity in self.site_state.ev_missing_entities
+            and not (set(self.site_state.ev_missing_entities) - {online_entity})
+            and not self.site_state.ev_issues
+            and session is not None and session.connected
+            and easee_status in EV_WAITING_TO_START_STATUSES | {"charging"}
+            and ev.desired_action is None and ev.desired_enabled is None
+            and not getattr(plan, "safe_mode", False)
+        )
         probe_due = self._ev_actuation.telemetry_recovery_due(
-            ev, now=now, status=easee_status, evidence=evidence,
-            online=bool(self.site_state.easee_online
+            ev, now=now, status=easee_status,
+            evidence="unknown" if transport_blocked else evidence,
+            online=transport_blocked or bool(self.site_state.easee_online
                         and not self.site_state.ev_issues
                         and not self.site_state.ev_missing_entities),
+            transport_blocked=transport_blocked,
         )
         if probe_due and write_allowed(
             getattr(self, "_last_ev_transport_reload_at", None),
             EV_TRANSPORT_RELOAD_COOLDOWN_SECONDS, now,
         ):
             self._ev_actuation.telemetry_recovery_attempted(now)
-            return await self._async_recover_easee_transport(now, pause_unverified=ev)
-        if evidence == "unknown" and self._ev_actuation.telemetry_reloaded_at is not None:
+            return await self._async_recover_easee_transport(
+                now, pause_unverified=None if transport_blocked else ev,
+            )
+        if (evidence == "unknown" or transport_blocked) and self._ev_actuation.telemetry_reloaded_at is not None:
             self._ev_control_blocked_reason = "ev_telemetry_unverified"
             self._ev_start_status = "telemetry_unknown"
             if ((now - self._ev_actuation.telemetry_reloaded_at).total_seconds()
                     >= EV_TRANSPORT_RELOAD_GRACE_SECONDS):
                 await self._async_ev_alert(
                     "telemetry_unverified",
+                    ("Easees online-status er stadig ukendt efter automatisk genforbindelse. "
+                     "Wattson starter ikke bilen på ukendte forbindelsesdata. "
+                     "Kontroller Easee-forbindelsen." if transport_blocked else
                     "Wattson vil lade bilen, men Easee giver ingen valide effekt- eller "
                     "energimålinger efter automatisk genforbindelse. Pause er forsøgt, "
                     "men kan ikke bekræftes fysisk. Wattson afventer valide data før "
-                    "nye startforsøg. Kontroller Easee-forbindelsen.",
+                    "nye startforsøg. Kontroller Easee-forbindelsen."),
                 )
             return []
         if blocked_reason:
