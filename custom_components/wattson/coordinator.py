@@ -3340,8 +3340,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._pending_replan_reason = "ev_energy_request_changed"
         self._ev_applied_energy_request_kwh = requested_energy
         fresh_sample = sample_at is not None and 0 <= now.timestamp() - sample_at.timestamp() <= 12000
+        scheduled_cheapest = self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
         plug = self.hass.states.get("binary_sensor.niro_ev_battery_plug")
-        location = self.hass.states.get("device_tracker.niro_location")
         plug_reported_at = (getattr(plug, "last_reported", None)
                             or getattr(plug, "last_updated", None)) if plug else None
         plug_fresh = bool(
@@ -3349,32 +3349,23 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             and 0 <= now.timestamp() - plug_reported_at.timestamp() <= 12000
         )
         niro_plugged = bool(plug_fresh and plug.state == "on")
-        niro_unplugged = bool(plug_fresh and plug.state == "off")
-        if (profile == "auto" and session.vehicle == "niro" and fresh_sample
-                and session.energy.anchor_at and sample_at.timestamp() > datetime.fromisoformat(session.energy.anchor_at).timestamp()
-                and (niro_unplugged or (not niro_plugged and location
-                     and location.state not in {"home", "unknown", "unavailable"}))):
-            # Fresh vehicle evidence can reveal a fast car swap that happened
-            # entirely between two charger polls.
-            session.observe(status="disconnected", session_kwh=None, power_w=0,
-                now=now, one_phase_ceiling_w=EV_SINGLE_PHASE_OBSERVED_CEILING_W)
-            session.observe(status=state.easee_status, session_kwh=state.easee_session_kwh,
-                power_w=state.easee_power_w, now=now, one_phase_ceiling_w=EV_SINGLE_PHASE_OBSERVED_CEILING_W)
-            session.set_deadline(now, self.ev_ready_hour, rearm=True)
-            self._ev_minimum_recovery = None
         if profile == "niro":
             session.vehicle = "niro" if self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY else "configured"
         elif profile == "other":
             session.vehicle = "other"
+        elif scheduled_cheapest and session.connected:
+            # Scheduled-cheapest explicitly targets the Niro SOC. The Kia
+            # integration's plug/GPS signals can lag or be wrong, so the
+            # connected Easee session plus a fresh SOC sample is the authority.
+            if fresh_sample and self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY:
+                session.vehicle = "niro"
+            elif not fresh_sample:
+                session.vehicle = "unknown"
         elif session.vehicle == "unknown" and session.connected:
             if niro_plugged and fresh_sample:
                 session.vehicle = "niro"
-            elif niro_unplugged:
-                # The charger session is connected, but a fresh Niro plug sensor
-                # says the Niro is not. Treat this as another vehicle so auto
-                # mode can use its bounded energy request without borrowing Niro SOC.
-                session.vehicle = "other"
-        trusted = session.connected and session.allows_vehicle_soc(self.mapping.ev_soc_entity, DEFAULT_EV_SOC_ENTITY)
+        trusted = (scheduled_cheapest and session.connected
+                   and session.allows_vehicle_soc(self.mapping.ev_soc_entity, DEFAULT_EV_SOC_ENTITY))
         # An old sample may remain an anchor once identified, but must not become
         # a fresh anchor merely because HA restarted.
         max_amps = int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS))
@@ -3406,7 +3397,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             session.notifications = [code for code in session.notifications if code != "unknown_soc"]
             session.dirty = True
         data_reason = None
-        other_vehicle = profile == "other" or (profile == "auto" and session.vehicle == "other")
+        other_vehicle = (not scheduled_cheapest or profile == "other"
+                         or (profile == "auto" and session.vehicle == "other"))
         if estimate is None and not other_vehicle:
             if sample_at is None:
                 data_reason = "vehicle_sample_missing"

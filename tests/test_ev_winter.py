@@ -474,7 +474,7 @@ class EvWinterTests(unittest.TestCase):
         self.assertEqual("charging", co._ev_start_status)
         self.assertEqual(0, co._ev_start_recovery_attempts)
 
-    def test_coordinator_soc_anchor_survives_staleness_and_car_swap(self):
+    def test_coordinator_soc_source_is_mode_scoped(self):
         co_mod = ws._coordinator_module()
         co = object.__new__(co_mod.WattsonCoordinator)
         now = datetime(2026, 12, 1, 17, tzinfo=timezone.utc)
@@ -502,20 +502,25 @@ class EvWinterTests(unittest.TestCase):
         co.site_state = replace(co.site_state, timestamp=later, easee_session_kwh=20,
                                 ev_soc_pct=None, ev_raw_soc_pct=50)
         co._ev_session = session_module.EvSessionContext.from_storage_dict(co._ev_session.to_storage_dict())
+        co.hass = ws.FakeHass({"sensor.niro_last_updated_at": later.isoformat(),
+            "binary_sensor.niro_ev_battery_plug": "on", "device_tracker.niro_location": "home"})
+        plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
+        plug_state.last_updated = plug_state.last_reported = later
         co._update_ev_energy_state(later)
-        self.assertGreater(co.site_state.ev_soc_pct, 74)
-        # The Niro backend now proves it is unplugged, despite an uninterrupted
-        # three-phase-capable charger session for the next vehicle.
+        self.assertEqual(50, co.site_state.ev_soc_pct)
+        # Modes other than scheduled-cheapest must not consume Niro SOC,
+        # even when its integration reports a fresh sample and plug status.
+        co.ev_mode = "solar_only"
         co.hass = ws.FakeHass({"sensor.niro_last_updated_at": later.isoformat(),
             "binary_sensor.niro_ev_battery_plug": "off", "device_tracker.niro_location": "not_home"})
         plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
         plug_state.last_updated = plug_state.last_reported = later
         co.site_state = replace(co.site_state, ev_raw_soc_pct=35)
         co._update_ev_energy_state(later)
-        self.assertEqual("other", co._ev_session.vehicle)
+        self.assertEqual("niro", co._ev_session.vehicle)
         self.assertIsNone(co.site_state.ev_soc_pct)
         self.assertEqual("energy_budget", co.site_state.ev_soc_source)
-        self.assertEqual(1, len(co._ev_session.history))
+        self.assertEqual(0, len(co._ev_session.history))
 
 
 if __name__ == "__main__":

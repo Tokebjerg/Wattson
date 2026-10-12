@@ -128,33 +128,7 @@ class EvRegressionTests(unittest.TestCase):
         self.assertEqual([12,13,14],[datetime.fromisoformat(h["hour"]).hour for h in after["hours"] if h["charge"]])
         self.assertEqual("ev_vehicle_data_recovered",co._pending_replan_reason)
 
-    def test_auto_uses_latest_soc_for_plugged_niro_even_if_sample_predates_session(self):
-        now = datetime(2026, 10, 12, 22, tzinfo=TZ)
-        sample_at = now - timedelta(minutes=20)
-        co = coordinator(now, soc=44)
-        co.ev_ready_hour = 7
-        co.hass = ws.FakeHass({
-            "sensor.niro_last_updated_at": sample_at.astimezone(timezone.utc).isoformat(),
-            "binary_sensor.niro_ev_battery_plug": "on",
-            "device_tracker.niro_location": "home",
-        })
-        plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
-        plug_state.last_updated = plug_state.last_reported = now
-        co.site_state = replace(co.site_state, timestamp=now, ev_raw_soc_pct=44,
-                                ev_soc_sample_at=sample_at, price_slots=prices(now))
-
-        co._update_ev_energy_state(now)
-        plan = co.ev_charge_schedule
-
-        self.assertEqual("niro", co._ev_session.vehicle)
-        self.assertEqual("metered", co.site_state.ev_soc_source)
-        self.assertEqual(44, co.site_state.ev_soc_pct)
-        self.assertFalse(plan["waiting_for_vehicle_data"])
-        self.assertTrue(any(hour["charge"] for hour in plan["hours"]))
-        self.assertTrue(all(datetime.fromisoformat(hour["hour"]).hour < 7
-                            for hour in plan["hours"] if hour["charge"]))
-
-    def test_auto_plans_bounded_cheap_energy_for_other_car_without_niro_soc(self):
+    def test_scheduled_cheapest_uses_fresh_niro_soc_even_if_plug_sensor_says_off(self):
         now = datetime(2026, 10, 12, 22, tzinfo=TZ)
         sample_at = now - timedelta(minutes=20)
         co = coordinator(now, soc=44)
@@ -172,15 +146,35 @@ class EvRegressionTests(unittest.TestCase):
         co._update_ev_energy_state(now)
         plan = co.ev_charge_schedule
 
-        self.assertEqual("other", co._ev_session.vehicle)
-        self.assertIsNone(co.site_state.ev_soc_pct)
-        self.assertEqual("energy_budget", co.site_state.ev_soc_source)
+        self.assertEqual("niro", co._ev_session.vehicle)
+        self.assertEqual("metered", co.site_state.ev_soc_source)
+        self.assertEqual(44, co.site_state.ev_soc_pct)
         self.assertFalse(plan["waiting_for_vehicle_data"])
         self.assertTrue(any(hour["charge"] for hour in plan["hours"]))
-        self.assertLessEqual(sum(hour["planned_kwh"] for hour in plan["hours"]),
-                             co.ev_energy_request_kwh)
         self.assertTrue(all(datetime.fromisoformat(hour["hour"]).hour < 7
                             for hour in plan["hours"] if hour["charge"]))
+
+    def test_non_cheapest_modes_use_generic_budget_not_niro_soc(self):
+        now = datetime(2026, 10, 12, 22, tzinfo=TZ)
+        sample_at = now - timedelta(minutes=20)
+        for mode in ("solar_only", "full_speed", "scheduled_periods"):
+            with self.subTest(mode=mode):
+                co = coordinator(now, soc=44)
+                co.ev_mode = mode
+                co.hass = ws.FakeHass({
+                    "sensor.niro_last_updated_at": sample_at.astimezone(timezone.utc).isoformat(),
+                    "binary_sensor.niro_ev_battery_plug": "on",
+                    "device_tracker.niro_location": "home",
+                })
+                plug_state = co.hass.states.get("binary_sensor.niro_ev_battery_plug")
+                plug_state.last_updated = plug_state.last_reported = now
+                co.site_state = replace(co.site_state, timestamp=now, ev_raw_soc_pct=44,
+                                        ev_soc_sample_at=sample_at, price_slots=prices(now))
+
+                co._update_ev_energy_state(now)
+
+                self.assertIsNone(co.site_state.ev_soc_pct)
+                self.assertEqual("energy_budget", co.site_state.ev_soc_source)
 
     def test_other_vehicle_never_uses_niro_soc_and_budget_stays_bounded(self):
         now=datetime(2026,10,10,9,tzinfo=TZ)
