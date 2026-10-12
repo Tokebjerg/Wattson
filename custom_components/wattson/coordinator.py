@@ -2572,6 +2572,15 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if self._ev_solar_surplus_since is not None
             else None
         )
+        if grid_budget_exhausted and self._ev_solar_budget_recovery_ready(
+            ev_plan,
+            surplus_elapsed_seconds=surplus_elapsed,
+        ):
+            # The hourly budget protects against real grid-backed EV charging; it
+            # must not keep the car stopped after clean PV export has recovered.
+            self._ev_solar_grid_budget_kwh = 0.0
+            self._ev_solar_grid_budget_last_tick = now
+            grid_budget_exhausted = False
         action = _ev_solar_session_action(
             base_wants_charge=base_wants_charge,
             physically_charging=physically_charging,
@@ -2629,6 +2638,41 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             desired_phase_mode=None,
             desired_action="pause",
         )
+
+    def _ev_solar_budget_recovery_ready(
+        self,
+        ev_plan: EvPlan,
+        *,
+        surplus_elapsed_seconds: float | None,
+    ) -> bool:
+        """Release a tripped solar-only grid budget only on independently measured PV.
+
+        A stable planner surplus alone is insufficient: require fresh grid and
+        battery telemetry, near-zero grid import, no battery discharge, and net
+        export sufficient for the actual per-phase EV offer.
+        """
+        if (
+            ev_plan.desired_enabled is not True
+            or ev_plan.desired_action != "resume"
+            or surplus_elapsed_seconds is None
+            or surplus_elapsed_seconds < EV_SOLAR_RESTART_SURPLUS_SECONDS
+            or self.mapping is None
+        ):
+            return False
+        stale = set(self.site_state.ev_stale_entities)
+        grid_entity = self.mapping.grid_power_entity
+        battery_entity = self.mapping.battery_power_entity
+        if not grid_entity or not battery_entity or grid_entity in stale or battery_entity in stale:
+            return False
+        if self.site_state.grid_import_power_w > EV_SUPPORT_GRID_IMPORT_W:
+            return False
+        if max(0.0, self.site_state.battery_power_w) > EV_SUPPORT_BATTERY_DRAW_W:
+            return False
+        currents = ev_plan.desired_circuit_currents
+        if currents is None:
+            return False
+        offered_power_w = sum(max(0, int(current)) for current in currents) * 230.0
+        return offered_power_w > 0 and self.site_state.grid_export_power_w >= offered_power_w
 
     def _update_self_consumption_watchdog(
         self,

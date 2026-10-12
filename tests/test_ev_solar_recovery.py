@@ -91,7 +91,7 @@ def plant_coordinator(now):
     co.mapping = SimpleNamespace(easee_device_id="offline", easee_power_entity="sensor.easee_power",
         easee_session_entity="sensor.easee_energy", easee_status_entity="sensor.easee_status",
         easee_online_entity="binary_sensor.easee_online", easee_enable_switch="switch.easee_enabled",
-        grid_power_entity="sensor.grid_power")
+        grid_power_entity="sensor.grid_power", battery_power_entity="sensor.battery_power")
     co.hass = ws.FakeHass({"switch.easee_enabled": "on"})
     plant = ChargerPlant(co)
     co.hass.services = plant
@@ -103,6 +103,62 @@ def plant_coordinator(now):
 
 
 class SolarRecoveryTests(unittest.TestCase):
+    def test_exhausted_grid_budget_recovers_after_stable_clean_solar_export(self):
+        now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
+        co, _plant = plant_coordinator(now)
+        co._ev_solar_grid_budget_kwh = 0.153
+        co._ev_solar_surplus_since = now - timedelta(minutes=4)
+        co.site_state = replace(
+            co.site_state,
+            grid_import_power_w=0,
+            grid_export_power_w=4200,
+            battery_power_w=-300,
+            ev_stale_entities=["sensor.easee_power", "sensor.easee_status"],
+        )
+        plan = ws.models.EvPlan(
+            "solar_only", "recorded export surplus", desired_enabled=True,
+            desired_action="resume", desired_amps=6,
+            desired_circuit_currents=(6, 6, 6), desired_phase_mode="auto_phase",
+        )
+
+        result = co._apply_ev_solar_session_hysteresis(
+            plan,
+            now=now,
+            runtime_state="waiting",
+            grid_budget_exhausted=True,
+        )
+
+        self.assertEqual("resume", result.desired_action)
+        self.assertEqual(0, co._ev_solar_grid_budget_kwh)
+
+    def test_exhausted_grid_budget_stays_locked_without_clean_independent_surplus(self):
+        now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
+        for changes in (
+            {"grid_import_power_w": 700, "grid_export_power_w": 2600, "battery_power_w": -300,
+             "ev_stale_entities": []},
+            {"grid_import_power_w": 0, "grid_export_power_w": 2600, "battery_power_w": 700,
+             "ev_stale_entities": []},
+            {"grid_import_power_w": 0, "grid_export_power_w": 2600, "battery_power_w": -300,
+             "ev_stale_entities": ["sensor.grid_power"]},
+            {"grid_import_power_w": 0, "grid_export_power_w": 2000, "battery_power_w": -300,
+             "ev_stale_entities": []},
+        ):
+            with self.subTest(changes=changes):
+                co, _plant = plant_coordinator(now)
+                co._ev_solar_grid_budget_kwh = 0.153
+                co._ev_solar_surplus_since = now - timedelta(minutes=4)
+                co.site_state = replace(co.site_state, **changes)
+
+                result = co._apply_ev_solar_session_hysteresis(
+                    solar_offer(),
+                    now=now,
+                    runtime_state="waiting",
+                    grid_budget_exhausted=True,
+                )
+
+                self.assertEqual("pause", result.desired_action)
+                self.assertEqual(0.153, co._ev_solar_grid_budget_kwh)
+
     def test_recorded_stale_zero_and_online_heartbeat_recover_actual_charging(self):
         start = datetime(2026, 10, 12, 10, 56, tzinfo=TZ)
         co, plant = plant_coordinator(start)
