@@ -60,14 +60,12 @@ Version 0.31.2 also probes a connected session whose online diagnostic stays
 unknown after restart. This is connection recovery only: no current/start command
 is authorized until online status and physical feedback are valid.
 
-Version 0.31.3 adds a short-lived read-only REST snapshot through the already
-loaded Easee integration when SignalR or mapped sensor feedback is unavailable.
-It requires the mapped charger identity, authoritative online state, a recent
-backend pulse and valid status, power and session energy. Invalid snapshots do
-not unblock EV control. If a previously verified active charge loses fresh REST
-feedback, Wattson makes at most three zero-current pause attempts and waits for
-valid telemetry before offering current again. It does not disable the charger
-or take ownership of Easee credentials.
+Version 0.31.4 warns when solar-only mode is exporting at least 500 W while the
+mapped Easee enable switch is off. Wattson marks EV control blocked and notifies
+through HA and the configured phone service. It respects the explicit off state
+and never turns the charger back on automatically. An Easee REST state fallback
+was tried in 0.31.3, but the live endpoint returned `ForbiddenServiceException`;
+the unverified fallback was removed.
 
 ## Evidence And Accounting
 

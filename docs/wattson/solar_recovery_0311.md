@@ -90,28 +90,18 @@ budget/hold survive transient unavailable states; cloud connectivity is not
 invented from cached measurements. Two additional isolated tests exercise recovery
 and persistent failure without any start/current writes.
 
-## Read-only feedback fallback: 0.31.3
+## Retrospective: 0.31.3 and 0.31.4
 
-Because the Easee app confirmed that the charger was online and the vehicle was
-connected while Home Assistant's SignalR diagnostic remained unknown, 0.31.3
-adds a bounded read-only call to the already authenticated Easee charger's state
-endpoint. It is keyed to the charger ID shared by the mapped power and status
-entities. The snapshot is usable only for 45 seconds and only with an explicit
-online value, a recent backend pulse, a known operation mode and finite,
-in-range power/session measurements. The fallback never infers connectivity
-from the user's app confirmation.
+The 0.31.3 REST fallback was deployed, but its first live request returned
+`ForbiddenServiceException`; it did not provide usable charger feedback and was
+removed in 0.31.4. After the charger was manually enabled, HA's SignalR stream
+recovered. Easee then reported online, `charging`, and 4.672 kW; Wattson reported
+`ready` with `EV_CHARGING_RESUME`. The physical charging resumption is confirmed
+by the Easee power sensor. The failure was the charger being disabled while the
+online diagnostic stream was also unavailable.
 
-The REST data overlays only the mapped online/status/power/session fields; other
-stale EV inputs remain blocking. No credentials are read or copied, and the
-native Easee entities are not modified. If a fresh, positive charging snapshot
-expires, Wattson makes at most three bounded zero-current pause attempts. It
-does not turn off the charger; positive offers remain blocked until valid
-feedback returns. Diagnostics expose the selected source, freshness, parse
-error and a small allowlisted payload preview.
-
-This fallback is locally unit-tested with an independent charger plant. The REST
-schema was checked against the upstream Easee controller and pyeasee source:
-[controller polling](https://github.com/nordicopen/easee_hass/blob/master/custom_components/easee/controller.py),
-[charger state endpoint](https://github.com/nordicopen/pyeasee/blob/master/pyeasee/charger.py).
-Its first live response must still pass the same strict parser; an unknown schema
-fails closed and remains visible in diagnostics.
+Version 0.31.4 adds a bounded alert for solar-only mode when HA's mapped Easee
+enable switch is off and measured export is at least 500 W. It marks EV control
+blocked and sends the persistent HA notification plus the configured phone
+notification. It does not re-enable a charger that may have been manually
+disabled. This alert does not infer that a vehicle is connected.

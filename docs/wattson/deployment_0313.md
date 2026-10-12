@@ -24,3 +24,14 @@ house-battery threshold and physical 70 A battery limit are unchanged.
   numeric values, expiry and bounded physical-plant pause behavior.
 - Live HA installation, first REST response and actual charging status are
   recorded after deployment. Simulation does not establish physical charging.
+
+## Live result and correction
+
+The first post-restart REST state request returned
+`ForbiddenServiceException: REST request failed`, so the strict fallback never
+authorized charging. After the user enabled the charger, Easee SignalR recovered
+independently. HA then reported SignalR connected, online `on`, status `charging`,
+4.672 kW and a 7 A dynamic limit; Wattson reported `ready` with
+`EV_CHARGING_RESUME`. The direct REST fallback is retired in 0.31.4. The 4.672 kW
+reading is direct physical feedback; no claim about its energy source is inferred
+from that reading alone.

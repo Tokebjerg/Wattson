@@ -90,7 +90,8 @@ def plant_coordinator(now):
     co.ev_mode = "solar_only"
     co.mapping = SimpleNamespace(easee_device_id="offline", easee_power_entity="sensor.easee_power",
         easee_session_entity="sensor.easee_energy", easee_status_entity="sensor.easee_status",
-        easee_online_entity="binary_sensor.easee_online", easee_enable_switch="switch.easee_enabled")
+        easee_online_entity="binary_sensor.easee_online", easee_enable_switch="switch.easee_enabled",
+        grid_power_entity="sensor.grid_power")
     co.hass = ws.FakeHass({"switch.easee_enabled": "on"})
     plant = ChargerPlant(co)
     co.hass.services = plant
@@ -129,6 +130,32 @@ class SolarRecoveryTests(unittest.TestCase):
         self.assertTrue(all(c["current_p2"] == c["current_p3"] == 0 for c in currents))
         self.assertTrue(all(c["current_p1"] <= 6 for c in currents))
         co._async_ev_alert.assert_not_called()
+
+    def test_disabled_charger_during_export_warns_and_respects_manual_off(self):
+        now = datetime(2026, 10, 12, 11, 40, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        co.hass = ws.FakeHass({"switch.easee_enabled": "off"})
+        co.hass.services = plant
+        co.site_state = replace(co.site_state, grid_export_power_w=1800)
+        calls = []
+        co.__dict__["_background_work"] = SimpleNamespace(submit=lambda *args: calls.append(args))
+        co._ev_charger_disabled_alert_at = None
+        plan = SimpleNamespace(ev=solar_offer())
+
+        actions = asyncio.run(co._async_apply_ev(plan, now))
+        asyncio.run(co._async_apply_ev(plan, now + timedelta(seconds=10)))
+
+        self.assertEqual([], actions)
+        self.assertEqual("easee_charger_disabled", co._ev_control_blocked_reason)
+        self.assertEqual("charger_disabled", co.ev_health["state"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], plant.calls)
+
+        co.hass = ws.FakeHass({"switch.easee_enabled": "on"})
+        co.hass.services = plant
+        co.site_state = replace(co.site_state, grid_export_power_w=0)
+        asyncio.run(co._async_apply_ev(plan, now + timedelta(seconds=20)))
+        self.assertIsNone(co._ev_charger_disabled_alert_at)
 
     def test_unavailable_during_reload_cannot_erase_probe_or_reopen_offer(self):
         now = datetime(2026, 10, 12, 11, tzinfo=TZ)
