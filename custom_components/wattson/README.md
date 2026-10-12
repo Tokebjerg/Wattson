@@ -67,6 +67,11 @@ and never turns the charger back on automatically. An Easee REST state fallback
 was tried in 0.31.3, but the live endpoint returned `ForbiddenServiceException`;
 the unverified fallback was removed.
 
+Version 0.31.5 can recover from the solar-only hourly grid-support budget lock
+before the next clock hour, but only after stable surplus and fresh independent
+measurements prove that net export covers the requested charger offer without
+grid import or house-battery discharge.
+
 ## Evidence And Accounting
 
 Desired plan, service acceptance and physical feedback are separate states.
