@@ -110,7 +110,10 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
     if soc is not None and target > soc and target > 90:
         # Taper belongs to the final SOC band, not the entire charging session.
         tail_fraction = max(0.0, target - max(90.0, soc)) / (target - soc)
-        power_kw /= 1 + tail_fraction * (1 / 0.85 - 1)
+        # A known low-power session needs more completion time: its late taper
+        # cannot be recovered with an 11 kW offer before the departure deadline.
+        tail_rate = 0.6 if (state.ev_full_power_kw or nominal_kw) <= 4.3 else 0.85
+        power_kw /= 1 + tail_fraction * (1 / tail_rate - 1)
     slots = sorted(state.price_slots, key=lambda s: s.start.timestamp())
     windows = []
     for index, slot in enumerate(slots):

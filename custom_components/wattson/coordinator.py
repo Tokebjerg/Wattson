@@ -842,6 +842,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._last_ev_current_change_at: datetime | None = None
         self._last_ev_circuit_refresh_at: datetime | None = None
         self._ev_control_blocked_reason: str | None = None
+        self._ev_supervision_status: dict[str, Any] = {"state": "pending", "checks": 0}
         self._ev_charger_disabled_alert_at: datetime | None = None
         self._ev_start_wait_since: datetime | None = None
         self._last_ev_start_recovery_at: datetime | None = None
@@ -3340,6 +3341,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._pending_replan_reason = "ev_energy_request_changed"
         self._ev_applied_energy_request_kwh = requested_energy
         fresh_sample = sample_at is not None and 0 <= now.timestamp() - sample_at.timestamp() <= 12000
+        anchor_at = (datetime.fromisoformat(session.energy.anchor_at)
+                     if session.energy.has_soc_anchor else None)
+        retained_anchor = bool(anchor_at and anchor_at.timestamp() <= now.timestamp())
         scheduled_cheapest = self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
         plug = self.hass.states.get("binary_sensor.niro_ev_battery_plug")
         plug_reported_at = (getattr(plug, "last_reported", None)
@@ -3356,10 +3360,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         elif scheduled_cheapest and session.connected:
             # Scheduled-cheapest explicitly targets the Niro SOC. The Kia
             # integration's plug/GPS signals can lag or be wrong, so the
-            # connected Easee session plus a fresh SOC sample is the authority.
-            if fresh_sample and self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY:
+            # connected Easee session plus a valid SOC anchor is the authority.
+            # Freshness governs new API samples, never expiry of this session's
+            # previously accepted anchor and metered energy projection.
+            if (fresh_sample or retained_anchor) and self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY:
                 session.vehicle = "niro"
-            elif not fresh_sample:
+            elif not fresh_sample and not retained_anchor:
                 session.vehicle = "unknown"
         elif session.vehicle == "unknown" and session.connected:
             if niro_plugged and fresh_sample:
@@ -3412,8 +3418,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             enabled=self.ev_target_soc >= 100 or self.ev_charge_until_complete,
             soc=estimate, nominal_kw=max_amps * 0.69)
         phases = 1 if session.single_phase_locked else 3
+        accepted_sample_at = (datetime.fromisoformat(session.energy.anchor_at)
+                              if estimate is not None and session.energy.has_soc_anchor else sample_at)
         self.site_state = replace(state, ev_soc_pct=estimate,
-            ev_soc_sample_at=sample_at, ev_soc_data_reason=data_reason,
+            ev_soc_sample_at=accepted_sample_at, ev_soc_data_reason=data_reason,
             ev_soc_source=("metered" if estimate is not None else
                            "energy_budget" if other_vehicle else "awaiting_vehicle_data"),
             ev_ac_kwh_per_pct=session.energy.ac_kwh_per_pct,
@@ -3428,11 +3436,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
     def ev_charge_schedule(self) -> dict[str, Any]:
         if self.site_state is None:
             return {"hours": [], "intervals": [], "feasible": True}
-        key = (id(self.site_state), self.ev_ready_hour, self.ev_target_soc, self.ev_min_soc,
+        key = (self.ev_ready_hour, self.ev_target_soc, self.ev_min_soc,
                self.ev_charge_until_complete, self.ev_minimum_recovery_complete,
                repr(self.config_entry.options), repr(self.config_entry.data))
-        if getattr(self, "_ev_schedule_view_key", None) != key:
+        if (getattr(self, "_ev_schedule_view_state", None) is not self.site_state
+                or getattr(self, "_ev_schedule_view_key", None) != key):
             self._ev_schedule_view = self._build_ev_charge_schedule()
+            self._ev_schedule_view_state = self.site_state
             self._ev_schedule_view_key = key
         return deepcopy(self._ev_schedule_view)
 
@@ -3444,6 +3454,107 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_min_soc=self.ev_min_soc, ev_charge_until_complete=self.ev_charge_until_complete,
             ev_minimum_recovery_complete=self.ev_minimum_recovery_complete,
             ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)))
+
+    @property
+    def ev_supervision_status(self) -> dict[str, Any]:
+        return dict(getattr(self, "_ev_supervision_status", {"state": "pending", "checks": 0}))
+
+    async def _async_supervise_ev(self, now: datetime) -> None:
+        """Reconcile the physical charger and its plan every fifteen minutes."""
+        if not self._cadence.due("ev_supervision", now, timedelta(minutes=15)):
+            return
+        previous = self.ev_supervision_status
+        session = self._ev_session
+        check = {"state": "waiting", "checks": previous.get("checks", 0) + 1,
+                 "checked_at": now.isoformat(),
+                 "next_check_at": (now + timedelta(minutes=15)).isoformat(),
+                 "session_id": session.session_id, "mode": self.ev_mode,
+                 "delivered_kwh": round(session.energy.delivered_kwh, 3),
+                 "corrections": []}
+        self._ev_supervision_status = check
+        if (not self.ev_control_enabled or not self.automation_enabled or self.shadow_mode
+                or (self.pause_until and now < self.pause_until)):
+            check["state"] = "suspended"
+            return
+        if not session.connected or self.site_state is None or self.control_plan is None:
+            check["state"] = "disconnected" if not session.connected else "initializing"
+            return
+        if self.control_plan.safe_mode:
+            check["state"] = "site_data_unavailable"
+            if previous.get("checks", 0):
+                await self._async_ev_alert("plan_not_followed",
+                    "Wattsons kvarterskontrol: opladning afventer valide anlægsdata. Kontroller Home Assistant og Easee.")
+            return
+        overview = self.ev_charge_schedule if self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST else {}
+        if overview.get("waiting_for_vehicle_data") and session.energy.has_soc_anchor:
+            self._update_ev_energy_state(now)
+            overview = self.ev_charge_schedule
+            if not overview.get("waiting_for_vehicle_data"):
+                self._pending_replan_reason = "ev_supervision_soc_recovered"
+                check["corrections"].append("restored_session_soc")
+        check.update({"soc_source": self.site_state.ev_soc_source,
+                      "deadline": overview.get("deadline"), "feasible": overview.get("feasible"),
+                      "required_kwh": overview.get("required_kwh")})
+        if overview.get("waiting_for_vehicle_data"):
+            check["state"] = "waiting_for_vehicle_data"
+            if previous.get("checks", 0):
+                await self._async_ev_alert("unknown_soc",
+                    "Wattsons kvarterskontrol finder intet gyldigt SOC-grundlag til ladeplanen. "
+                    "Kontroller bilens login og data. Automatisk netladning afventer brugbare data.")
+            return
+        if self.site_state.easee_completed_stable:
+            check["state"] = "complete_soc_unverified" if overview.get("goal_unverified") else "complete"
+            if overview.get("goal_unverified"):
+                await self._async_ev_alert("full_goal_unverified",
+                    "Laderen melder opladning færdig, men bilens API har endnu ikke bekræftet 100 %. "
+                    "Kontroller bilens SOC og dens egen ladegrænse.")
+            return
+        if overview.get("feasible") is False:
+            self._pending_replan_reason = "ev_supervision_deadline_shortfall"
+            check["corrections"].append("replan_requested")
+            await self._async_ev_alert("deadline_shortfall",
+                f"Wattsons kvarterskontrol finder, at lademålet ikke kan nås inden {overview.get('deadline')}. "
+                f"Der mangler plads til {overview.get('remaining_unserved_kwh', 0):.1f} kWh. Kontroller bil og frist.")
+        evidence = self._ev_charging_evidence(now)
+        action = self.control_plan.ev.desired_action
+        check.update({"expected_action": action, "charging_evidence": evidence})
+        if previous.get("session_id") == session.session_id and previous.get("checked_at"):
+            check["energy_since_check_kwh"] = round(
+                max(0.0, session.energy.delivered_kwh - previous["delivered_kwh"]), 3)
+        no_progress = bool(action == "resume" and previous.get("expected_action") == "resume"
+                           and check.get("energy_since_check_kwh") is not None
+                           and check["energy_since_check_kwh"] <= 0.01)
+        check["energy_progress_missing"] = no_progress
+        mismatch = (action == "resume" and evidence != "charging"
+                    or action == "pause" and evidence == "charging" or no_progress)
+        if not mismatch:
+            check["state"] = "charging" if evidence == "charging" else "planned_wait"
+            if "plan_not_followed" in session.notifications:
+                session.notifications.remove("plan_not_followed")
+                session.dirty = True
+            return
+        enable_entity = getattr(self.mapping, "easee_enable_switch", None)
+        enabled = self.hass.states.get(enable_entity) if enable_entity else None
+        charger_disabled = bool(enabled and enabled.state == "off")
+        waiting_since = self._ev_actuation.start_wait_since
+        if (action == "resume" and evidence == "not_charging" and not no_progress
+                and not charger_disabled and (waiting_since is None
+                    or (now - waiting_since).total_seconds() < EV_START_VERIFY_SECONDS)):
+            check["state"] = "starting"
+            return
+        check["state"] = "plan_not_followed"
+        self._pending_replan_reason = "ev_supervision_plan_not_followed"
+        check["corrections"].append("replan_requested")
+        if charger_disabled:
+            check["state"] = "charger_disabled"
+        elif evidence in {"charging", "not_charging"} and self._ev_actuation.request_reassert(now, action):
+            check["corrections"].append("charger_offer_reassert_requested")
+        else:
+            check["state"] = "recovery_pending" if evidence in {"charging", "not_charging"} else "telemetry_unverified"
+        await self._async_ev_alert("plan_not_followed",
+            f"Wattsons kvarterskontrol: ladeplanen følges ikke ({check['state']}). "
+            "Planen genberegnes, og laderen genforsøges inden for de normale grænser. "
+            "Kontroller Easee og bilens egen ladeplan, hvis opladningen fortsat udebliver.")
 
     @property
     def ev_health(self) -> dict[str, Any]:
@@ -3459,11 +3570,22 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         evidence = self._ev_charging_evidence(self.site_state.timestamp) if self.site_state else "unknown"
         actual = evidence == "charging"
         failure = self._ev_start_status == "start_failed" and not actual
+        supervision = self.ev_supervision_status
+        supervised_action = supervision.get("expected_action")
+        current_action = self.control_plan.ev.desired_action if self.control_plan else None
+        supervision_problem = bool(supervision.get("state") in {"plan_not_followed", "recovery_pending", "telemetry_unverified"}
+            and supervised_action == current_action and (
+                supervised_action == "resume" and not actual
+                or supervised_action == "pause" and actual
+                or supervision.get("energy_progress_missing")
+                    and self._ev_session.energy.delivered_kwh <= supervision.get("delivered_kwh", 0) + 0.01))
         state = "complete" if self.site_state and self.site_state.easee_completed_stable else (
             "waiting_for_vehicle_data" if overview.get("waiting_for_vehicle_data") else
             "charging" if actual else "telemetry_unknown" if evidence == "unknown" else
             "start_failed" if failure else "blocked" if blocked else "waiting")
-        return {"state": state, "problem": bool(failure or blocked or overview.get("feasible") is False or overview.get("goal_unverified")),
+        if supervision_problem and state in {"charging", "waiting"}:
+            state = "plan_not_followed"
+        return {"state": state, "problem": bool(failure or blocked or supervision_problem or overview.get("feasible") is False or overview.get("goal_unverified")),
                 "blocked_reason": blocked, "session_id": self._ev_session.session_id,
                 "vehicle": self._ev_session.vehicle,
                 "soc_source": self.site_state.ev_soc_source if self.site_state else "unavailable",
@@ -3479,6 +3601,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 "goal_status": overview.get("goal_status"),
                 "goal_label": overview.get("goal_label"),
                 "goal_confirmed": overview.get("goal_confirmed"),
+                "supervision": supervision,
                 "start": self.ev_start_status}
 
     async def _async_ev_alert(self, code: str, message: str) -> None:
@@ -4938,6 +5061,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
         )
 
+        try:
+            await self._async_supervise_ev(tick.local_now)
+        except Exception as err:  # noqa: BLE001
+            self._ev_supervision_status = {"state": "check_failed", "checked_at": tick.local_now.isoformat(),
+                                          "error": type(err).__name__}
+            _LOGGER.exception("Wattson EV supervision failed; continuing normal control")
         if not self.shadow_mode and self.automation_enabled and not (
             self.pause_until and tick.now < self.pause_until
         ):

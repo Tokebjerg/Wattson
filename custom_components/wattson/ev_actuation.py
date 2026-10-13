@@ -140,6 +140,24 @@ class EvActuationState:
         self.command_failed_at = self.written_at = now
         self.start_status = "command_failed"
 
+    def request_reassert(self, now: datetime, action: str) -> bool:
+        """A periodic check must respect the same retry budgets and cooldowns."""
+        if action == "resume":
+            if self.start_attempts >= 12 or not write_allowed(self.start_retried_at,
+                    min(1800, EV_START_RECOVERY_RETRY_SECONDS * 2 ** max(0, self.start_attempts - 1)), now):
+                return False
+        elif action == "pause":
+            if self.stop_attempts >= 3 or not write_allowed(
+                    self.stop_retried_at, EV_START_RECOVERY_RETRY_SECONDS, now):
+                return False
+        else:
+            return False
+        if self.command_failed_at and not write_allowed(self.command_failed_at,
+                min(1800, 90 * 2 ** min(5, max(0, self.command_failures - 1))), now):
+            return False
+        self.last_fp = None
+        return True
+
     def command_accepted(self) -> None:
         self.command_failures = 0
         self.command_failed_at = None

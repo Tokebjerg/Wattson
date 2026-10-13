@@ -42,7 +42,7 @@ def recordable_attributes(attributes: dict[str, Any], limit: int = 14000) -> dic
     if size() > limit:
         result = {key: result[key] for key in (
             "automatiseringsopgaver", "hours", "deadline", "note", "version",
-            "decision_code", "replan_reason", "ev_start", "ev_health", "ev_control_blocked_reason"
+            "decision_code", "replan_reason", "ev_start", "ev_health", "ev_supervision", "ev_control_blocked_reason"
         ) if key in result}
         result["attributes_compacted"] = True
     return result

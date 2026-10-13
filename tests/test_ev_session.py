@@ -105,6 +105,7 @@ class EvSessionTests(unittest.TestCase):
         self.observe(context)
         context.vehicle = "niro"
         context.energy.anchor_soc = 40.0
+        context.energy.anchor_at = self.now.isoformat()
         context.set_deadline(self.now, 16)
         saved = context.to_storage_dict()
         self.assertFalse(self.observe(context, status="unavailable", power=0, kwh=None, offset=60))

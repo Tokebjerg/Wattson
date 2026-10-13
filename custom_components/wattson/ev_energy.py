@@ -128,6 +128,18 @@ class EvEnergyMeter:
         self.anchor_energy_kwh = sample_energy
 
     @property
+    def has_soc_anchor(self) -> bool:
+        try:
+            stamp = datetime.fromisoformat(self.anchor_at) if self.anchor_at else None
+            return bool(stamp and stamp.tzinfo is not None
+                        and self.anchor_soc is not None and isfinite(self.anchor_soc)
+                        and 0 <= self.anchor_soc <= 100
+                        and isfinite(self.anchor_energy_kwh)
+                        and 0 <= self.anchor_energy_kwh <= self.delivered_kwh + 0.001)
+        except (TypeError, ValueError):
+            return False
+
+    @property
     def estimated_soc(self) -> float | None:
         if self.anchor_soc is None:
             return None
@@ -169,6 +181,9 @@ class EvEnergyMeter:
                        meter.ac_kwh_per_pct, meter.full_power_kw)
             if not all(isfinite(value) and value >= 0 for value in numbers) or not 0.1 <= meter.ac_kwh_per_pct <= 2:
                 return cls()
+            if not meter.has_soc_anchor:
+                meter.anchor_soc = meter.anchor_at = meter.last_soc_seen_at = None
+                meter.anchor_energy_kwh = 0.0
             return meter
         except (TypeError, ValueError):
             return cls()

@@ -26,6 +26,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
             "physical_write_counts": coordinator.physical_write_counts,
             "ev_session": coordinator._ev_session.as_dict(),
             "ev_health": coordinator.ev_health,
+            "ev_supervision": coordinator.ev_supervision_status,
             "ev_charge_schedule": coordinator.ev_charge_schedule,
             "ev_phase_transition": coordinator.ev_phase_transition_status,
             "execution": coordinator.execution_status,

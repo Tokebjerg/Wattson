@@ -85,6 +85,16 @@ waits for valid data.
 
 ## Evidence And Accounting
 
+Version 0.31.9 retains an accepted SOC anchor throughout the same connected EV
+session, including overnight waits and HA restarts. API freshness controls new
+samples, not expiry of an established metered SOC projection. A native
+15-minute supervisor compares the current plan with charger power and measured
+energy, requests replanning and bounded offer retries, and alerts through the
+configured mobile notification service when recovery or the deadline is at risk.
+The latest check and next check are recorded in `ev_supervision` on site status.
+The overnight incident, counterfactual replay and test boundaries are documented
+in `docs/wattson/ev_overnight_0319.md`.
+
 Desired plan, service acceptance and physical feedback are separate states.
 Battery confirmation requires all requested registers to read back; unavailable
 or restored-only values are not proof. A no-write cooldown cannot discard earlier
