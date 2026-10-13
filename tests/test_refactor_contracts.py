@@ -254,6 +254,40 @@ class PolicyContracts(unittest.TestCase):
             self.assertEqual(1, owner.command_failures)
         self.assertTrue(owner.decide(plan, now=now+timedelta(seconds=91), **args).full_apply)
 
+    def test_zero_charger_limit_repairs_while_waiting_with_separate_bounded_budget(self):
+        now = datetime.now(timezone.utc)
+        owner = ev_actuation.EvActuationState()
+        plan = ws.models.EvPlan("scheduled_cheapest", "limit repair", desired_enabled=True,
+            desired_action="resume", desired_amps=16, desired_circuit_currents=(16, 16, 16))
+        args = dict(status="awaiting_start", evidence="not_charging", online=True,
+                    retune_seconds=60, effective_amps=None, charger_limit_amps=16)
+        owner.decide(plan, now=now, **args)
+        owner.last_fp = owner.intent_fp
+        owner.last_amps = 16
+        owner.last_currents = (16, 16, 16)
+        owner.start_retried_at = now
+        self.assertFalse(owner.decide(plan, now=now+timedelta(seconds=5), status="awaiting_start",
+            evidence="unknown", online=True, retune_seconds=60, effective_amps=None,
+            charger_limit_amps=0).offer_repair)
+
+        blocked = owner.decide(plan, now=now+timedelta(seconds=10),
+            **(args | {"charger_limit_amps": 0}))
+        self.assertTrue(blocked.offer_repair)
+        self.assertTrue(blocked.full_apply)
+        owner.offer_repaired_at = now + timedelta(seconds=10)
+        owner.offer_attempts = 1
+        self.assertFalse(owner.decide(plan, now=now+timedelta(seconds=20),
+            **(args | {"charger_limit_amps": 0})).offer_repair)
+        self.assertFalse(owner.decide(plan, now=now+timedelta(seconds=189),
+            **(args | {"charger_limit_amps": 0})).offer_repair)
+        self.assertTrue(owner.decide(plan, now=now+timedelta(seconds=191),
+            **(args | {"charger_limit_amps": 0})).offer_repair)
+        owner.offer_attempts = 3
+        self.assertFalse(owner.decide(plan, now=now+timedelta(minutes=10),
+            **(args | {"charger_limit_amps": 0})).offer_repair)
+        self.assertFalse(owner.decide(plan, now=now+timedelta(minutes=10),
+            **(args | {"effective_amps": 10, "charger_limit_amps": 16})).offer_repair)
+
     def test_legacy_replay_cannot_claim_exact_reconstruction(self):
         with self.assertRaises(ValueError):
             replay.request_from_record({"schema": 1})

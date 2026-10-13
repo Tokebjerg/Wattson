@@ -453,7 +453,14 @@ class EaseeController:
             if plan.desired_circuit_currents is not None:
                 actions.extend(await self._set_circuit_dynamic_limit(mapping.easee_device_id, plan.desired_circuit_currents))
             if plan.desired_amps is not None:
-                actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, plan.desired_amps))
+                charger_amps = plan.desired_amps
+                if (plan.desired_action == "resume"
+                        and plan.desired_circuit_currents is not None
+                        and any(plan.desired_circuit_currents)):
+                    # Do not ask the charger for more than this plan has safely
+                    # allowed on its most constrained phase/circuit.
+                    charger_amps = min(charger_amps, max(plan.desired_circuit_currents))
+                actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, charger_amps))
             if plan.desired_phase_mode is not None:
                 if self._normalize_phase_mode(state.easee_phase_mode) != self._normalize_phase_mode(plan.desired_phase_mode):
                     now = state.timestamp

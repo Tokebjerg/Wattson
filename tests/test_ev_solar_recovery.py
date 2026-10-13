@@ -103,6 +103,54 @@ def plant_coordinator(now):
 
 
 class SolarRecoveryTests(unittest.TestCase):
+    def test_zero_dynamic_charger_cap_is_reasserted_without_exceeding_circuit_offer(self):
+        now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        plant.stalled = False
+        plant.fresh = True
+        plant.schedule_blocked = False
+        plant.amps, plant.currents, plant.resumed = 11, (11, 0, 0), True
+        plant.observe(now)
+        owner = co._ev_actuation
+        owner.last_fp = owner.intent_fp = ("solar_only", True, "auto_phase", "resume")
+        owner.last_amps, owner.last_currents = 11, (11, 0, 0)
+        owner.current_changed_at = now
+        owner.start_wait_since = now
+        co._last_ev_write_at = now - timedelta(seconds=30)
+        co.hass = ws.FakeHass({
+            "switch.easee_enabled": "on",
+            "sensor.easee_dynamic_charger_limit": "0",
+            "sensor.easee_dynamic_circuit_limit": "16",
+        })
+        plant.amps = 0
+        tick = now + timedelta(seconds=30)
+        plant.observe(tick)
+
+        actions = asyncio.run(co._async_apply_ev(SimpleNamespace(ev=solar_offer()), tick))
+
+        self.assertTrue(any("easee.dynamic_limit=11A" == action for action in actions))
+        self.assertEqual(11, plant.amps)
+        self.assertGreaterEqual(plant.power, 500)
+        self.assertTrue(any(call[1] == "action_command"
+                            and call[2]["action_command"] == "resume" for call in plant.calls))
+        self.assertEqual(0, plant.import_kwh)
+        self.assertEqual(0, plant.battery_support_kwh)
+
+    def test_resume_charger_limit_never_exceeds_planned_circuit_current(self):
+        now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
+        co, plant = plant_coordinator(now)
+        plant.stalled = False
+        plan = ws.models.EvPlan("scheduled_cheapest", "bounded offer", desired_enabled=True,
+            desired_action="resume", desired_amps=16, desired_circuit_currents=(10, 0, 0),
+            desired_phase_mode="auto_phase")
+
+        asyncio.run(co._easee.apply_ev_plan(co.mapping, co.site_state, plan))
+
+        charger_limit = [call[2]["current"] for call in plant.calls
+                         if call[1] == "set_charger_dynamic_limit"]
+        self.assertEqual([10], charger_limit)
+        self.assertEqual((10, 0, 0), plant.currents)
+
     def test_pause_stops_session_without_disabling_user_owned_charger(self):
         now = datetime(2026, 10, 12, 12, 40, tzinfo=TZ)
         co, plant = plant_coordinator(now)

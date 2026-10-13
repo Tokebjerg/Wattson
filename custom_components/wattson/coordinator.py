@@ -5606,10 +5606,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._easee.commands.confirm_action("resume" if physically_charging else "pause"
                                            if evidence == "not_charging" else None)
         wants_charging = ev.desired_action == "resume" or ev.desired_enabled is True
+        observed_offer = self._ev_observed_offer(now)
         transition = self._ev_actuation.decide(
             ev, now=now, status=easee_status, evidence=evidence,
             online=bool(self.site_state.easee_online), retune_seconds=self.ev_retune_seconds,
-            effective_amps=self._ev_observed_offer(now).get("effective_amps"),
+            effective_amps=observed_offer.get("effective_amps"),
+            charger_limit_amps=observed_offer.get("dynamic_charger_limit_amps"),
         )
         structural = transition.structural
         within_deadband = transition.within_deadband
@@ -5734,12 +5736,17 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             result[name] = state.state
             if name != "reason_for_no_current":
                 reported = getattr(state, "last_reported", state.last_updated)
+                try:
+                    amps = float(state.state)
+                except ValueError:
+                    continue
+                if name == "dynamic_charger_limit":
+                    # A charger limit can remain unchanged (and therefore not
+                    # be re-reported) while Easee is online. Keep this distinct
+                    # from the circuit limit: the latter is the physical cap.
+                    result["dynamic_charger_limit_amps"] = amps
                 if 0 <= now.timestamp() - reported.timestamp() <= 180:
-                    try:
-                        amps = float(state.state)
-                        result["effective_amps"] = min(result.get("effective_amps", amps), amps)
-                    except ValueError:
-                        pass
+                    result["effective_amps"] = min(result.get("effective_amps", amps), amps)
         return result
 
     def _grid_power_sign_should_be_inverted(self) -> bool:

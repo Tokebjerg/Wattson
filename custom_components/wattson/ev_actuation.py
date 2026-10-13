@@ -72,7 +72,8 @@ class EvActuationState:
         self.telemetry_reload_attempts += 1
 
     def decide(self, ev: EvPlan, *, now: datetime, status: str, evidence: str,
-               online: bool, retune_seconds: int, effective_amps: float | None) -> EvTransition:
+               online: bool, retune_seconds: int, effective_amps: float | None,
+               charger_limit_amps: float | None = None) -> EvTransition:
         structural = (ev.mode, ev.desired_enabled, ev.desired_phase_mode, ev.desired_action)
         changed = structural != self.last_fp
         if structural != self.intent_fp:
@@ -122,7 +123,13 @@ class EvActuationState:
                                min(1800, EV_START_RECOVERY_RETRY_SECONDS * 2 ** max(0, self.start_attempts-1)), now))
         mismatch = (wants and ev.desired_amps is not None and effective_amps is not None
                     and abs(effective_amps-ev.desired_amps) > EV_CURRENT_DEADBAND_A)
-        offer_repair = bool(mismatch and charging and self.offer_attempts < 3
+        charger_limit_block = bool(
+            wants and waiting and evidence == "not_charging" and online
+            and ev.desired_amps is not None and charger_limit_amps is not None
+            and charger_limit_amps + EV_CURRENT_DEADBAND_A < ev.desired_amps
+        )
+        offer_repair = bool(((mismatch and charging) or charger_limit_block)
+                            and self.offer_attempts < 3
                             and write_allowed(self.offer_repaired_at, 180, now))
         refresh = bool(wants and online and status not in {"", "disconnected", "unknown", "unavailable"}
                        and ev.desired_circuit_currents and any(requested)

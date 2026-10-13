@@ -1342,7 +1342,7 @@ def test_c_smartcharge():
             desired_phase_mode="auto_phase",
         )))
     circuit_i = next((i for i, x in enumerate(resume_order) if "circuit_dynamic_limit" in x), -1)
-    limit_i = next((i for i, x in enumerate(resume_order) if "dynamic_limit=12A" in x), -1)
+    limit_i = next((i for i, x in enumerate(resume_order) if "dynamic_limit=11A" in x), -1)
     resume_i = next((i for i, x in enumerate(resume_order) if "action_command=resume" in x), -1)
     checks.append(("apply: resume writes non-zero limits before action_command",
                    -1 not in (circuit_i, limit_i, resume_i) and circuit_i < resume_i and limit_i < resume_i,
