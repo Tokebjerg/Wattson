@@ -53,6 +53,36 @@ def coordinator(now, *, profile="auto", soc=77):
 
 
 class EvRegressionTests(unittest.TestCase):
+    def test_kia_refresh_is_one_shot_and_only_for_niro_cheapest_session(self):
+        now = datetime(2026, 10, 10, 9, 3, tzinfo=TZ)
+
+        class Background:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, name, key, operation):
+                self.calls.append((name, key, operation))
+                return True
+
+        co = coordinator(now)
+        co._background_work = Background()
+        co.site_state = replace(co.site_state, easee_online=True)
+        co._request_niro_soc_refresh_for_session(now)
+        co._request_niro_soc_refresh_for_session(now)
+        self.assertEqual(1, len(co.background.calls))
+        self.assertEqual("niro_soc_refresh", co.background.calls[0][0])
+        self.assertTrue(co._ev_session.soc_refresh_requested)
+
+        for change in ({"ev_mode": "solar_only"}, {"mapping": SimpleNamespace(ev_soc_entity="sensor.other_soc")},
+                       {"config_entry": SimpleNamespace(data={}, options={"ev_vehicle_profile": "other"}, entry_id="offline")}):
+            candidate = coordinator(now)
+            candidate._background_work = Background()
+            candidate.site_state = replace(candidate.site_state, easee_online=True)
+            for name, value in change.items():
+                setattr(candidate, name, value)
+            candidate._request_niro_soc_refresh_for_session(now)
+            self.assertEqual([], candidate.background.calls)
+
     def test_counter_bursts_and_telemetry_gap_are_recovered_after_restore(self):
         now = datetime(2026, 10, 10, 9, tzinfo=TZ)
         meter = energy.EvEnergyMeter(counter_last_kwh=0)

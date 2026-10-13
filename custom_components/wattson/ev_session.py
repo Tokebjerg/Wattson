@@ -48,6 +48,7 @@ class EvSessionContext:
     energy: EvEnergyMeter = field(default_factory=EvEnergyMeter)
     full_goal_limit_kwh: float | None = None
     full_goal_anchor_at: str | None = None
+    soc_refresh_requested: bool = False
     notifications: list[str] = field(default_factory=list)
     notification_times: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -92,6 +93,7 @@ class EvSessionContext:
                 self.energy = EvEnergyMeter()
                 self.full_goal_limit_kwh = None
                 self.full_goal_anchor_at = None
+                self.soc_refresh_requested = False
                 self.notifications = []
                 self.notification_times = {}
                 self.updated_at = now
@@ -106,6 +108,7 @@ class EvSessionContext:
             self.energy = EvEnergyMeter(counter_last_kwh=session_kwh, counter_last_at=now.isoformat())
             self.full_goal_limit_kwh = None
             self.full_goal_anchor_at = None
+            self.soc_refresh_requested = False
             self.phase_capability = EvPhaseCapability.UNKNOWN
             self.updated_at = now
             self.dirty = True
@@ -188,6 +191,7 @@ class EvSessionContext:
             "energy": self.energy.as_dict(),
             "full_goal_limit_kwh": self.full_goal_limit_kwh,
             "full_goal_anchor_at": self.full_goal_anchor_at,
+            "soc_refresh_requested": self.soc_refresh_requested,
             "notifications": self.notifications,
             "notification_times": self.notification_times,
             "history": self.history[-20:],
@@ -220,6 +224,7 @@ class EvSessionContext:
             phase_capability=capability,
             last_session_kwh=last_kwh,
             updated_at=updated_at,
+            soc_refresh_requested=bool(raw.get("soc_refresh_requested", False)),
         )
         context._last_persisted_kwh = last_kwh
         context.energy = EvEnergyMeter.restore(raw.get("energy"))

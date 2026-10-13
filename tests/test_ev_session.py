@@ -62,6 +62,18 @@ class EvSessionTests(unittest.TestCase):
         self.assertEqual(EvPhaseCapability.UNKNOWN, context.phase_capability)
         self.assertFalse(context.single_phase_locked)
 
+    def test_soc_refresh_guard_survives_restore_and_resets_only_on_new_session(self) -> None:
+        context = EvSessionContext()
+        self.observe(context)
+        context.soc_refresh_requested = True
+        restored = EvSessionContext.from_storage_dict(context.to_storage_dict())
+        self.assertTrue(restored.soc_refresh_requested)
+        self.assertFalse(self.observe(restored, offset=60))
+        self.assertTrue(restored.soc_refresh_requested)
+        self.observe(restored, status="disconnected", kwh=0, power=0, offset=120)
+        self.assertTrue(self.observe(restored, offset=180))
+        self.assertFalse(restored.soc_refresh_requested)
+
     def test_session_counter_reset_preserves_physical_session(self) -> None:
         context = EvSessionContext()
         self.observe(context, kwh=2.4)

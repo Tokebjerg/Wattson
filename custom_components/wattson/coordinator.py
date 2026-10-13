@@ -1093,6 +1093,50 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_single_phase_session_locked = self._ev_session.single_phase_locked
         self._ev_phase_session_last_kwh = self._ev_session.last_session_kwh
 
+    def _request_niro_soc_refresh_for_session(self, now: datetime) -> None:
+        """Queue one targeted Kia refresh for a new Niro cheapest-hours session."""
+        session = self._ev_session
+        if (not session.connected or session.soc_refresh_requested
+                or self.ev_mode != EV_MODE_SCHEDULED_CHEAPEST
+                or self.ev_vehicle_profile not in {"auto", "niro"}
+                or self.mapping.ev_soc_entity != DEFAULT_EV_SOC_ENTITY
+                or not self.site_state or not self.site_state.easee_online):
+            return
+        # Set and persist the one-shot guard before the remote request starts. This
+        # prevents a HA restart or repeated coordinator tick from spamming Kia.
+        session.soc_refresh_requested = True
+        session.dirty = True
+        if not self.background.submit(
+            "niro_soc_refresh", session.session_id,
+            lambda: self._async_force_niro_soc_refresh(session.session_id, now),
+        ):
+            _LOGGER.warning("Wattson could not queue Kia SOC refresh for session %s", session.session_id)
+
+    async def _async_force_niro_soc_refresh(self, session_id: str | None, requested_at: datetime) -> None:
+        """Persist the one-shot guard, then ask only the configured Niro to refresh."""
+        try:
+            await self._ev_session_store.async_save(self._ev_session.to_storage_dict())
+            from homeassistant.helpers import entity_registry as er
+
+            entity = er.async_get(self.hass).async_get(DEFAULT_EV_SOC_ENTITY)
+            if entity is None or entity.platform != "kia_uvo" or not entity.device_id:
+                raise RuntimeError("Niro SOC entity is not registered to a Kia UVO device")
+            await self.hass.services.async_call(
+                "kia_uvo", "force_update", {"device_id": entity.device_id}, blocking=True,
+            )
+            _LOGGER.info(
+                "Wattson requested one Kia SOC refresh for EV session %s at %s",
+                session_id, requested_at.isoformat(),
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson Kia SOC refresh failed for session %s: %s", session_id, err)
+            if self._ev_session.session_id == session_id:
+                await self._async_send_ev_alert(
+                    "niro_soc_refresh_failed",
+                    "Wattson kunne ikke hente en frisk Niro-batteristatus ved tilslutning. "
+                    "Planlagt opladning afventer stadig valide bildata; kontrollér Kia-forbindelsen.",
+                )
+
     def _reset_ev_phase_transition_state(self) -> None:
         self._ev_phase_transition_state = "idle"
         self._ev_phase_transition_started_at = None
@@ -3915,6 +3959,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._reset_ev_phase_transition_state()
             self._ev_offer_repair_attempts = 0
             self._ev_minimum_recovery = None
+            self._request_niro_soc_refresh_for_session(tick.now)
         self._update_ev_energy_state(tick.local_now)
 
         # Telemetry/price corrections before anything consumes the state.
