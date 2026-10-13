@@ -2564,8 +2564,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         session = self._ev_session
         recovery = session.full_power_recovery
         previous = recovery.as_dict()
+        paused_until = getattr(self, "pause_until", None)
+        active_control = bool(getattr(self, "ev_control_enabled", True)
+            and getattr(self, "automation_enabled", True)
+            and not getattr(self, "shadow_mode", False)
+            and not (paused_until and paused_until.timestamp() > now.timestamp()))
         eligible = bool(ev.mode == EV_MODE_SCHEDULED_CHEAPEST and session.vehicle == "niro"
-                        and session.connected and not session.single_phase_locked
+                        and active_control and session.connected and not session.single_phase_locked
                         and not ev.solar_opportunity
                         and ev.desired_circuit_currents == (ev_max_amps,) * 3
                         and getattr(self, "ev_override", EV_OVERRIDE_AUTO) == EV_OVERRIDE_AUTO)

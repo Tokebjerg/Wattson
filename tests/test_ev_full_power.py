@@ -186,6 +186,24 @@ class FullPowerTests(unittest.TestCase):
         self.assertIsNone(co.site_state.ev_soc_pct)
         self.assertEqual(3.68, co.site_state.ev_full_power_kw)
 
+    def test_suspended_control_does_not_spend_phase_recovery_attempts(self):
+        for condition in ("disabled", "automation_disabled", "shadow", "pause"):
+            with self.subTest(condition=condition):
+                co, _, _ = asyncio.run(replay_phase_loss(seconds=0))
+                now = co.site_state.timestamp + timedelta(minutes=10)
+                if condition == "disabled":
+                    co.ev_control_enabled = False
+                elif condition == "automation_disabled":
+                    co.automation_enabled = False
+                elif condition == "shadow":
+                    co.shadow_mode = True
+                else:
+                    co.pause_until = now + timedelta(minutes=5)
+                plan = co._apply_ev_full_power_recovery(full_offer(), now=now, ev_max_amps=16)
+                self.assertEqual("auto_phase", plan.desired_phase_mode)
+                self.assertEqual(0, co._ev_session.full_power_recovery.attempts)
+                self.assertIsNone(co._ev_session.full_power_recovery.pause_at)
+
 
 if __name__ == "__main__":
     unittest.main()

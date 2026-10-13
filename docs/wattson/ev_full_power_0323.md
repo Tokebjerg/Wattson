@@ -1,4 +1,4 @@
-# EV full power recovery 0.32.3
+# EV full power recovery 0.32.3 / 0.32.4
 
 On 2026-10-13 the same charger delivered 10.60-10.72 kW at 18:21-18:31.
 Following the 19:07 restart of charging, power was 6.77-7.01 kW. Easee reported
@@ -23,6 +23,8 @@ and its capacity learning accepted the reduced rate as full charging capacity.
   Attempts and an in-progress pause survive HA restart. A failed pause stays
   paused; an unresolved power fault raises the existing repeated phone alarm
   and uses the reduced physical capacity for the deadline calculation.
+- 0.32.4 explicitly suspends recovery decisions and retry accounting during
+  manual pause, shadow mode, disabled automation or disabled EV control.
 - Missing-phase observations and near-full taper do not train full-rate
   capacity. Restored physical power revises the next rolling plan. A lower
   physical rate without phase-loss evidence is used as a temporary forecast
