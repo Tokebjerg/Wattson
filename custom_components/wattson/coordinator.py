@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from bisect import bisect_left
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 import logging
 from typing import Any
@@ -3461,13 +3461,13 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     async def _async_supervise_ev(self, now: datetime) -> None:
         """Reconcile the physical charger and its plan every fifteen minutes."""
-        if not self._cadence.due("ev_supervision", now, timedelta(minutes=15)):
+        if not self._cadence.due("ev_supervision", now.astimezone(timezone.utc), timedelta(minutes=15)):
             return
         previous = self.ev_supervision_status
         session = self._ev_session
         check = {"state": "waiting", "checks": previous.get("checks", 0) + 1,
                  "checked_at": now.isoformat(),
-                 "next_check_at": (now + timedelta(minutes=15)).isoformat(),
+                 "next_check_at": datetime.fromtimestamp(now.timestamp() + 900, now.tzinfo).isoformat(),
                  "session_id": session.session_id, "mode": self.ev_mode,
                  "delivered_kwh": round(session.energy.delivered_kwh, 3),
                  "corrections": []}

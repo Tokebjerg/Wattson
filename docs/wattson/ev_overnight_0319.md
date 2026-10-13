@@ -38,7 +38,8 @@ had also been changed to inject fresh Kia data, removing relevant coverage.
 
 ## Native quarter-hour supervision
 
-The coordinator checks immediately after startup and every 15 minutes thereafter.
+The coordinator checks immediately after startup and every 15 elapsed minutes
+thereafter, including both daylight-saving transitions.
 It records the check, next check, expected action, physical charging evidence,
 measured energy since the preceding check, deadline feasibility and corrective
 actions in site status and diagnostics. It requests replanning and charger offer
@@ -73,7 +74,7 @@ limits; user pause; disabled charger; and offline/site-fault guards.
 The deployed quarter-hour status can be checked live without starting a charge.
 The next real overnight session remains the physical end-to-end validation.
 
-Pre-deployment gates: 145 unit/regression tests, 690 behavior simulation checks
+Pre-deployment gates: 146 unit/regression tests, 690 behavior simulation checks
 and the connected 20-day house/battery winter stress study passed. Compilation
 and diff validation also passed. The HA configuration was valid.
 

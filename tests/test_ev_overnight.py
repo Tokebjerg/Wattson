@@ -215,6 +215,21 @@ class OvernightTests(unittest.TestCase):
         self.assertEqual("starting", co.ev_supervision_status["state"])
         self.assertFalse(co._async_ev_alert.called)
 
+    def test_quarter_hour_is_elapsed_time_across_both_dst_changes(self):
+        for now in (datetime(2026, 3, 29, 1, 50, tzinfo=TZ),
+                    datetime(2026, 10, 25, 2, 50, tzinfo=TZ, fold=0)):
+            with self.subTest(now=now):
+                co = coordinator(now)
+                enable_supervision(co)
+                co.ev_mode = "full_speed"
+                co.control_plan = SimpleNamespace(safe_mode=False,
+                    ev=ws.models.EvPlan("full_speed", "wait", desired_action="pause"))
+                asyncio.run(co._async_supervise_ev(now))
+                later = datetime.fromtimestamp(now.timestamp() + 900, TZ)
+                self.assertEqual(later.isoformat(), co.ev_supervision_status["next_check_at"])
+                asyncio.run(co._async_supervise_ev(later))
+                self.assertEqual(2, co.ev_supervision_status["checks"])
+
     def test_schedule_recomputes_completion_from_the_latest_observation(self):
         now = datetime(2026, 10, 13, 2, tzinfo=TZ)
         co = coordinator(now, soc=44)
