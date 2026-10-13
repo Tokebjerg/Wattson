@@ -3562,9 +3562,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 self.background.poll("ev_recovery_notice", session.session_id)
                 self.background.submit("ev_recovery_notice", session.session_id,
                     lambda: self._async_send_ev_recovery_notice())
-            if "plan_not_followed" in session.notifications:
-                session.notifications.remove("plan_not_followed")
-                session.dirty = True
             return
         enable_entity = getattr(self.mapping, "easee_enable_switch", None)
         enabled = self.hass.states.get(enable_entity) if enable_entity else None
