@@ -108,6 +108,7 @@ async def run_night(*, soc=44, capacity=64, efficiency=.9, max_kw=10.8,
         ev = ws.planner.build_ev_plan(co.site_state, ev_mode=co.ev_mode, ev_max_amps=16,
             ev_windows="", ev_solar_min_surplus_w=1400, ev_target_soc=100, ev_min_soc=30,
             ev_charge_until_complete=True)
+        ev = co._apply_ev_phase_transition(ev, now=tick, ev_max_amps=16)
         co.control_plan = SimpleNamespace(ev=ev, safe_mode=False)
         if hasattr(co, "_async_supervise_ev"):
             await co._async_supervise_ev(tick)

@@ -13,6 +13,7 @@ from math import isfinite
 from typing import Any
 
 from .ev_energy import EvEnergyMeter
+from .ev_performance import FullPowerRecovery
 from .ev_schedule import next_deadline
 
 
@@ -46,6 +47,7 @@ class EvSessionContext:
     deadline_at: datetime | None = None
     deadline_hour: int = -1
     energy: EvEnergyMeter = field(default_factory=EvEnergyMeter)
+    full_power_recovery: FullPowerRecovery = field(default_factory=FullPowerRecovery)
     full_goal_limit_kwh: float | None = None
     full_goal_anchor_at: str | None = None
     soc_refresh_requested: bool = False
@@ -91,6 +93,7 @@ class EvSessionContext:
                 self.deadline_at = None
                 self.deadline_hour = -1
                 self.energy = EvEnergyMeter()
+                self.full_power_recovery = FullPowerRecovery()
                 self.full_goal_limit_kwh = None
                 self.full_goal_anchor_at = None
                 self.soc_refresh_requested = False
@@ -106,6 +109,7 @@ class EvSessionContext:
             self.connected = True
             self.started_at = now
             self.energy = EvEnergyMeter(counter_last_kwh=session_kwh, counter_last_at=now.isoformat())
+            self.full_power_recovery = FullPowerRecovery()
             self.full_goal_limit_kwh = None
             self.full_goal_anchor_at = None
             self.soc_refresh_requested = False
@@ -144,6 +148,7 @@ class EvSessionContext:
     def reset_vehicle_energy(self, *, counter_kwh: float | None, now: datetime) -> None:
         """Change vehicle evidence without inheriting the previous energy goal."""
         self.energy = EvEnergyMeter(counter_last_kwh=counter_kwh, counter_last_at=now.isoformat())
+        self.full_power_recovery = FullPowerRecovery()
         self.vehicle = "unknown"
         self.full_goal_limit_kwh = None
         self.full_goal_anchor_at = None
@@ -189,6 +194,7 @@ class EvSessionContext:
             "deadline_at": self.deadline_at.isoformat() if self.deadline_at else None,
             "deadline_hour": self.deadline_hour,
             "energy": self.energy.as_dict(),
+            "full_power_recovery": self.full_power_recovery.as_dict(),
             "full_goal_limit_kwh": self.full_goal_limit_kwh,
             "full_goal_anchor_at": self.full_goal_anchor_at,
             "soc_refresh_requested": self.soc_refresh_requested,
@@ -228,6 +234,7 @@ class EvSessionContext:
         )
         context._last_persisted_kwh = last_kwh
         context.energy = EvEnergyMeter.restore(raw.get("energy"))
+        context.full_power_recovery = FullPowerRecovery.restore(raw.get("full_power_recovery"))
         try:
             limit = float(raw["full_goal_limit_kwh"])
             if isfinite(limit) and limit >= 0:

@@ -283,7 +283,7 @@ class EvRegressionTests(unittest.TestCase):
         self.assertEqual(0,co._ev_stop_recovery_attempts)
         self.assertIsNone(co._ev_control_blocked_reason)
 
-    def test_high_soc_single_phase_rate_is_learned(self):
+    def test_high_soc_taper_does_not_replace_full_power_capacity(self):
         now=datetime(2026,10,10,12,tzinfo=TZ)
         co=coordinator(now,profile="niro",soc=90)
         co._last_ev_amps,co._last_ev_currents=16,(16,)*3
@@ -293,8 +293,9 @@ class EvRegressionTests(unittest.TestCase):
             co.site_state=site(tick,ev_raw_soc_pct=90,easee_power_w=3680,easee_session_kwh=3.68*second/3600,
                                price_slots=prices(now))
             co._update_ev_energy_state(tick)
-        self.assertAlmostEqual(3.68,co.site_state.ev_full_power_kw)
-        self.assertLessEqual(co.ev_charge_schedule["power_kw"],3.68)
+        self.assertAlmostEqual(11.04,co.site_state.ev_full_power_kw)
+        self.assertEqual(11.04, co.ev_charge_schedule["expected_power_kw"])
+        self.assertLess(co.ev_charge_schedule["planning_power_kw"], 11.04)
 
     def test_disconnected_chart_is_preview_not_active(self):
         now=datetime(2026,10,10,13,tzinfo=TZ)

@@ -106,7 +106,8 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
                   "soc_estimate": "Planlagt efter beregnet bil-SOC",
                   "energy_request": "Planlagt efter manuelt energimål"}[goal_status]
     overdue = deadline is not None and now.timestamp() >= deadline.timestamp()
-    power_kw = min(nominal_kw, state.ev_full_power_kw or nominal_kw) * 0.9
+    expected_power_kw = min(nominal_kw, state.ev_full_power_kw or nominal_kw)
+    power_kw = expected_power_kw * 0.9
     if soc is not None and target > soc and target > 90:
         # Taper belongs to the final SOC band, not the entire charging session.
         tail_fraction = max(0.0, target - max(90.0, soc)) / (target - soc)
@@ -176,6 +177,9 @@ def energy_schedule(state, *, ev_required_hours=4, ev_ready_hour=-1,
             "goal_confirmed": goal_confirmed, "goal_unverified": goal_unverified,
             "expected_departure_soc": round(projected, 1) if projected is not None else None,
             "soc_source": state.ev_soc_source, "power_kw": round(power_kw, 3),
+            "offered_power_kw": round(nominal_kw, 3),
+            "expected_power_kw": round(expected_power_kw, 3),
+            "planning_power_kw": round(power_kw, 3),
             "waiting_for_vehicle_data": False, "data_reason": state.ev_soc_data_reason,
             "soc_sample_at": state.ev_soc_sample_at.isoformat() if state.ev_soc_sample_at else None,
             "preview": not connected, "plan_kind": "active" if connected else "preview",

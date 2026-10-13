@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .config import entry_value, merged_entry_config, update_entry_options
+from .ev_performance import missing_phase, tn_phase_currents
 from .const import (
     BATTERY_MIN_CHARGE_TEMP_C,
     EV_SOAK_BATTERY_DRAW_W,
@@ -2417,7 +2418,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_phase_transition_pause_at = None
             self._ev_phase_transition_failures = 0
             self._ev_phase_transition_cooldown_until = None
-            return ev_plan
+            return self._apply_ev_full_power_recovery(ev_plan, now=now, ev_max_amps=ev_max_amps)
         if not wants_charge:
             self._ev_phase_transition_state = (
                 "session_single_phase" if session.single_phase_locked else "idle"
@@ -2539,6 +2540,49 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_max_amps=ev_max_amps,
             reason="two verified three-phase attempts failed; current EV session locked to one phase",
         )
+
+    def _ev_tn_phase_currents(self, now: datetime) -> tuple[float, float, float] | None:
+        entity = getattr(self.mapping, "easee_power_entity", None)
+        states = getattr(self.hass, "states", None)
+        if not entity or not entity.endswith("_power") or states is None:
+            return None
+        prefix = entity[:-6]
+        status = states.get(f"{prefix}_status")
+        current = states.get(f"{prefix}_current")
+        if status is None or current is None or str(status.attributes.get("state_outputPhase")) != "30":
+            return None
+        reported = getattr(current, "last_reported", None) or current.last_updated
+        # Easee emits unchanged RMS currents roughly every fifteen minutes.
+        if not 0 <= now.timestamp() - reported.timestamp() <= 1200:
+            return None
+        recovery = self._ev_session.full_power_recovery
+        if recovery.resumed_at and reported.timestamp() < datetime.fromisoformat(recovery.resumed_at).timestamp():
+            return None
+        return tn_phase_currents(current.attributes)
+
+    def _apply_ev_full_power_recovery(self, ev: EvPlan, *, now: datetime, ev_max_amps: int) -> EvPlan:
+        session = self._ev_session
+        recovery = session.full_power_recovery
+        previous = recovery.as_dict()
+        eligible = bool(ev.mode == EV_MODE_SCHEDULED_CHEAPEST and session.vehicle == "niro"
+                        and session.connected and not session.single_phase_locked
+                        and not ev.solar_opportunity
+                        and ev.desired_circuit_currents == (ev_max_amps,) * 3
+                        and getattr(self, "ev_override", EV_OVERRIDE_AUTO) == EV_OVERRIDE_AUTO)
+        state = self.site_state
+        fresh = bool(state.easee_online and not state.ev_issues and not state.ev_missing_entities
+                     and self.mapping.easee_power_entity not in state.ev_stale_entities)
+        adjusted = recovery.adjust(ev, now=now, eligible=eligible,
+            power_w=state.easee_power_w, fresh=fresh, currents=self._ev_tn_phase_currents(now),
+            amps=ev_max_amps, soc=state.ev_soc_pct)
+        if previous != recovery.as_dict():
+            session.dirty = True
+            if recovery.state == "recovered":
+                session.energy.full_power_kw = max(session.energy.full_power_kw, (state.easee_power_w or 0) / 1000)
+                self._pending_replan_reason = "ev_full_power_restored"
+            elif recovery.state in {"failed", "pause_failed", "power_limited"}:
+                self._pending_replan_reason = "ev_full_power_degraded"
+        return adjusted
 
     def _update_ev_solar_grid_budget(self, now: datetime) -> bool:
         """Integrate grid-backed solar-EV energy and enforce an hourly cap."""
@@ -3426,13 +3470,21 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         counter_fresh = bool(state.easee_online and not state.ev_issues and
                              self.mapping.easee_session_entity not in state.ev_stale_entities)
         before = session.energy.as_dict()
+        niro_capacity = trusted and session.vehicle == "niro"
+        phase_fault = niro_capacity and missing_phase(self._ev_tn_phase_currents(now), max_amps)
+        capacity_soc = session.energy.estimated_soc if niro_capacity else None
+        capacity_learning = not phase_fault and (capacity_soc is None or capacity_soc < 90)
+        if niro_capacity and not session.single_phase_locked:
+            capacity_learning &= bool(state.easee_power_w is not None
+                                      and state.easee_power_w >= max_amps * 690 * .85)
         session.energy.observe(now=now, counter_kwh=state.easee_session_kwh,
             power_w=state.easee_power_w, telemetry_fresh=power_fresh,
             counter_fresh=counter_fresh,
             soc=state.ev_raw_soc_pct, soc_at=sample_at, soc_trusted=trusted and fresh_sample,
             nominal_kwh_per_pct=max_amps * 0.69 / max(1.0, speed),
             max_power_kw=max_amps * 0.69,
-            full_offer=(self.ev_mode in {EV_MODE_FULL_SPEED, EV_MODE_SCHEDULED_CHEAPEST, EV_MODE_SCHEDULED}
+            full_offer=(capacity_learning
+                        and self.ev_mode in {EV_MODE_FULL_SPEED, EV_MODE_SCHEDULED_CHEAPEST, EV_MODE_SCHEDULED}
                         and self._last_ev_amps == max_amps
                         and self._last_ev_currents == (max_amps,) * 3
                         and self.control_plan is not None
@@ -3463,6 +3515,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             enabled=self.ev_target_soc >= 100 or self.ev_charge_until_complete,
             soc=estimate, nominal_kw=max_amps * 0.69)
         phases = 1 if session.single_phase_locked else 3
+        full_power_kw = min(session.energy.full_power_kw, max_amps * 230 * phases / 1000)
+        if session.full_power_recovery.limited_power_kw is not None:
+            # A real unresolved fault must not promise nominal deadline capacity.
+            full_power_kw = min(full_power_kw, session.full_power_recovery.limited_power_kw)
         accepted_sample_at = (datetime.fromisoformat(session.energy.anchor_at)
                               if estimate is not None and session.energy.has_soc_anchor else sample_at)
         self.site_state = replace(state, ev_soc_pct=estimate,
@@ -3470,7 +3526,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_soc_source=("metered" if estimate is not None else
                            "energy_budget" if other_vehicle else "awaiting_vehicle_data"),
             ev_ac_kwh_per_pct=session.energy.ac_kwh_per_pct,
-            ev_full_power_kw=min(session.energy.full_power_kw, max_amps * 230 * phases / 1000),
+            ev_full_power_kw=full_power_kw,
             ev_session_delivered_kwh=session.energy.delivered_kwh,
             ev_unknown_budget_kwh=self.ev_energy_request_kwh,
             ev_full_goal_limit_kwh=session.full_goal_limit_kwh,
@@ -3518,6 +3574,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_min_soc=self.ev_min_soc, ev_charge_until_complete=self.ev_charge_until_complete,
             ev_minimum_recovery_complete=self.ev_minimum_recovery_complete,
             ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)))
+        if self._ev_session.full_power_recovery.state == "pause_failed":
+            schedule.update({"active": False, "feasible": False,
+                "remaining_unserved_kwh": schedule.get("required_kwh"),
+                "expected_departure_soc": state.ev_soc_pct,
+                "control_blocked_by": "easee_phase_pause_failed"})
         if preview_soc is not None and schedule.get("preview"):
             stale = preview_age > 12000
             schedule.update({"preview_soc_source": self.mapping.ev_soc_entity,
@@ -3598,6 +3659,20 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                            and check.get("energy_since_check_kwh") is not None
                            and check["energy_since_check_kwh"] <= 0.01)
         check["energy_progress_missing"] = no_progress
+        performance = session.full_power_recovery.as_dict()
+        check["full_power_recovery"] = performance
+        if performance["state"] in {"degraded", "pausing", "verifying", "failed", "pause_failed", "power_limited"}:
+            check["state"] = "phase_degraded"
+            check["corrections"].append("bounded_three_phase_recovery")
+            if performance["state"] in {"failed", "pause_failed"}:
+                await self._async_ev_alert("phase_degraded",
+                    "Wattson kan ikke genoprette fuld trefaset ladning efter begrænsede genforsøg. "
+                    "Ladeplanen tager højde for den lavere effekt. Kontroller Easee, kabel og bil.")
+            elif performance["state"] == "power_limited":
+                await self._async_ev_alert("phase_degraded",
+                    "Bilen tager vedvarende mindre effekt end den fulde ladeplan tilbyder. "
+                    "Wattson har tilpasset planen til den målte effekt. Kontroller bilens AC-ladestrøm og Easee.")
+            return
         mismatch = (action == "resume" and evidence != "charging"
                     or action == "pause" and evidence == "charging" or no_progress)
         if not mismatch:
@@ -3645,6 +3720,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         actual = evidence == "charging"
         failure = self._ev_start_status == "start_failed" and not actual
         supervision = self.ev_supervision_status
+        performance = self._ev_session.full_power_recovery.as_dict()
+        phase_problem = performance["state"] in {"degraded", "pausing", "verifying", "failed", "pause_failed", "power_limited"}
         supervised_action = supervision.get("expected_action")
         current_action = self.control_plan.ev.desired_action if self.control_plan else None
         supervision_problem = bool(supervision.get("state") in {"plan_not_followed", "recovery_pending", "telemetry_unverified"}
@@ -3659,7 +3736,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "start_failed" if failure else "blocked" if blocked else "waiting")
         if supervision_problem and state in {"charging", "waiting"}:
             state = "plan_not_followed"
-        return {"state": state, "problem": bool(failure or blocked or supervision_problem or overview.get("feasible") is False or overview.get("goal_unverified")),
+        return {"state": state, "problem": bool(failure or blocked or supervision_problem or phase_problem or overview.get("feasible") is False or overview.get("goal_unverified")),
                 "blocked_reason": blocked, "session_id": self._ev_session.session_id,
                 "vehicle": self._ev_session.vehicle,
                 "soc_source": self.site_state.ev_soc_source if self.site_state else "unavailable",
@@ -3676,6 +3753,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 "goal_label": overview.get("goal_label"),
                 "goal_confirmed": overview.get("goal_confirmed"),
                 "supervision": supervision,
+                "full_power_recovery": performance,
                 "start": self.ev_start_status}
 
     async def _async_ev_alert(self, code: str, message: str) -> None:
