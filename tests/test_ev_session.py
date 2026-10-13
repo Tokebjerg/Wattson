@@ -113,6 +113,20 @@ class EvSessionTests(unittest.TestCase):
         restored = EvSessionContext.from_storage_dict(saved)
         self.assertEqual(saved, restored.to_storage_dict())
 
+    def test_notification_repeat_timestamps_survive_restart_and_reject_invalid_data(self) -> None:
+        context = EvSessionContext(notifications=["plan_not_followed"],
+            notification_times={"plan_not_followed": self.now.isoformat()})
+        saved = context.to_storage_dict()
+        restored = EvSessionContext.from_storage_dict(saved)
+        self.assertEqual(context.notification_times, restored.notification_times)
+
+        saved["notification_times"] = {
+            "plan_not_followed": "not-a-timestamp",
+            "unknown_soc": "2026-08-04T12:00:00",
+        }
+        restored = EvSessionContext.from_storage_dict(saved)
+        self.assertEqual({}, restored.notification_times)
+
 
 if __name__ == "__main__":
     unittest.main()

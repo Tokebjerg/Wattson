@@ -158,6 +158,29 @@ class OvernightTests(unittest.TestCase):
         self.assertTrue(co.ev_charge_schedule["waiting_for_vehicle_data"])
         self.assertIsNone(co.site_state.ev_soc_pct)
 
+    def test_disconnected_preview_uses_stale_niro_soc_but_never_creates_control_soc(self):
+        now = datetime(2026, 10, 13, 2, tzinfo=TZ)
+        sample_at = now - timedelta(hours=7)
+        co = coordinator(now, soc=44)
+        co.ev_ready_hour = 7
+        co._ev_session.observe(status="disconnected", session_kwh=0, power_w=0,
+            now=now, one_phase_ceiling_w=4300)
+        co.hass = ws.FakeHass({"sensor.niro_last_updated_at": sample_at.isoformat(),
+            "binary_sensor.niro_ev_battery_plug": "off"})
+        co.site_state = replace(co.site_state, timestamp=now, ev_raw_soc_pct=44,
+            ev_soc_sample_at=sample_at, easee_status="disconnected", easee_online=True,
+            price_slots=co.site_state.price_slots)
+
+        co._update_ev_energy_state(now)
+        preview = co.ev_charge_schedule
+
+        self.assertEqual("preview", preview["plan_kind"])
+        self.assertFalse(preview["waiting_for_vehicle_data"])
+        self.assertEqual("stale_preview", preview["preview_soc_status"])
+        self.assertEqual(44, preview["hours"][0]["soc_start"])
+        self.assertIsNone(co.site_state.ev_soc_pct)
+        self.assertIn("forældet Niro-SOC", preview["note"])
+
     def test_disconnection_removes_anchor_and_never_applies_it_to_next_session(self):
         now = datetime(2026, 10, 12, 22, tzinfo=TZ)
         co = coordinator(now, soc=44)
@@ -172,6 +195,34 @@ class OvernightTests(unittest.TestCase):
         co._update_ev_energy_state(later)
         self.assertTrue(co.ev_charge_schedule["waiting_for_vehicle_data"])
         self.assertFalse(co._ev_session.energy.has_soc_anchor)
+
+    def test_ev_alert_repeats_after_one_hour_and_recovery_clears_active_fault(self):
+        now = datetime(2026, 10, 13, 2, tzinfo=TZ)
+        co = coordinator(now)
+        calls = []
+
+        class Services:
+            def has_service(self, domain, service):
+                return False
+
+            async def async_call(self, domain, service, data, blocking=False):
+                calls.append((domain, service, data))
+
+        co.hass.services = Services()
+        co._ev_session.connected = True
+        co._ev_session.session_id = "session"
+        async def scenario():
+            await co._async_send_ev_alert("plan_not_followed", "test", now)
+            await co._async_send_ev_alert("plan_not_followed", "test", now + timedelta(seconds=3599))
+            self.assertEqual(1, len(calls))
+            await co._async_send_ev_alert("plan_not_followed", "test", now + timedelta(seconds=3600))
+            self.assertEqual(2, len(calls))
+            await co._async_send_ev_recovery_notice()
+
+        asyncio.run(scenario())
+        self.assertEqual([], co._ev_session.notifications)
+        self.assertEqual({}, co._ev_session.notification_times)
+        self.assertEqual("wattson_ev_recovered", calls[-1][2]["notification_id"])
 
     def test_corrupt_restored_anchor_is_ignored_without_losing_measured_energy(self):
         meter = session_module.EvEnergyMeter.restore({"anchor_soc": float("nan"),

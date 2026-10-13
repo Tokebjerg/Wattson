@@ -95,6 +95,13 @@ The latest check and next check are recorded in `ev_supervision` on site status.
 The overnight incident, counterfactual replay and test boundaries are documented
 in `docs/wattson/ev_overnight_0319.md`.
 
+Version 0.32.0 keeps a disconnected scheduled-cheapest chart as a Niro-specific
+preview using the latest valid SOC sample, including stale samples visibly
+marked with their age. This preview never populates control SOC: starting still
+requires a verified Easee session and a fresh SOC or a valid same-session energy
+anchor. Persistent EV faults repeat at most hourly, with timestamps surviving HA
+restarts; an explicit recovery notice is sent only after Easee confirms charging.
+
 Desired plan, service acceptance and physical feedback are separate states.
 Battery confirmation requires all requested registers to read back; unavailable
 or restored-only values are not proof. A no-write cooldown cannot discard earlier

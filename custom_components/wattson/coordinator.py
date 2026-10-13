@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 import logging
+from math import isfinite
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -3447,13 +3448,41 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         return deepcopy(self._ev_schedule_view)
 
     def _build_ev_charge_schedule(self) -> dict[str, Any]:
-        return energy_schedule(self.site_state,
+        state = self.site_state
+        preview_soc = None
+        preview_age = None
+        if (self.ev_mode == EV_MODE_SCHEDULED_CHEAPEST
+                and not self._ev_session.connected
+                and self.ev_vehicle_profile in {"auto", "niro"}
+                and self.mapping.ev_soc_entity == DEFAULT_EV_SOC_ENTITY):
+            raw_soc = state.ev_raw_soc_pct
+            sample_at = state.ev_soc_sample_at
+            if (isinstance(raw_soc, (int, float)) and isfinite(raw_soc)
+                    and sample_at is not None and sample_at.tzinfo is not None
+                    and 0 <= raw_soc <= 100):
+                age = self.site_state.timestamp.timestamp() - sample_at.timestamp()
+                if age >= 0:
+                    preview_soc = float(raw_soc)
+                    preview_age = int(age)
+                    state = replace(state, ev_soc_pct=preview_soc,
+                                    ev_soc_sample_at=sample_at,
+                                    ev_soc_source="niro_preview")
+        schedule = energy_schedule(state,
             ev_required_hours=int(entry_value(self.config_entry, CONF_EV_REQUIRED_HOURS, DEFAULT_EV_REQUIRED_HOURS)),
             ev_ready_hour=self.ev_ready_hour, ev_target_soc=self.ev_target_soc,
             ev_charge_speed_pct_h=float(entry_value(self.config_entry, CONF_EV_CHARGE_SPEED_PCT_H, DEFAULT_EV_CHARGE_SPEED_PCT_H)),
             ev_min_soc=self.ev_min_soc, ev_charge_until_complete=self.ev_charge_until_complete,
             ev_minimum_recovery_complete=self.ev_minimum_recovery_complete,
             ev_max_amps=int(entry_value(self.config_entry, CONF_EV_MAX_AMPS, DEFAULT_EV_MAX_AMPS)))
+        if preview_soc is not None and schedule.get("preview"):
+            stale = preview_age > 12000
+            schedule.update({"preview_soc_source": self.mapping.ev_soc_entity,
+                             "preview_soc_age_seconds": preview_age,
+                             "preview_soc_stale": stale,
+                             "preview_soc_status": "stale_preview" if stale else "fresh_preview"})
+            if stale:
+                schedule["note"] = f"Forhåndsplan med forældet Niro-SOC ({preview_soc:.1f} %, {preview_age // 3600} t gammel); kræver frisk SOC før start. " + schedule.get("note", "")
+        return schedule
 
     @property
     def ev_supervision_status(self) -> dict[str, Any]:
@@ -3529,6 +3558,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     or action == "pause" and evidence == "charging" or no_progress)
         if not mismatch:
             check["state"] = "charging" if evidence == "charging" else "planned_wait"
+            if evidence == "charging" and session.notifications:
+                self.background.poll("ev_recovery_notice", session.session_id)
+                self.background.submit("ev_recovery_notice", session.session_id,
+                    lambda: self._async_send_ev_recovery_notice())
             if "plan_not_followed" in session.notifications:
                 session.notifications.remove("plan_not_followed")
                 session.dirty = True
@@ -3606,12 +3639,26 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     async def _async_ev_alert(self, code: str, message: str) -> None:
         session = getattr(self, "_ev_session", None)
-        if session is None or code in session.notifications or not session.connected:
+        if session is None or not session.connected:
             return
+        now = dt_util.now()
+        last_raw = session.notification_times.get(code)
+        if code in session.notifications:
+            if last_raw is None:
+                # Legacy sessions lacked timestamps; grant one quiet hour after upgrade.
+                session.notification_times[code] = now.isoformat()
+                session.dirty = True
+                return
+            try:
+                last = datetime.fromisoformat(last_raw)
+            except (TypeError, ValueError):
+                last = now
+            if last.tzinfo is None or (now - last).total_seconds() < 3600:
+                return
         key = f"ev_alert_{code}"
         self.background.poll(key, session.session_id)
         self.background.submit(key, session.session_id,
-                               lambda: self._async_send_ev_alert(code, message))
+                               lambda: self._async_send_ev_alert(code, message, now))
 
     async def _async_send_ev_charger_disabled_alert(self) -> None:
         message = (
@@ -3637,10 +3684,19 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Wattson disabled-charger notification failed: %s", err)
 
-    async def _async_send_ev_alert(self, code: str, message: str) -> None:
+    async def _async_send_ev_alert(self, code: str, message: str, sent_at: datetime | None = None) -> None:
         session = getattr(self, "_ev_session", None)
-        if session is None or code in session.notifications or not session.connected:
+        if session is None or not session.connected:
             return
+        sent_at = sent_at or dt_util.now()
+        last_raw = session.notification_times.get(code)
+        if code in session.notifications and last_raw:
+            try:
+                last = datetime.fromisoformat(last_raw)
+            except (TypeError, ValueError):
+                last = sent_at
+            if last.tzinfo is None or (sent_at - last).total_seconds() < 3600:
+                return
         service = str(entry_value(self.config_entry, "ev_notify_service", ""))
         try:
             await self.hass.services.async_call("persistent_notification", "create",
@@ -3649,10 +3705,35 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 await self.hass.services.async_call("notify", service[7:],
                     {"title": "Wattson: EV-opladning", "message": message,
                      "data": {"tag": f"wattson_ev_{code}"}}, blocking=True)
-            session.notifications.append(code)
+            if code not in session.notifications:
+                session.notifications.append(code)
+            session.notification_times[code] = sent_at.isoformat()
             session.dirty = True
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Wattson EV notification failed: %s", err)
+
+    async def _async_send_ev_recovery_notice(self) -> None:
+        session = getattr(self, "_ev_session", None)
+        if session is None or not session.connected or not session.notifications:
+            return
+        codes = list(session.notifications)
+        message = "Wattson har genoptaget normal EV-opladning, og Easee bekræfter fysisk ladeeffekt."
+        service = str(entry_value(self.config_entry, "ev_notify_service", ""))
+        try:
+            for code in codes:
+                await self.hass.services.async_call("persistent_notification", "dismiss",
+                    {"notification_id": f"wattson_ev_{code}"}, blocking=True)
+            await self.hass.services.async_call("persistent_notification", "create",
+                {"notification_id": "wattson_ev_recovered", "title": "Wattson: EV-opladning", "message": message}, blocking=True)
+            if service.startswith("notify.") and self.hass.services.has_service("notify", service[7:]):
+                await self.hass.services.async_call("notify", service[7:],
+                    {"title": "Wattson: EV-opladning", "message": message,
+                     "data": {"tag": "wattson_ev_recovered"}}, blocking=True)
+            session.notifications = [code for code in session.notifications if code not in codes]
+            session.notification_times = {code: stamp for code, stamp in session.notification_times.items() if code not in codes}
+            session.dirty = True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson EV recovery notification failed: %s", err)
 
     async def async_set_ev_solar_battery_priority(self, enabled: bool) -> None:
         self.ev_solar_battery_priority = bool(enabled)

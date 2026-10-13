@@ -16,6 +16,14 @@ from .ev_energy import EvEnergyMeter
 from .ev_schedule import next_deadline
 
 
+def _valid_aware_datetime(value: str) -> bool:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return parsed.tzinfo is not None
+
+
 class EvPhaseCapability(StrEnum):
     """Observed phase capability for the currently connected vehicle."""
 
@@ -41,6 +49,7 @@ class EvSessionContext:
     full_goal_limit_kwh: float | None = None
     full_goal_anchor_at: str | None = None
     notifications: list[str] = field(default_factory=list)
+    notification_times: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
     dirty: bool = False
     _last_persisted_kwh: float | None = None
@@ -84,6 +93,7 @@ class EvSessionContext:
                 self.full_goal_limit_kwh = None
                 self.full_goal_anchor_at = None
                 self.notifications = []
+                self.notification_times = {}
                 self.updated_at = now
                 self.dirty = True
             return False
@@ -135,6 +145,7 @@ class EvSessionContext:
         self.full_goal_limit_kwh = None
         self.full_goal_anchor_at = None
         self.notifications = []
+        self.notification_times = {}
         self.dirty = True
 
     def set_deadline(self, now: datetime, hour: int, *, rearm: bool = False) -> None:
@@ -178,6 +189,7 @@ class EvSessionContext:
             "full_goal_limit_kwh": self.full_goal_limit_kwh,
             "full_goal_anchor_at": self.full_goal_anchor_at,
             "notifications": self.notifications,
+            "notification_times": self.notification_times,
             "history": self.history[-20:],
         }
 
@@ -226,6 +238,14 @@ class EvSessionContext:
             context.energy.delivered_kwh = last_kwh
         context.vehicle = str(raw.get("vehicle", "unknown"))
         context.notifications = list(raw.get("notifications", []))[-10:]
+        times = raw.get("notification_times", {})
+        if isinstance(times, dict):
+            context.notification_times = {
+                str(code): stamp for code, value in times.items()
+                if isinstance(value, str)
+                and _valid_aware_datetime(value)
+                for stamp in [value]
+            }
         context.history = list(raw.get("history", []))[-20:]
         try:
             context.started_at = datetime.fromisoformat(raw["started_at"]) if raw.get("started_at") else None
