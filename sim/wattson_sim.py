@@ -2502,14 +2502,19 @@ def test_tou_management():
         checks.append((f"mock fidelity step={step}: within-half-step skips, full-step writes [{len(w_skip)},{len(w_write)}]",
                        len(w_skip) == 0 and len(w_write) == 1, f"skip={w_skip} write={w_write}"))
 
-    # A rejected TOU field is isolated and backed off after two retries.  Normal
+    # A rejected TOU field is isolated and backed off after three real attempts. Normal
     # inverter writes still run, but one bad bridge field cannot create the
     # thousands-of-writes limit cycle observed in September.
     rejected_states = _States({"number.reject": "15"}, step=5.0)
     rejected_services = _Services(rejected_states, step=5.0)
     rejected_ctrl = control.KlatremisController(_Hass(rejected_states, rejected_services))
     rejected_services.async_call = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("rejected"))
-    rejected = [asyncio.run(rejected_ctrl._set_number_best_effort("number.reject", 55.0)) for _ in range(4)]
+    rejected = []
+    for _ in range(4):
+        rejected_ctrl.commands._retry_after = 0
+        if rejected_ctrl._write_attempts.get("number.reject", 0) < 3:
+            rejected_ctrl._best_effort_retry_after.clear()
+        rejected.append(asyncio.run(rejected_ctrl._set_number_best_effort("number.reject", 55.0)))
     checks.append(("rejected TOU register backs off after bounded retries",
                    "number.reject" in rejected_ctrl.degraded_entities
                    and sum(bool(item) for item in rejected) == 3,

@@ -22,6 +22,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
             "last_actions": coordinator.last_actions,
             "capabilities": coordinator.capabilities,
             "battery_model": coordinator._battery_model.as_dict(),
+            "battery_feedback": coordinator.battery_feedback,
             "load_profile": coordinator.load_profile,
             "physical_write_counts": coordinator.physical_write_counts,
             "ev_session": coordinator._ev_session.as_dict(),

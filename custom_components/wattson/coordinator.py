@@ -904,6 +904,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._avoidable_import_watchdog_reason: str = "inactive"
         self._avoidable_import_watchdog_counterfactual_value_kr: float = 0.0
         self._avoidable_import_watchdog_destination_at: datetime | None = None
+        self._battery_feedback_since: datetime | None = None
+        self.battery_feedback: dict[str, Any] = {"state": "pending", "problem": False}
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -2110,6 +2112,46 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ],
         )
 
+    def _update_battery_feedback(self, now: datetime) -> None:
+        """Separate discharge intent from register readback and physical response."""
+        state, plan = self.site_state, self.control_plan
+        enabled = bool(state and plan and self.battery_control_enabled
+            and self.automation_enabled and not self.shadow_mode
+            and not (self.pause_until and now < self.pause_until)
+            and not plan.safe_mode and state.inverter_online
+            and not state.stale_required_entities
+            and plan.battery.discharge_intent == "allow"
+            and plan.battery.desired_tou_capacity_pct is not None)
+        feedback: dict[str, Any] = {"state": "inactive", "problem": False}
+        stalled = False
+        if enabled:
+            floor = plan.battery.desired_tou_capacity_pct
+            ev_w = max(0.0, state.easee_power_w or 0.0)
+            house_w = max(0.0, state.load_power_w - (ev_w if state.load_includes_ev else 0.0))
+            demand_w = max(0.0, house_w - state.pv_power_w)
+            expected_w = min(demand_w, battery_rate_kwh(self.battery_discharge_current) * 1000)
+            house_import_w = max(0.0, state.grid_import_power_w - ev_w)
+            battery_w = max(0.0, state.battery_power_w)
+            registers = self._klatremis.battery_plan_converged(self.mapping, plan.battery)
+            stalled = bool(state.battery_soc_pct > floor + 2.5 and expected_w >= 300
+                and house_import_w >= 200
+                and battery_w < expected_w - max(200, expected_w * .25))
+            feedback.update(state="discharging" if battery_w >= 100 else "waiting_for_load",
+                registers_verified=registers, requested_floor_pct=floor,
+                battery_power_w=battery_w, house_grid_import_w=house_import_w,
+                expected_discharge_w=round(expected_w, 1))
+            if stalled:
+                if self._battery_feedback_since is None:
+                    self._battery_feedback_since = now
+                blocked = (now - self._battery_feedback_since).total_seconds() >= 90
+                feedback.update(state="discharge_blocked" if blocked else "awaiting_discharge",
+                    problem=blocked, since=self._battery_feedback_since.isoformat(),
+                    reason=("Inverterens registre matcher ikke afladeplanen" if not registers
+                            else "Inverteren aflader ikke som forventet trods korrekte registre"))
+        if not stalled:
+            self._battery_feedback_since = None
+        self.battery_feedback = feedback
+
     def _sync_repairs(self) -> None:
         """Phase F: surface Wattson problems in Settings → Repairs and clear them
         when resolved. Only fires create/delete on a transition to avoid churn."""
@@ -2122,6 +2164,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             "missing_entities": sorted(state.missing_entities) if state else [],
             "controller_contention": sorted(self.contended_entities or []),
             "degraded_writes": sorted(getattr(self._klatremis, "degraded_entities", []) or []),
+            "battery_discharge_blocked": ([self.battery_feedback["reason"]]
+                if self.battery_feedback.get("problem") else []),
         }
         severities = {
             "missing_entities": ir.IssueSeverity.ERROR,
@@ -2131,6 +2175,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             # notification below), not a quiet WARNING. NOT CRITICAL — that severity is
             # reserved for HA core and renders as un-ignorable.
             "degraded_writes": ir.IssueSeverity.ERROR,
+            "battery_discharge_blocked": ir.IssueSeverity.ERROR,
         }
         for key, entities in conditions.items():
             issue_id = f"{key}_{self.config_entry.entry_id}"
@@ -2144,6 +2189,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     self._repairs_state[key] = entities
                     if key == "degraded_writes":
                         self._notify_degraded_writes(entities)
+                    if key == "battery_discharge_blocked":
+                        self._notify_battery_feedback(True)
             else:
                 # Clear UNCONDITIONALLY (delete/dismiss are cheap no-ops when absent).
                 # The issue registry persists across a restart but self._repairs_state
@@ -2153,6 +2200,24 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 ir.async_delete_issue(self.hass, DOMAIN, issue_id)
                 if key == "degraded_writes":
                     self._notify_degraded_writes(None)
+                if key == "battery_discharge_blocked":
+                    self._notify_battery_feedback(False)
+
+    def _notify_battery_feedback(self, blocked: bool) -> None:
+        try:
+            from homeassistant.components import persistent_notification
+            nid = f"wattson_battery_feedback_{self.config_entry.entry_id}"
+            if blocked:
+                persistent_notification.async_create(self.hass,
+                    "Batteriet dækker ikke huset som planlagt. "
+                    f"{self.battery_feedback['reason']}. "
+                    "Wattson genforsøger TOU-styringen med begrænset frekvens; "
+                    "70 A-grænsen og den planlagte SOC-reserve bevares.",
+                    title="Wattson: afladning blokeret", notification_id=nid)
+            else:
+                persistent_notification.async_dismiss(self.hass, nid)
+        except Exception:  # noqa: BLE001 - observability must not interrupt control
+            pass
 
     def _notify_degraded_writes(self, entities: list[str] | None) -> None:
         """O6: a persistent notification (the bell, not just the Repairs page) when an
@@ -5324,6 +5389,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if left < 3600 and overview["required_kwh"] > 0.1:
                     await self._async_ev_alert("deadline_blocked",
                         f"EV-opladning er blokeret ({self._ev_control_blocked_reason}), og fristen nærmer sig. Kontroller bilen og Easee.")
+        self._update_battery_feedback(tick.now)
         self._sync_repairs()
         # Self-diagnosis runs AFTER control is applied and must NEVER be able to break the
         # control loop — it is pure observability. Swallow + log any error here.

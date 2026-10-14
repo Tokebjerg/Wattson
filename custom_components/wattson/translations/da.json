@@ -235,6 +235,10 @@
     }
   },
   "issues": {
+    "battery_discharge_blocked": {
+      "title": "Wattson: afladning blokeret",
+      "description": "Huset køber strøm, selv om batteriet skal aflade: {entities}. Wattson genforsøger inverterstyringen med begrænset frekvens uden at ændre afladegrænsen eller SOC-reserven."
+    },
     "missing_entities": {
       "title": "Wattson: påkrævede entiteter mangler",
       "description": "Wattson kan ikke køre aktiv styring, fordi disse påkrævede entiteter er utilgængelige: {entities}. Tjek integrationens opsætning, og at enhederne er online."

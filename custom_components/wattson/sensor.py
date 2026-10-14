@@ -62,11 +62,22 @@ ACTION_LABELS = {
 
 
 def _plan_action_label(coordinator: Any) -> Any:
+    if getattr(coordinator, "battery_feedback", {}).get("problem"):
+        return "Afladning blokeret"
     plan = getattr(coordinator, "control_plan", None)
     if not plan or not plan.schedule:
         return None
     action = display_plan_action(plan.schedule[0])
     return ACTION_LABELS.get(action, action)
+
+
+def _live_decision_reason(coordinator: Any) -> Any:
+    plan = coordinator.control_plan
+    feedback = getattr(coordinator, "battery_feedback", {})
+    if plan and feedback.get("state") in {"awaiting_discharge", "discharge_blocked"}:
+        label = "Afladning blokeret" if feedback.get("problem") else "Afventer faktisk afladning"
+        return f"{label}: {feedback['reason']} | {plan.ev.reason}"[:255]
+    return plan.last_decision_reason if plan else None
 
 
 def _daily_load_forecast(coordinator: Any, *, conservative: bool = False) -> dict[str, float]:
@@ -99,7 +110,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         key="site_status",
         name="Site Status",
         icon="mdi:home-lightning-bolt-outline",
-        value_fn=lambda c: "safe_mode" if c.control_plan and c.control_plan.safe_mode else ("ev_degraded" if c.ev_health["problem"] else "ready"),
+        value_fn=lambda c: "safe_mode" if c.control_plan and c.control_plan.safe_mode else ("battery_degraded" if getattr(c, "battery_feedback", {}).get("problem") else ("ev_degraded" if c.ev_health["problem"] else "ready")),
     ),
     WattsonSensorDescription(
         key="ev_charging_status", name="EV Charging Status", icon="mdi:ev-station",
@@ -116,12 +127,13 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         key="last_decision_reason",
         name="Last Decision Reason",
         icon="mdi:brain",
-        value_fn=lambda c: c.control_plan.last_decision_reason if c.control_plan else None,
+        value_fn=_live_decision_reason,
         attrs_fn=lambda c: {
             "version": c.control_plan.version,
             "decision_code": c.control_plan.decision_code,
             "replan_reason": c.control_plan.replan_reason,
             "ev_runtime_state": c.control_plan.ev_runtime_state,
+            "battery_feedback": getattr(c, "battery_feedback", {}),
         } if c.control_plan else None,
     ),
     WattsonSensorDescription(
@@ -171,6 +183,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         name="Battery Strategy",
         icon="mdi:battery-sync",
         value_fn=lambda c: c.control_plan.battery.strategy if c.control_plan else None,
+        attrs_fn=lambda c: {"feedback": getattr(c, "battery_feedback", {})},
     ),
     WattsonSensorDescription(
         key="ev_strategy",
@@ -451,6 +464,7 @@ class WattsonSensor(CoordinatorEntity, SensorEntity):
                 "issues": site_state.issues,
                 "last_actions": getattr(self.coordinator, "last_actions", []),
                 "safe_reasons": control_plan.safe_reasons if control_plan else [],
+                "battery_feedback": getattr(self.coordinator, "battery_feedback", {}),
                 "version": control_plan.version if control_plan else None,
                 "decision_code": control_plan.decision_code if control_plan else None,
                 "replan_reason": control_plan.replan_reason if control_plan else None,

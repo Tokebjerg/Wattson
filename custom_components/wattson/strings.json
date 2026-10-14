@@ -235,6 +235,10 @@
     }
   },
   "issues": {
+    "battery_discharge_blocked": {
+      "title": "Wattson: battery discharge blocked",
+      "description": "The house is importing power although battery discharge is planned: {entities}. Wattson retries the inverter settings at a bounded rate without changing the discharge limit or SOC reserve."
+    },
     "missing_entities": {
       "title": "Wattson: required entities missing",
       "description": "Wattson cannot run active control because these required entities are unavailable: {entities}. Check the integration configuration and that the devices are online."
