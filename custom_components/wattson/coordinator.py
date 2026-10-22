@@ -3553,6 +3553,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             soc=state.ev_raw_soc_pct, soc_at=sample_at, soc_trusted=trusted and fresh_sample,
             nominal_kwh_per_pct=max_amps * 0.69 / max(1.0, speed),
             max_power_kw=max_amps * 0.69,
+            session_started_at=session.started_at,
             full_offer=(capacity_learning
                         and self.ev_mode in {EV_MODE_FULL_SPEED, EV_MODE_SCHEDULED_CHEAPEST, EV_MODE_SCHEDULED}
                         and self._last_ev_amps == max_amps
@@ -3562,6 +3563,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                         and not self.control_plan.ev.solar_opportunity))
         if session.energy.as_dict() != before:
             session.dirty = True
+        if (before["anchor_at"] and session.energy.anchor_at != before["anchor_at"]
+                and before["anchor_soc"] is not None
+                and abs(session.energy.anchor_soc - before["anchor_soc"]) >= 5):
+            self._pending_replan_reason = "ev_soc_corrected"
         estimate = session.energy.conservative_soc if trusted else None
         previous_valid = getattr(self, "_ev_vehicle_data_valid", None)
         self._ev_vehicle_data_valid = estimate is not None

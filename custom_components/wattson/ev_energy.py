@@ -35,7 +35,8 @@ class EvEnergyMeter:
                 soc: float | None, soc_at: datetime | None,
                 soc_trusted: bool, nominal_kwh_per_pct: float,
                 full_offer: bool = False, counter_fresh: bool | None = None,
-                max_power_kw: float = 11.04) -> None:
+                max_power_kw: float = 11.04,
+                session_started_at: datetime | None = None) -> None:
         if not self.learned:
             self.ac_kwh_per_pct = max(0.1, nominal_kwh_per_pct)
         previous = datetime.fromisoformat(self.last_tick) if self.last_tick else now
@@ -95,8 +96,15 @@ class EvEnergyMeter:
             return
         if self.anchor_at and soc_at.timestamp() <= datetime.fromisoformat(self.anchor_at).timestamp():
             return
-        if self.last_soc_seen_at and soc_at.timestamp() <= datetime.fromisoformat(self.last_soc_seen_at).timestamp():
-            return
+        pre_session_anchor = bool(session_started_at and self.anchor_at
+            and datetime.fromisoformat(self.anchor_at).timestamp() < session_started_at.timestamp())
+        if self.last_soc_seen_at:
+            seen = datetime.fromisoformat(self.last_soc_seen_at).timestamp()
+            # Reconsider a sample rejected by an older version after restoring
+            # this session. Never reconsider older data or infer energy used
+            # driving from a SOC observation made before the car was plugged in.
+            if soc_at.timestamp() < seen or (soc_at.timestamp() == seen and not pre_session_anchor):
+                return
         self.last_soc_seen_at = soc_at.isoformat()
         sample_energy = self.delivered_kwh
         prior = None
@@ -114,11 +122,12 @@ class EvEnergyMeter:
             gained_energy = sample_energy - self.anchor_energy_kwh
             during_charge = (self.last_active_at is not None and
                 soc_at.timestamp() <= datetime.fromisoformat(self.last_active_at).timestamp() + 300)
-            if self.delivered_kwh - self.anchor_energy_kwh >= 0.25 and soc <= self.anchor_soc and during_charge:
+            if (not pre_session_anchor and self.delivered_kwh - self.anchor_energy_kwh >= 0.25
+                    and soc <= self.anchor_soc and during_charge):
                 self.rejected_samples += 1
                 return
             delta = soc - self.anchor_soc
-            if delta >= 3 and gained_energy >= 0.5:
+            if not pre_session_anchor and delta >= 3 and gained_energy >= 0.5:
                 observed = gained_energy / delta
                 if 0.35 <= observed <= 1.2:
                     self.ac_kwh_per_pct = max(self.ac_kwh_per_pct * 0.8 + observed * 0.2, observed)
