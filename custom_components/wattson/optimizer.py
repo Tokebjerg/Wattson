@@ -238,7 +238,7 @@ def score_schedule(
                 house_kwh *= interval_h / step_h
                 ev_kwh = ev_hour * interval_h
                 solar_kwh = solar_hour * interval_h
-                target = max_kwh if price.total_import_price < 0.0 else care_kwh
+                target = max_kwh if price.total_import_price < 0.0 or task.peak_charge_goal else care_kwh
                 if task.grid_charge_target_soc_pct is not None:
                     target = min(target, max(floor_kwh,
                         task.grid_charge_target_soc_pct / 100.0 * capacity))
@@ -435,6 +435,7 @@ def score_realized_interval(
     sell: bool | None = None,
     charge_current_a: float | None = None,
     intent: str | None = None,
+    peak_charge_goal: bool = False,
 ) -> RealizedIntervalScore:
     """Counterfactual score for one completed interval using measured energy."""
     capacity = max(0.1, capacity_kwh)
@@ -454,7 +455,7 @@ def score_realized_interval(
     physical_charge_rate = max(0.0, charge_rate_kwh_h)
     if charge_current_a is not None:
         physical_charge_rate = min(physical_charge_rate, battery_rate_kwh(charge_current_a))
-    target = ceiling if import_price < 0.0 else care
+    target = ceiling if import_price < 0.0 or peak_charge_goal else care
     if grid_charge_target_soc_pct is not None:
         target = min(target, max(min_soc / 100.0 * capacity,
                                 grid_charge_target_soc_pct / 100.0 * capacity))

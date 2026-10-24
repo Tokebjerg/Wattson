@@ -18,19 +18,21 @@ def request_from_record(record: dict) -> PlanningRequest:
         raise ValueError("Legacy record lacks complete planning options")
     zone = ZoneInfo(record["local_timezone"]) if record.get("local_timezone") else None
 
-    def stamp(value):
+    def stamp(value, *, preserve_offset=False):
         if value is None:
             return None
         result = datetime.fromisoformat(value)
         if result.tzinfo is None:
             raise ValueError("Naive timestamp cannot be replayed exactly")
-        return result.astimezone(zone) if zone else result
+        return result.astimezone(zone) if zone and not preserve_offset else result
 
     def dated(row):
         row = dict(row)
         for key in ("start", "reserve_destination_at"):
             if key in row:
-                row[key] = stamp(row[key])
+                # Provider slot offsets are part of the recorded input. Converting
+                # them before replay changes ISO identities across a DST boundary.
+                row[key] = stamp(row[key], preserve_offset=True)
         return row
 
     values = deepcopy(record["normalized_input"])
@@ -57,10 +59,11 @@ def request_from_record(record: dict) -> PlanningRequest:
         previous = DayPlan(built_at=stamp(previous["built_at"]), day=date.fromisoformat(previous["day"]),
             slots=tuple(SlotPlan(**dated(row)) for row in previous["slots"]),
             tasks=tuple(PlanTask(**dated(row)) for row in previous["tasks"]),
-            initial_soc_pct=previous["initial_soc_pct"])
+            initial_soc_pct=previous["initial_soc_pct"],
+            peak_charge_goals=tuple(previous.get("peak_charge_goals", ())))
     return PlanningRequest(state, options(config["planning_options"]),
         options(config["scenario_options"]), options(config["scoring_options"]),
-        previous, bool(config.get("routine")))
+        previous, bool(config.get("routine")), config.get("peak_charge_target_pct"))
 
 
 def replay_record(record: dict):

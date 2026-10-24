@@ -1257,6 +1257,7 @@ def apply_sell_throttle(
     refill_margin: float = SELL_REFILL_MARGIN,
     pv_power_w: float | None = None,
     load_power_w: float | None = None,
+    peak_charge_goal: bool = False,
 ):
     """Throttle the charge register to ``throttle_a`` while the plan is SELLING
     surplus AND there is a cheaper same-day refill window ahead with enough forecast
@@ -1272,7 +1273,9 @@ def apply_sell_throttle(
     no cheaper refill window — so the low charge can ONLY ride with an active sell that
     has a guaranteed cheaper refill, never on its own. CAUTION: the 10A+sell pair is the
     v0.23.0 stall family — see SELL_THROTTLE_CHARGE_A; applied as a stable setpoint."""
-    if not getattr(plan, "desired_solar_sell", False):
+    if peak_charge_goal or not getattr(plan, "desired_solar_sell", False):
+        # The explicit deadline was solved with the committed charge ceiling.
+        # A reactive sell overlay must not silently remove that solar intake.
         return plan
     active, refill_kwh = sell_throttle_active(
         price_slots=price_slots, solar_slots=solar_slots, load_hourly_w=load_hourly_w,
@@ -3229,12 +3232,12 @@ def reproject_day_plan(plan: DayPlan, state: SiteState, *, capacity_kwh: float,
         reserve = resolve_reserve(hard_floor=min_soc, max_soc=max_soc,
             committed_floor=slot.tou_floor_pct, fallback_floor=min_soc)
         charge_a = slot.charge_current_a if slot.charge_current_a is not None else charge_current_a
-        if (slot.sell and not slot.grid_charge and (task.pv_estimate_kwh or 0) > (task.load_estimate_kwh or 0)
+        if (not slot.peak_charge_goal and slot.sell and not slot.grid_charge and (task.pv_estimate_kwh or 0) > (task.load_estimate_kwh or 0)
                 and sell_throttle_active(price_slots=state.price_slots, solar_slots=state.solar_slots,
                     load_hourly_w=load_hourly_w, now=task.start, soc_pct=stored/capacity*100,
                     max_soc_pct=max_soc, capacity_kwh=capacity_kwh)[0]):
             charge_a = min(charge_a, SELL_THROTTLE_CHARGE_A)
-        target_pct = max_soc if task.total_import_price < 0 else min(max_soc, battery_care_soc)
+        target_pct = max_soc if task.total_import_price < 0 or slot.peak_charge_goal else min(max_soc, battery_care_soc)
         if task.grid_charge_target_soc_pct is not None:
             target_pct = min(target_pct, task.grid_charge_target_soc_pct)
         flow = DEFAULT_PHYSICS.flow(stored_kwh=stored,
@@ -3364,7 +3367,7 @@ def execute_slot(
     _grid_charge_target_reached = bool(
         intent == "GRID_CHARGE"
         and _grid_charge_target is not None
-        and state.battery_soc_pct >= float(_grid_charge_target) - 0.5
+        and state.battery_soc_pct >= float(_grid_charge_target) - (0.0 if slot.peak_charge_goal else 0.5)
     )
     # S1 (2026-06-21): a FULL pack in a charge slot must HOLD, not cover the house
     # from the battery. SELF_CONSUME leaves the discharge open, so the pack covers a
@@ -3396,8 +3399,8 @@ def execute_slot(
             intent = "HOLD_FULL"
         elif (
             _grid_charge_target_reached
-            and slot.reserve_economically_valid
-            and slot.tou_floor_pct > min_soc + 0.1
+            and (slot.peak_charge_goal or (slot.reserve_economically_valid
+                                          and slot.tou_floor_pct > min_soc + 0.1))
         ):
             intent = "RESERVE_HOLD"
         else:
@@ -3424,6 +3427,7 @@ def execute_slot(
     # re-open the overnight ceiling flap on negative-price nights. So exclude it too.
     if negative_export_active and not allow_negative_export and intent not in (
         "ABSORB_NEGATIVE",
+        "GRID_CHARGE",
         "HOLD_FULL",
         "RESERVE_HOLD",
     ):
@@ -3473,14 +3477,17 @@ def execute_slot(
         return (
             BatteryPlan(
                 strategy="GRID_CHARGE",
-                reason=f"[plan] charging at one of the day's cheapest hours ({slot.total_import_price:.2f})",
+                reason=(f"[plan] charging for the full pre-evening battery goal ({slot.total_import_price:.2f})"
+                        if slot.peak_charge_goal else
+                        f"[plan] charging at one of the day's cheapest hours ({slot.total_import_price:.2f})"),
                 desired_grid_charge=True,
                 desired_solar_sell=False,
                 desired_energy_priority="Load first",
                 desired_limit_control_mode="Zero export to CT",
-                desired_export_limit_w=export_limit_default_w,
+                desired_export_limit_w=0.0 if negative_export_active and not allow_negative_export else export_limit_default_w,
                 discharge_intent="hold",
-                charge_target_soc_pct=min(float(battery_care_soc), max(float(plan_target), min_soc)),
+                charge_target_soc_pct=min(float(max_soc if slot.peak_charge_goal else battery_care_soc),
+                                          max(float(plan_target), min_soc)),
             ),
             negative_export_active,
         )
@@ -3489,7 +3496,7 @@ def execute_slot(
         return (
             BatteryPlan(
                 strategy="RESERVE_HOLD",
-                reason=(
+                reason=("[plan] holding the battery for the full pre-evening goal" if slot.peak_charge_goal else
                     "[plan] grid-charge target reached; grid charging stopped and "
                     "the marginally valuable reserve is held explicitly"
                 ),

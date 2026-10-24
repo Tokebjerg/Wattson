@@ -14,6 +14,7 @@ from .planner import (
 )
 from .optimizer import build_scenario_plan, score_schedule
 from .models import SiteState, DayPlan
+from .battery_goal import apply_peak_charge_goal
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class PlanningRequest:
     score_options: dict[str, Any]
     previous: DayPlan | None
     routine: bool
+    peak_charge_target_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,12 @@ class PlanningEngine:
             active = reproject_day_plan(active, request.state, **request.battery_options)
             if candidate:
                 candidate = reproject_day_plan(candidate, request.state, **request.battery_options)
+        if request.peak_charge_target_pct is not None:
+            active = apply_peak_charge_goal(active, request.state,
+                target_pct=request.peak_charge_target_pct, **request.battery_options)
+            if candidate:
+                candidate = apply_peak_charge_goal(candidate, request.state,
+                    target_pct=request.peak_charge_target_pct, **request.battery_options)
         active_score = score_schedule(active.tasks, request.state, **request.score_options)
         candidate_score = (score_schedule(candidate.tasks[:len(active.tasks)], request.state,
                                          **request.score_options) if candidate else None)

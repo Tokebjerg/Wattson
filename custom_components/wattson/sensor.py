@@ -355,6 +355,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
         icon="mdi:timeline-clock-outline",
         value_fn=_plan_action_label,
         attrs_fn=lambda c: {
+            "battery_peak_charge_goals": c.battery_peak_charge_goals,
             "automatiseringsopgaver": [
                 {
                     "hour": task.start.isoformat(),
@@ -366,6 +367,7 @@ SENSORS: tuple[WattsonSensorDescription, ...] = (
                     "ev_load_estimate_kwh": task.ev_load_estimate_kwh,
                     "projected_soc_pct": task.projected_soc_pct,
                     "grid_charge_target_soc_pct": task.grid_charge_target_soc_pct,
+                    "peak_charge_goal": task.peak_charge_goal,
                     "tou_floor_pct": task.tou_floor_pct,
                     "reserve_hard_floor_pct": task.reserve_hard_floor_pct,
                     "reserve_learned_floor_pct": task.reserve_learned_floor_pct,

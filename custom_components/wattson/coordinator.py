@@ -906,6 +906,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._avoidable_import_watchdog_destination_at: datetime | None = None
         self._battery_feedback_since: datetime | None = None
         self.battery_feedback: dict[str, Any] = {"state": "pending", "problem": False}
+        self._battery_goal_alert_key: tuple | None = None
         # Keeps EV-solar priority engaged through brief charger dips so the battery
         # strategy doesn't flip (and churn the inverter settings) every few seconds.
         self._ev_active_until: datetime | None = None
@@ -1733,6 +1734,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 "sell": task.sell,
                 "charge_current_a": task.charge_current_a,
                 "intent": task.intent,
+                "peak_charge_goal": task.peak_charge_goal,
             }
 
         self._optimizer_interval = {
@@ -2151,6 +2153,51 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if not stalled:
             self._battery_feedback_since = None
         self.battery_feedback = feedback
+
+    @property
+    def battery_peak_charge_goals(self) -> list[dict]:
+        plan = getattr(self, "_day_plan", None)
+        return list(plan.peak_charge_goals) if plan else []
+
+    def _update_battery_goal_alert(self, now: datetime) -> None:
+        """Surface infeasible deadlines without blocking the physical control tick."""
+        if (not self.automation_enabled or not self.battery_control_enabled or self.shadow_mode
+                or self.battery_override != BATTERY_OVERRIDE_AUTO
+                or (self.pause_until and now < self.pause_until)):
+            return
+        failed = next((goal for goal in self.battery_peak_charge_goals
+                       if not goal["feasible"]
+                       and datetime.fromisoformat(goal["deadline"]).timestamp() > now.timestamp()), None)
+        key = (failed["deadline"], int(now.timestamp() // 3600)) if failed else None
+        if key == getattr(self, "_battery_goal_alert_key", None):
+            return
+        self._battery_goal_alert_key = key
+        self.background.poll("battery_goal_alert", "current")
+        self.background.submit("battery_goal_alert", "current",
+            lambda: self._async_send_battery_goal_alert(failed))
+
+    async def _async_send_battery_goal_alert(self, failed: dict | None) -> None:
+        nid = f"wattson_battery_goal_{self.config_entry.entry_id}"
+        try:
+            if failed is None:
+                await self.hass.services.async_call("persistent_notification", "dismiss",
+                    {"notification_id": nid}, blocking=True)
+                return
+            deadline = datetime.fromisoformat(failed["deadline"])
+            message = (f"Husbatteriet forventes kun at nå {failed['expected_soc_pct']:.1f}% "
+                f"før de dyre timer {deadline:%d/%m kl. %H:%M}, mod målet på "
+                f"{failed['target_soc_pct']:.0f}%. Der mangler {failed['shortfall_kwh']:.2f} kWh. "
+                "Wattson planlægger mest mulig opladning inden fristen uden at overskride "
+                "ladegrænserne. Planen genberegnes løbende; solprognosen er ikke en garanti.")
+            await self.hass.services.async_call("persistent_notification", "create",
+                {"notification_id": nid, "title": "Wattson: batterimål kan ikke nås", "message": message},
+                blocking=True)
+            service = str(entry_value(self.config_entry, "ev_notify_service", ""))
+            if service.startswith("notify.") and self.hass.services.has_service("notify", service[7:]):
+                await self.hass.services.async_call("notify", service[7:],
+                    {"title": "Wattson: husbatteri", "message": message, "data": {"tag": nid}}, blocking=True)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Wattson battery-goal notification failed: %s", err)
 
     def _sync_repairs(self) -> None:
         """Phase F: surface Wattson problems in Settings → Repairs and clear them
@@ -2898,6 +2945,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         }
         excluded = bool(
             slot is None
+            or getattr(slot, "peak_charge_goal", False)
             or self.site_state is None
             or planned_floor is None
             or safe_reasons
@@ -4531,7 +4579,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 _critical_plan_pending = _replan_reason != "rolling_15m"
                 _request = PlanningRequest(deepcopy(self.site_state), deepcopy(_battery_options),
                                            deepcopy(_scenario_options), deepcopy(_score_options),
-                                           self._day_plan, _replan_reason == "rolling_15m")
+                                           self._day_plan, _replan_reason == "rolling_15m",
+                                           peak_charge_target_pct=100.0)
                 self.background.submit("planning", _job_key,
                                        lambda: self._async_evaluate_plan(_request))
             if _bundle is not None:
@@ -4623,6 +4672,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                                 "scoring_options": _bundle.request.score_options,
                                 "previous_plan": _bundle.request.previous,
                                 "routine": _bundle.request.routine,
+                                "peak_charge_target_pct": _bundle.request.peak_charge_target_pct,
                                 "battery_mode": self.battery_mode,
                                 "min_soc": _min_soc,
                                 "max_soc": _max_soc,
@@ -5120,6 +5170,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             capacity_kwh=_capacity,
             pv_power_w=self.site_state.pv_power_w,
             load_power_w=self.site_state.load_power_w,
+            peak_charge_goal=bool(_slot and _slot.peak_charge_goal),
         )
         # Phase E: a manual battery override is an explicit user action and wins
         # over the AI plan, EV-solar priority and the current restoration above.
@@ -5275,6 +5326,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             peak=expensive_peak(self.site_state.timestamp, self.site_state.price_slots,
                                 margin=self.reserve_hold_margin),
             protected=(bool(safe_reasons) or self.battery_override != BATTERY_OVERRIDE_AUTO
+                       or bool(_slot and _slot.peak_charge_goal and _slot.intent == "RESERVE_HOLD")
                        or battery_plan.desired_grid_charge
                        or battery_plan.discharge_intent == "hold"
                        or battery_plan.strategy in {"HOLD", "PROTECT"}),
@@ -5395,6 +5447,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                     await self._async_ev_alert("deadline_blocked",
                         f"EV-opladning er blokeret ({self._ev_control_blocked_reason}), og fristen nærmer sig. Kontroller bilen og Easee.")
         self._update_battery_feedback(tick.now)
+        self._update_battery_goal_alert(tick.now)
         self._sync_repairs()
         # Self-diagnosis runs AFTER control is applied and must NEVER be able to break the
         # control loop — it is pure observability. Swallow + log any error here.

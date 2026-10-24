@@ -397,6 +397,7 @@ class PlanTask:
     discharge_extension_allowed: bool = False
     duration_minutes: int = 60
     allocation_soc_pct: float | None = None
+    peak_charge_goal: bool = False
 
 
 @dataclass(frozen=True)
@@ -446,6 +447,7 @@ class SlotPlan:
     discharge_extension_allowed: bool = False
     duration_minutes: int = 60
     allocation_soc_pct: float | None = None
+    peak_charge_goal: bool = False
 
 
 @dataclass(frozen=True)
@@ -457,6 +459,7 @@ class DayPlan:
     slots: tuple[SlotPlan, ...] = ()
     tasks: tuple[PlanTask, ...] = ()
     initial_soc_pct: float | None = None
+    peak_charge_goals: tuple[dict, ...] = ()
 
     def slot_for(self, now: datetime) -> SlotPlan | None:
         instant = now.timestamp()
