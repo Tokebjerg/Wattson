@@ -456,6 +456,28 @@ class EaseeController:
     ) -> list[str]:
         actions: list[str] = []
 
+        if plan.desired_action == "pause" or plan.desired_enabled is False:
+            # Independent stop paths: a failed/ignored pause must not leave a
+            # live current offer. Never change the shared circuit or master switch.
+            failures = []
+            try:
+                actions.extend(await self._set_dynamic_limit(mapping.easee_device_id, 0))
+            except Exception as err:
+                if "superseded" in str(err):
+                    raise
+                failures.append(err)
+            try:
+                actions.extend(await self._action(mapping.easee_device_id, "pause"))
+            except Exception as err:
+                if "superseded" in str(err):
+                    raise
+                failures.append(err)
+            if failures:
+                # Partial success is retained in command evidence, never reported
+                # as a verified stop. Backoff/probes continue until physical rest.
+                raise failures[0]
+            return actions
+
         async def apply_current_offer() -> None:
             if plan.desired_circuit_currents is not None:
                 actions.extend(await self._set_circuit_dynamic_limit(mapping.easee_device_id, plan.desired_circuit_currents))

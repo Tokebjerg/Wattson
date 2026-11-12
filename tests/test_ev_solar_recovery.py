@@ -41,7 +41,7 @@ class ChargerPlant:
                 raise RuntimeError("offline cloud")
             self.stalled, self.fresh = False, True
             return
-        if self.fail_pause and service == "set_circuit_dynamic_limit" and data["current_p1"] == 0:
+        if self.fail_pause and service == "set_charger_dynamic_limit" and data["current"] == 0:
             self.fail_pause = False
             raise RuntimeError("cloud pause rejected")
         if self.stalled:

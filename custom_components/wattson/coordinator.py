@@ -5728,15 +5728,16 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             ev_plan=ev,
         )
         blocked_reason = None
-        if self.site_state.easee_online is False:
+        stopping = ev.desired_action == "pause" or ev.desired_enabled is False
+        if self.site_state.easee_online is False and not stopping:
             blocked_reason = "easee_offline"
-        elif easee_status in {"", "disconnected", "unknown", "unavailable"}:
+        elif easee_status == "disconnected" or (easee_status in {"", "unknown", "unavailable"} and not stopping):
             blocked_reason = "easee_status_unavailable"
         elif self.site_state.ev_issues and ev.desired_action != "pause":
             blocked_reason = "ev_telemetry_issue"
         elif self.site_state.ev_missing_entities and ev.desired_action != "pause":
             blocked_reason = "ev_telemetry_missing"
-        elif stale_power_blocks:
+        elif stale_power_blocks and not stopping:
             blocked_reason = "ev_power_stale"
         self._ev_control_blocked_reason = blocked_reason
         evidence = self._ev_charging_evidence(now)
@@ -5884,8 +5885,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             if self._ev_stop_recovery_attempts == 3:
                 self._ev_control_blocked_reason = "easee_stop_failed"
                 await self._async_ev_alert("stop_failed",
-                    "Bilen lader fortsat efter Wattsons pausekommando og tre genforsøg. "
-                    "Kontroller Easee og eventuel ekstern styring. Wattson starter ikke en dyr nødplan.")
+                    "Stop er ikke fysisk bekræftet trods pause og 0 A-strømtilbud. "
+                    "Wattson fortsætter stopforsøg med begrænset frekvens. "
+                    "Kontroller Easee og eventuel ekstern styring; fysisk stop er ikke bekræftet.")
         if start_recovery_due:
             self._last_ev_start_recovery_at = now
             self._ev_start_recovery_attempts += 1

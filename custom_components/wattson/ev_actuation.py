@@ -47,6 +47,9 @@ class EvActuationState:
     telemetry_reloaded_at: datetime | None = None
     telemetry_reload_attempts: int = 0
 
+    def stop_retry_seconds(self) -> int:
+        return min(300, EV_START_RECOVERY_RETRY_SECONDS * 2 ** min(4, max(0, self.stop_attempts - 2)))
+
     def telemetry_recovery_due(self, ev: EvPlan, *, now: datetime, status: str,
                                evidence: str, online: bool,
                                transport_blocked: bool = False) -> bool:
@@ -97,11 +100,10 @@ class EvActuationState:
         pauses = ev.desired_action == "pause" or ev.desired_enabled is False
         waiting = status in EV_WAITING_TO_START_STATUSES or status == "charging"
         stop_retry = False
-        if pauses and charging:
+        if pauses and evidence != "not_charging" and status != "disconnected":
             self.stop_wait_since = self.stop_wait_since or now
             stop_retry = ((now-self.stop_wait_since).total_seconds() >= EV_START_VERIFY_SECONDS
-                          and self.stop_attempts < 3
-                          and write_allowed(self.stop_retried_at, EV_START_RECOVERY_RETRY_SECONDS, now))
+                          and write_allowed(self.stop_retried_at, self.stop_retry_seconds(), now))
         elif not pauses or evidence == "not_charging":
             self.stop_wait_since = self.stop_retried_at = None
             self.stop_attempts = 0
@@ -135,7 +137,7 @@ class EvActuationState:
                        and ev.desired_circuit_currents and any(requested)
                        and write_allowed(self.circuit_refreshed_at, EV_CIRCUIT_LIMIT_REFRESH_SECONDS, now))
         failed_backoff = bool(self.command_failed_at and not write_allowed(self.command_failed_at,
-                              min(1800, 90 * 2 ** min(5, max(0, self.command_failures-1))), now))
+                              min(300 if pauses else 1800, 90 * 2 ** min(5, max(0, self.command_failures-1))), now))
         if failed_backoff:
             self.start_status = "command_failed"
         return EvTransition(structural, within,
@@ -154,13 +156,12 @@ class EvActuationState:
                     min(1800, EV_START_RECOVERY_RETRY_SECONDS * 2 ** max(0, self.start_attempts - 1)), now):
                 return False
         elif action == "pause":
-            if self.stop_attempts >= 3 or not write_allowed(
-                    self.stop_retried_at, EV_START_RECOVERY_RETRY_SECONDS, now):
+            if not write_allowed(self.stop_retried_at, self.stop_retry_seconds(), now):
                 return False
         else:
             return False
         if self.command_failed_at and not write_allowed(self.command_failed_at,
-                min(1800, 90 * 2 ** min(5, max(0, self.command_failures - 1))), now):
+                min(300 if action == "pause" else 1800, 90 * 2 ** min(5, max(0, self.command_failures - 1))), now):
             return False
         self.last_fp = None
         return True

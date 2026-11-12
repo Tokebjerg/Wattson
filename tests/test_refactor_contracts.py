@@ -730,6 +730,7 @@ class AsyncContracts(unittest.IsolatedAsyncioTestCase):
             await recorder_release.wait()
         co._async_update_load_profile = blocked_recorder
         co._sync_repairs = Mock()
+        co._update_battery_goal_alert = Mock()
         co._run_anomaly_checks = Mock()
         with patch.object(mod.dt_util, "now", return_value=now), patch.object(mod.dt_util, "utcnow", return_value=now.astimezone(timezone.utc)):
             first = await asyncio.wait_for(co._async_update_data(), .5)
