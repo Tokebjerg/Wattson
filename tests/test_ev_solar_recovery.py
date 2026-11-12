@@ -87,6 +87,8 @@ class ChargerPlant:
 
 def plant_coordinator(now):
     co = coordinator(now, soc=47)
+    from homeassistant.helpers.storage import Store
+    co._site_supervision_store = Store(None, 1, "solar_supervision_harness")
     co.ev_mode = "solar_only"
     co.mapping = SimpleNamespace(easee_device_id="offline", easee_power_entity="sensor.easee_power",
         easee_session_entity="sensor.easee_energy", easee_status_entity="sensor.easee_status",

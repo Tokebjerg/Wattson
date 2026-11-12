@@ -3,6 +3,11 @@ and Easee EV charging control. It combines live telemetry, day-ahead prices,
 solar forecasts and learned house load while keeping the two actuators in
 independent fault domains.
 
+Version 0.32.9 adds persistent whole-site supervision, a half-hour audit, verified
+recovery and a manually acknowledged EV emergency interlock. The first 30 minutes
+observe only; existing fast protection continues. See
+[`site_supervision_0329.md`](../../docs/wattson/site_supervision_0329.md).
+
 ## Runtime design
 
 - `observations.py` normalizes units, finite values, provenance and data quality.

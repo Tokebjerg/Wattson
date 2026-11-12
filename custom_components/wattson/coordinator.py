@@ -21,6 +21,7 @@ from homeassistant.util import dt as dt_util
 
 from .config import entry_value, merged_entry_config, update_entry_options
 from .ev_performance import missing_phase, tn_phase_currents
+from .site_supervision import SiteSupervisionMixin
 from .const import (
     BATTERY_MIN_CHARGE_TEMP_C,
     EV_SOAK_BATTERY_DRAW_W,
@@ -751,7 +752,7 @@ def _control_safe_reasons(
     return reasons
 
 
-class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
+class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
     @property
     def background(self) -> BackgroundWork:
         if "_background_work" not in self.__dict__:
@@ -776,10 +777,11 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._accounting_store.async_save(self.accounting.as_dict()),
             self._decision_ledger_store.async_save(self._decision_ledger.as_dict()),
             self._decision_archive.flush(),
+            self._async_save_site_supervision(),
         )
         results = await asyncio.gather(*(asyncio.wait_for(operation, 15) for operation in operations),
                                        return_exceptions=True)
-        for name, result in zip(("ev", "accounting", "decision_ledger", "replay_archive"), results):
+        for name, result in zip(("ev", "accounting", "decision_ledger", "replay_archive", "supervision"), results):
             if isinstance(result, Exception):
                 _LOGGER.error("Wattson could not flush %s on shutdown: %s", name, result)
 
@@ -950,6 +952,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         self._ev_session_store = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.ev_session"
         )
+        self._site_supervision_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.site_supervision")
         self._accounting_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.accounting")
         self._decision_ledger_store = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.decision_ledger"
@@ -1006,6 +1009,7 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     async def async_startup(self) -> None:
         self.config_entry.async_on_unload(self.hass.bus.async_listen_once("homeassistant_stop", self.async_shutdown))
+        await self._async_restore_site_supervision()
         try:
             self._accounting_state = AccountingState.restore(await self._accounting_store.async_load())
         except Exception as err:  # noqa: BLE001
@@ -3668,7 +3672,12 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_schedule_view = self._build_ev_charge_schedule()
             self._ev_schedule_view_state = self.site_state
             self._ev_schedule_view_key = key
-        return deepcopy(self._ev_schedule_view)
+        view = deepcopy(self._ev_schedule_view)
+        if self.site_supervisor.emergency:
+            view.update(active=False, preview=True, plan_kind="blocked_preview",
+                        control_blocked_by="ev_emergency_locked",
+                        note="EV safety lock: manual acknowledgement required. " + view.get("note", ""))
+        return view
 
     def _build_ev_charge_schedule(self) -> dict[str, Any]:
         state = self.site_state
@@ -3830,6 +3839,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
 
     @property
     def ev_health(self) -> dict[str, Any]:
+        if self.site_supervisor.emergency:
+            return {"state": "emergency_locked", "problem": True,
+                    "blocked_reason": "ev_emergency_locked",
+                    "emergency": self.site_supervisor.emergency}
         if not self.ev_control_enabled:
             return {"state": "disabled", "problem": False}
         if self._ev_control_blocked_reason == "easee_charger_disabled":
@@ -5389,6 +5402,14 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             allow_grid_charge=_allow_grid_charge and not _cold_grid_charge_blocked,
         )
 
+        self.control_plan = self._supervision_contract_plan(self.control_plan)
+        self._update_battery_feedback(tick.now)
+        try:
+            self._supervise_site(tick.now)
+            self._site_supervision_error = None
+        except Exception as err:  # noqa: BLE001 - monitoring must not freeze physical protection
+            self._site_supervision_error = type(err).__name__
+            _LOGGER.exception("Wattson site supervision failed; continuing normal control")
         try:
             await self._async_supervise_ev(tick.local_now)
         except Exception as err:  # noqa: BLE001
@@ -5446,7 +5467,6 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
                 if left < 3600 and overview["required_kwh"] > 0.1:
                     await self._async_ev_alert("deadline_blocked",
                         f"EV-opladning er blokeret ({self._ev_control_blocked_reason}), og fristen nærmer sig. Kontroller bilen og Easee.")
-        self._update_battery_feedback(tick.now)
         self._update_battery_goal_alert(tick.now)
         self._sync_repairs()
         # Self-diagnosis runs AFTER control is applied and must NEVER be able to break the
@@ -5616,6 +5636,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             self._ev_transport_recovery_status = "cooldown"
             return []
 
+        if not self.site_supervisor.transport_reload_allowed(now):
+            self._ev_transport_recovery_status = "supervision_cooldown"
+            return []
+
         actions = CommandActions()
         self._last_ev_transport_reload_at = now
         if pause_unverified is not None:
@@ -5631,6 +5655,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             except CommandFailure as err:
                 actions.extend(CommandActions(err.actions, err.events))
                 _LOGGER.warning("Wattson could not pause unverified Easee before reconnecting: %s", err)
+        self.site_supervisor.record_transport_reload(now)
+        await self._async_save_site_supervision()
         # The HA reload service is local, not an Easee cloud command. Discard
         # cloud transport backoff so it cannot prevent its own recovery.
         self._easee.commands.invalidate()
@@ -5689,6 +5715,8 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
         if not self.ev_control_enabled:
             self._ev_control_blocked_reason = "ev_control_disabled"
             return []
+        if self.site_supervisor.emergency:
+            return await self._async_enforce_ev_emergency(now)
         enable_entity = getattr(self.mapping, "easee_enable_switch", None)
         states = getattr(getattr(self, "hass", None), "states", None)
         enable_state = states.get(enable_entity) if enable_entity and states else None
@@ -5718,6 +5746,10 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             return []
         if not charger_disabled:
             self._ev_charger_disabled_alert_at = None
+        else:
+            self._ev_control_blocked_reason = "easee_charger_disabled"
+            self._last_ev_fp = None
+            return []
         easee_status = (self.site_state.easee_status or "").strip().lower()
         requested_ev = plan.ev
         ev = requested_ev
@@ -5741,6 +5773,9 @@ class WattsonCoordinator(TelemetryMixin, DataUpdateCoordinator[ControlPlan]):
             blocked_reason = "ev_power_stale"
         self._ev_control_blocked_reason = blocked_reason
         evidence = self._ev_charging_evidence(now)
+        if getattr(self, "_site_ev_reload_requested", False):
+            self._site_ev_reload_requested = False
+            return await self._async_recover_easee_transport(now, pause_unverified=ev)
         online_entity = getattr(self.mapping, "easee_online_entity", None)
         session = getattr(self, "_ev_session", None)
         # Easee can poll status/power while its stream-only online entity remains

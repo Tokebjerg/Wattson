@@ -12,7 +12,8 @@ from .const import DOMAIN, NAME
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([WattsonReplanButton(coordinator, entry), WattsonPauseButton(coordinator, entry), WattsonResumeButton(coordinator, entry)])
+    async_add_entities([WattsonReplanButton(coordinator, entry), WattsonPauseButton(coordinator, entry),
+                        WattsonResumeButton(coordinator, entry), WattsonResetEvSafetyButton(coordinator, entry)])
 
 
 class _BaseButton(ButtonEntity):
@@ -54,3 +55,11 @@ class WattsonResumeButton(_BaseButton):
 
     async def async_press(self) -> None:
         await self._coordinator.async_resume()
+
+
+class WattsonResetEvSafetyButton(_BaseButton):
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "Reset EV Safety Lock", "reset_ev_safety_lock", "mdi:shield-check")
+
+    async def async_press(self) -> None:
+        await self._coordinator.async_acknowledge_ev_emergency()

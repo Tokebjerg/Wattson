@@ -107,6 +107,11 @@ def _predicted_load_today_kwh(coordinator: Any) -> float | None:
 
 SENSORS: tuple[WattsonSensorDescription, ...] = (
     WattsonSensorDescription(
+        key="site_supervision", name="Site Supervision", icon="mdi:shield-check-outline",
+        value_fn=lambda c: c.site_supervision_status["state"],
+        attrs_fn=lambda c: c.site_supervision_summary,
+    ),
+    WattsonSensorDescription(
         key="site_status",
         name="Site Status",
         icon="mdi:home-lightning-bolt-outline",

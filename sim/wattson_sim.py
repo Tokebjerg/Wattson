@@ -2903,6 +2903,8 @@ def test_coordinator_ev_harness():
 
     def make_co(status="charging"):
         co = object.__new__(co_mod.WattsonCoordinator)
+        from homeassistant.helpers.storage import Store
+        co._site_supervision_store = Store(None, 1, "supervision_harness")
         co.ev_control_enabled = True
         co.config_entry = _Entry()
         co.hass = _Hass()

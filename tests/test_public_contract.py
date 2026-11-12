@@ -117,6 +117,7 @@ class PublicContractTests(unittest.TestCase):
         self.assertEqual(
             {
                 "site_status",
+                "site_supervision",
                 "last_decision_reason",
                 "next_action",
                 "pv_power",
