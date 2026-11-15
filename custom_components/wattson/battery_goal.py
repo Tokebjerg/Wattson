@@ -42,6 +42,7 @@ def apply_peak_charge_goal(plan: DayPlan, state: SiteState, *, target_pct: float
     discharge_kw = battery_rate_kwh(discharge_current_a)
     grid_kw = max(0.0, grid_charge_rate_kwh if grid_charge_rate_kwh is not None else 1.15)
     price_by_stamp = {p.start.timestamp(): p for p in state.price_slots}
+    solar_by_stamp = {s.start.timestamp(): s for s in state.solar_slots}
     local_prices = [replace(p, start=p.start.astimezone(state.timestamp.tzinfo)) for p in state.price_slots]
     # Use the full published day, not the remaining prices: a 17:15 replan must
     # not turn 18:00 into a new deadline and buy peak electricity to refill.
@@ -49,7 +50,8 @@ def apply_peak_charge_goal(plan: DayPlan, state: SiteState, *, target_pct: float
              if expensive_peak(p.start, local_prices, margin=reserve_hold_margin)}
     deadlines = {}
     for price in sorted(local_prices, key=lambda p: p.start.timestamp()):
-        if (16 <= price.start.hour < 22 and price.start.timestamp() in peaks):
+        if (12 <= price.start.hour < 22 and not price.estimated
+                and price.start.timestamp() in peaks):
             deadlines.setdefault(price.start.date(), price.start)
     boundaries = {i: deadlines[slot.start.astimezone(state.timestamp.tzinfo).date()]
                   for i, slot in enumerate(plan.slots)
@@ -59,16 +61,20 @@ def apply_peak_charge_goal(plan: DayPlan, state: SiteState, *, target_pct: float
     if not boundaries:
         return plan
 
-    def flow(stored, slot, task):
+    def flow(stored, slot, task, *, conservative=False):
         duration = max(1, slot.duration_minutes) / 60
         remaining = max(0.0, min(duration, (slot.start.timestamp() + duration * 3600
                                            - state.timestamp.timestamp()) / 3600))
         imported = exported = drawn = 0.0
+        solar = solar_by_stamp.get(slot.start.timestamp())
+        solar_factor = 1.0
+        if conservative and solar and solar.pv_estimate10_kwh is not None and solar.pv_estimate_kwh > 0:
+            solar_factor = max(0.0, min(1.0, solar.pv_estimate10_kwh / solar.pv_estimate_kwh))
         while remaining > 1e-9:
             interval = min(.25, remaining)
             fraction = interval / duration
             result = DEFAULT_PHYSICS.flow(stored_kwh=stored,
-                pv_kwh=max(0.0, task.pv_estimate_kwh or 0) * fraction,
+                pv_kwh=max(0.0, task.pv_estimate_kwh or 0) * fraction * solar_factor,
                 load_kwh=max(0.0, task.load_estimate_kwh or 0) * fraction,
                 ev_kwh=max(0.0, task.ev_load_estimate_kwh or 0) * fraction,
                 protect_ev=ev_battery_protected,
@@ -126,7 +132,7 @@ def apply_peak_charge_goal(plan: DayPlan, state: SiteState, *, target_pct: float
                                 actions.append(policy(original, intent="GRID_CHARGE", floor=min_soc,
                                                       charge_target=float(pct)))
                 for action in actions:
-                    result = flow(node.stored, action, task)
+                    result = flow(node.stored, action, task, conservative=True)
                     # Tiny holding cost breaks equal-price ties in favour of late
                     # filling; it cannot outweigh a meaningful price difference.
                     cost = (node.cost + result.import_kwh * task.total_import_price
@@ -147,7 +153,7 @@ def apply_peak_charge_goal(plan: DayPlan, state: SiteState, *, target_pct: float
                       "expected_soc_pct": round(expected, 3),
                       "feasible": bool(feasible) and max_soc >= requested,
                       "shortfall_kwh": round(max(0.0, capacity * requested / 100 - selected.stored), 3),
-                      "forecast_basis": "rolling_p50", "max_soc_pct": max_soc})
+                      "forecast_basis": "rolling_p10_when_available", "max_soc_pct": max_soc})
         chosen = []
         while selected.slot is not None:
             action = selected.slot

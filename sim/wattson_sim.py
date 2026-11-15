@@ -2831,6 +2831,9 @@ def _coordinator_module():
             async def async_save(self, data):
                 self.data = data
 
+            def async_delay_save(self, callback, delay):
+                self.data = callback()
+
             async def async_remove(self):
                 self.data = None
 

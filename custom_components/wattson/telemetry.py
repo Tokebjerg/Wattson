@@ -57,6 +57,8 @@ GRID_IMPORT_CAUSES = (
     "discharge_limit",
     "safe_or_manual",
     "reserve_hold",
+    "goal_hold",
+    "ev_battery_protection",
     "avoidable",
     "other",
 )
@@ -86,6 +88,8 @@ def classify_grid_import_power(
     reserve_value_kr: float,
     reserve_economically_valid: bool | None = None,
     min_reserve_value_kr: float = RESERVE_HOLD_MIN_VALUE_KR,
+    mandatory_goal_hold: bool = False,
+    ev_battery_protected: bool = False,
 ) -> dict[str, float]:
     """Split measured import into mutually exclusive physical/control causes."""
     causes = {cause: 0.0 for cause in GRID_IMPORT_CAUSES}
@@ -101,6 +105,10 @@ def classify_grid_import_power(
         take("battery_grid_charge", max(0.0, -float(battery_power_w or 0.0)))
 
     take("ev_charging", max(0.0, float(ev_power_w or 0.0)))
+    if ev_battery_protected and ev_power_w > 200:
+        take("ev_battery_protection", remaining)
+    if mandatory_goal_hold:
+        take("goal_hold", remaining)
 
     battery_discharge_w = max(0.0, float(battery_power_w or 0.0))
     discharge_headroom_w = max(0.0, float(max_discharge_w) - battery_discharge_w)
@@ -942,6 +950,10 @@ class TelemetryMixin:
             return
         battery = plan.battery if plan is not None else None
         causes_w = classify_grid_import_power(
+            mandatory_goal_hold=bool(getattr(slot, "peak_charge_goal", False)
+                                     and getattr(slot, "intent", None) == "RESERVE_HOLD"),
+            ev_battery_protected=bool(battery is not None and battery.discharge_intent == "hold"
+                                     and "EV-beskyt" in battery.reason),
             grid_import_w=grid_in,
             battery_power_w=state.battery_power_w or 0.0,
             battery_soc_pct=state.battery_soc_pct,

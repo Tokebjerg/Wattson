@@ -189,9 +189,12 @@ class SiteSupervisor:
         return result
 
     def status(self, now: datetime, *, enabled: bool) -> dict:
+        failed_today = any(datetime.fromisoformat(key).astimezone(now.tzinfo).date() == now.date()
+                           and goal["state"] in {"missed", "unverified"}
+                           for key, goal in self.battery_goals.items())
         state = ("emergency_locked" if self.emergency else "suspended" if not enabled else
                  "observing" if now.timestamp() < self.observe_until else
-                 "degraded" if self.incidents else "healthy")
+                 "degraded" if self.incidents else "goal_missed" if failed_today else "healthy")
         return {"state": state, "checked_at": self.last_check, "checks": self.checks,
                 "last_full_audit_at": self.last_audit, "next_full_audit_at": self.last_audit + 1800,
                 "automatic_corrections_from": self.observe_until,

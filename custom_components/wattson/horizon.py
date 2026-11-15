@@ -91,7 +91,7 @@ def build_temperature_forecast(hass: Any, entity_id: str | None) -> dict[datetim
             temperature = float(value)
         except (TypeError, ValueError):
             continue
-        if start is not None and math.isfinite(temperature):
+        if start is not None and math.isfinite(temperature) and -50 <= temperature <= 60:
             result[utc_instant(start)] = temperature
     return result
 
@@ -132,6 +132,26 @@ def _raw_points(attrs: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(value, list):
             points.extend(item for item in value if isinstance(item, dict))
     return points
+
+
+def build_forecast_price_slots(hass: Any, buy_entity: str | None) -> list[PriceSlot]:
+    """Provider forecasts are shadow-only; published prices always win."""
+    attrs = _attrs(hass, buy_entity)
+    published = {_parse_dt(row.get("hour")) for row in _raw_points(attrs)}
+    result = {}
+    rows = attrs.get("forecast")
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        start = _parse_dt(row.get("hour"))
+        price = finite_number(row.get("price"))
+        if start is None or start in published or price is None:
+            continue
+        tariff = _hourly_tariff(attrs.get("tariffs"), start.hour) + _flat_tariff_total(attrs.get("tariffs"))
+        total = price if _raw_prices_include_tariffs(attrs) else price + tariff
+        result[utc_instant(start)] = PriceSlot(start, total - tariff, tariff, total,
+                                              export_value=None, estimated=True)
+    return sorted(result.values(), key=lambda slot: slot.start.timestamp())[:168]
 
 
 def _raw_prices_include_tariffs(attrs: dict[str, Any]) -> bool:

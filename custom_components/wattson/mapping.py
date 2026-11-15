@@ -44,7 +44,7 @@ from .const import (
     TOU_TIME_POINT_COUNT,
     KNOWN_DEFAULTS,
 )
-from .horizon import build_price_slots, build_solar_slots
+from .horizon import build_price_slots, build_solar_slots, current_price_slot
 from .models import Capabilities, EntityMapping, SiteState
 from .observations import finite_number, observe_numeric, power_factor
 
@@ -106,7 +106,10 @@ def build_entity_mapping(config: dict[str, Any]) -> EntityMapping:
             CONF_OUTDOOR_TEMPERATURE_ENTITY,
             DEFAULT_OUTDOOR_TEMPERATURE_ENTITY,
         ) or None,
-        raw_load_includes_ev=config.get("raw_load_includes_ev", False) is True,
+        raw_load_includes_ev=config.get(
+            "raw_load_includes_ev",
+            config[CONF_LOAD_POWER_ENTITY] == "sensor.klatremishw_deye_load_totalpower",
+        ) is True,
     )
 
 
@@ -395,6 +398,12 @@ def build_site_state(
         buy_price = None
     if mapping.sell_price_entity and (price_state := hass.states.get(mapping.sell_price_entity)) is not None and _is_stale(price_state, stale_seconds):
         sell_price = None
+    # Published slot validity is economic evidence even if its sensor value has
+    # not changed for ten minutes. Never apply this to physical telemetry.
+    published_slot = current_price_slot(price_slots or [], now)
+    if published_slot is not None and not published_slot.estimated:
+        buy_price = published_slot.total_import_price
+        sell_price = published_slot.export_value
     forecast_today = _read_float(hass, mapping.forecast_today_entity, missing=[], issues=[], stale=[], stale_seconds=stale_seconds)
 
     # Phase A trin A1: ingest the hourly planning horizon. Defensive — returns

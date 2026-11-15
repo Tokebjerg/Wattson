@@ -30,6 +30,8 @@ class SiteSupervisionMixin:
     def site_supervision_status(self) -> dict:
         now = self.site_state.timestamp if self.site_state else datetime.now(timezone.utc)
         status = self.site_supervisor.status(now, enabled=self._site_supervision_enabled(now))
+        if status["state"] == "healthy" and self.ev_health.get("problem"):
+            status.update(state="telemetry_or_ev_fault")
         if getattr(self, "_site_supervision_error", None):
             status.update(state="check_failed", error=self._site_supervision_error)
         return status

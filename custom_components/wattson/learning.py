@@ -281,7 +281,7 @@ def build_load_profile(
             paired.append((temp, watts - baseline))
     temp_reference: float | None = None
     temp_slope = 0.0
-    if len(paired) >= 48:
+    if len(paired) >= 96:
         ordered_t = sorted(t for t, _ in paired)
         temp_reference = ordered_t[len(ordered_t) // 2]
         xys = [(max(0.0, temp_reference - temp), residual) for temp, residual in paired]
@@ -290,6 +290,15 @@ def build_load_profile(
             # Negative/noisy slopes are unsafe and ignored. The upper bound keeps
             # one heater event from predicting implausible multi-kW corrections.
             temp_slope = max(0.0, min(500.0, sum(x * y for x, y in xys) / denominator))
+            # A cold-load model must beat the seasonal baseline on held-out
+            # recent observations before it can increase future energy demand.
+            split = len(xys) * 3 // 4
+            train, validation = xys[:split], xys[split:]
+            train_denominator = sum(x * x for x, _ in train)
+            fitted = max(0.0, min(500.0, sum(x*y for x, y in train) / train_denominator)) if train_denominator > 1 else 0.0
+            baseline_error = sum(abs(y) for _, y in validation)
+            model_error = sum(abs(y - x*fitted) for x, y in validation)
+            temp_slope = fitted if model_error < baseline_error * .95 else 0.0
 
     days_observed = len(days)
     confidence = min(1.0, days_observed / full_days) if full_days > 0 else 0.0
@@ -366,7 +375,7 @@ def forecast_load_w(
             0.0,
             float(hourly_table.get(start.hour, generic_hour)),
         )
-        seasonal_factor = min(1.8, max(0.6, seasonal_hour / generic_hour))
+        seasonal_factor = seasonal_hour / generic_hour
         selected_watts = float(quarter_value) * seasonal_factor
     else:
         selected_watts = float(

@@ -67,15 +67,17 @@ def _promotion_statistics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
         if abs(value) >= PROMOTION_DECISIVE_EPSILON_KR
     ]
     daily: dict[str, float] = {}
+    daily_counts: dict[str, int] = {}
     for row, value in zip(rows, advantages):
         day = str(row.get("at", ""))[:10]
-        if day:
+        if day and abs(value) >= PROMOTION_DECISIVE_EPSILON_KR:
             daily[day] = daily.get(day, 0.0) + value
+            daily_counts[day] = daily_counts.get(day, 0) + 1
     decisive_mean = mean(decisive) if decisive else 0.0
     # Fifteen-minute intervals on the same day are strongly correlated.  A
     # confidence bound based on them as independent observations promotes a
     # noisy candidate too early; calculate uncertainty from daily outcomes.
-    daily_values = list(daily.values())
+    daily_values = [value / daily_counts[day] for day, value in daily.items()]
     standard_error = (
         pstdev(daily_values) / math.sqrt(len(daily_values))
         if len(daily_values) > 1
@@ -83,6 +85,7 @@ def _promotion_statistics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
     )
     return {
         "decisive": len(decisive),
+        "calibrated_days": len(daily_values),
         "neutral": len(advantages) - len(decisive),
         "win_rate": (
             sum(value > 0.0 for value in decisive) / len(decisive)
@@ -191,6 +194,7 @@ class OptimizerLifecycle:
             stats = _promotion_statistics(valid_rows)
             if (
                 len(days) >= PROMOTION_MIN_DAYS
+                and stats["calibrated_days"] >= PROMOTION_MIN_DAYS
                 and stats["decisive"] >= PROMOTION_MIN_DECISIVE_EVALUATIONS
                 and stats["decisive_mean"] >= PROMOTION_MIN_MEAN_ADVANTAGE_KR
                 and stats["win_rate"] >= PROMOTION_MIN_WIN_RATE
@@ -228,6 +232,7 @@ class OptimizerLifecycle:
             "neutral_evaluations": stats["neutral"],
             "decisive_mean_advantage_kr": round(float(stats["decisive_mean"]), 4),
             "cumulative_advantage_kr": round(float(stats["cumulative"]), 4),
+            "advantage_basis": "overlapping_model_comparisons_not_cash_savings",
             "lower_confidence_bound_kr": round(float(stats["lower_confidence_bound"]), 4),
             "win_rate": round(float(stats["win_rate"]), 3),
             "worst_regret_kr": round(max((max(0.0, -value) for value in advantages), default=0.0), 4),

@@ -1,14 +1,17 @@
 """Cached Home Assistant input snapshot builder."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
-from .horizon import build_price_slots, build_solar_slots, build_temperature_forecast
+from .horizon import build_price_slots, build_solar_slots, build_temperature_forecast, build_forecast_price_slots
 from .mapping import build_capabilities, build_entity_mapping, build_site_state
 from .models import Capabilities, EntityMapping, PriceSlot, SiteState, SolarSlot
+from .forecast_shadow import ForecastShadow
 
 
 class SnapshotBuilder:
@@ -23,6 +26,26 @@ class SnapshotBuilder:
         self._price_slots: list[PriceSlot] = []
         self._solar_slots: list[SolarSlot] = []
         self._temperature_by_start_c: dict = {}
+        self.forecast_price_slots: list[PriceSlot] = []
+        self.forecast_shadow = ForecastShadow()
+        self._weather_forecast: dict = {}
+        self._weather_refreshed_at: datetime | None = None
+
+    async def refresh_weather(self) -> None:
+        """Cache real hourly weather off the fast control path; never force a vehicle refresh."""
+        entities = self.hass.states.async_all("weather")
+        if len(entities) != 1:
+            return
+        entity = entities[0].entity_id
+        response = await asyncio.wait_for(self.hass.services.async_call(
+            "weather", "get_forecasts", {"entity_id": entity, "type": "hourly"},
+            blocking=True, return_response=True), timeout=20)
+        rows = (response or {}).get(entity, {}).get("forecast", [])
+        fake = SimpleNamespace(states=SimpleNamespace(get=lambda _: SimpleNamespace(attributes={"forecast": rows})))
+        parsed = build_temperature_forecast(fake, entity)
+        if parsed:
+            self._weather_forecast = parsed
+            self._weather_refreshed_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _config_fp(config: dict[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -70,6 +93,8 @@ class SnapshotBuilder:
             self._price_slots = build_price_slots(
                 self.hass, mapping.buy_price_entity, mapping.sell_price_entity
             )
+            self.forecast_price_slots = build_forecast_price_slots(self.hass, mapping.buy_price_entity)
+            self.forecast_shadow.observe(datetime.now(timezone.utc), self.forecast_price_slots, self._price_slots)
             self._solar_slots = build_solar_slots(
                 self.hass, mapping.forecast_today_entity
             )
@@ -85,6 +110,8 @@ class SnapshotBuilder:
             invert_battery_power_sign=invert_battery_power_sign,
             price_slots=self._price_slots,
             solar_slots=self._solar_slots,
-            outdoor_temperature_by_start_c=self._temperature_by_start_c,
+            outdoor_temperature_by_start_c=(self._weather_forecast
+                if self._weather_refreshed_at and datetime.now(timezone.utc) - self._weather_refreshed_at < timedelta(hours=3)
+                else self._temperature_by_start_c),
         )
         return mapping, capabilities, state

@@ -3,10 +3,11 @@ and Easee EV charging control. It combines live telemetry, day-ahead prices,
 solar forecasts and learned house load while keeping the two actuators in
 independent fault domains.
 
-Version 0.32.9 adds persistent whole-site supervision, a half-hour audit, verified
-recovery and a manually acknowledged EV emergency interlock. The first 30 minutes
-observe only; existing fast protection continues. See
-[`site_supervision_0329.md`](../../docs/wattson/site_supervision_0329.md).
+Version 0.33.0 corrects winter load/rate learning, aligns the full-pack deadline
+with afternoon peak release, adds hourly weather and conservative PV feasibility,
+and observes longer price forecasts without granting them control. Existing EV
+supervision and physical interlocks remain. See
+[`winter_review_0330.md`](../../docs/wattson/winter_review_0330.md).
 
 ## Runtime design
 

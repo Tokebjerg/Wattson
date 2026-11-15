@@ -1,7 +1,8 @@
 """Stable planning boundary used by the runtime coordinator."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Any
 
 from .planner import (
@@ -26,6 +27,7 @@ class PlanningRequest:
     previous: DayPlan | None
     routine: bool
     peak_charge_target_pct: float | None = None
+    forecast_slots: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class PlanningResult:
     candidate_score: Any
     candidate_source: str | None
     request: PlanningRequest
+    forecast_preview: DayPlan | None = None
 
 
 class BatteryPlanner:
@@ -84,3 +87,20 @@ class PlanningEngine:
                                          **request.score_options) if candidate else None)
         return PlanningResult(active, candidate, active_score, candidate_score,
                               scenario.source if scenario else None, request)
+
+    @staticmethod
+    def preview(request: PlanningRequest) -> DayPlan | None:
+        """Separate diagnostic job; cannot delay or fail an active-plan result."""
+        preview = None
+        if request.forecast_slots:
+            prices = {p.start.timestamp(): p for p in request.forecast_slots}
+            prices.update({p.start.timestamp(): p for p in request.state.price_slots if not p.estimated})
+            end = request.state.timestamp + timedelta(hours=72)
+            shadow_state = replace(request.state, price_slots=sorted(
+                (p for p in prices.values() if p.start.timestamp() < end.timestamp()),
+                key=lambda p: p.start.timestamp()))
+            preview = build_day_plan(shadow_state, **request.battery_options)
+            if preview and request.peak_charge_target_pct is not None:
+                preview = apply_peak_charge_goal(preview, shadow_state,
+                    target_pct=request.peak_charge_target_pct, **request.battery_options)
+        return preview

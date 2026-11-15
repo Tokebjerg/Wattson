@@ -92,6 +92,7 @@ class InputContracts(unittest.TestCase):
 
     def test_raw_history_does_not_inherit_derived_site_semantics(self):
         config = dict(ws.BASE_CONFIG)
+        config["raw_load_includes_ev"] = False
         mapping = mapping_module.build_entity_mapping(config)
         self.assertFalse(observations.raw_load_includes_ev(mapping))
         self.assertTrue(observations.raw_load_includes_ev(replace(mapping, raw_load_includes_ev=True)))
@@ -135,7 +136,8 @@ class InputContracts(unittest.TestCase):
         mod = ws._coordinator_module()
         co = object.__new__(mod.WattsonCoordinator)
         co.config_entry = SimpleNamespace(data=ws.BASE_CONFIG, options={})
-        co.mapping = replace(mapping_module.build_entity_mapping(ws.BASE_CONFIG), outdoor_temperature_entity=None)
+        co.mapping = replace(mapping_module.build_entity_mapping(ws.BASE_CONFIG), outdoor_temperature_entity=None,
+                             raw_load_includes_ev=False)
         co.site_state = site(now, load_includes_ev=True)
         co.hass = ws.FakeHass({co.mapping.load_power_entity: (1000, "W"),
                                co.mapping.easee_power_entity: (11, "kW")})

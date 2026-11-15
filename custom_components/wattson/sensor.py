@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from homeassistant.components.sensor import RestoreSensor, SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
@@ -13,6 +13,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
+
 
 from .config import entry_value
 from .const import (
@@ -34,6 +35,20 @@ from .models import ControlPlan, SiteState
 from .planner import display_plan_action, ev_cheapest_charge_hours
 from .ev_observability import recordable_attributes
 from .telemetry import GRID_IMPORT_CAUSES
+from .horizon import utc_instant
+
+
+def _calendar_reset(period):
+    now = dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        return now
+    if period == "week":
+        return now - timedelta(days=now.weekday())
+    if period == "month":
+        return now.replace(day=1)
+    if period == "year":
+        return now.replace(month=1, day=1)
+    return None
 
 
 def pricing_attributes(coordinator, family: str, period: str) -> dict:
@@ -93,7 +108,9 @@ def _daily_load_forecast(coordinator: Any, *, conservative: bool = False) -> dic
         str(hour): round(forecast_load_w(
             profile,
             day.replace(hour=hour),
-            outdoor_temperature_c=temperature,
+            outdoor_temperature_c=(coordinator.site_state.outdoor_temperature_by_start_c or {}).get(
+                utc_instant(day.replace(hour=hour)), temperature
+            ) if coordinator.site_state is not None else temperature,
             conservative=conservative,
         ))
         for hour in range(24)
@@ -806,6 +823,10 @@ class WattsonGridImportCostSensor(CoordinatorEntity, RestoreSensor):
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
 
+    @property
+    def last_reset(self):
+        return _calendar_reset(self._period)
+
     _NAMES = {
         "today": "Grid Import Cost Today",
         "week": "Grid Import Cost Week",
@@ -901,6 +922,10 @@ class WattsonGridImportEnergySensor(CoordinatorEntity, RestoreSensor):
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self):
+        return _calendar_reset(self._period)
 
     _NAMES = {
         "today": "Grid Import Energy Today",
@@ -999,6 +1024,8 @@ class WattsonGridImportCauseSensor(CoordinatorEntity, RestoreSensor):
         "discharge_limit": "Grid Import Cause Discharge Limit Today",
         "safe_or_manual": "Grid Import Cause Safe Or Manual Today",
         "reserve_hold": "Grid Import Cause Valid Reserve Today",
+        "goal_hold": "Grid Import Cause Mandatory Goal Today",
+        "ev_battery_protection": "Grid Import Cause EV Battery Protection Today",
         "avoidable": "Grid Import Cause Avoidable Today",
         "other": "Grid Import Cause Other Today",
     }
@@ -1008,6 +1035,8 @@ class WattsonGridImportCauseSensor(CoordinatorEntity, RestoreSensor):
         "discharge_limit": "Forbrug over batteriets fysiske afladningsloft.",
         "safe_or_manual": "Import under sikker tilstand eller manuel batteristyring.",
         "reserve_hold": "Import mens en konkret og økonomisk gyldig reserve holdes.",
+        "goal_hold": "Import required to retain the mandatory pre-peak SOC target.",
+        "ev_battery_protection": "House import while the shared battery is held to protect EV charging.",
         "avoidable": "Import som batteriet kunne have dækket uden at bryde planen.",
         "other": "Import som ikke entydigt kan placeres i de andre årsager.",
     }
@@ -1055,6 +1084,10 @@ class WattsonGridImportCauseSensor(CoordinatorEntity, RestoreSensor):
             ),
             3,
         )
+
+    @property
+    def last_reset(self):
+        return dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

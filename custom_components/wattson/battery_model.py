@@ -142,13 +142,14 @@ def observe_grid_rate(
     observed_kwh_h: float,
     *,
     configured_kwh_h: float,
+    physical_limit_kw: float | None = None,
     updated_at: str | None = None,
 ) -> BatteryModelState:
-    # Also bind an observation to 50-175% of the configured rate. The absolute
-    # limits protect first-run/default configurations.
-    lo = max(BATTERY_MODEL_GRID_RATE_MIN_KWH, configured_kwh_h * 0.5)
-    hi = min(BATTERY_MODEL_GRID_RATE_MAX_KWH, configured_kwh_h * 1.75)
-    if lo > hi or not (lo <= observed_kwh_h <= hi):
+    # An old configured estimate must not reject valid faster physical charging.
+    lo = BATTERY_MODEL_GRID_RATE_MIN_KWH
+    hi = min(BATTERY_MODEL_GRID_RATE_MAX_KWH,
+             physical_limit_kw if physical_limit_kw is not None else BATTERY_MODEL_GRID_RATE_MAX_KWH)
+    if not math.isfinite(observed_kwh_h) or lo > hi or not (lo <= observed_kwh_h <= hi):
         return model
     learned = _ewma(model.grid_charge_rate_kwh, observed_kwh_h)
     return replace(

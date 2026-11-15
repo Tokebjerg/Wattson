@@ -354,7 +354,7 @@ def _canonical_load_forecast(
             profile,
             dt_util.as_local(instant),
             outdoor_temperature_c=(outdoor_temperature_by_start_c or {}).get(
-                utc_instant(instant), outdoor_temperature_c
+                utc_instant(instant).replace(minute=0, second=0, microsecond=0), outdoor_temperature_c
             ),
             conservative=conservative,
             quarter_hour=quarter_hour,
@@ -778,10 +778,11 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
             self._decision_ledger_store.async_save(self._decision_ledger.as_dict()),
             self._decision_archive.flush(),
             self._async_save_site_supervision(),
+            self._forecast_shadow_store.async_save(self._snapshot_builder.forecast_shadow.rows),
         )
         results = await asyncio.gather(*(asyncio.wait_for(operation, 15) for operation in operations),
                                        return_exceptions=True)
-        for name, result in zip(("ev", "accounting", "decision_ledger", "replay_archive", "supervision"), results):
+        for name, result in zip(("ev", "accounting", "decision_ledger", "replay_archive", "supervision", "price_forecast_shadow"), results):
             if isinstance(result, Exception):
                 _LOGGER.error("Wattson could not flush %s on shutdown: %s", name, result)
 
@@ -954,6 +955,7 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
         )
         self._site_supervision_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.site_supervision")
         self._accounting_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.accounting")
+        self._forecast_shadow_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.price_forecast_shadow")
         self._decision_ledger_store = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.decision_ledger"
         )
@@ -965,6 +967,7 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
         self._optimizer_active_score = None
         self._optimizer_candidate_score = None
         self._optimizer_interval: dict[str, Any] | None = None
+        self._forecast_preview = None
         self._battery_model = BatteryModelState()
         self._battery_model_last_tick: datetime | None = None
         self._battery_model_capacity_day = None
@@ -1010,6 +1013,12 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
     async def async_startup(self) -> None:
         self.config_entry.async_on_unload(self.hass.bus.async_listen_once("homeassistant_stop", self.async_shutdown))
         await self._async_restore_site_supervision()
+        try:
+            rows = await self._forecast_shadow_store.async_load()
+            if isinstance(rows, list):
+                self._snapshot_builder.forecast_shadow = type(self._snapshot_builder.forecast_shadow)(rows)
+        except Exception as err:
+            _LOGGER.warning("Cannot restore shadow price observations: %s", err)
         try:
             self._accounting_state = AccountingState.restore(await self._accounting_store.async_load())
         except Exception as err:  # noqa: BLE001
@@ -1534,12 +1543,15 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
             and 10.0 <= state.battery_soc_pct <= 98.0
             and state.battery_power_w < -100.0
             and state.grid_import_power_w > 100.0
+            and state.pv_power_w < 100.0
         )
         if charging:
             charge_kw = min(-state.battery_power_w, state.grid_import_power_w) / 1000.0
             self._battery_model_grid_hours += dt_hours
             self._battery_model_grid_kwh += charge_kw * dt_hours
-        elif self._battery_model_grid_hours > 0.0:
+        if self._battery_model_grid_hours > 0.0 and (
+            not charging or self._battery_model_grid_hours >= 0.25
+        ):
             if self._battery_model_grid_hours >= 0.25 and self._battery_model_grid_kwh >= 0.2:
                 configured_rate = float(entry_value(
                     self.config_entry,
@@ -1550,6 +1562,7 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
                     self._battery_model,
                     self._battery_model_grid_kwh / self._battery_model_grid_hours,
                     configured_kwh_h=configured_rate,
+                    physical_limit_kw=battery_rate_kwh(self.battery_charge_current) * 1.10,
                     updated_at=now.isoformat(),
                 )
             self._battery_model_grid_hours = 0.0
@@ -4096,6 +4109,14 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
         if getattr(self, "_shutting_down", False):
             return self.control_plan
         tick = TickContext(now=dt_util.utcnow(), local_now=dt_util.now())
+        self.background.poll("weather_forecast", "current")
+        preview = self.background.poll("price_preview", "current")
+        if preview is not None:
+            self._forecast_preview = preview
+        if self._cadence.due("forecast_shadow_save", tick.now, timedelta(minutes=5)):
+            self._forecast_shadow_store.async_delay_save(lambda: self._snapshot_builder.forecast_shadow.rows, 5)
+        if self._cadence.due("weather_forecast", tick.now, timedelta(hours=1)):
+            self.background.submit("weather_forecast", "current", self._snapshot_builder.refresh_weather)
         # Phase E: auto-resume — drop any manual override whose window elapsed.
         self._expire_overrides(tick.now)
         self._reset_physical_write_counts_if_new_day()
@@ -4232,6 +4253,8 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
         _hourly_forecast_instants = unique_utc_instants((
             *(slot.start for slot in self.site_state.price_slots),
             *(slot.start for slot in self.site_state.solar_slots),
+            *(slot.start for slot in self._snapshot_builder.forecast_price_slots
+              if 0 <= slot.start.timestamp() - tick.local_now.timestamp() < 72 * 3600),
         ))
         _forecast_instants = _hourly_forecast_instants
         _scenario_instants = unique_utc_instants(
@@ -4593,10 +4616,15 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
                 _request = PlanningRequest(deepcopy(self.site_state), deepcopy(_battery_options),
                                            deepcopy(_scenario_options), deepcopy(_score_options),
                                            self._day_plan, _replan_reason == "rolling_15m",
-                                           peak_charge_target_pct=100.0)
+                                           peak_charge_target_pct=100.0,
+                                           forecast_slots=tuple(self._snapshot_builder.forecast_price_slots))
                 self.background.submit("planning", _job_key,
                                        lambda: self._async_evaluate_plan(_request))
             if _bundle is not None:
+                if _bundle.request.forecast_slots:
+                    self.background.submit("price_preview", "current",
+                        lambda request=_bundle.request: self.hass.async_add_executor_job(
+                            self._planning_engine.preview, request))
                 _realized_outcome = self._finish_optimizer_interval()
                 if _realized_outcome is not None:
                     self._decision_ledger.attach_outcome(_realized_outcome)
