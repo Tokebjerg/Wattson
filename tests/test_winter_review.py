@@ -2,6 +2,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import importlib
+import asyncio
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -131,6 +132,19 @@ class WinterReviewTests(unittest.TestCase):
 
 
 class WeatherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_price_preview_wraps_ha_future_as_coroutine(self):
+        module = ws._coordinator_module()
+        co = object.__new__(module.WattsonCoordinator)
+        result = object()
+        def executor(fn, request):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(result)
+            return future
+        co.hass = SimpleNamespace(async_add_executor_job=executor)
+        co._planning_engine = SimpleNamespace(preview=lambda request: result)
+        job = asyncio.create_task(co._async_evaluate_price_preview(None))
+        self.assertIs(result, await job)
+
     async def test_hourly_weather_cached_without_actuation(self):
         start = datetime.now(timezone.utc).isoformat()
         services = SimpleNamespace(async_call=AsyncMock(return_value={"weather.home":{"forecast":[

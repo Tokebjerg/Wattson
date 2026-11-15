@@ -33,6 +33,8 @@ class SnapshotBuilder:
 
     async def refresh_weather(self) -> None:
         """Cache real hourly weather off the fast control path; never force a vehicle refresh."""
+        if self._weather_refreshed_at and datetime.now(timezone.utc) - self._weather_refreshed_at < timedelta(hours=1):
+            return
         entities = self.hass.states.async_all("weather")
         if len(entities) != 1:
             return

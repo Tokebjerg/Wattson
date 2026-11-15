@@ -763,6 +763,10 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
         return await asyncio.wait_for(
             self.hass.async_add_executor_job(self._planning_engine.evaluate, request), 120)
 
+    async def _async_evaluate_price_preview(self, request: PlanningRequest):
+        return await asyncio.wait_for(
+            self.hass.async_add_executor_job(self._planning_engine.preview, request), 90)
+
     async def async_shutdown(self, _event=None) -> None:
         if getattr(self, "_shutting_down", False):
             return
@@ -4115,7 +4119,7 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
             self._forecast_preview = preview
         if self._cadence.due("forecast_shadow_save", tick.now, timedelta(minutes=5)):
             self._forecast_shadow_store.async_delay_save(lambda: self._snapshot_builder.forecast_shadow.rows, 5)
-        if self._cadence.due("weather_forecast", tick.now, timedelta(hours=1)):
+        if self._cadence.due("weather_forecast", tick.now, timedelta(minutes=1)):
             self.background.submit("weather_forecast", "current", self._snapshot_builder.refresh_weather)
         # Phase E: auto-resume — drop any manual override whose window elapsed.
         self._expire_overrides(tick.now)
@@ -4623,8 +4627,7 @@ class WattsonCoordinator(SiteSupervisionMixin, TelemetryMixin, DataUpdateCoordin
             if _bundle is not None:
                 if _bundle.request.forecast_slots:
                     self.background.submit("price_preview", "current",
-                        lambda request=_bundle.request: self.hass.async_add_executor_job(
-                            self._planning_engine.preview, request))
+                        lambda request=_bundle.request: self._async_evaluate_price_preview(request))
                 _realized_outcome = self._finish_optimizer_interval()
                 if _realized_outcome is not None:
                     self._decision_ledger.attach_outcome(_realized_outcome)
